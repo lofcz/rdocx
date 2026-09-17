@@ -8,9 +8,9 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use rdocx_oxml::math::{
-    FractionType, MathAccent, MathArgument, MathDelimiter, MathExpression, MathFraction, MathLimit,
-    MathMatrix, MathMatrixRow, MathNary, MathPreSubSuperscript, MathRadical, MathRun, MathScript,
-    MathSubSuperscript,
+    BarPosition, FractionType, MathAccent, MathArgument, MathBar, MathDelimiter, MathExpression,
+    MathFraction, MathLimit, MathMatrix, MathMatrixRow, MathNary, MathPreSubSuperscript,
+    MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
 };
 
 use crate::{Error, Result};
@@ -489,16 +489,24 @@ fn mathml_element_to_expressions(
         "munder" => &["accentunder"][..],
         "munderover" => &["accent", "accentunder"][..],
         "mfenced" => &["open", "close", "separators"][..],
+        "mi" | "mn" | "mo" | "mtext" => &["mathvariant"][..],
+        "mspace" => &["width"][..],
         _ => &[][..],
     };
     diagnose_attributes(node, path, allowed_attributes, diagnostics)?;
     if !matches!(
         node.local.as_str(),
-        "math" | "mrow" | "mi" | "mn" | "mo" | "mtext" | "msqrt" | "mfenced"
+        "math" | "mrow" | "mstyle" | "mpadded" | "mi" | "mn" | "mo" | "mtext" | "msqrt" | "mfenced"
     ) {
         diagnose_structural_text(node, path, diagnostics)?;
     }
     match node.local.as_str() {
+        // Style and spacing wrappers carry no OMML meaning; their content does.
+        "mstyle" | "mpadded" => {
+            Ok(mathml_children_to_argument(node, path, diagnostics, nodes)?.expressions)
+        }
+        "mspace" => Ok(mathml_space(node)),
+        "mphantom" => Ok(mathml_phantom(node)),
         "math" | "mrow" => {
             if node.local == "mrow"
                 && let Some(delimiter) = parse_explicit_fenced_row(node, path, diagnostics, nodes)?
@@ -513,13 +521,24 @@ fn mathml_element_to_expressions(
             Ok(mathml_children_to_argument(node, path, diagnostics, nodes)?.expressions)
         }
         "mi" | "mn" | "mo" | "mtext" => {
+            // Some renderers (KaTeX `\overset`) wrap a whole construct in a
+            // token element; with no text of its own the token is a plain wrapper.
+            if node.elements().next().is_some() && node.text().trim().is_empty() {
+                return Ok(mathml_children_to_argument(node, path, diagnostics, nodes)?.expressions);
+            }
             for (index, _) in node.elements().enumerate() {
                 diagnostics.push(
                     format!("{path}/*[{}]", index + 1),
                     "nested MathML token content was discarded",
                 )?;
             }
-            Ok(vec![MathRun::new(node.text()).into()])
+            let text = node.text();
+            if node.local == "mo" && text.chars().all(is_invisible_operator) {
+                // U+2061..U+2064 (function application, invisible times, …) have
+                // no glyph; OMML relies on operator spacing instead.
+                return Ok(Vec::new());
+            }
+            Ok(vec![mathml_token_run(node, text, path, diagnostics)?.into()])
         }
         "mfrac" => {
             let children = mathml_element_children(node);
@@ -685,6 +704,148 @@ fn require_child_count(path: &str, children: &[&XmlNode], expected: usize) -> Re
     Ok(())
 }
 
+/// Pure presentation hints without an OMML counterpart; accepted silently on
+/// any element so that renderer output (KaTeX, MathJax, browsers) round-trips
+/// without diagnostic noise.
+const IGNORED_PRESENTATION_ATTRIBUTES: &[&str] = &[
+    "class",
+    "columnalign",
+    "columnlines",
+    "columnspacing",
+    "depth",
+    "dir",
+    "display",
+    "displaystyle",
+    "fence",
+    "form",
+    "frame",
+    "height",
+    "id",
+    "largeop",
+    "linethickness",
+    "lspace",
+    "mathbackground",
+    "mathcolor",
+    "mathsize",
+    "maxsize",
+    "minsize",
+    "movablelimits",
+    "rowalign",
+    "rowlines",
+    "rowspacing",
+    "rspace",
+    "scriptlevel",
+    "separator",
+    "stretchy",
+    "style",
+    "symmetric",
+    "voffset",
+    "width",
+];
+
+fn is_invisible_operator(c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}')
+}
+
+/// Token run with MathML default styling: `mtext` and multi-character
+/// identifiers (`sin`, `lim`) are upright; `mathvariant` overrides the rest.
+fn mathml_token_run(
+    node: &XmlNode,
+    text: String,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) -> Result<MathRun> {
+    let mut run = MathRun::new(text);
+    match node.attribute("mathvariant") {
+        None => {
+            if node.local == "mtext" || (node.local == "mi" && run.text.chars().count() > 1) {
+                run.properties.normal = Some(true);
+            }
+        }
+        Some("normal") => run.properties.normal = Some(true),
+        Some("bold") => run.properties.style = Some(MathStyle::Bold),
+        // Math italic is the OMML default (`m:sty` = `i`).
+        Some("italic") => {}
+        Some("bold-italic") => run.properties.style = Some(MathStyle::BoldItalic),
+        Some("double-struck") => {
+            let mapped: Option<String> = run.text.chars().map(double_struck).collect();
+            match mapped {
+                Some(mapped) => {
+                    run.text = mapped;
+                    run.properties.normal = Some(true);
+                }
+                None => diagnostics.push(
+                    format!("{path}/@mathvariant"),
+                    "double-struck mathvariant has no Unicode form for this text and was discarded",
+                )?,
+            }
+        }
+        Some(_) => diagnostics.push(
+            format!("{path}/@mathvariant"),
+            "unsupported MathML mathvariant was discarded",
+        )?,
+    }
+    Ok(run)
+}
+
+/// Unicode Mathematical Alphanumeric double-struck letter for a Latin letter or digit.
+fn double_struck(c: char) -> Option<char> {
+    Some(match c {
+        'C' => '\u{2102}',
+        'H' => '\u{210D}',
+        'N' => '\u{2115}',
+        'P' => '\u{2119}',
+        'Q' => '\u{211A}',
+        'R' => '\u{211D}',
+        'Z' => '\u{2124}',
+        'A'..='Z' => char::from_u32(0x1D538 + (c as u32 - 'A' as u32))?,
+        'a'..='z' => char::from_u32(0x1D552 + (c as u32 - 'a' as u32))?,
+        '0'..='9' => char::from_u32(0x1D7D8 + (c as u32 - '0' as u32))?,
+        _ => return None,
+    })
+}
+
+/// `mspace` as a run of ordinary spaces (OMML has no spacing element); one
+/// space per 0.5em, default `1em`, clamped to 1..=16.
+fn mathml_space(node: &XmlNode) -> Vec<MathExpression> {
+    let width = node.attribute("width").unwrap_or("1em").trim();
+    let em = if let Some(value) = width.strip_suffix("em") {
+        value.trim().parse::<f64>().unwrap_or(1.0)
+    } else if let Some(value) = width.strip_suffix("ex") {
+        value.trim().parse::<f64>().unwrap_or(2.0) * 0.5
+    } else if let Some(value) = width.strip_suffix("pt") {
+        value.trim().parse::<f64>().unwrap_or(10.0) / 10.0
+    } else if let Some(value) = width.strip_suffix("px") {
+        value.trim().parse::<f64>().unwrap_or(13.0) / 13.0
+    } else if let Some(value) = width.strip_suffix("mu") {
+        value.trim().parse::<f64>().unwrap_or(18.0) / 18.0
+    } else {
+        1.0
+    };
+    let count = (em / 0.5).round().clamp(1.0, 16.0) as usize;
+    let mut run = MathRun::new(" ".repeat(count));
+    run.properties.normal = Some(true);
+    vec![run.into()]
+}
+
+/// `mphantom` reserves the width of its content; OMML has no invisible
+/// content, so one space stands in per character of text.
+fn mathml_phantom(node: &XmlNode) -> Vec<MathExpression> {
+    fn text_len(node: &XmlNode) -> usize {
+        node.children
+            .iter()
+            .map(|child| match child {
+                XmlChild::Text(text) => text.trim().chars().count(),
+                XmlChild::Element(element) => text_len(element),
+            })
+            .sum()
+    }
+    let count = text_len(node).clamp(1, 16);
+    let mut run = MathRun::new(" ".repeat(count));
+    run.properties.normal = Some(true);
+    vec![run.into()]
+}
+
 fn diagnose_attributes(
     node: &XmlNode,
     path: &str,
@@ -692,6 +853,11 @@ fn diagnose_attributes(
     diagnostics: &mut Diagnostics,
 ) -> Result<()> {
     for attribute in &node.attributes {
+        if attribute.namespace.is_none()
+            && IGNORED_PRESENTATION_ATTRIBUTES.contains(&attribute.local.as_str())
+        {
+            continue;
+        }
         if attribute.namespace.is_some() || !allowed.contains(&attribute.local.as_str()) {
             diagnostics.push(
                 format!("{path}/@{}", attribute.local),
@@ -827,6 +993,10 @@ fn is_supported_mathml_element(node: &XmlNode) -> bool {
                 | "mover"
                 | "munderover"
                 | "mfenced"
+                | "mstyle"
+                | "mpadded"
+                | "mspace"
+                | "mphantom"
                 | "semantics"
         )
 }
@@ -926,8 +1096,7 @@ fn parse_mathml_matrix(
     if row_nodes.is_empty() || row_nodes.len() > MAX_ROWS {
         return Err(math_error(format!("{path} exceeds the matrix row limit")));
     }
-    let mut rows = Vec::new();
-    let mut width = None;
+    let mut rows: Vec<Vec<MathArgument>> = Vec::new();
     for (row_index, row) in row_nodes.iter().enumerate() {
         if row.namespace.as_deref() != Some(MATHML_NS) || row.local != "mtr" {
             return Err(math_error(format!("{path} contains a non-row child")));
@@ -940,12 +1109,6 @@ fn parse_mathml_matrix(
             return Err(math_error(format!(
                 "{path} exceeds the matrix column limit"
             )));
-        }
-        if width
-            .replace(cells.len())
-            .is_some_and(|value| value != cells.len())
-        {
-            return Err(math_error(format!("{path} has a ragged matrix")));
         }
         let mut converted = Vec::new();
         for (column_index, cell) in cells.iter().enumerate() {
@@ -961,9 +1124,22 @@ fn parse_mathml_matrix(
                 nodes,
             )?);
         }
-        rows.push(MathMatrixRow::new(converted));
+        rows.push(converted);
     }
-    Ok(vec![MathExpression::Matrix(MathMatrix::new(rows))])
+    // TeX `array`/`matrix` rows may stop early; renderers emit them as-is.
+    // Pad with empty cells so the matrix stays rectangular, like TeX does.
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if rows.iter().any(|row| row.len() != width) {
+        diagnostics.push(path, "ragged MathML matrix rows were padded with empty cells")?;
+    }
+    Ok(vec![MathExpression::Matrix(MathMatrix::new(
+        rows.into_iter()
+            .map(|mut row| {
+                row.resize_with(width, MathArgument::default);
+                MathMatrixRow::new(row)
+            })
+            .collect(),
+    ))])
 }
 
 fn parse_mathml_limits_or_accent(
@@ -986,6 +1162,16 @@ fn parse_mathml_limits_or_accent(
         || node.attribute("accentunder") == Some("true")
         || token_accent;
     if accent {
+        if node.local == "munder"
+            && children[1].namespace.as_deref() == Some(MATHML_NS)
+            && children[1].local == "mo"
+            && matches!(children[1].text().trim(), "‾" | "¯" | "_" | "̲" | "―" | "—")
+        {
+            return Ok(vec![MathExpression::Bar(MathBar::new(
+                BarPosition::Bottom,
+                mathml_node_to_argument(children[0], &format!("{path}/*[1]"), diagnostics, nodes)?,
+            ))]);
+        }
         if node.local != "mover" {
             diagnostics.push(path, "under-accent MathML cannot be represented")?;
             return Ok(Vec::new());
@@ -1337,6 +1523,7 @@ fn normalize_expression(expression: &mut MathExpression) {
             }
         }
         MathExpression::Accent(value) => normalize_argument(&mut value.base),
+        MathExpression::Bar(value) => normalize_argument(&mut value.base),
     }
 }
 
@@ -1426,6 +1613,7 @@ fn validate_tree(argument: &MathArgument) -> std::result::Result<(), String> {
                     }
                 }
                 MathExpression::Accent(value) => visit(&value.base, depth + 1, nodes, text)?,
+                MathExpression::Bar(value) => visit(&value.base, depth + 1, nodes, text)?,
             }
         }
         Ok(())
@@ -1481,6 +1669,7 @@ fn expression_has_direct_unsupported_content(expression: &MathExpression) -> boo
         }
         MathExpression::Delimiter(value) => value.arguments.clear(),
         MathExpression::Accent(value) => value.base = MathArgument::default(),
+        MathExpression::Bar(value) => value.base = MathArgument::default(),
     }
     direct.has_unsupported_content()
 }
@@ -1516,7 +1705,12 @@ fn write_mathml_expression(
     }
     match expression {
         MathExpression::Run(run) => {
-            if run.properties != Default::default() {
+            let properties = &run.properties;
+            if properties.literal.is_some()
+                || properties.script.is_some()
+                || properties.break_before
+                || properties.break_alignment.is_some()
+            {
                 diagnostics.push(
                     format!("{path}/rPr"),
                     "OfficeMath run properties were discarded",
@@ -1529,7 +1723,20 @@ fn write_mathml_expression(
                 )?;
                 return Ok(());
             }
-            output.push_str("<mi>");
+            // `m:nor`/`m:sty` map onto `mathvariant`; a plain OMML run is math
+            // italic, which MathML only assumes for single-character `mi`.
+            let variant = match (properties.normal, properties.style) {
+                (Some(true), _) | (_, Some(MathStyle::Plain)) => Some("normal"),
+                (_, Some(MathStyle::Bold)) => Some("bold"),
+                (_, Some(MathStyle::BoldItalic)) => Some("bold-italic"),
+                _ if run.text.chars().count() > 1 => Some("italic"),
+                _ => None,
+            };
+            match variant {
+                Some(variant) => write!(output, "<mi mathvariant=\"{variant}\">")
+                    .expect("String writes are infallible"),
+                None => output.push_str("<mi>"),
+            }
             output.push_str(&xml_escape(&run.text));
             output.push_str("</mi>");
         }
@@ -1677,6 +1884,18 @@ fn write_mathml_expression(
                 xml_escape(&value.end_character)
             )
             .expect("String writes are infallible");
+        }
+        MathExpression::Bar(value) => {
+            let (open, close) = match value.position {
+                BarPosition::Top => ("<mover accent=\"true\"><mrow>", "</mrow><mo>\u{203E}</mo></mover>"),
+                BarPosition::Bottom => (
+                    "<munder accentunder=\"true\"><mrow>",
+                    "</mrow><mo>\u{203E}</mo></munder>",
+                ),
+            };
+            output.push_str(open);
+            write_mathml_argument(&value.base, path, output, diagnostics)?;
+            output.push_str(close);
         }
         MathExpression::Accent(value) => {
             if value.character.chars().count() != 1 {
@@ -2001,6 +2220,14 @@ impl<'a> LatexParser<'a> {
                 )]))
             }
             "left" => self.parse_left_right(start),
+            "underline" => {
+                let base = self.parse_required_argument()?;
+                self.add_node()?;
+                Ok(MathArgument::new(vec![MathExpression::Bar(MathBar::new(
+                    BarPosition::Bottom,
+                    base,
+                ))]))
+            }
             "hat" | "widehat" | "bar" | "overline" | "vec" | "overrightarrow" | "tilde"
             | "widetilde" | "dot" | "ddot" => {
                 let base = self.parse_required_argument()?;
@@ -2202,9 +2429,24 @@ impl<'a> LatexParser<'a> {
         self.parse_argument(Some('}'))
     }
 
+    /// Argument of `_`, `^` or an accent. Braced groups and commands parse as
+    /// atoms; an unbraced argument is exactly one character, as in TeX —
+    /// `C_2H_5OH` is C₂H₅OH and `x^2y` is x²y, not a script over `2H` / `2y`.
     fn parse_required_argument(&mut self) -> Result<MathArgument> {
         self.skip_whitespace();
-        self.parse_atom()
+        match self.peek() {
+            Some(character)
+                if !character.is_whitespace()
+                    && !matches!(character, '{' | '}' | '[' | ']' | '\\' | '_' | '^' | '&') =>
+            {
+                let text = character.to_string();
+                self.bump();
+                self.add_text(text.len())?;
+                self.add_node()?;
+                Ok(MathArgument::text(text))
+            }
+            _ => self.parse_atom(),
+        }
     }
 
     fn read_raw_group(&mut self) -> Result<String> {
@@ -2748,6 +2990,9 @@ fn diagnose_empty_latex_runs(
             MathExpression::Accent(value) => {
                 diagnose_empty_latex_runs(&value.base, &expression_path, diagnostics)?;
             }
+            MathExpression::Bar(value) => {
+                diagnose_empty_latex_runs(&value.base, &expression_path, diagnostics)?;
+            }
         }
     }
     Ok(())
@@ -2949,6 +3194,13 @@ fn write_latex_expression(
             }
             output.push_str("\\right");
             output.push_str(&end);
+        }
+        MathExpression::Bar(value) => {
+            output.push_str(match value.position {
+                BarPosition::Top => "\\overline",
+                BarPosition::Bottom => "\\underline",
+            });
+            write_latex_group(&value.base, path, output, diagnostics)?;
         }
         MathExpression::Accent(value) => {
             let Some(command) = latex_accent_command(&value.character) else {
@@ -3167,41 +3419,45 @@ mod tests {
         ))
         .expect("complete supported MathML subset");
         assert!(coverage.diagnostics.is_empty());
-        assert_eq!(coverage.value.expressions.len(), 9);
+        assert_eq!(coverage.value.expressions.len(), 10);
         assert!(matches!(
             &coverage.value.expressions[0],
-            MathExpression::Run(run) if run.text == "x2+word"
+            MathExpression::Run(run) if run.text == "x2+" && run.properties.normal.is_none()
         ));
         assert!(matches!(
-            coverage.value.expressions[1],
-            MathExpression::Subscript(_)
+            &coverage.value.expressions[1],
+            MathExpression::Run(run) if run.text == "word"
         ));
         assert!(matches!(
             coverage.value.expressions[2],
-            MathExpression::Superscript(_)
+            MathExpression::Subscript(_)
         ));
         assert!(matches!(
             coverage.value.expressions[3],
-            MathExpression::PreSubSuperscript(_)
+            MathExpression::Superscript(_)
         ));
         assert!(matches!(
             coverage.value.expressions[4],
-            MathExpression::Radical(_)
+            MathExpression::PreSubSuperscript(_)
         ));
         assert!(matches!(
             coverage.value.expressions[5],
-            MathExpression::LowerLimit(_)
+            MathExpression::Radical(_)
         ));
         assert!(matches!(
             coverage.value.expressions[6],
-            MathExpression::UpperLimit(_)
+            MathExpression::LowerLimit(_)
         ));
         assert!(matches!(
             coverage.value.expressions[7],
+            MathExpression::UpperLimit(_)
+        ));
+        assert!(matches!(
+            coverage.value.expressions[8],
             MathExpression::Nary(_)
         ));
         assert!(matches!(
-            &coverage.value.expressions[8],
+            &coverage.value.expressions[9],
             MathExpression::Delimiter(value) if value.separator_character == ";"
         ));
 
@@ -3257,34 +3513,43 @@ mod tests {
 
         let attribute_losses = equation_from_mathml(&format!(
             concat!(
-                r#"<math xmlns="{}"><mo largeop="true">x</mo>"#,
+                r#"<math xmlns="{}"><mo unknown="true" largeop="true">x</mo>"#,
                 r#"<mover accent="invalid"><mi>x</mi><mi>n</mi></mover>"#,
                 r#"<mtable><mtr row="lost">row text<mtd cell="lost"><mi>x</mi></mtd></mtr></mtable>"#,
-                r#"<mrow><mo fence="true" stretchy="invalid">(</mo><mi>z</mi><mo fence="true" form="invalid">)</mo></mrow>"#,
+                r#"<mrow><mo foo="invalid" stretchy="false">(</mo><mi>z</mi><mo bar="invalid" form="postfix">)</mo></mrow>"#,
                 "</math>"
             ),
             MATHML_NS
         ))
         .expect("unsupported safe attributes are diagnosed");
         assert!(attribute_losses.diagnostics.iter().any(|value| {
-            value.path == "/math[1]/mo[1]/@largeop"
+            value.path == "/math[1]/mo[1]/@unknown"
                 && value.message == "unsupported MathML attribute was discarded"
         }));
+        // Presentation hints without an OMML counterpart are accepted silently.
+        assert!(
+            !attribute_losses
+                .diagnostics
+                .iter()
+                .any(|value| value.path.ends_with("/@largeop")
+                    || value.path.ends_with("/@stretchy")
+                    || value.path.ends_with("/@form"))
+        );
         assert!(attribute_losses.diagnostics.iter().any(|value| {
             value.path == "/math[1]/mover[1]/@accent"
                 && value.message == "unsupported MathML attribute value was discarded"
         }));
         assert!(attribute_losses.diagnostics.iter().any(|value| {
-            value.path.ends_with("mrow[1]/mo[1]/@stretchy")
+            value.path.ends_with("mrow[1]/mo[1]/@foo")
                 && value.message == "unsupported MathML attribute was discarded"
         }));
         assert!(attribute_losses.diagnostics.iter().any(|value| {
-            value.path.ends_with("mrow[1]/mo[2]/@form")
+            value.path.ends_with("mrow[1]/mo[2]/@bar")
                 && value.message == "unsupported MathML attribute was discarded"
         }));
         for path in [
-            "/math[1]/mrow[1]/mo[1]/@stretchy",
-            "/math[1]/mrow[1]/mo[2]/@form",
+            "/math[1]/mrow[1]/mo[1]/@foo",
+            "/math[1]/mrow[1]/mo[2]/@bar",
         ] {
             assert_eq!(
                 attribute_losses
@@ -3364,7 +3629,9 @@ mod tests {
                     .iter()
                     .any(|value| matches!(value, MathExpression::Delimiter(_)))
             );
-            assert!(!converted.diagnostics.is_empty());
+            // The fences stay as ordinary text; nothing is lost, so nothing is diagnosed.
+            assert_eq!(converted.value, MathArgument::text("(x)"));
+            assert!(converted.diagnostics.is_empty());
         }
 
         let mixed_separators = equation_from_mathml(&format!(
@@ -3394,6 +3661,121 @@ mod tests {
             value.path == "/math[1]/mfenced[1]"
                 && value.message == "text outside a MathML token was discarded"
         }));
+    }
+
+    #[test]
+    fn unbraced_latex_scripts_take_a_single_token_like_tex() {
+        // Chemistry-style formulas chain several scripts across one run of
+        // letters; each `_` must bind to exactly one character.
+        let ethanol = equation_from_latex("C_2H_5OH").expect("chained subscripts convert");
+        assert!(ethanol.diagnostics.is_empty());
+        assert_eq!(equation_to_latex(&ethanol.value).value, "{C}_{2}{H}_{5}OH");
+
+        let power = equation_from_latex("x^2y + 10^-3").expect("unbraced superscripts convert");
+        assert_eq!(equation_to_latex(&power.value).value, "{x}^{2}y+{10}^{-}3");
+
+        let braced = equation_from_latex("x^{2y}").expect("braced group stays whole");
+        assert_eq!(equation_to_latex(&braced.value).value, "{x}^{2y}");
+    }
+
+    #[test]
+    fn renderer_mathml_presentation_maps_onto_omml_run_styles_and_bars() {
+        // KaTeX (`output: "mathml"`) shapes: upright text, function names,
+        // mathvariant, spacing, style wrappers, invisible operators, underbars.
+        let katex = equation_from_mathml(&format!(
+            concat!(
+                r#"<math xmlns="{}"><mrow>"#,
+                r#"<msup><mtext>cm</mtext><mn>2</mn></msup>"#,
+                r#"<mi>sin</mi><mo>⁡</mo><mi>x</mi>"#,
+                r#"<mi mathvariant="normal">lcm</mi><mi mathvariant="bold">v</mi>"#,
+                r#"<mi mathvariant="double-struck">R</mi>"#,
+                r#"<mspace width="2em"/>"#,
+                r#"<mstyle scriptlevel="0" displaystyle="true"><mfrac><mn>3</mn><mn>4</mn></mfrac></mstyle>"#,
+                r#"<munder accentunder="true"><mspace width="2em"/><mo stretchy="true">‾</mo></munder>"#,
+                r#"<mo stretchy="false">(</mo><mn>4</mn><mo separator="true">,</mo><mn>6</mn><mo stretchy="false">)</mo>"#,
+                "</mrow></math>"
+            ),
+            MATHML_NS
+        ))
+        .expect("renderer MathML converts");
+        assert!(
+            katex.diagnostics.is_empty(),
+            "presentation hints are silent: {:?}",
+            katex.diagnostics
+        );
+        let expressions = &katex.value.expressions;
+        let MathExpression::Superscript(unit) = &expressions[0] else {
+            panic!("cm^2 is a superscript")
+        };
+        let MathExpression::Run(cm) = &unit.base.expressions[0] else {
+            panic!("mtext run")
+        };
+        assert_eq!((cm.text.as_str(), cm.properties.normal), ("cm", Some(true)));
+        let MathExpression::Run(sin) = &expressions[1] else {
+            panic!("function name run")
+        };
+        assert_eq!((sin.text.as_str(), sin.properties.normal), ("sin", Some(true)));
+        let MathExpression::Run(x) = &expressions[2] else {
+            panic!("invisible operator is dropped and x follows")
+        };
+        assert_eq!((x.text.as_str(), x.properties.normal), ("x", None));
+        let MathExpression::Run(lcm) = &expressions[3] else {
+            panic!("operatorname run")
+        };
+        assert_eq!(lcm.properties.normal, Some(true));
+        let MathExpression::Run(bold) = &expressions[4] else {
+            panic!("bold run")
+        };
+        assert_eq!(bold.properties.style, Some(MathStyle::Bold));
+        let MathExpression::Run(reals) = &expressions[5] else {
+            panic!("double-struck run")
+        };
+        assert_eq!(reals.text, "ℝ");
+        let MathExpression::Run(space) = &expressions[6] else {
+            panic!("mspace run")
+        };
+        assert_eq!(space.text, "    ");
+        assert!(matches!(expressions[7], MathExpression::Fraction(_)));
+        let MathExpression::Bar(blank) = &expressions[8] else {
+            panic!("underlined blank is a bottom bar")
+        };
+        assert_eq!(blank.position, BarPosition::Bottom);
+        assert_eq!(expressions.len(), 10, "{expressions:#?}");
+
+        // KaTeX `\overset{a}{\longrightarrow}` wraps the construct in text-less `mo` tokens.
+        let wrapped = equation_from_mathml(&format!(
+            r#"<math xmlns="{MATHML_NS}"><mrow><mo><mover><mo><mo>⟶</mo></mo><mrow><mi>h</mi><mi>ν</mi></mrow></mover></mo></mrow></math>"#
+        ))
+        .expect("wrapper tokens convert");
+        assert!(wrapped.diagnostics.is_empty(), "{:?}", wrapped.diagnostics);
+        let MathExpression::UpperLimit(limit) = &wrapped.value.expressions[0] else {
+            panic!("label over arrow is an upper limit: {:#?}", wrapped.value)
+        };
+        assert_eq!(limit.base, MathArgument::text("⟶"));
+
+        // Bars and styles survive OMML serialisation and the MathML round trip.
+        let bar_tree = MathArgument::new(vec![
+            MathExpression::Bar(MathBar::new(BarPosition::Bottom, MathArgument::text("x"))),
+            MathExpression::Bar(MathBar::new(BarPosition::Top, MathArgument::text("AB"))),
+        ]);
+        let mathml = equation_to_mathml(&bar_tree);
+        assert!(mathml.diagnostics.is_empty());
+        assert!(mathml.value.contains("<munder accentunder=\"true\">"));
+        assert!(mathml.value.contains("<mover accent=\"true\">"));
+        let reparsed = equation_from_mathml(&mathml.value).expect("emitted MathML");
+        assert!(matches!(
+            &reparsed.value.expressions[0],
+            MathExpression::Bar(bar) if bar.position == BarPosition::Bottom
+        ));
+        assert_eq!(
+            equation_to_latex(&bar_tree).value,
+            r"\underline{x}\overline{AB}"
+        );
+        let underline = equation_from_latex(r"\underline{\qquad}").expect("underline parses");
+        assert!(matches!(
+            &underline.value.expressions[0],
+            MathExpression::Bar(bar) if bar.position == BarPosition::Bottom
+        ));
     }
 
     #[test]
@@ -3579,7 +3961,9 @@ mod tests {
             r#"<math xmlns="{MATHML_NS}"><semantics><annotation>meta</annotation><mi>kept</mi></semantics></math>"#
         ))
         .expect("semantics retains its first supported descendant");
-        assert_eq!(metadata_first.value, MathArgument::text("kept"));
+        let mut kept = MathRun::new("kept");
+        kept.properties.normal = Some(true);
+        assert_eq!(metadata_first.value, MathArgument::new(vec![kept.into()]));
         assert_eq!(metadata_first.diagnostics.len(), 1);
 
         let recovered_environment = equation_from_latex(r"a\begin{array}x\end{array}b")
@@ -3984,7 +4368,7 @@ mod tests {
         let mut diagnostic_runs = Vec::new();
         for _ in 0..=MAX_DIAGNOSTICS {
             let mut run = MathRun::new("x");
-            run.properties.style = Some(MathStyle::Bold);
+            run.properties.literal = Some(true);
             diagnostic_runs.push(MathExpression::Run(run));
         }
         let diagnostic_tree = MathArgument::new(diagnostic_runs);

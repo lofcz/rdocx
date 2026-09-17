@@ -399,6 +399,35 @@ pub fn break_into_lines(
 
                 // Add segment items to current line
                 for item in &seg_items {
+                    if matches!(item, InlineItem::Tab) {
+                        // Tab stops are measured from the paragraph's left
+                        // margin, so resolve against the absolute x of the
+                        // caret (line indent + width so far), not the
+                        // placeholder width used for break decisions.
+                        let indent = line_indent_at(params, line_index, is_first_line);
+                        let (mut tab_width, leader_char) =
+                            resolve_tab_width(indent + current_width, &params.tab_stops);
+                        // Right / centre / decimal stops depend on the text
+                        // that follows the tab; start at zero width so that
+                        // text is not pushed onto the next line, and let
+                        // `align_trailing_tabs` widen the gap once the line
+                        // is complete.
+                        if matches!(
+                            next_tab_stop(indent + current_width, &params.tab_stops)
+                                .map(|stop| stop.align),
+                            Some(TabAlign::Right | TabAlign::Center | TabAlign::Decimal)
+                        ) {
+                            tab_width = 0.0;
+                        }
+                        let leader =
+                            leader_char.and_then(|ch| shape_leader(fm, font_ctx, ch, tab_width));
+                        current_width += tab_width;
+                        current_items.push(LineItem::Tab {
+                            width: tab_width,
+                            leader,
+                        });
+                        continue;
+                    }
                     let (w, a, d, natural_height, font_size) = item_metrics(item);
                     current_width += w;
                     if a > current_ascent {
@@ -615,7 +644,55 @@ pub fn break_into_lines(
         is_last: true,
     });
 
+    align_trailing_tabs(&mut lines, &params.tab_stops);
     Ok(lines)
+}
+
+/// The explicit tab stop a tab at absolute `current_x` would jump to.
+fn next_tab_stop(current_x: f64, tab_stops: &[TabStop]) -> Option<&TabStop> {
+    tab_stops.iter().find(|stop| stop.pos_pt > current_x)
+}
+
+/// Widen tabs that jump to right / centre / decimal stops so the text that
+/// follows them ends at (or is centred on) the stop. Runs after line breaking
+/// because the width of that trailing text is only known once the line is
+/// complete; the gap is clamped so the line never exceeds its available width.
+fn align_trailing_tabs(lines: &mut [LayoutLine], tab_stops: &[TabStop]) {
+    if tab_stops.iter().all(|stop| matches!(stop.align, TabAlign::Left | TabAlign::Bar)) {
+        return;
+    }
+    for line in lines.iter_mut() {
+        let mut x = line.indent_left;
+        let count = line.items.len();
+        for idx in 0..count {
+            let width = line.items[idx].width();
+            let Some(stop) = next_tab_stop(x, tab_stops) else {
+                x += width;
+                continue;
+            };
+            let is_tab = matches!(line.items[idx], LineItem::Tab { .. });
+            if !is_tab || matches!(stop.align, TabAlign::Left | TabAlign::Bar) {
+                x += width;
+                continue;
+            }
+            let trailing: f64 = line.items[idx + 1..]
+                .iter()
+                .take_while(|item| !matches!(item, LineItem::Tab { .. }))
+                .map(LineItem::width)
+                .sum();
+            let target = match stop.align {
+                TabAlign::Center => stop.pos_pt - x - trailing / 2.0,
+                _ => stop.pos_pt - x - trailing,
+            };
+            let room = (line.available_width - line.width).max(0.0);
+            let new_width = target.max(0.0).min(width + room);
+            if let LineItem::Tab { width: w, .. } = &mut line.items[idx] {
+                *w = new_width;
+            }
+            line.width += new_width - width;
+            x += new_width;
+        }
+    }
 }
 
 /// Break rich text in logical order, then reorder each completed line for painting.

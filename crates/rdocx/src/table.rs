@@ -483,6 +483,33 @@ impl<'a> Cell<'a> {
         });
     }
 
+    /// Set this cell's own borders on all four edges, overriding the table
+    /// borders for this cell only. Use [`crate::BorderStyle::None`] to frame
+    /// nothing (a spacer square inside an otherwise bordered grid).
+    pub fn borders(mut self, style: crate::BorderStyle, size_eighths_pt: u32, color: &str) -> Self {
+        self.set_borders(style, size_eighths_pt, color);
+        self
+    }
+
+    /// Set this cell's own borders in place.
+    pub fn set_borders(&mut self, style: crate::BorderStyle, size_eighths_pt: u32, color: &str) {
+        let edge = CT_BorderEdge {
+            val: style.to_st(),
+            sz: Some(size_eighths_pt),
+            space: Some(0),
+            color: Some(color.to_string()),
+        };
+        self.ensure_tc_pr().borders = Some(CT_TblBorders {
+            top: Some(edge.clone()),
+            bottom: Some(edge.clone()),
+            left: Some(edge.clone()),
+            right: Some(edge),
+            inside_h: None,
+            inside_v: None,
+            extra_xml: Vec::new(),
+        });
+    }
+
     /// Set vertical alignment within the cell.
     pub fn vertical_alignment(mut self, align: VerticalAlignment) -> Self {
         self.set_vertical_alignment(align);

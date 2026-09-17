@@ -147,6 +147,9 @@ pub struct TableRow {
     pub height: f64,
     /// Whether this row is a header row.
     pub is_header: bool,
+    /// Word's row-level keep-with-next: every paragraph in the row carries
+    /// `keepNext`, so the row must share a page with whatever follows it.
+    pub keep_next: bool,
 }
 
 /// One source-ordered block inside a table cell.
@@ -517,11 +520,13 @@ fn layout_table_inner(
             max_cell_height.max(specified_height)
         };
 
+        let keep_next = row_keeps_with_next(&cells);
         rows.push(TableRow {
             structure_id: None,
             cells,
             height: row_height,
             is_header,
+            keep_next,
         });
         row_semantics.push(RowSemantics {
             cells: cell_semantics,
@@ -1169,6 +1174,27 @@ fn overlay_borders(target: &mut Option<CT_TblBorders>, source: &CT_TblBorders) {
     if source.inside_v.is_some() {
         target.inside_v = source.inside_v.clone();
     }
+}
+
+/// A row keeps with the next row (or the block after the table) when every
+/// paragraph directly inside its cells has `keepNext`, which is how Word
+/// exposes row-level keep-with-next.
+fn row_keeps_with_next(cells: &[TableCell]) -> bool {
+    let mut saw_paragraph = false;
+    for cell in cells {
+        if cell.is_vmerge_continue {
+            continue;
+        }
+        for block in &cell.blocks {
+            if let CellBlock::Paragraph(paragraph) = block {
+                saw_paragraph = true;
+                if !paragraph.keep_next {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_paragraph
 }
 
 #[cfg(test)]

@@ -578,7 +578,18 @@ fn paginate_pass_from<B: LayoutBlockLike>(
                 let row_semantics = table
                     .semantics
                     .and_then(|semantics| semantics.rows.get(row_idx));
-                if pager.cursor_y + row.height > pager.available_height() && pager.has_content() {
+                let needed = if row.keep_next {
+                    row_keep_chain_height(
+                        &table.rows,
+                        row_idx,
+                        blocks,
+                        block_idx,
+                        pager.available_height(),
+                    )
+                } else {
+                    row.height
+                };
+                if pager.cursor_y + needed > pager.available_height() && pager.has_content() {
                     pager.finish_page();
 
                     // Repeat header rows
@@ -2075,6 +2086,97 @@ fn reflow_around_wraps(
     Some(adjusted)
 }
 
+/// Height that must follow a keep-with-next block starting at `blocks[start]`:
+/// every further block bound to its successor by keep-with-next (or by rows
+/// that all keep with next), then the first line / first row of the block that
+/// ends the chain. When the chain would exceed `page_height`, fall back to the
+/// first line of `blocks[start]` alone, which is what Word does with a chain
+/// that cannot fit on any page.
+fn keep_chain_height<B: LayoutBlockLike>(blocks: &[B], start: usize, page_height: f64) -> f64 {
+    let Some(first) = blocks.get(start) else {
+        return 0.0;
+    };
+    let minimal = block_first_height(first, page_height);
+    let mut height = 0.0;
+    let mut idx = start;
+    while let Some(block) = blocks.get(idx) {
+        let binds_next = block
+            .paragraph()
+            .map_or_else(|| block.table().is_some_and(|table| table.rows.iter().all(|row| row.keep_next)), |paragraph| paragraph.keep_next);
+        if !binds_next {
+            height += block_first_height(block, page_height);
+            break;
+        }
+        height += block.space_before() + block.content_height() + block.space_after();
+        idx += 1;
+    }
+    if height > page_height { minimal } else { height }
+}
+
+/// The least of a block that must land on the same page as its keep-with-next
+/// predecessor: the first line of a paragraph (all of it when the paragraph
+/// keeps its lines together), or the leading keep-with-next row chain of a
+/// table — exactly what the table's own pagination will refuse to split, so
+/// the predecessor never stays behind on a page the rows then leave.
+fn block_first_height<B: LayoutBlockLike>(block: &B, page_height: f64) -> f64 {
+    block.paragraph().map_or_else(
+        || {
+            let Some(table) = block.table() else {
+                return 0.0;
+            };
+            let mut chain = 0.0;
+            for row in &table.rows {
+                chain += row.height;
+                if !row.keep_next {
+                    break;
+                }
+            }
+            if chain > page_height {
+                table.rows.first().map_or(0.0, |row| row.height)
+            } else {
+                chain
+            }
+        },
+        |paragraph| {
+            // Mirrors the split rule in `paginate_paragraph`: paragraphs that
+            // keep their lines together, or have at most two lines, move whole.
+            let body = if paragraph.keep_lines || paragraph.lines.len() <= 2 {
+                paragraph.content_height()
+            } else {
+                paragraph.lines.first().map_or(0.0, |line| line.height)
+            };
+            paragraph.space_before + body
+        },
+    )
+}
+
+/// Height the rows from `row_idx` on must share a page with: consecutive
+/// keep-with-next rows plus the row (or following block's first line) that
+/// ends the chain. Falls back to the row alone when the chain cannot fit.
+fn row_keep_chain_height<B: LayoutBlockLike>(
+    rows: &[crate::table::TableRow],
+    row_idx: usize,
+    blocks: &[B],
+    block_idx: usize,
+    page_height: f64,
+) -> f64 {
+    let mut height = 0.0;
+    let mut idx = row_idx;
+    let mut closed = false;
+    while let Some(row) = rows.get(idx) {
+        height += row.height;
+        if !row.keep_next {
+            closed = true;
+            break;
+        }
+        idx += 1;
+    }
+    if !closed {
+        height += keep_chain_height(blocks, block_idx + 1, page_height);
+    }
+    if height > page_height { rows[row_idx].height } else { height }
+}
+
 fn paginate_paragraph<B: LayoutBlockLike>(
     para: ParagraphView<'_>,
     body_index: Option<usize>,
@@ -2192,19 +2294,14 @@ fn paginate_paragraph<B: LayoutBlockLike>(
         }
     }
 
-    // Check keep-with-next
+    // Check keep-with-next. Like Word, the whole chain of keep-with-next
+    // blocks moves together when it fits on a page; a chain taller than a page
+    // degrades to keeping just the next block's first line.
     if para.keep_next && block_idx + 1 < blocks.len() {
-        let next = &blocks[block_idx + 1];
-        let next_first = next.paragraph().map_or_else(
-            || {
-                next.table().map_or(0.0, |table| {
-                    table.rows.first().map_or(0.0, |row| row.height)
-                })
-            },
-            |paragraph| paragraph.lines.first().map_or(0.0, |line| line.height),
-        );
-        if pager.cursor_y + space_before + para.content_height() + next_first
-            > pager.available_height_for(&para.lines)
+        let available = pager.available_height_for(&para.lines);
+        let chain = keep_chain_height(blocks, block_idx + 1, available);
+        if pager.cursor_y + space_before + para.content_height() + para.space_after + chain
+            > available
             && pager.has_content()
         {
             pager.finish_page_before(block_idx);
@@ -5753,6 +5850,7 @@ mod tests {
             }],
             height: 10.0,
             is_header: false,
+            keep_next: false,
         };
         let mut elements = Vec::new();
         render_table_row(

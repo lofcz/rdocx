@@ -3,7 +3,8 @@ use oxml_layout::{
     Transform,
 };
 use rdocx_oxml::math::{
-    FractionType, LimitLocation, MathAccent, MathArgument, MathDelimiter, MathExpression,
+    BarPosition, FractionType, LimitLocation, MathAccent, MathArgument, MathBar, MathDelimiter,
+    MathExpression,
     MathFraction, MathJustification, MathLimit, MathMatrix, MathNary, MathPreSubSuperscript,
     MathProperties, MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
     MatrixBaseJustification, OfficeMath,
@@ -242,6 +243,7 @@ fn apply_expression_limit_defaults(
                 }
             }
             MathExpression::Accent(value) => argument(&mut value.base, properties),
+            MathExpression::Bar(value) => argument(&mut value.base, properties),
         }
     }
 }
@@ -258,17 +260,47 @@ fn layout_expressions(
 ) -> Result<MeasuredMath> {
     let mut measured = Vec::with_capacity(expressions.len());
     for (index, expression) in expressions.iter().enumerate() {
-        measured.push(layout_expression(
-            expression,
-            fm,
-            font_family,
-            font_size,
-            color,
-            &format!("{source_path}/expression/{index}"),
-            diagnostics,
-        )?);
+        let path = format!("{source_path}/expression/{index}");
+        // A run that opens with an operator (`+1` after `x²`) is binary when
+        // something precedes it in the same argument; alone it is unary.
+        let left_operand = index > 0 && ends_with_operand(&expressions[index - 1]);
+        measured.push(match expression {
+            MathExpression::Run(run) if left_operand => layout_run_after_operand(
+                run,
+                fm,
+                font_family,
+                font_size,
+                color,
+                &path,
+                diagnostics,
+            )?,
+            _ => layout_expression(
+                expression,
+                fm,
+                font_family,
+                font_size,
+                color,
+                &path,
+                diagnostics,
+            )?,
+        });
     }
     Ok(layout_spaced_sequence(measured, spacing))
+}
+
+/// Whether an operator right after `expression` has a left operand.
+fn ends_with_operand(expression: &MathExpression) -> bool {
+    match expression {
+        MathExpression::Run(run) => run
+            .text
+            .chars()
+            .rev()
+            .find(|ch| !ch.is_whitespace())
+            .is_some_and(|ch| {
+                MathAtom::classify(ch) == MathAtom::Ordinary && !matches!(ch, '(' | '[' | '{')
+            }),
+        _ => true,
+    }
 }
 
 fn layout_argument(
@@ -424,11 +456,98 @@ fn layout_expression(
             source_path,
             diagnostics,
         ),
+        MathExpression::Bar(value) => layout_bar(
+            value,
+            fm,
+            font_family,
+            font_size,
+            color,
+            source_path,
+            diagnostics,
+        ),
     }
+}
+
+/// `m:bar`: the base with a rule drawn along its top or bottom edge.
+#[allow(clippy::too_many_arguments)]
+fn layout_bar(
+    value: &MathBar,
+    fm: &mut FontManager,
+    font_family: Option<&str>,
+    font_size: f64,
+    color: Color,
+    source_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<MeasuredMath> {
+    let base = layout_argument(
+        &value.base,
+        fm,
+        font_family,
+        font_size,
+        color,
+        &format!("{source_path}/base"),
+        diagnostics,
+    )?;
+    let gap = font_size * GAP_EM / 2.0;
+    let rule = font_size * RULE_EM;
+    let line = |y: f64| PositionedElement::Line {
+        start: Point { x: 0.0, y },
+        end: Point { x: base.width, y },
+        width: rule,
+        color,
+        dash_pattern: None,
+    };
+    Ok(match value.position {
+        BarPosition::Top => MeasuredMath {
+            width: base.width,
+            ascent: base.ascent + gap + rule,
+            descent: base.descent,
+            group: group(vec![
+                translated(base.group, 0.0, gap + rule),
+                line(rule / 2.0),
+            ]),
+        },
+        BarPosition::Bottom => MeasuredMath {
+            width: base.width,
+            ascent: base.ascent,
+            descent: base.descent + gap + rule,
+            group: group(vec![
+                line(base.ascent + base.descent + gap + rule / 2.0),
+                translated(base.group, 0.0, 0.0),
+            ]),
+        },
+    })
 }
 
 fn layout_run(
     run: &MathRun,
+    fm: &mut FontManager,
+    font_family: Option<&str>,
+    font_size: f64,
+    color: Color,
+    source_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<MeasuredMath> {
+    layout_run_with_context(run, false, fm, font_family, font_size, color, source_path, diagnostics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_run_after_operand(
+    run: &MathRun,
+    fm: &mut FontManager,
+    font_family: Option<&str>,
+    font_size: f64,
+    color: Color,
+    source_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<MeasuredMath> {
+    layout_run_with_context(run, true, fm, font_family, font_size, color, source_path, diagnostics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_run_with_context(
+    run: &MathRun,
+    left_operand: bool,
     fm: &mut FontManager,
     font_family: Option<&str>,
     font_size: f64,
@@ -443,17 +562,147 @@ fn layout_run(
     };
     let bold = matches!(style, MathStyle::Bold | MathStyle::BoldItalic);
     let italic = matches!(style, MathStyle::Italic | MathStyle::BoldItalic);
-    layout_text(
-        &run.text,
-        fm,
-        font_family,
-        font_size,
-        color,
-        bold,
-        italic,
-        source_path,
-        diagnostics,
-    )
+    // Word's math engine styles and spaces a run per character class: math
+    // italic applies to letters only (digits, operators and punctuation stay
+    // upright, so `2x+1` slants just `x`), binary operators and relations get
+    // TeX's medium / thick space on both sides, and a leading operator is
+    // unary (`-3`) and gets none.
+    let literal = run.properties.literal == Some(true);
+    let mut segments: Vec<(bool, MathAtom, String)> = Vec::new();
+    let chars: Vec<char> = run.text.chars().collect();
+    for (index, &ch) in chars.iter().enumerate() {
+        let atom = if literal {
+            MathAtom::Ordinary
+        } else {
+            MathAtom::classify_at(&chars, index)
+        };
+        let slanted = italic && ch.is_alphabetic();
+        match segments.last_mut() {
+            Some((last_slanted, last_atom, segment))
+                if *last_slanted == slanted && *last_atom == atom && atom == MathAtom::Ordinary =>
+            {
+                segment.push(ch)
+            }
+            _ => segments.push((slanted, atom, ch.to_string())),
+        }
+    }
+    if segments.is_empty() {
+        segments.push((italic, MathAtom::Ordinary, String::new()));
+    }
+    let mut pieces = Vec::with_capacity(segments.len() * 3);
+    let mut previous = left_operand.then_some(MathAtom::Ordinary);
+    for (slanted, atom, segment) in &segments {
+        let (before, after) = match atom {
+            MathAtom::Ordinary => (0.0, 0.0),
+            // No operand before it: unary sign or a run that starts with the operator.
+            MathAtom::Binary if previous.is_none_or(|p| p != MathAtom::Ordinary) => (0.0, 0.0),
+            MathAtom::Binary => {
+                let gap = font_size * BINARY_OPERATOR_GAP_EM;
+                (gap, gap)
+            }
+            MathAtom::Relation => {
+                let gap = font_size * RELATION_GAP_EM;
+                (gap, gap)
+            }
+            MathAtom::Punctuation => (0.0, font_size * PUNCTUATION_GAP_EM),
+        };
+        if before > 0.0 {
+            pieces.push(MathAtom::spacer(before));
+        }
+        pieces.push(layout_text(
+            segment,
+            fm,
+            font_family,
+            font_size,
+            color,
+            bold,
+            *slanted,
+            source_path,
+            diagnostics,
+        )?);
+        if after > 0.0 {
+            pieces.push(MathAtom::spacer(after));
+        }
+        previous = Some(*atom);
+    }
+    if pieces.len() == 1 {
+        return Ok(pieces.pop().expect("one piece"));
+    }
+    Ok(layout_sequence(pieces))
+}
+
+/// Width in em of a Unicode typographic space, per its TeX counterpart
+/// (`\,` = 3mu = 1/6 em, `\:` = 4mu, `\;` = 5mu, `\quad` = 1 em).
+fn typographic_space_em(ch: char) -> Option<f64> {
+    Some(match ch {
+        '\u{2000}' | '\u{2002}' => 0.5,
+        '\u{2001}' | '\u{2003}' => 1.0,
+        '\u{2004}' => 1.0 / 3.0,
+        '\u{2005}' => 0.25,
+        '\u{2006}' | '\u{2009}' => 1.0 / 6.0,
+        '\u{2007}' => 0.5,
+        '\u{2008}' => 0.25,
+        '\u{200A}' => 1.0 / 18.0,
+        '\u{200B}' | '\u{2062}' | '\u{2063}' | '\u{2064}' | '\u{FEFF}' => 0.0,
+        '\u{202F}' => 0.2,
+        '\u{205F}' => 4.0 / 18.0,
+        _ => return None,
+    })
+}
+
+/// TeX medium space (`\medmuskip`, 4/18 em) around binary operators.
+const BINARY_OPERATOR_GAP_EM: f64 = 4.0 / 18.0;
+/// TeX thick space (`\thickmuskip`, 5/18 em) around relations.
+const RELATION_GAP_EM: f64 = 5.0 / 18.0;
+/// TeX thin space (`\thinmuskip`, 3/18 em) after list punctuation.
+const PUNCTUATION_GAP_EM: f64 = 3.0 / 18.0;
+
+/// Spacing class of a formula character (a subset of TeX's atom types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MathAtom {
+    Ordinary,
+    Binary,
+    Relation,
+    Punctuation,
+}
+
+impl MathAtom {
+    /// Class of `chars[index]`; a comma between digits is a decimal mark
+    /// (`12,01`), not list punctuation.
+    fn classify_at(chars: &[char], index: usize) -> Self {
+        let ch = chars[index];
+        if ch == ',' {
+            let decimal = index > 0
+                && chars[index - 1].is_ascii_digit()
+                && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+            return if decimal { Self::Ordinary } else { Self::Punctuation };
+        }
+        Self::classify(ch)
+    }
+
+    fn classify(ch: char) -> Self {
+        match ch {
+            ';' => Self::Punctuation,
+            ':' => Self::Relation,
+            '+' | '−' | '-' | '×' | '⋅' | '·' | '÷' | '±' | '∓' | '∗' | '∘' | '∖' | '∧' | '∨'
+            | '∩' | '∪' | '⊕' | '⊗' | '⊙' => Self::Binary,
+            '=' | '≠' | '<' | '>' | '≤' | '≥' | '≪' | '≫' | '≈' | '≐' | '≡' | '≢' | '∼' | '≃'
+            | '≅' | '∝' | '∈' | '∉' | '∋' | '⊂' | '⊃' | '⊆' | '⊇' | '∥' | '⊥' | '→' | '←'
+            | '↔' | '⇒' | '⇐' | '⇔' | '⟶' | '⟵' | '⟹' | '⟸' | '⟺' | '↦' | '⇌' | '≔' => {
+                Self::Relation
+            }
+            _ => Self::Ordinary,
+        }
+    }
+
+    fn spacer(width: f64) -> MeasuredMath {
+        MeasuredMath {
+            width,
+            ascent: 0.0,
+            descent: 0.0,
+            group: group(Vec::new()),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,6 +720,75 @@ fn layout_text(
     let family = font_family
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_MATH_FONT);
+    // Typographic spaces (`\,` → U+2009, `\;` → U+2005 …) are fixed-width
+    // gaps, not glyphs: fonts rarely carry them and would draw a .notdef box.
+    if text.chars().any(|ch| typographic_space_em(ch).is_some()) {
+        let mut pieces = Vec::new();
+        let mut current = String::new();
+        for ch in text.chars() {
+            if let Some(em) = typographic_space_em(ch) {
+                if !current.is_empty() {
+                    pieces.push(layout_text(
+                        &std::mem::take(&mut current),
+                        fm,
+                        font_family,
+                        font_size,
+                        color,
+                        bold,
+                        italic,
+                        source_path,
+                        diagnostics,
+                    )?);
+                }
+                pieces.push(MathAtom::spacer(font_size * em));
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            pieces.push(layout_text(
+                &current,
+                fm,
+                font_family,
+                font_size,
+                color,
+                bold,
+                italic,
+                source_path,
+                diagnostics,
+            )?);
+        }
+        return Ok(layout_sequence(pieces));
+    }
+    // Formula runs mix digits and letters with symbols the math font may
+    // lack (`267⋅35`). Falling back per run would draw the digits with the
+    // symbol font; segment by coverage so each part keeps its best font.
+    let primary = fm.resolve_font(Some(family), bold, italic)?;
+    let mut segments: Vec<(bool, String)> = Vec::new();
+    for ch in text.chars() {
+        let covered = fm.font_covers(primary, ch);
+        match segments.last_mut() {
+            Some((last, segment)) if *last == covered => segment.push(ch),
+            _ => segments.push((covered, ch.to_string())),
+        }
+    }
+    if segments.len() > 1 {
+        let mut pieces = Vec::with_capacity(segments.len());
+        for (_, segment) in &segments {
+            pieces.push(layout_text(
+                segment,
+                fm,
+                font_family,
+                font_size,
+                color,
+                bold,
+                italic,
+                source_path,
+                diagnostics,
+            )?);
+        }
+        return Ok(layout_sequence(pieces));
+    }
     let font_id = fm.resolve_font_for_text(Some(family), bold, italic, text)?;
     let shaped = fm.shape_text(font_id, text, font_size)?;
     let metrics = fm.metrics(font_id, font_size)?;
@@ -1466,6 +1784,136 @@ mod tests {
             assert!(measured.height() > 0.0, "expression {index} has no height");
             assert!(!measured.group.children.is_empty(), "expression {index}");
         }
+    }
+
+    /// Every glyph run in a measured group, depth first.
+    fn glyph_runs(group: &GroupElement) -> Vec<GlyphRun> {
+        let mut out = Vec::new();
+        for child in &group.children {
+            match child {
+                PositionedElement::Text(run) => out.push(run.clone()),
+                PositionedElement::Group(inner) => out.extend(glyph_runs(inner)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn layout_plain_run(fm: &mut FontManager, source: &str) -> MeasuredMath {
+        let mut diagnostics = Vec::new();
+        layout_argument(
+            &text(source),
+            fm,
+            None,
+            11.0,
+            Color::BLACK,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("run layout")
+    }
+
+    #[test]
+    fn math_runs_slant_letters_only_space_operators_and_keep_digits_in_the_math_font() {
+        let mut fm = deterministic_font_manager();
+
+        // `2x+1`: only `x` is italic; `+` is a binary operator with a medium space each side.
+        let runs = glyph_runs(&layout_plain_run(&mut fm, "2x+1").group);
+        let slanted: Vec<(&str, bool)> = runs.iter().map(|r| (r.text.as_str(), r.italic)).collect();
+        assert_eq!(slanted, vec![("2", false), ("x", true), ("+", false), ("1", false)]);
+        let tight = layout_plain_run(&mut fm, "2x").width + layout_plain_run(&mut fm, "1").width
+            + glyph_runs(&layout_plain_run(&mut fm, "+").group)[0].advances.iter().sum::<f64>()
+                * MATH_TEXT_X_SCALE;
+        let spaced = layout_plain_run(&mut fm, "2x+1").width;
+        assert!(
+            (spaced - tight - 2.0 * 11.0 * BINARY_OPERATOR_GAP_EM).abs() < 0.05,
+            "binary operator gap: {spaced} vs {tight}"
+        );
+
+        // A leading minus is unary and gets no space; a decimal comma is not punctuation.
+        let unary = layout_plain_run(&mut fm, "-3").width;
+        let bare = layout_plain_run(&mut fm, "3").width
+            + glyph_runs(&layout_plain_run(&mut fm, "-").group)[0].advances.iter().sum::<f64>()
+                * MATH_TEXT_X_SCALE;
+        assert!((unary - bare).abs() < 0.05, "unary minus: {unary} vs {bare}");
+        let decimal = glyph_runs(&layout_plain_run(&mut fm, "12,01").group);
+        assert_eq!(decimal.len(), 1, "decimal number stays one run: {decimal:?}");
+
+        // A symbol the math font lacks falls back on its own; the digits keep the math font.
+        let mixed = glyph_runs(&layout_plain_run(&mut fm, "267⋅35").group);
+        let digits: Vec<&GlyphRun> = mixed.iter().filter(|r| r.text != "⋅").collect();
+        assert_eq!(digits.len(), 2);
+        assert_eq!(digits[0].font_id, digits[1].font_id);
+        assert!(digits.iter().all(|r| !r.glyph_ids.contains(&0)), "digits have glyphs");
+
+        // Typographic spaces are fixed gaps, never .notdef glyphs.
+        let thin = layout_plain_run(&mut fm, "80\u{2009}000");
+        assert!(glyph_runs(&thin.group).iter().all(|r| !r.text.contains('\u{2009}')));
+        let expected = layout_plain_run(&mut fm, "80").width
+            + layout_plain_run(&mut fm, "000").width
+            + 11.0 / 6.0;
+        assert!((thin.width - expected).abs() < 0.05, "thin space: {} vs {expected}", thin.width);
+    }
+
+    #[test]
+    fn operator_after_a_script_is_binary_and_bars_extend_over_their_base() {
+        let mut fm = deterministic_font_manager();
+        let mut diagnostics = Vec::new();
+        let script = MathExpression::Superscript(MathScript::new(text("x"), text("2")));
+        let with_plus = layout_argument(
+            &MathArgument::new(vec![script.clone(), MathExpression::Run(MathRun::new("+1"))]),
+            &mut fm,
+            None,
+            11.0,
+            Color::BLACK,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("layout");
+        let alone = layout_argument(
+            &MathArgument::new(vec![script]),
+            &mut fm,
+            None,
+            11.0,
+            Color::BLACK,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("layout");
+        let plus_one = layout_plain_run(&mut fm, "+1").width; // leading `+` alone is unary
+        assert!(
+            with_plus.width - alone.width - plus_one > 11.0 * BINARY_OPERATOR_GAP_EM * 1.5,
+            "`+` after x² is binary: {} vs {} + {plus_one}",
+            with_plus.width,
+            alone.width
+        );
+
+        let base = layout_plain_run(&mut fm, "AB");
+        let under = layout_expression(
+            &MathExpression::Bar(MathBar::new(BarPosition::Bottom, text("AB"))),
+            &mut fm,
+            None,
+            11.0,
+            Color::BLACK,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("bar layout");
+        assert!((under.width - base.width).abs() < 1e-6);
+        assert!(under.descent > base.descent, "underbar adds descent");
+        assert!((under.ascent - base.ascent).abs() < 1e-6, "underbar leaves ascent alone");
+        let over = layout_expression(
+            &MathExpression::Bar(MathBar::new(BarPosition::Top, text("AB"))),
+            &mut fm,
+            None,
+            11.0,
+            Color::BLACK,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("bar layout");
+        assert!(over.ascent > base.ascent, "overbar adds ascent");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
