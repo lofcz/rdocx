@@ -2516,12 +2516,14 @@ impl Engine {
             }
             let page = Arc::make_mut(page);
             let page_num = page.displayed_page_number;
+            let page_width = page.width;
             substitute_fields(
                 &mut page.elements,
                 page_num,
                 total_pages,
                 &bookmark_pages,
                 &mut self.font_manager,
+                page_width,
             );
             substitution_inputs.push(Some(inputs));
         }
@@ -5068,37 +5070,29 @@ fn extract_background_color(xml: &str) -> Option<Color> {
 }
 
 /// Replace field placeholder GlyphRuns with actual values.
+///
+/// Placeholders are laid out with a two-digit width. Once the real value is
+/// shaped, the rest of the line is re-aligned so left-anchored text closes the
+/// gap, right-anchored text (right-aligned paragraphs, text after a right tab)
+/// keeps its right edge and centred text stays centred.
 fn substitute_fields(
     elements: &mut Vec<PositionedElement>,
     page_number: usize,
     total_pages: usize,
     bookmark_pages: &HashMap<usize, usize>,
     fm: &mut FontManager,
+    page_width: f64,
 ) {
     for element in elements.iter_mut() {
         match element {
-            PositionedElement::Text(run) => {
-                let Some(fk) = run.field_kind else {
-                    continue;
-                };
-                let value = match fk {
-                    FieldKind::Page => page_number.to_string(),
-                    FieldKind::NumPages => total_pages.to_string(),
-                    FieldKind::TargetPage(target) => {
-                        let Some(page) = bookmark_pages.get(&target) else {
-                            run.field_kind = None;
-                            continue;
-                        };
-                        page.to_string()
-                    }
-                    FieldKind::Target(_) => continue,
-                };
-                if let Ok(shaped) = fm.shape_text(run.font_id, &value, run.font_size) {
-                    run.text = value;
-                    run.glyph_ids = shaped.glyph_ids;
-                    run.advances = shaped.advances;
-                }
-            }
+            PositionedElement::Group(group) => substitute_fields(
+                &mut group.children,
+                page_number,
+                total_pages,
+                bookmark_pages,
+                fm,
+                page_width,
+            ),
             PositionedElement::MultilingualText(run) => {
                 let Some(fk) = run.field_kind else {
                     continue;
@@ -5164,17 +5158,43 @@ fn substitute_fields(
                     run.bidi_level = shaped.bidi_level();
                 }
             }
-            PositionedElement::Group(group) => substitute_fields(
-                &mut group.children,
-                page_number,
-                total_pages,
-                bookmark_pages,
-                fm,
-            ),
-            PositionedElement::MarkedContent { children, .. } => {
-                substitute_fields(children, page_number, total_pages, bookmark_pages, fm)
-            }
             _ => {}
+        }
+    }
+    let mut flat = Vec::new();
+    flatten_line_items(elements, &mut flat);
+    for index in 0..flat.len() {
+        let delta = {
+            let LineFlatItem::Run(run) = &mut flat[index] else {
+                continue;
+            };
+            let Some(fk) = run.field_kind else {
+                continue;
+            };
+            let value = match fk {
+                FieldKind::Page => page_number.to_string(),
+                FieldKind::NumPages => total_pages.to_string(),
+                FieldKind::TargetPage(target) => {
+                    let Some(page) = bookmark_pages.get(&target) else {
+                        run.field_kind = None;
+                        continue;
+                    };
+                    page.to_string()
+                }
+                FieldKind::Target(_) => continue,
+            };
+            let Ok(shaped) = fm.shape_text(run.font_id, &value, run.font_size) else {
+                continue;
+            };
+            let old_width: f64 = run.advances.iter().sum();
+            let new_width: f64 = shaped.advances.iter().sum();
+            run.text = value;
+            run.glyph_ids = shaped.glyph_ids;
+            run.advances = shaped.advances;
+            new_width - old_width
+        };
+        if delta.abs() > 0.01 {
+            realign_line_after_field(&mut flat, index, delta, page_width);
         }
     }
     elements.retain(|element| match element {
@@ -5185,6 +5205,166 @@ fn substitute_fields(
         PositionedElement::MarkedContent { children, .. } => !children.is_empty(),
         _ => true,
     });
+}
+
+/// Line-level view over positioned elements (marked-content wrappers are
+/// transparent; groups and images are opaque line breakers).
+enum LineFlatItem<'a> {
+    Run(&'a mut GlyphRun),
+    Line { start: &'a mut Point, end: &'a mut Point },
+    Other,
+}
+
+fn flatten_line_items<'a>(elements: &'a mut [PositionedElement], out: &mut Vec<LineFlatItem<'a>>) {
+    for element in elements.iter_mut() {
+        match element {
+            PositionedElement::Text(run) => out.push(LineFlatItem::Run(run)),
+            PositionedElement::Line { start, end, .. } => {
+                out.push(LineFlatItem::Line { start, end })
+            }
+            PositionedElement::MarkedContent { children, .. } => {
+                flatten_line_items(children, out)
+            }
+            _ => out.push(LineFlatItem::Other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineAnchor {
+    Start,
+    Center,
+    End,
+}
+
+/// Shift the runs sharing a baseline with the substituted field so the line
+/// keeps its anchor. The anchor is inferred from the line's extent on the page:
+/// a line ending at the right margin (or the part of a line after a tab-sized
+/// gap) is right-anchored, a line equidistant from both edges is centred,
+/// anything else is left-anchored.
+fn realign_line_after_field(flat: &mut [LineFlatItem<'_>], index: usize, delta: f64, page_width: f64) {
+    let (baseline, font_size) = match &flat[index] {
+        LineFlatItem::Run(run) => (run.origin.y, run.font_size),
+        _ => return,
+    };
+    let on_line = |item: &LineFlatItem<'_>| match item {
+        LineFlatItem::Run(run) => (run.origin.y - baseline).abs() < 0.5,
+        LineFlatItem::Line { start, end } => {
+            (start.y - baseline).abs() < font_size * 1.5 && (end.y - baseline).abs() < font_size * 1.5
+        }
+        LineFlatItem::Other => false,
+    };
+    let mut lo = index;
+    while lo > 0 && on_line(&flat[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = index + 1;
+    while hi < flat.len() && on_line(&flat[hi]) {
+        hi += 1;
+    }
+
+    // Runs on the line in visual order: (flat index, x0, x1).
+    let mut runs: Vec<(usize, f64, f64)> = (lo..hi)
+        .filter_map(|i| match &flat[i] {
+            LineFlatItem::Run(run) => {
+                let width: f64 = run.advances.iter().sum();
+                Some((i, run.origin.x, run.origin.x + width))
+            }
+            _ => None,
+        })
+        .collect();
+    runs.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let Some(position) = runs.iter().position(|(i, _, _)| *i == index) else {
+        return;
+    };
+    let left = runs.first().map(|r| r.1).unwrap_or(0.0);
+    let right = runs.iter().map(|r| r.2).fold(f64::MIN, f64::max);
+
+    // A tab-sized gap splits the line into a left-anchored and a right-anchored part.
+    let mut split_at = None;
+    let mut widest_gap = font_size * 2.5;
+    for pair in runs.windows(2) {
+        let gap = pair[1].1 - pair[0].2;
+        if gap > widest_gap {
+            widest_gap = gap;
+            split_at = Some(pair[1].1);
+        }
+    }
+    let (group, anchor): (Vec<(usize, f64, f64)>, LineAnchor) = match split_at {
+        Some(x) => {
+            let field_x = runs[position].1;
+            if field_x >= x {
+                (runs.iter().copied().filter(|r| r.1 >= x).collect(), LineAnchor::End)
+            } else {
+                (runs.iter().copied().filter(|r| r.1 < x).collect(), LineAnchor::Start)
+            }
+        }
+        None => {
+            let left_margin = left;
+            let right_margin = page_width - right;
+            let anchor = if (left_margin - right_margin).abs() < 1.5
+                && right - left < page_width * 0.8
+            {
+                LineAnchor::Center
+            } else if right_margin < left_margin - 1.5 {
+                LineAnchor::End
+            } else {
+                LineAnchor::Start
+            };
+            (runs.clone(), anchor)
+        }
+    };
+
+    // Per-run shift, keyed by original span so underlines can follow.
+    let mut shifts: Vec<(f64, f64, f64)> = Vec::new();
+    for (i, x0, x1) in &group {
+        let after_field = *x0 > runs[position].1 + 0.01;
+        let shift = match anchor {
+            LineAnchor::Start => {
+                if after_field {
+                    delta
+                } else {
+                    0.0
+                }
+            }
+            LineAnchor::End => {
+                if after_field {
+                    0.0
+                } else {
+                    -delta
+                }
+            }
+            LineAnchor::Center => {
+                if after_field {
+                    delta / 2.0
+                } else {
+                    -delta / 2.0
+                }
+            }
+        };
+        if shift == 0.0 {
+            continue;
+        }
+        if let LineFlatItem::Run(run) = &mut flat[*i] {
+            run.origin.x += shift;
+        }
+        shifts.push((*x0, *x1, shift));
+    }
+    if shifts.is_empty() {
+        return;
+    }
+    for i in lo..hi {
+        if let LineFlatItem::Line { start, end } = &mut flat[i] {
+            let mid = (start.x + end.x) / 2.0;
+            if let Some((_, _, shift)) = shifts
+                .iter()
+                .find(|(x0, x1, _)| mid >= *x0 - 0.5 && mid <= *x1 + 0.5)
+            {
+                start.x += shift;
+                end.x += shift;
+            }
+        }
+    }
 }
 
 fn mark_remaining_artifacts(elements: &mut Vec<PositionedElement>) {
@@ -13970,6 +14150,112 @@ mod tests {
         ));
     }
 
+    /// `(text, x0, x1)` for every glyph run on the first page, in visual order.
+    fn first_page_text_spans(input: &LayoutInput) -> Vec<(String, f64, f64)> {
+        let output = deterministic_layout(input);
+        let mut spans = Vec::new();
+        oxml_layout::walk(&output.pages[0].elements, &mut |element, _| {
+            if let PositionedElement::Text(run) = element
+                && !run.text.is_empty()
+            {
+                let width: f64 = run.advances.iter().sum();
+                spans.push((run.text.clone(), run.origin.x, run.origin.x + width));
+            }
+        });
+        spans.sort_by(|a, b| a.1.total_cmp(&b.1));
+        spans
+    }
+
+    fn page_field_paragraph(prefix: &str, suffix: &str) -> CT_P {
+        let mut paragraph = CT_P::new();
+        paragraph.add_run(prefix);
+        let mut field = CT_R::new("");
+        field.content = vec![RunContent::Field(Field::new("PAGE", "1"))];
+        paragraph.runs.push(field);
+        paragraph.add_run(suffix);
+        paragraph
+    }
+
+    #[test]
+    fn substituted_page_field_closes_the_gap_in_left_aligned_text() {
+        let mut input = make_input_with_text("");
+        input.document.body.content[0] = BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
+        let spans = first_page_text_spans(&input);
+        assert!(spans.iter().any(|(text, _, _)| text == "1"), "{spans:?}");
+        assert!((spans[0].1 - 72.0).abs() < 0.5, "{spans:?}");
+        for pair in spans.windows(2) {
+            assert!(
+                (pair[1].1 - pair[0].2).abs() < 0.05,
+                "text after the field must move left by the placeholder surplus: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn substituted_page_field_keeps_right_aligned_text_on_the_margin() {
+        let mut input = make_input_with_text("");
+        let mut left = make_input_with_text("");
+        let mut paragraph = page_field_paragraph("Strana ", " z 9");
+        paragraph.properties = Some(CT_PPr {
+            jc: Some(rdocx_oxml::shared::ST_Jc::End),
+            ..Default::default()
+        });
+        input.document.body.content[0] = BodyContent::Paragraph(paragraph);
+        left.document.body.content[0] = BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
+
+        let spans = first_page_text_spans(&input);
+        let left_spans = first_page_text_spans(&left);
+        let line_width = spans.last().unwrap().2 - spans[0].1;
+        let left_width = left_spans.last().unwrap().2 - left_spans[0].1;
+        assert!((line_width - left_width).abs() < 0.05, "{spans:?} vs {left_spans:?}");
+        for pair in spans.windows(2) {
+            assert!((pair[1].1 - pair[0].2).abs() < 0.05, "{spans:?}");
+        }
+        let output = deterministic_layout(&input);
+        let right_margin = output.pages[0].width - 72.0;
+        assert!(
+            (spans.last().unwrap().2 - right_margin).abs() < 0.5,
+            "{spans:?} vs {right_margin}"
+        );
+    }
+
+    #[test]
+    fn substituted_page_field_after_a_right_tab_stays_on_the_tab_stop() {
+        use rdocx_oxml::borders::{CT_TabStop, CT_Tabs};
+        use rdocx_oxml::Twips;
+        use rdocx_oxml::shared::ST_TabJc;
+
+        let mut input = make_input_with_text("");
+        let mut paragraph = CT_P::new();
+        paragraph.add_run("Title");
+        let mut tab = CT_R::new("");
+        tab.content = vec![RunContent::Tab];
+        paragraph.runs.push(tab);
+        paragraph.add_run("Strana ");
+        let mut field = CT_R::new("");
+        field.content = vec![RunContent::Field(Field::new("PAGE", "1"))];
+        paragraph.runs.push(field);
+        paragraph.add_run(" / 9");
+        paragraph.properties = Some(CT_PPr {
+            tabs: Some(CT_Tabs {
+                tabs: vec![CT_TabStop::new(ST_TabJc::Right, Twips(468 * 20))],
+            }),
+            ..Default::default()
+        });
+        input.document.body.content[0] = BodyContent::Paragraph(paragraph);
+
+        let spans = first_page_text_spans(&input);
+        assert_eq!(spans[0].0, "Title");
+        assert!((spans[0].1 - 72.0).abs() < 0.5, "title stays at the left margin: {spans:?}");
+        for pair in spans[1..].windows(2) {
+            assert!((pair[1].1 - pair[0].2).abs() < 0.05, "no gap inside the tabbed group: {spans:?}");
+        }
+        assert!(
+            (spans.last().unwrap().2 - (72.0 + 468.0)).abs() < 0.5,
+            "the group must still end on the right tab stop: {spans:?}"
+        );
+    }
+
     #[test]
     fn changed_substitution_context_reshapes_pages() {
         fn assert_retained_key_miss(
@@ -15540,12 +15826,14 @@ mod tests {
                     cells: vec![cell(true)],
                     height: 12.0,
                     is_header: true,
+                    keep_next: false,
                 },
                 table::TableRow {
                     structure_id: None,
                     cells: vec![cell(false)],
                     height: 12.0,
                     is_header: false,
+                    keep_next: false,
                 },
             ],
             header_row_indices: vec![0],

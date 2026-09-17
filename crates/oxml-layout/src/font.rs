@@ -959,6 +959,15 @@ impl FontManager {
             .collect()
     }
 
+    /// Whether `font` can draw `ch`. Whitespace and control characters count
+    /// as covered (see [`Self::resolve_font_for_text`]); unknown ids do not.
+    pub fn font_covers(&self, font: FontId, ch: char) -> bool {
+        if ch.is_whitespace() || ch.is_control() {
+            return true;
+        }
+        self.index_of(font).is_some_and(|idx| self.covers(idx, ch))
+    }
+
     /// Whether the font at `idx` has a glyph for `ch`.
     fn covers(&self, idx: usize, ch: char) -> bool {
         let font = &self.fonts[idx];

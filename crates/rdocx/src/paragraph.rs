@@ -803,7 +803,9 @@ impl<'a> Paragraph<'a> {
         ppr.line_rule = Some("exact".to_string());
     }
 
-    pub(crate) fn set_line_spacing_at_least(&mut self, pt: f64) {
+    /// Set "at least" line spacing in place (`w:lineRule="atLeast"`): lines
+    /// are never shorter than `pt` but grow for tall content such as equations.
+    pub fn set_line_spacing_at_least(&mut self, pt: f64) {
         let ppr = self.ensure_ppr();
         ppr.line_spacing = Some(Twips::from_pt(pt));
         ppr.line_rule = Some("atLeast".to_string());

@@ -15,6 +15,9 @@
 //! - **Noto Sans Arabic**, **Noto Sans Devanagari**, **Noto Sans Thai**, and
 //!   **Noto Sans SC** — deterministic complex-script fallbacks licensed under
 //!   the SIL Open Font License 1.1
+//! - **Noto Sans Math** (symbol subset) — coverage fallback for mathematical
+//!   operators, arrows, letterlike symbols and Greek that the metric-compatible
+//!   text faces lack, licensed under the SIL Open Font License 1.1
 
 /// Returns bundled font data: `(family_name, font_bytes)` pairs.
 ///
@@ -123,6 +126,10 @@ pub fn bundled_font_data() -> Vec<(&'static str, &'static [u8])> {
             "Noto Sans SC",
             include_bytes!("../fonts/NotoSansSC-FX058-subset.ttf").as_slice(),
         ),
+        (
+            "Noto Sans Math",
+            include_bytes!("../fonts/NotoSansMath-symbols-subset.ttf").as_slice(),
+        ),
     ]
 }
 
@@ -142,6 +149,7 @@ mod tests {
             ("Liberation Serif", "LICENSE-Liberation"),
             ("Noto Sans Arabic", "LICENSE-Noto"),
             ("Noto Sans Devanagari", "LICENSE-Noto"),
+            ("Noto Sans Math", "LICENSE-Noto"),
             ("Noto Sans SC", "LICENSE-Noto"),
             ("Noto Sans Thai", "LICENSE-Noto"),
         ];
@@ -167,6 +175,7 @@ mod tests {
         assert!(fonts_dir.join("NOTICE-Caladea").is_file());
         assert!(fonts_dir.join("NOTICE-Noto").is_file());
         assert!(fonts_dir.join("SUBSET-NotoSansSC.md").is_file());
+        assert!(fonts_dir.join("SUBSET-NotoSansMath.md").is_file());
     }
 
     #[test]
@@ -176,6 +185,7 @@ mod tests {
             ("Noto Sans Devanagari", "कि"),
             ("Noto Sans Thai", "ภาษาไทยยินดีต้อนรับ"),
             ("Noto Sans SC", "〈中〉、你好世界"),
+            ("Noto Sans Math", "∈∉⊂∪∩≠≤≥→⇒ℝℕℤℚ∀∃αβπΩ"),
         ];
         for (family, text) in fixtures {
             let bytes = bundled_font_data()

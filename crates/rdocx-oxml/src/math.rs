@@ -285,6 +285,7 @@ pub enum MathExpression {
     Nary(MathNary),
     Delimiter(MathDelimiter),
     Accent(MathAccent),
+    Bar(MathBar),
 }
 
 impl MathExpression {
@@ -357,6 +358,11 @@ impl MathExpression {
                     || property_container_has_unsupported_content(&value.preservation, "accPr")
                     || value.base.has_unsupported_content()
             }
+            Self::Bar(value) => {
+                preservation_has_unsupported_content(&value.preservation)
+                    || property_container_has_unsupported_content(&value.preservation, "barPr")
+                    || value.base.has_unsupported_content()
+            }
         }
     }
 
@@ -382,6 +388,7 @@ impl MathExpression {
             Some("nary") => Some(Self::Nary(MathNary::from_raw(raw, inherited)?)),
             Some("d") => Some(Self::Delimiter(MathDelimiter::from_raw(raw, inherited)?)),
             Some("acc") => Some(Self::Accent(MathAccent::from_raw(raw, inherited)?)),
+            Some("bar") => Some(Self::Bar(MathBar::from_raw(raw, inherited)?)),
             _ => None,
         })
     }
@@ -401,6 +408,7 @@ impl MathExpression {
             Self::Nary(value) => value.write_xml(writer),
             Self::Delimiter(value) => value.write_xml(writer),
             Self::Accent(value) => value.write_xml(writer),
+            Self::Bar(value) => value.write_xml(writer),
         }
     }
 }
@@ -1745,6 +1753,97 @@ impl MathAccent {
     }
 }
 
+/// Side of the base an `m:bar` rule is drawn on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarPosition {
+    Top,
+    /// OMML default when `m:pos` is omitted.
+    #[default]
+    Bottom,
+}
+
+impl BarPosition {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "top" => Some(Self::Top),
+            "bot" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bot",
+        }
+    }
+}
+
+/// `m:bar`: a horizontal rule above or below its base (`\overline`, `\underline`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MathBar {
+    pub position: BarPosition,
+    pub base: MathArgument,
+    preservation: Preservation,
+}
+
+impl MathBar {
+    pub fn new(position: BarPosition, base: MathArgument) -> Self {
+        Self {
+            position,
+            base,
+            preservation: Preservation::default(),
+        }
+    }
+
+    fn from_raw(raw: &[u8], inherited: &[(String, String)]) -> Result<Self> {
+        let mut parsed = parse_element(raw, inherited)?;
+        let mut position = BarPosition::default();
+        let mut base = MathArgument::default();
+        let mut modeled = 0usize;
+        for child in parsed.children {
+            match math_local_name(&child, &parsed.bindings)?.as_deref() {
+                Some("barPr") if modeled == 0 => {
+                    position = child_property_value(&child, &parsed.bindings, "barPr", "pos")?
+                        .and_then(|value| BarPosition::parse(&value))
+                        .unwrap_or_default();
+                    preserve_modeled_child(
+                        &mut parsed.preservation,
+                        "barPr",
+                        &child,
+                        &parsed.bindings,
+                    );
+                    modeled += 1;
+                }
+                Some("e") => {
+                    base = MathArgument::from_raw(&child, &parsed.bindings)?;
+                    modeled += 1;
+                }
+                _ => parsed.preservation.raw_children.push((modeled, child)),
+            }
+        }
+        Ok(Self {
+            position,
+            base,
+            preservation: parsed.preservation,
+        })
+    }
+
+    fn write_xml<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+        write_container(writer, "bar", &self.preservation, |writer| {
+            let mut modeled = write_leading_property_container(
+                writer,
+                "barPr",
+                &[Property::text("pos", self.position.as_str())],
+                &self.preservation,
+                true,
+            )?;
+            self.base.write_xml(writer, "e")?;
+            modeled += 1;
+            write_raw_slot(writer, &self.preservation, modeled)
+        })
+    }
+}
+
 /// Document-wide defaults from `w:settings/m:mathPr`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MathProperties {
@@ -2431,6 +2530,7 @@ fn supported_properties(tag: &str) -> &'static [&'static str] {
         "naryPr" => &["chr", "limLoc", "grow", "subHide", "supHide"],
         "dPr" => &["begChr", "sepChr", "endChr", "grow"],
         "accPr" => &["chr"],
+        "barPr" => &["pos"],
         "oMathParaPr" => &["jc"],
         "mathPr" => &[
             "mathFont",
@@ -2459,6 +2559,7 @@ fn property_value_default(container: &str, property: &str) -> Option<&'static st
         ("mPr", "baseJc") => Some("center"),
         ("mPr", "rSp" | "cSp") => Some("0"),
         ("naryPr" | "accPr", "chr") => Some(""),
+        ("barPr", "pos") => Some("bot"),
         ("naryPr", "limLoc") => Some("undOvr"),
         ("dPr", "begChr" | "sepChr" | "endChr") => Some(""),
         ("oMathParaPr", "jc") => Some("centerGroup"),
@@ -2491,6 +2592,7 @@ fn full_property_order(tag: &str) -> &'static [&'static str] {
         "naryPr" => &["chr", "limLoc", "grow", "subHide", "supHide", "ctrlPr"],
         "dPr" => &["begChr", "sepChr", "endChr", "grow", "shp", "ctrlPr"],
         "accPr" => &["chr", "ctrlPr"],
+        "barPr" => &["pos", "ctrlPr"],
         "oMathParaPr" => &["jc"],
         "mathPr" => &[
             "mathFont",
@@ -2724,6 +2826,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "nary" => Some("naryPr"),
         "d" => Some("dPr"),
         "acc" => Some("accPr"),
+        "bar" => Some("barPr"),
         _ => None,
     };
     if let Some(property_tag) = property_tag {
@@ -2758,6 +2861,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "nary" => &["naryPr", "sub", "sup", "e"],
         "d" => &["dPr", "e"],
         "acc" => &["accPr", "e"],
+        "bar" => &["barPr", "e"],
         _ => return Ok(true),
     };
     let sequence = parsed
@@ -2783,6 +2887,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "limUpp" => sequence_matches(&sequence, "limUppPr", &["e", "lim"]),
         "nary" => sequence_matches_with_optional(&sequence, "naryPr", &["sub", "sup"], &["e"]),
         "acc" => sequence_matches(&sequence, "accPr", &["e"]),
+        "bar" => sequence_matches(&sequence, "barPr", &["e"]),
         "d" => {
             let argument_start = usize::from(sequence.first().is_some_and(|value| value == "dPr"));
             sequence.len() > argument_start

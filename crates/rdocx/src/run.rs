@@ -386,7 +386,7 @@ impl<'a> Run<'a> {
             .append_content(RunContent::Text(CT_Text::new(text)));
     }
 
-    /// Append a tab at the current end of this run.
+    /// Append a tab character (`<w:tab/>`) to this run.
     pub fn add_tab(&mut self) {
         self.inner.append_content(RunContent::Tab);
     }
