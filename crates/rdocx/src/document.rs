@@ -18834,6 +18834,36 @@ impl Document {
             .map(|page| page.as_ref().clone()))
     }
 
+    /// Registers the internal image relationships of one header / footer part
+    /// under their part-scoped ids so pictures in the part resolve at layout.
+    fn collect_hdr_ftr_images(
+        &self,
+        part_relationship_id: &str,
+        part_name: &str,
+        images: &mut std::collections::HashMap<String, rdocx_layout::ImageData>,
+    ) {
+        use oxml_opc::relationship::rel_types;
+        let Some(relationships) = self.package.get_part_rels(part_name) else {
+            return;
+        };
+        for image_relationship in relationships
+            .items
+            .iter()
+            .filter(|item| item.rel_type == rel_types::IMAGE && relationship_is_internal(item))
+        {
+            let image_part = OpcPackage::resolve_rel_target(part_name, &image_relationship.target);
+            if let Some(data) = self.package.get_part(&image_part) {
+                images.insert(
+                    rdocx_layout::scoped_relationship_id(part_relationship_id, &image_relationship.id),
+                    rdocx_layout::ImageData {
+                        data: data.to_vec(),
+                        content_type: oxml_media::resolve(data, &image_part).content_type().to_owned(),
+                    },
+                );
+            }
+        }
+    }
+
     /// Build a LayoutInput from the document's current state.
     fn build_layout_input(&self) -> rdocx_layout::LayoutInput {
         use oxml_opc::relationship::rel_types;
@@ -18869,30 +18899,7 @@ impl Document {
                         {
                             headers.insert(rel.id.clone(), hf);
                         }
-                        if let Some(header_relationships) = self.package.get_part_rels(&part_name) {
-                            for image_relationship in
-                                header_relationships.items.iter().filter(|item| {
-                                    item.rel_type == rel_types::IMAGE
-                                        && relationship_is_internal(item)
-                                })
-                            {
-                                let image_part = OpcPackage::resolve_rel_target(
-                                    &part_name,
-                                    &image_relationship.target,
-                                );
-                                if let Some(data) = self.package.get_part(&image_part) {
-                                    images.insert(
-                                        format!("{}\0{}", rel.id, image_relationship.id),
-                                        ImageData {
-                                            data: data.to_vec(),
-                                            content_type: oxml_media::resolve(data, &image_part)
-                                                .content_type()
-                                                .to_owned(),
-                                        },
-                                    );
-                                }
-                            }
-                        }
+                        self.collect_hdr_ftr_images(&rel.id, &part_name, &mut images);
                     }
                     t if t == rel_types::FOOTER => {
                         if !active_header_footer_ids.contains(&rel.id)
@@ -18907,6 +18914,7 @@ impl Document {
                         {
                             footers.insert(rel.id.clone(), hf);
                         }
+                        self.collect_hdr_ftr_images(&rel.id, &part_name, &mut images);
                     }
                     t if t == rel_types::IMAGE => {
                         if !relationship_is_internal(rel) {

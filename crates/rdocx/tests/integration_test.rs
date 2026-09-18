@@ -3786,6 +3786,48 @@ fn mhtml_oracle_accepts(rdocx: &MhtmlOracleRecord, word: &MhtmlOracleRecord) -> 
         && *word == pinned_word_mhtml_record()
 }
 
+#[test]
+fn footer_pictures_are_laid_out_from_the_footer_part_s_own_relationships() {
+    let mut document = Document::new();
+    document.add_paragraph("body");
+    // The body owns `rId1` for its own picture; the footer authors its picture
+    // with the very same id, so only part-scoped resolution can tell them apart.
+    let body_image = document.embed_image(&mhtml_pixel_png(), "body.png");
+    assert_eq!(body_image, "rId1");
+    let footer_xml = format!(
+        r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:p><w:r><w:t>footer</w:t></w:r><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="720000" cy="180000"/><wp:docPr id="1" name="mark"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="0" name="mark.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="720000" cy="180000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:ftr>"#,
+        id = body_image
+    );
+    let mut footer_png = mhtml_pixel_png();
+    *footer_png.last_mut().unwrap() ^= 1;
+    document.set_raw_footer_with_images(
+        footer_xml.into_bytes(),
+        &[(body_image.as_str(), footer_png.as_slice(), "mark.png")],
+        HdrFtrType::Default,
+    );
+
+    let page = document
+        .layout_page(0)
+        .unwrap()
+        .expect("a footer picture produces a page");
+    let page_height = page.height;
+    let mut footer_images = 0;
+    oxml_layout::walk(&page.elements, &mut |element, transform| {
+        if let oxml_layout::PositionedElement::Image { rect, data, .. } = element {
+            let y = transform.f + rect.y;
+            if y > page_height * 0.8 {
+                footer_images += 1;
+                assert_eq!(
+                    data, &footer_png,
+                    "the footer must draw its own picture, not the body's `{body_image}`"
+                );
+                assert!((rect.width - 56.69).abs() < 0.5, "720000 EMU is 20 mm = 56.69 pt wide");
+            }
+        }
+    });
+    assert_eq!(footer_images, 1, "the footer picture should be drawn once per page");
+}
+
 fn mhtml_pixel_png() -> Vec<u8> {
     vec![
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,

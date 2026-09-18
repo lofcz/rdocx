@@ -1,6 +1,7 @@
 //! Input types for the layout engine.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use oxml_chart::CT_ChartSpace;
 use oxml_drawing::color::ColorMap;
@@ -36,11 +37,18 @@ pub struct ImageData {
 }
 
 /// Collision-safe media lookup shared by layout and pagination.
+///
+/// Relationship ids are per package part: header and footer parts register
+/// their images under `"{part relationship id}\0{image relationship id}"`
+/// (see `Document::build_layout_input`). [`MediaRegistry::scoped`] gives the
+/// layout of one such part a view that resolves the part's own ids first.
 #[derive(Debug, Clone)]
 pub struct MediaRegistry {
     relationship_ids: HashMap<String, MediaId>,
-    media: HashMap<MediaId, ImageData>,
+    media: Arc<HashMap<MediaId, ImageData>>,
     missing_id: MediaId,
+    /// Header / footer relationship id whose scoped image ids take precedence.
+    scope: Option<String>,
 }
 
 impl MediaRegistry {
@@ -51,10 +59,27 @@ impl MediaRegistry {
 
     /// Resolve the renderer-local ID for one package relationship.
     pub fn id_for_relationship(&self, relationship_id: &str) -> MediaId {
+        if let Some(scope) = &self.scope
+            && let Some(id) = self.relationship_ids.get(&scoped_relationship_id(scope, relationship_id))
+        {
+            return *id;
+        }
         self.relationship_ids
             .get(relationship_id)
             .copied()
             .unwrap_or(self.missing_id)
+    }
+
+    /// View for laying out one header or footer part: `r:embed` ids inside it
+    /// resolve to that part's own images before falling back to the document's.
+    /// Cheap — the image bytes are shared.
+    pub fn scoped(&self, part_relationship_id: &str) -> Self {
+        Self {
+            relationship_ids: self.relationship_ids.clone(),
+            media: Arc::clone(&self.media),
+            missing_id: self.missing_id,
+            scope: Some(part_relationship_id.to_owned()),
+        }
     }
 
     /// Return the image bytes and content types keyed by resolved media ID.
@@ -100,10 +125,16 @@ impl MediaRegistry {
 
         Self {
             relationship_ids,
-            media,
+            media: Arc::new(media),
             missing_id,
+            scope: None,
         }
     }
+}
+
+/// Key under which a header / footer part's image relationship is registered.
+pub fn scoped_relationship_id(part_relationship_id: &str, image_relationship_id: &str) -> String {
+    format!("{part_relationship_id}\0{image_relationship_id}")
 }
 
 /// All inputs needed to lay out a DOCX document.

@@ -7679,6 +7679,8 @@ fn layout_header_footer_variant_uncached(
             relationship_id: relationship_id.to_owned(),
         },
     };
+    // Pictures inside the part reference the part's own relationships.
+    let media = media.scoped(relationship_id);
     let mut blocks = Vec::with_capacity(part.paragraphs.len());
     let mut directions = Vec::with_capacity(part.paragraphs.len());
     for (paragraph_index, paragraph) in part.paragraphs.iter().enumerate() {
@@ -7692,7 +7694,7 @@ fn layout_header_footer_variant_uncached(
             width,
             styles,
             input,
-            media,
+            &media,
             fm,
             num_state,
             diagnostics,
@@ -7783,7 +7785,7 @@ fn layout_watermark(
         VmlWatermark::Image {
             relationship_id, ..
         } => {
-            let scoped_id = format!("{header_relationship_id}\0{relationship_id}");
+            let scoped_id = crate::input::scoped_relationship_id(header_relationship_id, relationship_id);
             let Some(image) = input.images.get(&scoped_id) else {
                 diagnostics.push(Diagnostic {
                     message: format!(
@@ -15915,6 +15917,43 @@ mod tests {
 
         assert!(images.contains(&(b"\x01\x02\x03".as_slice(), "image/png", inline_id)));
         assert!(images.contains(&(b"\x04\x05\x06".as_slice(), "image/jpeg", anchor_id)));
+    }
+
+    #[test]
+    fn scoped_media_registry_prefers_the_part_s_own_relationships() {
+        let mut images = HashMap::new();
+        images.insert(
+            "rId1".to_owned(),
+            ImageData {
+                data: vec![1],
+                content_type: "image/png".to_owned(),
+            },
+        );
+        images.insert(
+            "rIdFooter\0rId1".to_owned(),
+            ImageData {
+                data: vec![2],
+                content_type: "image/png".to_owned(),
+            },
+        );
+        images.insert(
+            "rIdFooter\0rIdMark".to_owned(),
+            ImageData {
+                data: vec![3],
+                content_type: "image/png".to_owned(),
+            },
+        );
+        let media = MediaRegistry::new(&images);
+        let footer = media.scoped("rIdFooter");
+
+        // Same `r:embed` id, different image depending on which part asks.
+        assert_ne!(media.id_for_relationship("rId1"), footer.id_for_relationship("rId1"));
+        assert_eq!(footer.id_for_relationship("rId1"), media.id_for_relationship("rIdFooter\0rId1"));
+        // Ids the part does not own fall back to the document's relationships.
+        assert_eq!(footer.id_for_relationship("rIdMark"), media.id_for_relationship("rIdFooter\0rIdMark"));
+        assert_eq!(media.scoped("rIdHeader").id_for_relationship("rId1"), media.id_for_relationship("rId1"));
+        // The bytes are shared, not copied.
+        assert!(std::ptr::eq(media.media(), footer.media()));
     }
 
     #[test]
