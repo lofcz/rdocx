@@ -495,12 +495,19 @@ optional concrete copy of the document-wide defaults into that projection.
 The shared `oxml-layout` group variants carry an optional baseline through line
 breaking, while `None` retains the established top-aligned drawing behavior.
 The PDF and raster backends continue to consume only `LayoutResult` and gain no
-Word grammar dependency.
+Word grammar dependency. Vector accents use geometric shafts and arrowheads
+so their rendering does not require standalone combining-arrow glyphs. Side
+limits on n-ary operators share one column beside the operator.
 
 **MathML and LaTeX conversion belongs to the `rdocx` facade.** One private
 module projects both formats directly into the `rdocx-oxml` `MathArgument`
 tree. The MathML side reuses `quick-xml` with expanded names. The LaTeX side is
-a bounded local recursive-descent parser. Pandoc is an exact-version test
+a bounded local recursive-descent parser. Zero-width MathML fraction rules
+retain the no-bar form used by binomial coefficients, and bevelled fractions
+retain their skewed form. One-sided fences retain stretchy delimiters, and
+overlines become full-base Office bars. Authored square roots include an
+empty degree slot before the radicand for Office consumer interoperability.
+Pandoc is an exact-version test
 oracle only and is absent from the production dependency graph.
 
 The settings model owns the separate `w:settings` root and read-only

@@ -11605,8 +11605,56 @@ impl Document {
     }
 
     pub(crate) fn prepare_staged_output(&mut self) -> Result<()> {
+        // Opaque producer XML must survive untouched, even when it is malformed.
+        // Exempt only preserved, unauthored parts whose bytes stay identical.
+        let preserved_invalid_xml = self
+            .package
+            .parts
+            .iter()
+            .filter(|(name, bytes)| {
+                self.identifiers.part_is_preserved(name)
+                    && !self.identifiers.authored_story_parts.contains(*name)
+                    && self
+                        .package
+                        .content_types
+                        .content_type_for(name)
+                        .is_some_and(|value| {
+                            value.ends_with("+xml")
+                                || matches!(value, "application/xml" | "text/xml")
+                        })
+                    && validate_output_xml_characters(name, bytes).is_err()
+            })
+            .map(|(name, bytes)| (name.clone(), bytes.clone()))
+            .collect::<HashMap<_, _>>();
         self.comments_dirty |= self.comments.is_some() && self.comments_part_name.is_some();
-        self.prepare_staged_package()
+        self.prepare_staged_package()?;
+        // Validate at the fallible output boundary. Infallible text setters
+        // must not panic, and a failed save must not publish corrupt XML.
+        let mut parts = self.package.parts.iter().collect::<Vec<_>>();
+        parts.sort_by_key(|(name, _)| *name);
+        for (name, bytes) in parts {
+            if preserved_invalid_xml.get(name) == Some(bytes) {
+                continue;
+            }
+            let content_type = self.package.content_types.content_type_for(name);
+            if content_type.is_some_and(|value| {
+                value.ends_with("+xml") || matches!(value, "application/xml" | "text/xml")
+            }) {
+                validate_output_xml_characters(name, bytes)?;
+            }
+        }
+        validate_output_xml_characters(
+            "[Content_Types].xml",
+            &self.package.content_types.to_xml()?,
+        )?;
+        validate_output_xml_characters("_rels/.rels", &self.package.package_rels.to_xml()?)?;
+        for (owner, relationships) in &self.package.part_rels {
+            validate_output_xml_characters(
+                &format!("relationships for {owner}"),
+                &relationships.to_xml()?,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_and_reopen_staged(mut self) -> Result<Self> {
@@ -23559,6 +23607,30 @@ fn has_consistent_sfnt_header(data: &[u8]) -> bool {
         && range_shift == expected_range_shift
 }
 
+// Authored XML is UTF-8. Leave opaque parts in other encodings untouched.
+// This checks literal characters, not schemas or preserved extension markup.
+fn validate_output_xml_characters(part: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.starts_with(&[0xff, 0xfe])
+        || bytes.starts_with(&[0xfe, 0xff])
+        || bytes.starts_with(&[0, b'<'])
+        || bytes.starts_with(&[b'<', 0])
+    {
+        return Ok(());
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(());
+    };
+    if let Some(character) = text.chars().find(|character| {
+        !matches!(*character, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+    }) {
+        return Err(Error::Other(format!(
+            "{part} contains a character forbidden by XML 1.0: U+{:04X}",
+            character as u32
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23585,6 +23657,86 @@ mod tests {
     const FX087_PAGES_BUILD: &str = "7044.0.273";
     const FX087_CANDIDATE_SHA256: &str =
         "ab67b50393fc5258f7a3e9719344639d665feccc2615b13cab1915ea9a84566b";
+
+    #[test]
+    fn saving_forbidden_xml_characters_fails_without_overwriting_the_destination() {
+        let path =
+            std::env::temp_dir().join(format!("rdocx-invalid-xml-{}.docx", std::process::id()));
+        fs::write(&path, b"previous output").unwrap();
+        for character in [
+            '\0', '\u{1}', '\u{b}', '\u{c}', '\u{1f}', '\u{fffe}', '\u{ffff}',
+        ] {
+            for location in ["body", "table", "header", "footer", "title", "hyperlink"] {
+                let mut document = Document::new();
+                let text = format!("before{character}after");
+                match location {
+                    "body" => {
+                        document.add_paragraph(&text);
+                    }
+                    "table" => {
+                        document
+                            .add_table(1, 1)
+                            .cell(0, 0)
+                            .unwrap()
+                            .add_paragraph(&text);
+                    }
+                    "header" => document.set_header(&text),
+                    "footer" => document.set_footer(&text),
+                    "title" => document.set_title(&text),
+                    "hyperlink" => {
+                        document.add_hyperlink_relationship(&format!("https://example.com/{text}"));
+                    }
+                    _ => unreachable!(),
+                }
+                let error = document.to_bytes().unwrap_err().to_string();
+                assert!(
+                    error.contains("forbidden by XML 1.0"),
+                    "{location}: {error}"
+                );
+                assert!(document.save(&path).is_err(), "{location}");
+                assert_eq!(fs::read(&path).unwrap(), b"previous output");
+            }
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replacing_an_imported_header_cannot_bypass_output_character_checks() {
+        let mut original = Document::new();
+        original.set_header("valid header");
+        let mut reopened = Document::from_bytes(&original.to_bytes().unwrap()).unwrap();
+        reopened.set_header("invalid\u{1}header");
+        assert!(
+            reopened
+                .to_bytes()
+                .unwrap_err()
+                .to_string()
+                .contains("forbidden by XML 1.0")
+        );
+    }
+
+    #[test]
+    fn output_character_checks_preserve_valid_unicode_and_opaque_parts() {
+        let mut document = Document::new();
+        document.add_paragraph(" \t\r\nŽluťoučký <&> 😀\u{85}\u{fffd} ");
+        let binary = vec![0, 1, 0xff, 0xfe];
+        document.package.set_part("/opaque.bin", binary.clone());
+        document
+            .package
+            .content_types
+            .add_default("bin", "application/octet-stream");
+        let utf16: Vec<_> = "\u{feff}<root>Valid</root>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        document.package.set_part("/opaque.xml", utf16.clone());
+        let bytes = document.to_bytes().unwrap();
+        let package = OpcPackage::from_reader(Cursor::new(bytes)).unwrap();
+        assert_eq!(package.get_part("/opaque.bin").unwrap(), binary);
+        assert_eq!(package.get_part("/opaque.xml").unwrap(), utf16);
+        let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("Žluťoučký &lt;&amp;&gt; 😀"));
+    }
 
     #[test]
     fn python_story_inventory_scales_linearly() {

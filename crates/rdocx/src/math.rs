@@ -491,6 +491,7 @@ fn mathml_element_to_expressions(
         "mfenced" => &["open", "close", "separators"][..],
         "mi" | "mn" | "mo" | "mtext" => &["mathvariant"][..],
         "mspace" => &["width"][..],
+        "mfrac" => &["linethickness", "bevelled"][..],
         _ => &[][..],
     };
     diagnose_attributes(node, path, allowed_attributes, diagnostics)?;
@@ -538,15 +539,33 @@ fn mathml_element_to_expressions(
                 // no glyph; OMML relies on operator spacing instead.
                 return Ok(Vec::new());
             }
-            Ok(vec![mathml_token_run(node, text, path, diagnostics)?.into()])
+            Ok(vec![
+                mathml_token_run(node, text, path, diagnostics)?.into(),
+            ])
         }
         "mfrac" => {
             let children = mathml_element_children(node);
             require_child_count(path, &children, 2)?;
-            Ok(vec![MathExpression::Fraction(MathFraction::new(
+            let mut fraction = MathFraction::new(
                 mathml_node_to_argument(children[0], &format!("{path}/*[1]"), diagnostics, nodes)?,
                 mathml_node_to_argument(children[1], &format!("{path}/*[2]"), diagnostics, nodes)?,
-            ))])
+            );
+            diagnose_boolean_attribute(node, path, "bevelled", diagnostics)?;
+            if node.attribute("bevelled") == Some("true") {
+                fraction.fraction_type = FractionType::Skewed;
+            } else if node.attribute("linethickness").is_some_and(|width| {
+                width
+                    .trim()
+                    .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%')
+                    .trim()
+                    .parse::<f64>()
+                    .is_ok_and(|value| value == 0.0)
+            }) {
+                // KaTeX binomials use mfrac with a zero-width rule. A bar here
+                // changes the mathematical meaning, not just the styling.
+                fraction.fraction_type = FractionType::NoBar;
+            }
+            Ok(vec![MathExpression::Fraction(fraction)])
         }
         "msub" | "msup" => {
             let children = mathml_element_children(node);
@@ -722,7 +741,6 @@ const IGNORED_PRESENTATION_ATTRIBUTES: &[&str] = &[
     "height",
     "id",
     "largeop",
-    "linethickness",
     "lspace",
     "mathbackground",
     "mathcolor",
@@ -1194,8 +1212,13 @@ fn parse_mathml_limits_or_accent(
         )?;
         diagnose_boolean_attribute(children[1], &format!("{path}/*[2]"), "accent", diagnostics)?;
         diagnose_token_children(children[1], &format!("{path}/*[2]"), diagnostics)?;
+        if matches!(children[1].text().trim(), "‾" | "¯" | "̄" | "̅") {
+            return Ok(vec![MathExpression::Bar(MathBar::new(
+                BarPosition::Top,
+                mathml_node_to_argument(children[0], &format!("{path}/*[1]"), diagnostics, nodes)?,
+            ))]);
+        }
         let character = match children[1].text().as_str() {
-            "‾" | "¯" => "̄".to_owned(),
             "→" => "⃗".to_owned(),
             value => value.to_owned(),
         };
@@ -1286,55 +1309,45 @@ fn parse_explicit_fenced_row(
     }
     let first = children[0];
     let last = children[children.len() - 1];
-    if !is_mathml_fence(first, true) || !is_mathml_fence(last, false) {
+    let leading = is_mathml_fence(first, true);
+    let trailing = is_mathml_fence(last, false);
+    // Contradictory attributes on an explicit opposite fence must not be
+    // reinterpreted as an intentionally absent fence.
+    if (!leading && !trailing)
+        || (!leading && first.local == "mo")
+        || (!trailing && last.local == "mo")
+    {
         return Ok(None);
     }
     let mut arguments = Vec::new();
     let mut current = Vec::new();
     let mut separator = None::<String>;
-    diagnose_attributes(
-        first,
-        &format!("{path}/*[1]"),
-        &["fence", "stretchy", "form"],
-        diagnostics,
-    )?;
-    diagnose_boolean_attribute(first, &format!("{path}/*[1]"), "fence", diagnostics)?;
-    diagnose_boolean_attribute(first, &format!("{path}/*[1]"), "stretchy", diagnostics)?;
-    diagnose_enum_attribute(
-        first,
-        &format!("{path}/*[1]"),
-        "form",
-        &["prefix", "infix", "postfix"],
-        diagnostics,
-    )?;
-    diagnose_token_children(first, &format!("{path}/*[1]"), diagnostics)?;
-    diagnose_attributes(
-        last,
-        &format!("{path}/*[{}]", children.len()),
-        &["fence", "stretchy", "form"],
-        diagnostics,
-    )?;
-    diagnose_boolean_attribute(
-        last,
-        &format!("{path}/*[{}]", children.len()),
-        "fence",
-        diagnostics,
-    )?;
-    diagnose_boolean_attribute(
-        last,
-        &format!("{path}/*[{}]", children.len()),
-        "stretchy",
-        diagnostics,
-    )?;
-    diagnose_enum_attribute(
-        last,
-        &format!("{path}/*[{}]", children.len()),
-        "form",
-        &["prefix", "infix", "postfix"],
-        diagnostics,
-    )?;
-    diagnose_token_children(last, &format!("{path}/*[{}]", children.len()), diagnostics)?;
-    for (index, child) in children[1..children.len() - 1].iter().enumerate() {
+    for (fence, index) in [
+        (leading.then_some(first), 1),
+        (trailing.then_some(last), children.len()),
+    ] {
+        let Some(fence) = fence else { continue };
+        let fence_path = format!("{path}/*[{index}]");
+        diagnose_attributes(
+            fence,
+            &fence_path,
+            &["fence", "stretchy", "form"],
+            diagnostics,
+        )?;
+        diagnose_boolean_attribute(fence, &fence_path, "fence", diagnostics)?;
+        diagnose_boolean_attribute(fence, &fence_path, "stretchy", diagnostics)?;
+        diagnose_enum_attribute(
+            fence,
+            &fence_path,
+            "form",
+            &["prefix", "infix", "postfix"],
+            diagnostics,
+        )?;
+        diagnose_token_children(fence, &fence_path, diagnostics)?;
+    }
+    let start = usize::from(leading);
+    let end = children.len() - usize::from(trailing);
+    for (index, child) in children[start..end].iter().enumerate() {
         if child.namespace.as_deref() == Some(MATHML_NS)
             && child.local == "mo"
             && child.attribute("separator") == Some("true")
@@ -1342,24 +1355,28 @@ fn parse_explicit_fenced_row(
         {
             diagnose_attributes(
                 child,
-                &format!("{path}/*[{}]", index + 2),
+                &format!("{path}/*[{}]", index + start + 1),
                 &["separator"],
                 diagnostics,
             )?;
             diagnose_boolean_attribute(
                 child,
-                &format!("{path}/*[{}]", index + 2),
+                &format!("{path}/*[{}]", index + start + 1),
                 "separator",
                 diagnostics,
             )?;
-            diagnose_token_children(child, &format!("{path}/*[{}]", index + 2), diagnostics)?;
+            diagnose_token_children(
+                child,
+                &format!("{path}/*[{}]", index + start + 1),
+                diagnostics,
+            )?;
             let candidate = child.text();
             if separator
                 .as_ref()
                 .is_some_and(|current| current != &candidate)
             {
                 diagnostics.push(
-                    format!("{path}/*[{}]", index + 2),
+                    format!("{path}/*[{}]", index + start + 1),
                     "mixed MathML delimiter separators were normalized to the first character",
                 )?;
             } else {
@@ -1370,14 +1387,18 @@ fn parse_explicit_fenced_row(
         } else {
             current.extend(mathml_element_to_expressions(
                 child,
-                &format!("{path}/*[{}]", index + 2),
+                &format!("{path}/*[{}]", index + start + 1),
                 diagnostics,
                 nodes,
             )?);
         }
     }
     arguments.push(MathArgument::new(current));
-    let mut delimiter = MathDelimiter::new(first.text(), last.text(), arguments);
+    let mut delimiter = MathDelimiter::new(
+        if leading { first.text() } else { String::new() },
+        if trailing { last.text() } else { String::new() },
+        arguments,
+    );
     if delimiter.arguments.len() > 1 {
         delimiter.separator_character = separator.unwrap_or_else(|| ",".to_owned());
     }
@@ -3676,6 +3697,67 @@ mod tests {
 
         let braced = equation_from_latex("x^{2y}").expect("braced group stays whole");
         assert_eq!(equation_to_latex(&braced.value).value, "{x}^{2y}");
+    }
+
+    #[test]
+    fn mathml_overlines_become_full_base_office_bars() {
+        for character in ["‾", "¯", "̄", "̅"] {
+            let converted = equation_from_mathml(&format!(
+                r#"<math xmlns="{MATHML_NS}"><mover accent="true"><mrow><mi>x</mi><mo>+</mo><mi>y</mi></mrow><mo>{character}</mo></mover></math>"#,
+            )).unwrap();
+            assert!(converted.diagnostics.is_empty());
+            let MathExpression::Bar(bar) = &converted.value.expressions[0] else {
+                panic!("overline must span the base");
+            };
+            assert_eq!(bar.position, BarPosition::Top);
+            assert!(!bar.base.expressions.is_empty());
+        }
+    }
+
+    #[test]
+    fn mathml_cases_preserve_their_one_sided_stretchy_fence() {
+        let converted = equation_from_mathml(&format!(
+            r#"<math xmlns="{MATHML_NS}"><mrow><mo fence="true">{{</mo><mtable><mtr><mtd><mi>x</mi></mtd></mtr><mtr><mtd><mi>y</mi></mtd></mtr></mtable></mrow></math>"#,
+        )).unwrap();
+        assert!(converted.diagnostics.is_empty());
+        let MathExpression::Delimiter(delimiter) = &converted.value.expressions[0] else {
+            panic!("cases require a stretchy delimiter");
+        };
+        assert_eq!(delimiter.begin_character, "{");
+        assert_eq!(delimiter.end_character, "");
+        assert!(matches!(
+            delimiter.arguments[0].expressions[0],
+            MathExpression::Matrix(_)
+        ));
+    }
+
+    #[test]
+    fn mathml_binomials_do_not_gain_fraction_bars_and_bevelled_fractions_keep_their_form() {
+        for (attributes, expected) in [
+            ("", FractionType::Bar),
+            (r#" linethickness="0px""#, FractionType::NoBar),
+            (r#" linethickness="0""#, FractionType::NoBar),
+            (r#" linethickness="0.0em""#, FractionType::NoBar),
+            (r#" linethickness="1px""#, FractionType::Bar),
+            (r#" bevelled="true""#, FractionType::Skewed),
+        ] {
+            let converted = equation_from_mathml(&format!(
+                r#"<math xmlns="{MATHML_NS}"><mfrac{attributes}><mn>5</mn><mn>2</mn></mfrac></math>"#,
+            )).unwrap();
+            assert!(converted.diagnostics.is_empty());
+            let MathExpression::Fraction(fraction) = &converted.value.expressions[0] else {
+                panic!("expected fraction");
+            };
+            assert_eq!(fraction.fraction_type, expected, "{attributes}");
+            let xml = rdocx_oxml::math::CT_OMath::new(converted.value.expressions)
+                .to_xml()
+                .unwrap();
+            let reopened = rdocx_oxml::math::CT_OMath::from_xml(&xml).unwrap();
+            let MathExpression::Fraction(fraction) = &reopened.expressions[0] else {
+                panic!("expected saved fraction");
+            };
+            assert_eq!(fraction.fraction_type, expected);
+        }
     }
 
     #[test]

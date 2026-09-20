@@ -1070,6 +1070,22 @@ fn layout_three_part_script(
         &format!("{source_path}/superscript"),
         diagnostics,
     )?;
+    Ok(layout_measured_scripts(
+        base,
+        subscript,
+        superscript,
+        pre,
+        font_size,
+    ))
+}
+
+fn layout_measured_scripts(
+    base: MeasuredMath,
+    subscript: MeasuredMath,
+    superscript: MeasuredMath,
+    pre: bool,
+    font_size: f64,
+) -> MeasuredMath {
     let superscript_shift = font_size * SUPERSCRIPT_SHIFT_EM;
     let subscript_shift = font_size * SUBSCRIPT_SHIFT_EM;
     let ascent = base.ascent.max(superscript_shift + superscript.ascent);
@@ -1081,7 +1097,7 @@ fn layout_three_part_script(
     } else {
         (base.width + gap, 0.0)
     };
-    Ok(MeasuredMath {
+    MeasuredMath {
         width: base.width + gap + script_width,
         ascent,
         descent,
@@ -1098,7 +1114,7 @@ fn layout_three_part_script(
                 ascent + subscript_shift - subscript.ascent,
             ),
         ]),
-    })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1374,10 +1390,11 @@ fn layout_nary(
         &format!("{source_path}/base"),
         diagnostics,
     )?;
-    let mut decorated = operator;
     let under_over = value.limit_location == Some(LimitLocation::UnderOver);
+    let mut subscript = MeasuredMath::empty();
+    let mut superscript = MeasuredMath::empty();
     if !value.hide_subscript && !value.subscript.expressions.is_empty() {
-        let subscript = layout_argument(
+        subscript = layout_argument(
             &value.subscript,
             fm,
             font_family,
@@ -1386,14 +1403,9 @@ fn layout_nary(
             &format!("{source_path}/subscript"),
             diagnostics,
         )?;
-        decorated = if under_over {
-            stack_below(decorated, subscript, font_size)
-        } else {
-            layout_script_pair(decorated, subscript, false, font_size)?
-        };
     }
     if !value.hide_superscript && !value.superscript.expressions.is_empty() {
-        let superscript = layout_argument(
+        superscript = layout_argument(
             &value.superscript,
             fm,
             font_family,
@@ -1402,12 +1414,21 @@ fn layout_nary(
             &format!("{source_path}/superscript"),
             diagnostics,
         )?;
-        decorated = if under_over {
-            stack_above(decorated, superscript, font_size)
-        } else {
-            layout_script_pair(decorated, superscript, true, font_size)?
-        };
     }
+    let decorated = if under_over {
+        let mut decorated = operator;
+        if subscript.height() > 0.0 {
+            decorated = stack_below(decorated, subscript, font_size);
+        }
+        if superscript.height() > 0.0 {
+            decorated = stack_above(decorated, superscript, font_size);
+        }
+        decorated
+    } else if subscript.height() > 0.0 || superscript.height() > 0.0 {
+        layout_measured_scripts(operator, subscript, superscript, false, font_size)
+    } else {
+        operator
+    };
     Ok(layout_sequence(vec![decorated, base]))
 }
 
@@ -1572,6 +1593,48 @@ fn layout_accent(
         &format!("{source_path}/base"),
         diagnostics,
     )?;
+    // Combining vector arrows have no standalone glyph in the bundled fonts.
+    // Draw the shaft and heads above the complete base, independent of fonts.
+    if matches!(accent_text, "⃗" | "⃖" | "⃡" | "→" | "←" | "↔") {
+        let rule = font_size * RULE_EM;
+        let head = font_size * 0.18;
+        let width = base.width.max(head * 3.0);
+        let mid = head + rule / 2.0;
+        let raise = head * 2.0 + rule + font_size * GAP_EM / 2.0;
+        let line = |x1, y1, x2, y2| PositionedElement::Line {
+            start: Point { x: x1, y: y1 },
+            end: Point { x: x2, y: y2 },
+            width: rule,
+            color,
+            dash_pattern: None,
+        };
+        let mut children = vec![line(rule / 2.0, mid, width - rule / 2.0, mid)];
+        if matches!(accent_text, "⃗" | "⃡" | "→" | "↔") {
+            children.push(line(
+                width - head - rule / 2.0,
+                mid - head,
+                width - rule / 2.0,
+                mid,
+            ));
+            children.push(line(
+                width - head - rule / 2.0,
+                mid + head,
+                width - rule / 2.0,
+                mid,
+            ));
+        }
+        if matches!(accent_text, "⃖" | "⃡" | "←" | "↔") {
+            children.push(line(head + rule / 2.0, mid - head, rule / 2.0, mid));
+            children.push(line(head + rule / 2.0, mid + head, rule / 2.0, mid));
+        }
+        children.push(translated(base.group, (width - base.width) / 2.0, raise));
+        return Ok(MeasuredMath {
+            width,
+            ascent: base.ascent + raise,
+            descent: base.descent,
+            group: group(children),
+        });
+    }
     let accent = layout_text(
         accent_text,
         fm,
@@ -1891,6 +1954,52 @@ mod tests {
             }
         }
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn vector_accents_have_visible_heads_without_missing_font_glyphs() {
+        let mut fm = deterministic_font_manager();
+        for character in ["⃗", "⃖", "⃡", "→", "←", "↔"] {
+            let mut diagnostics = Vec::new();
+            let measured = layout_accent(
+                &MathAccent::new(character, text("AB")),
+                &mut fm,
+                None,
+                11.0,
+                Color::BLACK,
+                "test",
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            assert!(measured.is_bounded());
+            let lines = measured
+                .group
+                .children
+                .iter()
+                .filter(|child| matches!(child, PositionedElement::Line { .. }))
+                .count();
+            assert_eq!(
+                lines,
+                if matches!(character, "⃡" | "↔") {
+                    5
+                } else {
+                    3
+                }
+            );
+            let PositionedElement::Group(base) = measured.group.children.last().unwrap() else {
+                panic!("accent base");
+            };
+            for child in &measured.group.children[..lines] {
+                let PositionedElement::Line {
+                    start, end, width, ..
+                } = child
+                else {
+                    unreachable!()
+                };
+                assert!(start.y.max(end.y) + width / 2.0 < base.transform.f);
+            }
+        }
     }
 
     #[test]
@@ -2226,6 +2335,40 @@ mod tests {
                 .expect("UTF-8 XML")
                 .contains(r#"<x:visible data="kept">raw</x:visible>"#)
         );
+    }
+
+    #[test]
+    fn nary_side_limits_share_a_column_next_to_the_operator() {
+        let mut fm = deterministic_font_manager();
+        for operator in ["∑", "∏", "∫"] {
+            let mut nary = MathNary::new(operator, text("x"));
+            nary.hide_subscript = false;
+            nary.hide_superscript = false;
+            nary.subscript = text("i=1");
+            nary.superscript = text("n");
+            nary.limit_location = Some(LimitLocation::SubSuperscript);
+            let measured = layout_nary(
+                &nary,
+                &mut fm,
+                None,
+                11.0,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let PositionedElement::Group(decorated) = &measured.group.children[0] else {
+                panic!("operator group");
+            };
+            let PositionedElement::Group(upper) = &decorated.children[1] else {
+                panic!("upper limit");
+            };
+            let PositionedElement::Group(lower) = &decorated.children[2] else {
+                panic!("lower limit");
+            };
+            assert!((upper.transform.e - lower.transform.e).abs() < 1e-9);
+            assert!(upper.transform.f < lower.transform.f);
+        }
     }
 
     #[test]

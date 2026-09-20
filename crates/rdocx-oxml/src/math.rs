@@ -1036,7 +1036,9 @@ impl MathRadical {
             degree: MathArgument::default(),
             base,
             hide_degree: true,
-            degree_present: false,
+            // Emit an explicit empty degree for authored square roots. Office
+            // consumers otherwise may consume the radicand as the degree.
+            degree_present: true,
             preservation: Preservation::default(),
         }
     }
@@ -3746,6 +3748,22 @@ mod tests {
         let supported = CT_OMath::from_xml(supported.as_bytes()).unwrap();
         assert!(!supported.expressions[0].has_unsupported_content());
         assert!(!supported.expressions[1].has_unsupported_content());
+    }
+
+    #[test]
+    fn authored_square_roots_include_an_empty_degree_before_the_radicand() {
+        let equation = CT_OMath::new(vec![MathExpression::Radical(MathRadical::new(
+            MathArgument::text("x"),
+        ))]);
+        let xml = equation.to_xml().unwrap();
+        assert_fragments_in_order(&xml, &["<m:radPr>", "<m:deg", "<m:e>", "<m:t>x</m:t>"]);
+        let reopened = CT_OMath::from_xml(&xml).unwrap();
+        let MathExpression::Radical(radical) = &reopened.expressions[0] else {
+            panic!("square root");
+        };
+        assert!(radical.hide_degree);
+        assert!(radical.degree.expressions.is_empty());
+        assert!(matches!(radical.base.expressions.as_slice(), [MathExpression::Run(run)] if run.text == "x"));
     }
 
     #[test]
