@@ -17,7 +17,6 @@ const SUBSCRIPT_SHIFT_EM: f64 = 0.18;
 const SUPERSCRIPT_SHIFT_EM: f64 = 0.43;
 const GAP_EM: f64 = 0.12;
 const RULE_EM: f64 = 0.055;
-const MAX_DELIMITER_SCALE: f64 = 4.0;
 const EQUATION_SPACING_EM: f64 = 0.107;
 const LIMIT_GAP_EM: f64 = -0.29;
 const MATH_TEXT_X_SCALE: f64 = 1.1;
@@ -880,6 +879,10 @@ fn layout_fraction(
     let denominator_x = (width - denominator.width) / 2.0;
     let denominator_y = ascent - font_size * 0.36;
     let descent = (denominator_y + denominator.height() - ascent).max(0.0);
+    // The equation baseline is not the fraction rule. Keep the rule in the
+    // clearance between the complete child boxes, including nested fractions
+    // and scripts, rather than drawing it through the denominator.
+    let rule_y = (numerator.height() + denominator_y) / 2.0;
     let mut children = vec![
         translated(numerator.group, numerator_x, 0.0),
         translated(denominator.group, denominator_x, denominator_y),
@@ -888,11 +891,11 @@ fn layout_fraction(
         children.push(PositionedElement::Line {
             start: Point {
                 x: padding / 2.0,
-                y: ascent,
+                y: rule_y,
             },
             end: Point {
                 x: width - padding / 2.0,
-                y: ascent,
+                y: rule_y,
             },
             width: rule,
             color,
@@ -1480,9 +1483,19 @@ fn layout_delimiter(
     } else {
         contents.height() * 1.08
     };
+    // Scaled fences must share the content's vertical centre, not the
+    // original glyph's baseline ratio (which leaves tall matrices exposed).
+    let center_delimiter = |mut delimiter: MeasuredMath| {
+        if value.grow != Some(false) {
+            let extra = (delimiter.height() - contents.height()) / 2.0;
+            delimiter.ascent = contents.ascent + extra;
+            delimiter.descent = contents.descent + extra;
+        }
+        delimiter
+    };
     let mut pieces = Vec::new();
     if !value.begin_character.is_empty() {
-        pieces.push(vertically_scaled(
+        pieces.push(center_delimiter(vertically_scaled(
             layout_text(
                 &value.begin_character,
                 fm,
@@ -1495,11 +1508,10 @@ fn layout_delimiter(
                 diagnostics,
             )?,
             target_height,
-        ));
+        )));
     }
-    pieces.push(contents);
     if !value.end_character.is_empty() {
-        pieces.push(vertically_scaled(
+        pieces.push(center_delimiter(vertically_scaled(
             layout_text(
                 &value.end_character,
                 fm,
@@ -1512,8 +1524,9 @@ fn layout_delimiter(
                 diagnostics,
             )?,
             target_height,
-        ));
+        )));
     }
+    pieces.insert(usize::from(!value.begin_character.is_empty()), contents);
     Ok(layout_sequence(pieces))
 }
 
@@ -1527,6 +1540,29 @@ fn layout_accent(
     source_path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<MeasuredMath> {
+    let accent_text = if value.character.is_empty() {
+        "̂"
+    } else {
+        value.character.as_str()
+    };
+    if matches!(accent_text, "¯" | "‾" | "̄" | "̅" | "̲") {
+        return layout_bar(
+            &MathBar::new(
+                if accent_text == "̲" {
+                    BarPosition::Bottom
+                } else {
+                    BarPosition::Top
+                },
+                value.base.clone(),
+            ),
+            fm,
+            font_family,
+            font_size,
+            color,
+            source_path,
+            diagnostics,
+        );
+    }
     let base = layout_argument(
         &value.base,
         fm,
@@ -1536,36 +1572,6 @@ fn layout_accent(
         &format!("{source_path}/base"),
         diagnostics,
     )?;
-    let accent_text = if value.character.is_empty() {
-        "̂"
-    } else {
-        value.character.as_str()
-    };
-    let gap = font_size * GAP_EM / 2.0;
-    if matches!(accent_text, "¯" | "̅" | "̲") {
-        let rule = font_size * RULE_EM;
-        return Ok(MeasuredMath {
-            width: base.width,
-            ascent: base.ascent + gap + rule,
-            descent: base.descent,
-            group: group(vec![
-                translated(base.group, 0.0, gap + rule),
-                PositionedElement::Line {
-                    start: Point {
-                        x: 0.0,
-                        y: rule / 2.0,
-                    },
-                    end: Point {
-                        x: base.width,
-                        y: rule / 2.0,
-                    },
-                    width: rule,
-                    color,
-                    dash_pattern: None,
-                },
-            ]),
-        });
-    }
     let accent = layout_text(
         accent_text,
         fm,
@@ -1596,7 +1602,7 @@ fn vertically_scaled(value: MeasuredMath, target_height: f64) -> MeasuredMath {
     if height <= 0.0 || target_height <= height {
         return value;
     }
-    let scale = (target_height / height).min(MAX_DELIMITER_SCALE);
+    let scale = target_height / height;
     MeasuredMath {
         width: value.width,
         ascent: value.ascent * scale,
@@ -1784,6 +1790,196 @@ mod tests {
             assert!(measured.width > 0.0, "expression {index} has no width");
             assert!(measured.height() > 0.0, "expression {index} has no height");
             assert!(!measured.group.children.is_empty(), "expression {index}");
+        }
+    }
+
+    #[test]
+    fn nested_and_scripted_fractions_keep_rules_clear_at_different_sizes() {
+        let mut fm = deterministic_font_manager();
+        let mut diagnostics = Vec::new();
+        let nested = MathArgument::new(vec![MathExpression::Fraction(MathFraction::new(
+            text("3"),
+            text("10"),
+        ))]);
+        let script = MathArgument::new(vec![MathExpression::SubSuperscript(
+            MathSubSuperscript::new(text("x"), text("i"), text("2")),
+        )]);
+        for size in [6.0, 11.0, 24.0, 48.0] {
+            for (num, den) in [
+                (text("3"), text("10")),
+                (text("a+b"), text("c")),
+                (nested.clone(), script.clone()),
+                (script.clone(), nested.clone()),
+                (nested.clone(), nested.clone()),
+            ] {
+                let numerator = layout_argument(
+                    &num,
+                    &mut fm,
+                    None,
+                    size,
+                    Color::BLACK,
+                    "test",
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let denominator = layout_argument(
+                    &den,
+                    &mut fm,
+                    None,
+                    size,
+                    Color::BLACK,
+                    "test",
+                    &mut diagnostics,
+                )
+                .unwrap();
+                for fraction_type in [FractionType::Bar, FractionType::NoBar] {
+                    let mut fraction = MathFraction::new(num.clone(), den.clone());
+                    fraction.fraction_type = fraction_type;
+                    let measured = layout_fraction(
+                        &fraction,
+                        &mut fm,
+                        None,
+                        size,
+                        Color::BLACK,
+                        "test",
+                        &mut diagnostics,
+                    )
+                    .unwrap();
+                    let PositionedElement::Group(num_group) = &measured.group.children[0] else {
+                        panic!("numerator group");
+                    };
+                    let PositionedElement::Group(den_group) = &measured.group.children[1] else {
+                        panic!("denominator group");
+                    };
+                    let numerator_bottom = num_group.transform.f + numerator.height();
+                    let denominator_top = den_group.transform.f;
+                    assert!(numerator_bottom < denominator_top);
+                    assert!(
+                        (denominator_top + denominator.height() - measured.height()).abs() < 1e-8
+                    );
+                    assert!(
+                        (num_group.transform.e + numerator.width / 2.0 - measured.width / 2.0)
+                            .abs()
+                            < 1e-8
+                    );
+                    assert!(
+                        (den_group.transform.e + denominator.width / 2.0 - measured.width / 2.0)
+                            .abs()
+                            < 1e-8
+                    );
+                    if fraction_type == FractionType::NoBar {
+                        assert_eq!(measured.group.children.len(), 2);
+                        continue;
+                    }
+                    let PositionedElement::Line {
+                        start, end, width, ..
+                    } = &measured.group.children[2]
+                    else {
+                        panic!("fraction rule");
+                    };
+                    assert!(
+                        start.y - width / 2.0 > numerator_bottom,
+                        "rule intersects numerator at {size}pt"
+                    );
+                    assert!(
+                        start.y + width / 2.0 < denominator_top,
+                        "rule intersects denominator at {size}pt"
+                    );
+                    assert_eq!(start.y, end.y);
+                    assert!(start.x >= 0.0 && end.x <= measured.width && end.x > start.x);
+                }
+            }
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn combining_macron_and_underbar_accents_span_their_complete_base() {
+        let mut fm = deterministic_font_manager();
+        for character in ["¯", "‾", "̄", "̅", "̲"] {
+            let measured = layout_accent(
+                &MathAccent::new(character, text("x+y")),
+                &mut fm,
+                None,
+                11.0,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let rule = measured
+                .group
+                .children
+                .iter()
+                .find_map(|child| match child {
+                    PositionedElement::Line {
+                        start, end, width, ..
+                    } => Some((start, end, width)),
+                    _ => None,
+                })
+                .expect("accent must be a full-width rule, not a combining glyph");
+            assert_eq!(rule.0.x, 0.0);
+            assert_eq!(rule.1.x, measured.width);
+            let base = measured
+                .group
+                .children
+                .iter()
+                .find_map(|child| match child {
+                    PositionedElement::Group(base) => Some(base),
+                    _ => None,
+                })
+                .unwrap();
+            if character == "̲" {
+                assert!(rule.0.y - rule.2 / 2.0 > measured.ascent);
+            } else {
+                assert!(rule.0.y + rule.2 / 2.0 < base.transform.f);
+            }
+        }
+    }
+
+    #[test]
+    fn growing_delimiters_center_on_and_enclose_tall_fraction_matrices() {
+        let mut fm = deterministic_font_manager();
+        for count in [2, 6] {
+            let fraction = MathArgument::new(vec![MathExpression::Fraction(MathFraction::new(
+                text("3"),
+                text("10"),
+            ))]);
+            let matrix = MathArgument::new(vec![MathExpression::Matrix(MathMatrix::new(
+                (0..count)
+                    .map(|_| MathMatrixRow::new(vec![fraction.clone()]))
+                    .collect(),
+            ))]);
+            let contents = layout_argument(
+                &matrix,
+                &mut fm,
+                None,
+                11.0,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let measured = layout_delimiter(
+                &MathDelimiter::new("(", ")", vec![matrix]),
+                &mut fm,
+                None,
+                11.0,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert!((measured.height() - contents.height() * 1.08).abs() < 1e-8);
+            let PositionedElement::Group(body) = &measured.group.children[1] else {
+                panic!("matrix group");
+            };
+            let margin = (measured.height() - contents.height()) / 2.0;
+            assert!(
+                (body.transform.f - margin).abs() < 1e-8,
+                "matrix must be vertically centered inside its fences"
+            );
+            assert!(margin > 0.0);
         }
     }
 

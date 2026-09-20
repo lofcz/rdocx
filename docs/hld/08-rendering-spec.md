@@ -1394,6 +1394,14 @@ lower only to shared text, line, path, and group primitives. Visible unsupported
 content emits one stable source-path diagnostic, while the untouched typed tree
 continues to own its retained XML.
 
+Stacked fraction rules sit in the clearance between the complete numerator
+and denominator boxes, independently of the equation baseline. Rule thickness
+must clear both boxes, including nested fractions and scripted arguments.
+This drawing correction does not change fraction extents or serialized OMML.
+Growing delimiters are centered on the full content height and are not capped
+at a fixed multiple of the original glyph height. Macron and overbar accents
+span their complete base as rules. Underbar accents place the rule below it.
+
 `InlineItem::Group` and `LineItem::Group` carry `baseline: Option<f64>`.
 Finite values are normalized to the group height before line conversion. The
 line breaker contributes the normalized value as ascent and the remaining
