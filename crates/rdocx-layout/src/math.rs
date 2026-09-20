@@ -3,7 +3,7 @@ use oxml_layout::{
     Transform,
 };
 use rdocx_oxml::math::{
-    BarPosition, FractionType, LimitLocation, MathAccent, MathArgument, MathBar, MathDelimiter,
+    BarPosition, FractionType, LimitLocation, MathAccent, MathArgument, MathBar, MathBorderBox, MathDelimiter,
     MathExpression,
     MathFraction, MathJustification, MathLimit, MathMatrix, MathNary, MathPreSubSuperscript,
     MathProperties, MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
@@ -243,6 +243,7 @@ fn apply_expression_limit_defaults(
             }
             MathExpression::Accent(value) => argument(&mut value.base, properties),
             MathExpression::Bar(value) => argument(&mut value.base, properties),
+            MathExpression::BorderBox(value) => argument(&mut value.base, properties),
         }
     }
 }
@@ -455,6 +456,9 @@ fn layout_expression(
             source_path,
             diagnostics,
         ),
+        MathExpression::BorderBox(value) => {
+            layout_border_box(value, fm, font_family, font_size, color, source_path, diagnostics)
+        }
         MathExpression::Bar(value) => layout_bar(
             value,
             fm,
@@ -465,6 +469,56 @@ fn layout_expression(
             diagnostics,
         ),
     }
+}
+
+/// A real equation box, including a visible writing area for empty placeholders.
+#[allow(clippy::too_many_arguments)]
+fn layout_border_box(
+    value: &MathBorderBox,
+    fm: &mut FontManager,
+    font_family: Option<&str>,
+    font_size: f64,
+    color: Color,
+    source_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<MeasuredMath> {
+    let base = layout_argument(
+        &value.base,
+        fm,
+        font_family,
+        font_size,
+        color,
+        &format!("{source_path}/base"),
+        diagnostics,
+    )?;
+    let padding = font_size * 0.18;
+    let rule = font_size * RULE_EM;
+    let base_ascent = base.ascent.max(font_size * 0.75);
+    let base_descent = base.descent.max(font_size * 0.2);
+    let width = base.width.max(font_size * 0.5) + 2.0 * padding + rule;
+    let ascent = base_ascent + padding + rule / 2.0;
+    let descent = base_descent + padding + rule / 2.0;
+    let height = ascent + descent;
+    let inset = rule / 2.0;
+    let line = |x1, y1, x2, y2| PositionedElement::Line {
+        start: Point { x: x1, y: y1 },
+        end: Point { x: x2, y: y2 },
+        width: rule,
+        color,
+        dash_pattern: None,
+    };
+    Ok(MeasuredMath {
+        width,
+        ascent,
+        descent,
+        group: group(vec![
+            translated(base.group, (width - base.width) / 2.0, ascent - base.ascent),
+            line(inset, inset, width - inset, inset),
+            line(width - inset, inset, width - inset, height - inset),
+            line(width - inset, height - inset, inset, height - inset),
+            line(inset, height - inset, inset, inset),
+        ]),
+    })
 }
 
 /// `m:bar`: the base with a rule drawn along its top or bottom edge.
@@ -1087,7 +1141,12 @@ fn layout_measured_scripts(
     font_size: f64,
 ) -> MeasuredMath {
     let superscript_shift = font_size * SUPERSCRIPT_SHIFT_EM;
-    let subscript_shift = font_size * SUBSCRIPT_SHIFT_EM;
+    let mut subscript_shift = font_size * SUBSCRIPT_SHIFT_EM;
+    // Tall scripts such as boxed answers need disjoint bounds, not just
+    // the baseline offsets used for ordinary letters and digits.
+    if subscript.height().max(superscript.height()) > font_size * SCRIPT_SCALE * 1.2 {
+        subscript_shift = subscript_shift.max(subscript.ascent + superscript.descent + font_size * GAP_EM - superscript_shift);
+    }
     let ascent = base.ascent.max(superscript_shift + superscript.ascent);
     let descent = base.descent.max(subscript_shift + subscript.descent);
     let script_width = subscript.width.max(superscript.width);
@@ -1874,6 +1933,8 @@ mod tests {
                 (nested.clone(), script.clone()),
                 (script.clone(), nested.clone()),
                 (nested.clone(), nested.clone()),
+                (MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text("  ")))]), text("15")),
+                (text("15"), MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text(" ")))])),
             ] {
                 let numerator = layout_argument(
                     &num,
@@ -2645,4 +2706,90 @@ mod tests {
             && (expected.1 - actual.1).abs() <= tolerance
             && (expected.2 - actual.2).abs() <= tolerance
     }
+
+    #[test]
+    fn empty_border_boxes_have_four_edges_and_writing_height() {
+        let mut fm = deterministic_font_manager();
+        for size in [6.0, 11.0, 24.0] {
+            for base in [MathArgument::default(), text(" "), text("  "), text("10")] {
+                let mut diagnostics = Vec::new();
+                let measured = layout_border_box(
+                    &MathBorderBox::new(base),
+                    &mut fm,
+                    None,
+                    size,
+                    Color::BLACK,
+                    "test",
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert!(diagnostics.is_empty());
+                assert!(measured.height() > size);
+                assert!(measured.width > size * 0.5);
+                let mut edges = 0;
+                for child in &measured.group.children {
+                    if let PositionedElement::Line {
+                        start, end, width, ..
+                    } = child
+                    {
+                        edges += 1;
+                        for p in [start, end] {
+                            assert!(p.x - width / 2.0 >= -1e-8);
+                            assert!(p.y - width / 2.0 >= -1e-8);
+                            assert!(p.x + width / 2.0 <= measured.width + 1e-8);
+                            assert!(p.y + width / 2.0 <= measured.height() + 1e-8);
+                        }
+                    }
+                }
+                assert_eq!(edges, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn boxed_sub_and_superscripts_do_not_intersect() {
+        let mut fm = deterministic_font_manager();
+        for size in [6.0, 11.0, 24.0] {
+            let base = layout_argument(
+                &text("x"),
+                &mut fm,
+                None,
+                size,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let sub = layout_border_box(
+                &MathBorderBox::new(text(" ")),
+                &mut fm,
+                None,
+                size * SCRIPT_SCALE,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let sup = layout_border_box(
+                &MathBorderBox::new(text("2")),
+                &mut fm,
+                None,
+                size * SCRIPT_SCALE,
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let sup_height = sup.height();
+            let measured = layout_measured_scripts(base, sub, sup, false, size);
+            let PositionedElement::Group(upper) = &measured.group.children[1] else {
+                panic!("upper")
+            };
+            let PositionedElement::Group(lower) = &measured.group.children[2] else {
+                panic!("lower")
+            };
+            assert!(upper.transform.f + sup_height < lower.transform.f);
+        }
+    }
+
 }

@@ -286,6 +286,7 @@ pub enum MathExpression {
     Delimiter(MathDelimiter),
     Accent(MathAccent),
     Bar(MathBar),
+    BorderBox(MathBorderBox),
 }
 
 impl MathExpression {
@@ -363,6 +364,11 @@ impl MathExpression {
                     || property_container_has_unsupported_content(&value.preservation, "barPr")
                     || value.base.has_unsupported_content()
             }
+            Self::BorderBox(value) => {
+                preservation_has_unsupported_content(&value.preservation)
+                    || property_container_has_unsupported_content(&value.preservation, "borderBoxPr")
+                    || value.base.has_unsupported_content()
+            }
         }
     }
 
@@ -389,6 +395,7 @@ impl MathExpression {
             Some("d") => Some(Self::Delimiter(MathDelimiter::from_raw(raw, inherited)?)),
             Some("acc") => Some(Self::Accent(MathAccent::from_raw(raw, inherited)?)),
             Some("bar") => Some(Self::Bar(MathBar::from_raw(raw, inherited)?)),
+            Some("borderBox") => Some(Self::BorderBox(MathBorderBox::from_raw(raw, inherited)?)),
             _ => None,
         })
     }
@@ -409,6 +416,7 @@ impl MathExpression {
             Self::Delimiter(value) => value.write_xml(writer),
             Self::Accent(value) => value.write_xml(writer),
             Self::Bar(value) => value.write_xml(writer),
+            Self::BorderBox(value) => value.write_xml(writer),
         }
     }
 }
@@ -1846,6 +1854,65 @@ impl MathBar {
     }
 }
 
+/// `m:borderBox`: a rectangular outline around its base (`\boxed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MathBorderBox {
+    pub base: MathArgument,
+    preservation: Preservation,
+}
+
+impl MathBorderBox {
+    pub fn new(base: MathArgument) -> Self {
+        Self {
+            base,
+            preservation: Preservation::default(),
+        }
+    }
+
+    fn from_raw(raw: &[u8], inherited: &[(String, String)]) -> Result<Self> {
+        let mut parsed = parse_element(raw, inherited)?;
+        let mut base = MathArgument::default();
+        let mut modeled = 0usize;
+        for child in parsed.children {
+            match math_local_name(&child, &parsed.bindings)?.as_deref() {
+                Some("borderBoxPr") if modeled == 0 => {
+                    preserve_modeled_child(
+                        &mut parsed.preservation,
+                        "borderBoxPr",
+                        &child,
+                        &parsed.bindings,
+                    );
+                    modeled += 1;
+                }
+                Some("e") => {
+                    base = MathArgument::from_raw(&child, &parsed.bindings)?;
+                    modeled += 1;
+                }
+                _ => parsed.preservation.raw_children.push((modeled, child)),
+            }
+        }
+        Ok(Self {
+            base,
+            preservation: parsed.preservation,
+        })
+    }
+
+    fn write_xml<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+        write_container(writer, "borderBox", &self.preservation, |writer| {
+            let mut modeled = write_leading_property_container(
+                writer,
+                "borderBoxPr",
+                &[],
+                &self.preservation,
+                true,
+            )?;
+            self.base.write_xml(writer, "e")?;
+            modeled += 1;
+            write_raw_slot(writer, &self.preservation, modeled)
+        })
+    }
+}
+
 /// Document-wide defaults from `w:settings/m:mathPr`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MathProperties {
@@ -2595,6 +2662,7 @@ fn full_property_order(tag: &str) -> &'static [&'static str] {
         "dPr" => &["begChr", "sepChr", "endChr", "grow", "shp", "ctrlPr"],
         "accPr" => &["chr", "ctrlPr"],
         "barPr" => &["pos", "ctrlPr"],
+        "borderBoxPr" => &["ctrlPr"],
         "oMathParaPr" => &["jc"],
         "mathPr" => &[
             "mathFont",
@@ -2829,6 +2897,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "d" => Some("dPr"),
         "acc" => Some("accPr"),
         "bar" => Some("barPr"),
+        "borderBox" => Some("borderBoxPr"),
         _ => None,
     };
     if let Some(property_tag) = property_tag {
@@ -2864,6 +2933,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "d" => &["dPr", "e"],
         "acc" => &["accPr", "e"],
         "bar" => &["barPr", "e"],
+        "borderBox" => &["borderBoxPr", "e"],
         _ => return Ok(true),
     };
     let sequence = parsed
@@ -2890,6 +2960,7 @@ fn valid_expression_shape(raw: &[u8], inherited: &[(String, String)]) -> Result<
         "nary" => sequence_matches_with_optional(&sequence, "naryPr", &["sub", "sup"], &["e"]),
         "acc" => sequence_matches(&sequence, "accPr", &["e"]),
         "bar" => sequence_matches(&sequence, "barPr", &["e"]),
+        "borderBox" => sequence_matches(&sequence, "borderBoxPr", &["e"]),
         "d" => {
             let argument_start = usize::from(sequence.first().is_some_and(|value| value == "dPr"));
             sequence.len() > argument_start
@@ -4599,4 +4670,31 @@ mod tests {
         assert!(output.find("<m:mathFont").unwrap() < output.find("<m:brkBin").unwrap());
         assert!(output.find("<m:brkBin").unwrap() < output.find("<m:smallFrac").unwrap());
     }
+
+    #[test]
+    fn border_box_xml_roundtrip_and_unsupported_edges() {
+        for property in [
+            "",
+            "<m:borderBoxPr><m:hideTop m:val=\"1\"/></m:borderBoxPr>",
+        ] {
+            let xml = format!(
+                r#"<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:borderBox>{property}<m:e><m:r><m:t>  </m:t></m:r></m:e></m:borderBox></m:oMath>"#
+            );
+            let parsed = CT_OMath::from_xml(xml.as_bytes()).unwrap();
+            assert_eq!(parsed.has_unsupported_content(), !property.is_empty());
+            let saved = parsed.to_xml().unwrap();
+            let reopened = CT_OMath::from_xml(&saved).unwrap();
+            assert_eq!(reopened.has_unsupported_content(), !property.is_empty());
+            assert_eq!(saved, reopened.to_xml().unwrap());
+            let MathExpression::BorderBox(value) = &reopened.expressions[0] else {
+                panic!("border box lost on reopen");
+            };
+            let MathExpression::Run(run) = &value.base.expressions[0] else {
+                panic!("box spacing lost on reopen");
+            };
+            assert_eq!(run.text, "  ");
+            assert!(String::from_utf8(saved).unwrap().contains("m:borderBox"));
+        }
+    }
+
 }

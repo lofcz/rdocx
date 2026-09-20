@@ -8,8 +8,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use rdocx_oxml::math::{
-    BarPosition, FractionType, MathAccent, MathArgument, MathBar, MathDelimiter, MathExpression,
-    MathFraction, MathLimit, MathMatrix, MathMatrixRow, MathNary, MathPreSubSuperscript,
+    BarPosition, FractionType, MathAccent, MathArgument, MathBar, MathBorderBox, MathDelimiter,
+    MathExpression, MathFraction, MathLimit, MathMatrix, MathMatrixRow, MathNary, MathPreSubSuperscript,
     MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
 };
 
@@ -492,6 +492,7 @@ fn mathml_element_to_expressions(
         "mi" | "mn" | "mo" | "mtext" => &["mathvariant"][..],
         "mspace" => &["width"][..],
         "mfrac" => &["linethickness", "bevelled"][..],
+        "menclose" => &["notation"][..],
         _ => &[][..],
     };
     diagnose_attributes(node, path, allowed_attributes, diagnostics)?;
@@ -505,6 +506,11 @@ fn mathml_element_to_expressions(
         // Style and spacing wrappers carry no OMML meaning; their content does.
         "mstyle" | "mpadded" => {
             Ok(mathml_children_to_argument(node, path, diagnostics, nodes)?.expressions)
+        }
+        "menclose" if node.attribute("notation").unwrap_or("longdiv").trim() == "box" => {
+            Ok(vec![MathExpression::BorderBox(MathBorderBox::new(
+                mathml_children_to_argument(node, path, diagnostics, nodes)?,
+            ))])
         }
         "mspace" => Ok(mathml_space(node)),
         "mphantom" => Ok(mathml_phantom(node)),
@@ -824,7 +830,7 @@ fn double_struck(c: char) -> Option<char> {
 }
 
 /// `mspace` as a run of ordinary spaces (OMML has no spacing element); one
-/// space per 0.5em, default `1em`, clamped to 1..=16.
+/// space per 0.25em, default `1em`, clamped to 1..=64.
 fn mathml_space(node: &XmlNode) -> Vec<MathExpression> {
     let width = node.attribute("width").unwrap_or("1em").trim();
     let em = if let Some(value) = width.strip_suffix("em") {
@@ -840,7 +846,7 @@ fn mathml_space(node: &XmlNode) -> Vec<MathExpression> {
     } else {
         1.0
     };
-    let count = (em / 0.5).round().clamp(1.0, 16.0) as usize;
+    let count = (em / 0.25).round().clamp(1.0, 64.0) as usize;
     let mut run = MathRun::new(" ".repeat(count));
     run.properties.normal = Some(true);
     vec![run.into()]
@@ -1545,6 +1551,7 @@ fn normalize_expression(expression: &mut MathExpression) {
         }
         MathExpression::Accent(value) => normalize_argument(&mut value.base),
         MathExpression::Bar(value) => normalize_argument(&mut value.base),
+        MathExpression::BorderBox(value) => normalize_argument(&mut value.base),
     }
 }
 
@@ -1635,6 +1642,7 @@ fn validate_tree(argument: &MathArgument) -> std::result::Result<(), String> {
                 }
                 MathExpression::Accent(value) => visit(&value.base, depth + 1, nodes, text)?,
                 MathExpression::Bar(value) => visit(&value.base, depth + 1, nodes, text)?,
+                MathExpression::BorderBox(value) => visit(&value.base, depth + 1, nodes, text)?,
             }
         }
         Ok(())
@@ -1691,6 +1699,7 @@ fn expression_has_direct_unsupported_content(expression: &MathExpression) -> boo
         MathExpression::Delimiter(value) => value.arguments.clear(),
         MathExpression::Accent(value) => value.base = MathArgument::default(),
         MathExpression::Bar(value) => value.base = MathArgument::default(),
+        MathExpression::BorderBox(value) => value.base = MathArgument::default(),
     }
     direct.has_unsupported_content()
 }
@@ -1905,6 +1914,11 @@ fn write_mathml_expression(
                 xml_escape(&value.end_character)
             )
             .expect("String writes are infallible");
+        }
+        MathExpression::BorderBox(value) => {
+            output.push_str("<menclose notation=\"box\"><mrow>");
+            write_mathml_argument(&value.base, path, output, diagnostics)?;
+            output.push_str("</mrow></menclose>");
         }
         MathExpression::Bar(value) => {
             let (open, close) = match value.position {
@@ -2241,6 +2255,13 @@ impl<'a> LatexParser<'a> {
                 )]))
             }
             "left" => self.parse_left_right(start),
+            "boxed" => {
+                let base = self.parse_required_argument()?;
+                self.add_node()?;
+                Ok(MathArgument::new(vec![MathExpression::BorderBox(
+                    MathBorderBox::new(base),
+                )]))
+            }
             "underline" => {
                 let base = self.parse_required_argument()?;
                 self.add_node()?;
@@ -3011,6 +3032,9 @@ fn diagnose_empty_latex_runs(
             MathExpression::Accent(value) => {
                 diagnose_empty_latex_runs(&value.base, &expression_path, diagnostics)?;
             }
+            MathExpression::BorderBox(value) => {
+                diagnose_empty_latex_runs(&value.base, &expression_path, diagnostics)?;
+            }
             MathExpression::Bar(value) => {
                 diagnose_empty_latex_runs(&value.base, &expression_path, diagnostics)?;
             }
@@ -3215,6 +3239,10 @@ fn write_latex_expression(
             }
             output.push_str("\\right");
             output.push_str(&end);
+        }
+        MathExpression::BorderBox(value) => {
+            output.push_str("\\boxed");
+            write_latex_group(&value.base, path, output, diagnostics)?;
         }
         MathExpression::Bar(value) => {
             output.push_str(match value.position {
@@ -3816,7 +3844,7 @@ mod tests {
         let MathExpression::Run(space) = &expressions[6] else {
             panic!("mspace run")
         };
-        assert_eq!(space.text, "    ");
+        assert_eq!(space.text, "        ");
         assert!(matches!(expressions[7], MathExpression::Fraction(_)));
         let MathExpression::Bar(blank) = &expressions[8] else {
             panic!("underlined blank is a bottom bar")
@@ -4643,4 +4671,27 @@ mod tests {
         assert!(!differential_accepts(&matrix, &reordered_matrix));
         assert!(!differential_accepts(&lossy, &dropped_diagnostic));
     }
+
+    #[test]
+    fn border_boxes_roundtrip_without_loss() {
+        for latex in [
+            r"\boxed{x}",
+            r"\frac{\boxed{10}}{15}",
+            r"x_{\boxed{2}}",
+            r"\boxed{\frac{1}{2}}",
+        ] {
+            let parsed = equation_from_latex(latex).unwrap();
+            assert!(parsed.diagnostics.is_empty());
+            let ml = equation_to_mathml(&parsed.value);
+            assert!(ml.diagnostics.is_empty());
+            assert!(ml.value.contains("menclose notation=\"box\""));
+            let reopened = equation_from_mathml(&ml.value).unwrap();
+            assert!(reopened.diagnostics.is_empty());
+            assert_eq!(parsed.value, reopened.value);
+            let tex = equation_to_latex(&parsed.value);
+            assert!(tex.diagnostics.is_empty());
+            assert_eq!(equation_from_latex(&tex.value).unwrap().value, parsed.value);
+        }
+    }
+
 }

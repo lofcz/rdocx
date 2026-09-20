@@ -1464,3 +1464,7 @@ Every consuming formatting builder on `Paragraph`, `Run`, `Table`, `Row`, and
 cannot back a Python property setter. The 61 consuming builders delegate to
 their setter twins, so Rust callers retain chaining while borrowed handles and
 Python properties use in-place mutation.
+
+### Boxed mathematics
+
+MathML `menclose notation="box"` and LaTeX `\boxed` map to native Office Math `m:borderBox`. The base remains editable in DOCX. PDF layout draws four edges inside the measured bounds and reserves writing height for empty bases, including fraction and script positions. Unsupported border properties remain preserved and diagnosed rather than silently rendered as a different enclosure.
