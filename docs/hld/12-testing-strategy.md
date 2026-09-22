@@ -2619,7 +2619,13 @@ required, and no binary fixture enters the repository.
 - The public Word and PowerPoint regression builds 120 numbered Word lines and
   48 numbered slide lines split across Latin and CJK runs. Pinned Poppler
   26.01.0 must extract every complete line once and in source order. Its 72 DPI
-  first-page PNGs must retain the exact pre-change digests for both formats.
+  first-page PNGs must retain the exact reviewed digests for both formats.
+  The digests were refreshed after the upstream layout merge, with identical
+  page pixels from the committed and corrected PDF writers.
+- `legacy_ligatures_preserve_source_text_without_corrupting_later_runs` shapes
+  real bundled-font ligatures and checks exact extraction of later prose,
+  Czech text and combining accents. It also checks that direct font mappings
+  remain correct after a ligature-containing run.
 - **`Group` containing `Text` finds the font.** The regression test for the
   recursion hazard.
 - Tagged-PDF structure tests cover headings, nested lists, table headers and
@@ -3146,7 +3152,11 @@ successful run always starts with an empty prefix and rebuilds the reviewed
 source. Test, MSRV, both Python binding rows, and Presentation fidelity invoke
 the same unconditional failure-propagating installer before use. Platform
 package managers provide build dependencies only, never a moving Poppler
-binary package.
+binary package. Local runs use the same installer with `--prefix`, then prepend
+that prefix's `bin` directory to `PATH` for `cargo test`. On compilers whose
+standard headers no longer include `climits` transitively, set
+`CXXFLAGS="-include climits"` for the installer. This preserves the verified
+Poppler source and runtime version instead of weakening the oracle checks.
 
 The wheel workflow runs the installed `rdocx` suites except the
 Poppler-versioned rendering gate, which belongs to its pinned render job. It

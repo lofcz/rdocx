@@ -1185,6 +1185,31 @@ fn logical_line_spans(elements: &[PositionedElement]) -> Vec<LogicalLineSpan> {
     spans
 }
 
+// Mark logical text in page coordinates, then restore the painting transform.
+// This keeps extraction geometry valid inside rotated/flipped groups too.
+fn begin_actual_text(content: &mut Content, text: &str, transform: Transform, page_height: f64) {
+    let current = Transform {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: -1.0,
+        e: 0.0,
+        f: page_height,
+    }
+    .then(transform);
+    let inverse = inverse_transform(current);
+    if let Some(inverse) = inverse {
+        content.transform(transform_array(inverse));
+    }
+    content
+        .begin_marked_content_with_properties(Name(b"Span"))
+        .properties()
+        .actual_text(TextStr(text));
+    if inverse.is_some() {
+        content.transform(transform_array(current));
+    }
+}
+
 fn emit_elements(
     content: &mut Content,
     elements: &[PositionedElement],
@@ -1261,6 +1286,12 @@ fn emit_elements(
                     let font_name = format!("F{}", run.font_id.0);
 
                     content.save_state();
+                    begin_actual_text(
+                        content,
+                        actual_text.unwrap_or(&run.text),
+                        accumulated_transform,
+                        state.page_height,
+                    );
 
                     // Set text color
                     content.set_fill_rgb(
@@ -1294,6 +1325,7 @@ fn emit_elements(
                     );
 
                     content.end_text();
+                    content.end_marked_content();
                     content.restore_state();
                 }
             }
@@ -1304,15 +1336,6 @@ fn emit_elements(
                 {
                     let font_name = format!("F{}", run.font_id.0);
                     content.save_state();
-                    let page_flip = Transform {
-                        a: 1.0,
-                        b: 0.0,
-                        c: 0.0,
-                        d: -1.0,
-                        e: 0.0,
-                        f: state.page_height,
-                    };
-                    let current_pdf_transform = page_flip.then(accumulated_transform);
                     let text_matrix = Transform {
                         a: 1.0,
                         b: 0.0,
@@ -1321,22 +1344,12 @@ fn emit_elements(
                         e: run.origin.x,
                         f: run.origin.y,
                     };
-                    // Give ActualText page-oriented geometry, then restore the
-                    // current transform before painting the unchanged run.
-                    let corrected_actual_text =
-                        if let Some(current_inverse) = inverse_transform(current_pdf_transform) {
-                            content.transform(transform_array(current_inverse));
-                            true
-                        } else {
-                            false
-                        };
-                    content
-                        .begin_marked_content_with_properties(Name(b"Span"))
-                        .properties()
-                        .actual_text(TextStr(actual_text.unwrap_or(&run.logical_text)));
-                    if corrected_actual_text {
-                        content.transform(transform_array(current_pdf_transform));
-                    }
+                    begin_actual_text(
+                        content,
+                        actual_text.unwrap_or(&run.logical_text),
+                        accumulated_transform,
+                        state.page_height,
+                    );
                     content.set_fill_rgb(
                         run.color.r as f32,
                         run.color.g as f32,
@@ -3212,6 +3225,82 @@ mod tests {
             content_for(vec![plain]),
             content_for(vec![PositionedElement::Group(with_effect)])
         );
+    }
+
+    #[test]
+    fn legacy_ligatures_preserve_source_text_without_corrupting_later_runs() {
+        let mut fonts = oxml_layout::FontManager::new_deterministic().unwrap();
+        let font_id = fonts.resolve_font(Some("Carlito"), false, false).unwrap();
+        let samples = [
+            "After office affinity efficient ffi fi fl ft",
+            "Content continues. Before invalid expression: \\Uzivatel",
+            "Příliš žluťoučký kůň. Café e\u{301}.",
+        ];
+        let elements = samples
+            .iter()
+            .enumerate()
+            .map(|(line, text)| {
+                let shaped = fonts.shape_text(font_id, text, 12.0).unwrap();
+                if line == 0 {
+                    assert!(
+                        shaped.glyph_ids.len() < text.chars().count(),
+                        "fixture must contain ligatures"
+                    );
+                }
+                PositionedElement::Text(GlyphRun {
+                    origin: Point {
+                        x: 36.0,
+                        y: 48.0 + line as f64 * 24.0,
+                    },
+                    font_id,
+                    font_size: 12.0,
+                    glyph_ids: shaped.glyph_ids,
+                    advances: shaped.advances,
+                    text: (*text).to_owned(),
+                    source: None,
+                    color: Color::BLACK,
+                    bold: false,
+                    italic: false,
+                    field_kind: None,
+                    field_source: None,
+                    note: None,
+                })
+            })
+            .collect();
+        let font_data = fonts.font_data(font_id).unwrap();
+        let layout = LayoutResult::new(
+            vec![page_with(vec![group(Transform::IDENTITY, elements)]).into()],
+            vec![font_data.clone()],
+            None,
+            Vec::new(),
+        );
+        let usage = font::collect_glyph_usage(&layout);
+        let face = ttf_parser::Face::parse(&font_data.data, font_data.face_index).unwrap();
+        for ch in "continues".chars() {
+            let gid = face.glyph_index(ch).unwrap().0;
+            assert_eq!(usage[&font_id].glyph_to_unicode[&gid], ch);
+        }
+        let path =
+            std::env::temp_dir().join(format!("oxml-pdf-ligatures-{}.pdf", std::process::id()));
+        std::fs::write(&path, write_pdf(&layout)).unwrap();
+        let output = std::process::Command::new("pdftotext")
+            .arg(&path)
+            .arg("-")
+            .output()
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines, samples);
     }
 
     #[test]

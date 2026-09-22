@@ -87,3 +87,35 @@ PowerPoint gate exercises the changed rich path with pinned Poppler 26.01.0.
 ## Open questions
 
 None. The audit established both geometry and logical-order defects.
+
+## Legacy extraction follow-up
+
+The legacy `GlyphRun` path incorrectly zipped shaped glyphs with Unicode
+characters. A ligature shifted the font-wide ToUnicode mapping and corrupted
+later text extraction. The correction uses direct mappings from the font cmap
+and run-level `ActualText`, with widths retained for every subset glyph.
+The shared rich-run transform handling also applies to legacy replacement text.
+
+The regression shapes bundled Carlito ligatures followed by ordinary prose,
+Czech text and a combining accent. Extracted lines must equal their source.
+The application export regression checks complete surrounding prose as well
+as malformed formula source in the generated PDF.
+
+Expected hash changes are PDF content, font resources and complete PDF bytes.
+No OOXML or native raster change is caused by this correction. Any older raster
+baseline differences must be reproduced with the committed renderer before a
+separate baseline refresh. The pinned Poppler checks retain exact identities.
+
+Baseline verification reproduced the Word first-page digest
+`68689499f85d3cec9db4f9432efb3192d175195124288054a0b08a89b97419f8`
+with both the committed and corrected PDF writers under Poppler 26.01.0.
+The contract and letter native PNG baselines also predate the upstream merge.
+The sample generator renders PNG before calling the PDF writer, and neither
+layout nor native raster code changes in this correction. Refresh those two
+stale native PNG entries alongside the 21 intentional PDF fingerprint changes.
+The 21 OOXML entries and other five native PNG entries remain unchanged.
+
+The presentation first-page digest is
+`18e20d768f49393000303e4c4b624b357e4505cd57cbd9a5fd13eb1f86679f36`
+with both PDF writers under the same pinned Poppler build. Both reading-order
+raster pins are refreshed without relaxing exact pixel comparison.

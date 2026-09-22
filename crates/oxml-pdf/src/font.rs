@@ -33,44 +33,45 @@ pub(crate) struct PreparedFont {
 pub(crate) fn collect_glyph_usage(layout: &LayoutResult) -> HashMap<FontId, FontUsage> {
     let mut usage: HashMap<FontId, FontUsage> = HashMap::new();
 
+    let faces: HashMap<_, _> = layout
+        .fonts
+        .iter()
+        .filter_map(|font| {
+            ttf_parser::Face::parse(&font.data, font.face_index)
+                .ok()
+                .map(|face| (font.id, face))
+        })
+        .collect();
     for page in &layout.pages {
         walk(&page.elements, &mut |element, _| {
-            if let PositionedElement::Text(run) = element
-                && !(run.text.is_empty() && run.glyph_ids.is_empty())
-            {
-                let entry = usage.entry(run.font_id).or_insert_with(|| FontUsage {
-                    glyph_to_unicode: BTreeMap::new(),
-                    remapper: GlyphRemapper::new(),
-                });
-
-                // Map glyph IDs to unicode chars from the text
-                let chars: Vec<char> = run.text.chars().collect();
-                for (i, &gid) in run.glyph_ids.iter().enumerate() {
-                    entry.remapper.remap(gid);
-                    if let Some(&ch) = chars.get(i) {
-                        entry.glyph_to_unicode.entry(gid).or_insert(ch);
-                    }
+            let (font_id, glyph_ids, text) = match element {
+                PositionedElement::Text(run) => (run.font_id, &run.glyph_ids, run.text.as_str()),
+                PositionedElement::MultilingualText(run) if run.is_valid() => {
+                    (run.font_id, &run.glyph_ids, run.logical_text.as_str())
                 }
+                _ => return,
+            };
+            if text.is_empty() && glyph_ids.is_empty() {
+                return;
             }
-            if let PositionedElement::MultilingualText(run) = element
-                && !(run.logical_text.is_empty() && run.glyph_ids.is_empty())
-                && run.is_valid()
-            {
-                let entry = usage.entry(run.font_id).or_insert_with(|| FontUsage {
-                    glyph_to_unicode: BTreeMap::new(),
-                    remapper: GlyphRemapper::new(),
-                });
-                let chars = run.logical_text.chars().collect::<Vec<_>>();
-                for cluster in &run.clusters {
-                    let Some(&character) = chars.get(cluster.char_start as usize) else {
-                        continue;
-                    };
-                    for glyph in cluster.glyph_start..cluster.glyph_end {
-                        let Some(&gid) = run.glyph_ids.get(glyph as usize) else {
-                            continue;
-                        };
-                        entry.remapper.remap(gid);
-                        entry.glyph_to_unicode.entry(gid).or_insert(character);
+            let entry = usage.entry(font_id).or_insert_with(|| FontUsage {
+                glyph_to_unicode: BTreeMap::new(),
+                remapper: GlyphRemapper::new(),
+            });
+            for &gid in glyph_ids {
+                entry.remapper.remap(gid);
+            }
+            // Shaping can merge, split or reorder characters. Never zip source
+            // characters with shaped glyphs: one ligature would poison the
+            // shared font's mappings for the rest of the document. The font's
+            // cmap supplies direct mappings; run-level ActualText preserves
+            // ligatures, contextual forms and ambiguous Unicode aliases.
+            if let Some(face) = faces.get(&font_id) {
+                for ch in text.chars() {
+                    if let Some(gid) = face.glyph_index(ch)
+                        && entry.remapper.get(gid.0).is_some()
+                    {
+                        entry.glyph_to_unicode.entry(gid.0).or_insert(ch);
                     }
                 }
             }
@@ -127,7 +128,7 @@ fn compute_glyph_widths(font_data: &FontData, usage: &FontUsage) -> Vec<(u16, f6
     let units_per_em = face.units_per_em() as f64;
     let scale = 1000.0 / units_per_em;
 
-    for &old_gid in usage.glyph_to_unicode.keys() {
+    for old_gid in usage.remapper.remapped_gids() {
         if let Some(new_gid) = usage.remapper.get(old_gid) {
             let advance = face
                 .glyph_hor_advance(ttf_parser::GlyphId(old_gid))
@@ -136,8 +137,8 @@ fn compute_glyph_widths(font_data: &FontData, usage: &FontUsage) -> Vec<(u16, f6
         }
     }
 
-    // Also include glyphs that may not have unicode mapping but were remapped
-    // (e.g. .notdef glyph 0 is always included by subsetter)
+    // Include widths for ligatures and contextual glyphs without a direct cmap
+    // entry, as well as .notdef. Extraction must not alter painted advances.
 
     widths.sort_by_key(|&(gid, _)| gid);
     widths

@@ -539,7 +539,13 @@ empty replacement, and their paint operators stay in their original order.
 Ambiguous ownership, duplicate or gapped logical indices, and baseline changes
 end the line plan. Nested group transforms are cancelled only while expressing
 the same final glyph positions in page coordinates.
-Legacy Latin remains on `GlyphRun` so existing output bytes do not move.
+Legacy Latin remains on `GlyphRun`, with its original text emitted as
+run-level `ActualText`. Shaped glyph positions cannot be paired with source
+characters by index because ligatures can merge characters. Direct ToUnicode
+mappings come from the font cmap, while replacement text preserves ligatures,
+combining sequences and Unicode aliases exactly. Every subset glyph retains
+its width even without a direct Unicode mapping. These extraction metadata
+changes preserve painted glyph geometry but intentionally change PDF bytes.
 Non-negative leading is divided equally above and below the glyph box. A
 below-natural exact line keeps its stated height and places no negative leading
 before the baseline. Stored normal-autofit line-spacing reduction applies only

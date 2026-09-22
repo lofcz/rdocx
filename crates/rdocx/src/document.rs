@@ -29642,10 +29642,11 @@ mod tests {
 
         let word_pdf = word.to_pdf_deterministic().expect("render Word PDF");
         assert_eq!(extracted_logical_lines("word", &word_pdf), expected_word);
-        // Recorded from the pre-F-X092 writer with the pinned Poppler build.
+        // Refreshed after the upstream layout merge. The committed and corrected
+        // PDF writers rasterize this fixture identically with pinned Poppler.
         assert_eq!(
             rendered_pdf_page_sha("word", &word_pdf),
-            "7d800158f0b87c9596f524c4bfc91fbfa53e949b2113d573a8fc0ce3a28f332c"
+            "68689499f85d3cec9db4f9432efb3192d175195124288054a0b08a89b97419f8"
         );
 
         let presentation_pdf = presentation
@@ -29657,7 +29658,7 @@ mod tests {
         );
         assert_eq!(
             rendered_pdf_page_sha("presentation", &presentation_pdf),
-            "4fa599779bbeda5ad5a0d3c647c4a323f76dd151f2fffd9b51bff32382eab1d4"
+            "18e20d768f49393000303e4c4b624b357e4505cd57cbd9a5fd13eb1f86679f36"
         );
     }
 
