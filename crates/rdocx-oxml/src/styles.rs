@@ -891,6 +891,56 @@ impl CT_Styles {
             styles: vec![normal, heading1],
         }
     }
+
+    /// Create the conservative styles part accepted by Word's strict parser.
+    ///
+    /// Producers that apply all visual formatting directly to runs and
+    /// paragraphs do not need the extra default paragraph properties or the
+    /// built-in heading graph. Keeping this profile explicit avoids changing
+    /// the richer defaults used by the general authoring API.
+    pub fn new_word_safe() -> Self {
+        use crate::units::HalfPoint;
+
+        let normal = CT_Style {
+            style_id: "Normal".to_string(),
+            style_type: StyleType::Paragraph,
+            name: Some("Normal".to_string()),
+            based_on: None,
+            next_style: None,
+            linked_style: None,
+            auto_redefine: None,
+            hidden: None,
+            ui_priority: None,
+            semi_hidden: None,
+            unhide_when_used: None,
+            quick_format: None,
+            locked: None,
+            is_default: true,
+            ppr: None,
+            rpr: None,
+            table_properties: None,
+            table_properties_original: None,
+            table_properties_xml: None,
+            table_row_properties: None,
+            table_cell_properties: None,
+            conditional_table_styles: Vec::new(),
+            extra_attributes: Vec::new(),
+            modeled_xml: Vec::new(),
+            extra_xml: Vec::new(),
+        };
+        Self {
+            doc_defaults: Some(CT_DocDefaults {
+                rpr: Some(CT_RPr {
+                    font_ascii: Some("Calibri".to_string()),
+                    font_hansi: Some("Calibri".to_string()),
+                    sz: Some(HalfPoint(22)),
+                    ..Default::default()
+                }),
+                ppr: None,
+            }),
+            styles: vec![normal],
+        }
+    }
 }
 
 impl Default for CT_Styles {

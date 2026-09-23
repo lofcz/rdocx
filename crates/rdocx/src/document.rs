@@ -10216,6 +10216,12 @@ impl Document {
         ))
     }
 
+    /// Use the conservative styles profile for producers that write all
+    /// visual formatting directly onto document content.
+    pub fn use_word_safe_styles(&mut self) {
+        self.styles = CT_Styles::new_word_safe();
+    }
+
     /// Create a new document with explicit package completeness and class.
     pub fn new_with_profile(profile: WordCreationProfile) -> Self {
         let document = CT_Document::new();
@@ -12577,6 +12583,24 @@ impl Document {
         image_data: &[u8],
         filename: &str,
     ) -> Result<String> {
+        // Reuse an image already related from this part. Producers commonly
+        // pre-register images so table cells can reference them, then add the
+        // same image to a body paragraph. Emitting a second relationship for
+        // identical bytes creates redundant media parts and makes Word reject
+        // otherwise valid packages.
+        if let Some(existing) = self.package.get_part_rels(owner).and_then(|rels| {
+            rels.items.iter().find_map(|relationship| {
+                if relationship.rel_type != rel_types::IMAGE
+                    || !relationship_is_internal(relationship)
+                {
+                    return None;
+                }
+                let target = OpcPackage::resolve_rel_target(owner, &relationship.target);
+                (self.package.get_part(&target) == Some(image_data)).then(|| relationship.id.clone())
+            })
+        }) {
+            return Ok(existing);
+        }
         let (part_name, format) = self.reserve_image_part(image_data, filename)?;
         self.install_reserved_image_part(&part_name, image_data, format);
         self.add_relative_internal_relationship_checked(owner, rel_types::IMAGE, &part_name)
