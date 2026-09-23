@@ -960,8 +960,13 @@ impl<'a> Paragraph<'a> {
         self.inner.runs.push(run);
     }
 
-    /// Append an inline picture run using an existing document relationship.
-    pub(crate) fn add_picture(&mut self, rel_id: &str, width: Length, height: Length) -> &mut CT_R {
+    /// Add a picture using an image relationship already owned by this part.
+    pub fn add_picture_with_relationship(
+        &mut self,
+        rel_id: &str,
+        width: Length,
+        height: Length,
+    ) -> &mut CT_R {
         use rdocx_oxml::drawing::{CT_Drawing, CT_Inline};
 
         let inline = CT_Inline::new(rel_id, width.to_emu(), height.to_emu());
@@ -973,6 +978,10 @@ impl<'a> Paragraph<'a> {
             .runs
             .last_mut()
             .expect("picture run was appended")
+    }
+
+    pub(crate) fn add_picture(&mut self, rel_id: &str, width: Length, height: Length) -> &mut CT_R {
+        self.add_picture_with_relationship(rel_id, width, height)
     }
 
     /// Add a run wrapped in an external hyperlink relationship.
