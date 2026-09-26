@@ -897,6 +897,37 @@ impl<'a> Paragraph<'a> {
         }
     }
 
+    /// Add literal source code with explicit monospace, upright, regular styling.
+    ///
+    /// Tabs and newlines become OOXML controls rather than whitespace inside
+    /// `w:t`. CRLF and lone CR are normalized to line breaks. Indentation and
+    /// empty lines are retained. The returned run can be sized or recolored.
+    pub fn add_code_run(&mut self, text: &str) -> Run<'_> {
+        let mut run = self.add_run("");
+        run.set_font("Liberation Mono");
+        run.set_bold(false);
+        run.set_italic(false);
+        run.set_no_proof_value(Some(true));
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for part in normalized.split_inclusive(['\n', '\t']) {
+            let control = part.chars().last().filter(|ch| *ch == '\n' || *ch == '\t');
+            let value = if control.is_some() {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            if !value.is_empty() {
+                run.add_text(value);
+            }
+            match control {
+                Some('\n') => run.add_break(crate::run::BreakKind::Line),
+                Some('\t') => run.add_tab(),
+                _ => {}
+            }
+        }
+        run
+    }
+
     /// Add a ruby phonetic guide and return its index in this paragraph.
     ///
     /// The base text becomes an ordinary paragraph run, so [`Self::text`]
@@ -2926,6 +2957,33 @@ impl<'a> ParagraphRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_runs_preserve_controls_and_override_inherited_emphasis() {
+        let mut raw = CT_P::new();
+        {
+            let mut paragraph = Paragraph { inner: &mut raw };
+            paragraph.add_code_run("if x < 2:\r\n\t  print(\"žluťoučký\")\n\nend\r");
+        }
+        let run = &raw.runs[0];
+        assert_eq!(run.text(), "if x < 2:\n\t  print(\"žluťoučký\")\n\nend\n");
+        assert!(
+            run.content
+                .iter()
+                .any(|item| matches!(item, RunContent::Tab))
+        );
+        assert_eq!(
+            run.content
+                .iter()
+                .filter(|item| matches!(item, RunContent::Break { .. }))
+                .count(),
+            4
+        );
+        let properties = run.properties.as_ref().unwrap();
+        assert_eq!(properties.bold, Some(false));
+        assert_eq!(properties.italic, Some(false));
+        assert_eq!(properties.no_proof, Some(true));
+    }
 
     #[test]
     fn hyperlink_reader_exposes_modeled_and_unmodeled_attributes() {
