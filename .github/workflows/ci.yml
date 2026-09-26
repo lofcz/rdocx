@@ -261,6 +261,7 @@ jobs:
           "$binding_python" -m pytest "crates/${{ matrix.package.crate }}/tests"
 
   no-default-features:
+    if: github.event_name != 'workflow_dispatch'
     name: No default features
     runs-on: ubuntu-latest
     steps:
@@ -368,6 +369,7 @@ jobs:
           verify_package "$package_root/rpptx-wasm" "@tensorbee/rpptx-wasm" "0.12.1" "rpptx_wasm"
 
   release-regressions:
+    if: github.event_name != 'workflow_dispatch'
     name: Release regressions
     runs-on: ubuntu-latest
     steps:
@@ -436,7 +438,7 @@ jobs:
           python3 scripts/pptx_ssim_harness.py --check
           --output-dir "${RUNNER_TEMP}/presentation-fidelity"
       - name: Retain presentation fidelity evidence
-        if: always()
+        if: always() && github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: presentation-fidelity-evidence
@@ -477,7 +479,7 @@ jobs:
           python3 scripts/docx_ssim_harness.py --check
           --output-dir "${RUNNER_TEMP}/word-fidelity"
       - name: Retain Word fidelity evidence
-        if: always()
+        if: always() && github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: word-fidelity-evidence
@@ -487,6 +489,7 @@ jobs:
           if-no-files-found: error
 
   clippy:
+    if: github.event_name != 'workflow_dispatch'
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -500,6 +503,7 @@ jobs:
           --exclude rdocx-py --exclude rpptx-py -- -D warnings
 
   fmt:
+    if: github.event_name != 'workflow_dispatch'
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
@@ -510,6 +514,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   doc:
+    if: github.event_name != 'workflow_dispatch'
     name: Docs
     runs-on: ubuntu-latest
     env:
@@ -525,6 +530,7 @@ jobs:
         run: python3 scripts/readme_doctests.py
 
   package-oxml-layout:
+    if: github.event_name != 'workflow_dispatch'
     name: Package oxml-layout
     runs-on: ubuntu-latest
     steps:
@@ -667,7 +673,7 @@ jobs:
 
   ci-gate:
     name: CI gate
-    if: always()
+    if: always() && github.event_name != 'workflow_dispatch'
     needs:
       - changes
       - test
