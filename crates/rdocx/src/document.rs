@@ -5127,8 +5127,26 @@ fn new_word_compatible_package(
 fn default_application_properties() -> AppProperties {
     let mut properties = AppProperties::default();
     properties.application = Some("rdocx".to_owned());
-    properties.application_version = Some(env!("CARGO_PKG_VERSION").to_owned());
+    properties.application_version = Some(word_app_version(env!("CARGO_PKG_VERSION")));
     properties
+}
+
+/// `docProps/app.xml` `AppVersion` in the `XX.YYYY` shape ECMA-376 requires
+/// (Word writes `16.0000`).
+///
+/// A semver string such as `0.14.0` is not a cosmetic problem: Word parses the
+/// value as a number with the user's regional format, so on a comma-decimal
+/// locale (cs-CZ, sk-SK, pl-PL, de-DE, ...) Word 16 refuses the whole document
+/// with error 5121 "Word experienced an error trying to open the file", both
+/// in normal open and in Protected View. On en-US the same bytes open fine.
+fn word_app_version(crate_version: &str) -> String {
+    let mut parts = crate_version
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0).min(99));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    format!("{major:02}.{minor:02}{patch:02}")
 }
 
 fn equivalent_abstract_numbering(left: &CT_AbstractNum, right: &CT_AbstractNum) -> bool {
@@ -35709,5 +35727,23 @@ mod odttf_tests {
             "{error}"
         );
         assert_eq!(destination.to_bytes().unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod word_app_version_tests {
+    use super::word_app_version;
+
+    #[test]
+    fn app_version_uses_the_xx_yyyy_shape_word_requires() {
+        assert_eq!(word_app_version("0.14.0"), "00.1400");
+        assert_eq!(word_app_version("1.2.3"), "01.0203");
+        assert_eq!(word_app_version("12.34.56-beta.1"), "12.3456");
+        assert_eq!(word_app_version("250.1.0"), "99.0100");
+        assert_eq!(word_app_version(""), "00.0000");
+        let shaped = word_app_version(env!("CARGO_PKG_VERSION"));
+        let (int, frac) = shaped.split_once('.').expect("one dot");
+        assert!(int.len() == 2 && frac.len() == 4 && shaped.chars().filter(|c| *c == '.').count() == 1);
+        assert!(int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()));
     }
 }
