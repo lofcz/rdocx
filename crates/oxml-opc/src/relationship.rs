@@ -144,6 +144,7 @@ pub struct Relationship {
 pub struct Relationships {
     pub items: Vec<Relationship>,
     next_id: u32,
+    source: Option<(Vec<u8>, Vec<Relationship>)>,
 }
 
 impl Relationships {
@@ -151,6 +152,7 @@ impl Relationships {
         Self {
             items: Vec::new(),
             next_id: 1,
+            source: None,
         }
     }
 
@@ -197,6 +199,7 @@ impl Relationships {
         }
 
         Ok(Relationships {
+            source: Some((xml.to_vec(), items.clone())),
             items,
             next_id: next_relationship_number(max_id),
         })
@@ -205,6 +208,11 @@ impl Relationships {
     /// Serialize to XML bytes.
     pub fn to_xml(&self) -> Result<Vec<u8>> {
         self.validate_ids()?;
+        if let Some((xml, items)) = &self.source
+            && items == &self.items
+        {
+            return Ok(xml.clone());
+        }
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
 
         writer.write_event(Event::Decl(BytesDecl::new(
@@ -622,6 +630,25 @@ mod tests {
         assert_eq!(
             Relationships::from_xml(saved.as_bytes()).unwrap().items,
             parsed.items
+        );
+    }
+
+    #[test]
+    fn unchanged_relationship_parts_serialize_byte_for_byte() {
+        let xml = br#"<?xml version='1.0' encoding='UTF-8'?>
+<r:Relationships xmlns:r="http://schemas.openxmlformats.org/package/2006/relationships">
+ <r:Relationship Target="word/document.xml" Type="urn:document" Id="producer-id"></r:Relationship>
+</r:Relationships>"#;
+        let mut relationships = Relationships::from_xml(xml).unwrap();
+        assert_eq!(relationships.to_xml().unwrap(), xml);
+
+        relationships.items[0].target = "word/changed.xml".to_owned();
+        let changed = relationships.to_xml().unwrap();
+        assert_ne!(changed, xml);
+        assert!(
+            String::from_utf8(changed)
+                .unwrap()
+                .contains("word/changed.xml")
         );
     }
 }

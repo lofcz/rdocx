@@ -27,7 +27,8 @@ publication.
      state is not a cleanup target.
 
 2. **`/verify --full`.** Everything, workspace-wide, including packaging and the
-   supply-chain check. Not `--fast`, not the changed-crate subset.
+   supply-chain check. Not `--fast`, not `--scoped`, and not the changed-crate
+   subset.
 
 3. **`/sprint-review SNN`.** Run the bounded review loop to completion. Blocking
    findings are fixed and the loop repeats, at most three passes by default. A

@@ -81,7 +81,9 @@ templates, which users notice and cannot describe.
 table of sampled theme-colour resolutions asserted to exact RGB. Word style
 graphs are validated for type-compatible inheritance, cycle freedom,
 reciprocal links, legal next styles, and one default per style type before a
-mutation publishes. Paragraph, character, and table default resolution has
+mutation publishes. A TOC rebuild instead rejects only the defects its staged
+entry styles introduce and reports the producer defects it retains.
+Paragraph, character, and table default resolution has
 focused deterministic render coverage. Effective numbering resolution applies
 style inheritance, concrete replacement formatting, base-level start and
 restart controls, and counter projection once, then shares that result with
@@ -273,6 +275,12 @@ direct reference, while remove installs an explicit empty story. Pruning is
 limited to facade-owned graph nodes that are unreachable from modeled and
 opaque references. The document-wide even-page setting is an explicit typed
 operation, and first-page creation enables the section title-page state.
+
+Package save uses typed equality as part of the same invariant boundary.
+Unchanged modeled roots and relationship collections keep their exact source
+bytes. A targeted edit serializes only its owner and any graph edge that the
+operation actually changes. Regression gates compare every ZIP entry after a
+no-op save and enumerate the entries changed by one targeted edit.
 
 Style graph mutations use the same rule. Adding or updating one side of a
 legal paragraph and character link updates the reciprocal edge in the staged

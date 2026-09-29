@@ -91,6 +91,337 @@ impl F252OracleArtifacts {
     }
 }
 
+fn fx136_source_fixture() -> Document {
+    let mut document = Document::new();
+    document.set_footer("FOOTER ONLY SENTINEL");
+    {
+        let mut table = document.add_table(2, 1);
+        table.row(0).expect("header row").set_header();
+        table
+            .cell(0, 0)
+            .expect("header cell")
+            .set_text("REPEATED HEADER");
+        let mut cell = table.cell(1, 0).expect("long body cell");
+        cell.set_text("ROW LINE 00");
+        cell.paragraph_mut(0)
+            .expect("first body paragraph")
+            .set_line_spacing(16.0);
+        for index in 1..70 {
+            cell.add_paragraph(&format!("ROW LINE {index:02}"))
+                .set_line_spacing(16.0);
+        }
+    }
+    document.add_paragraph("");
+    document
+        .add_paragraph("HEADING AFTER TABLE")
+        .page_break_before(true);
+    document
+}
+
+#[test]
+fn table_row_breaks_before_footer_only_page_and_repeats_header() {
+    let document = fx136_source_fixture();
+    let result = document
+        .layout_deterministic()
+        .expect("the long table lays out");
+    let table_fragments = result.body_layout_fragments(0).expect("table body owner");
+    assert!(
+        table_fragments.len() >= 2,
+        "a row taller than one page must contribute table fragments on both pages: {table_fragments:?}"
+    );
+
+    let pages: Vec<_> = result
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    assert!(
+        pages
+            .iter()
+            .all(|page| !page.replace("FOOTER ONLY SENTINEL", "").trim().is_empty()),
+        "a page carries only the footer: {pages:?}"
+    );
+    for index in 0..70 {
+        let tag = format!("ROW LINE {index:02}");
+        assert_eq!(
+            pages.iter().filter(|page| page.contains(&tag)).count(),
+            1,
+            "row text is missing or duplicated: {tag}"
+        );
+    }
+    assert!(
+        pages
+            .iter()
+            .filter(|page| page.contains("REPEATED HEADER"))
+            .count()
+            >= 2,
+        "header did not repeat on the row continuation: {pages:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires pinned LibreOffice and Poppler paths in FX136 oracle environment"]
+fn table_row_page_membership_matches_pinned_libreoffice() {
+    let soffice = std::env::var_os("RDOCX_FX136_SOFFICE").expect("pinned soffice path");
+    let pdftotext = std::env::var_os("RDOCX_FX136_PDFTOTEXT").expect("pinned pdftotext path");
+    let pdftoppm = std::env::var_os("RDOCX_FX136_PDFTOPPM").expect("pinned pdftoppm path");
+    let version = std::process::Command::new(&soffice)
+        .arg("--version")
+        .output()
+        .expect("LibreOffice version");
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains("LibreOffice 26.2.5.2 "),
+        "the LibreOffice oracle is not pinned"
+    );
+    let version = std::process::Command::new(&pdftoppm)
+        .arg("-v")
+        .output()
+        .expect("Poppler version");
+    assert!(
+        String::from_utf8_lossy(&version.stderr).contains("pdftoppm version 26.01.0"),
+        "the Poppler oracle is not pinned"
+    );
+
+    let artifacts = F252OracleArtifacts::create(
+        std::env::temp_dir().join(format!("rdocx-fx136-oracle-{}", std::process::id())),
+    );
+    let source = artifacts.path().join("fixture.docx");
+    let pdf = artifacts.path().join("fixture.pdf");
+    let mut document = fx136_source_fixture();
+    document.save(&source).expect("save source-built fixture");
+    let own = document
+        .layout_deterministic()
+        .expect("deterministic layout");
+    let own_pages: Vec<_> = own
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    let conversion = std::process::Command::new(&soffice)
+        .arg(format!(
+            "-env:UserInstallation=file://{}/profile",
+            artifacts.path().display()
+        ))
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(artifacts.path())
+        .arg(&source)
+        .output()
+        .expect("LibreOffice conversion");
+    assert!(conversion.status.success(), "LibreOffice conversion failed");
+    let extracted = std::process::Command::new(&pdftotext)
+        .arg("-layout")
+        .arg(&pdf)
+        .arg("-")
+        .output()
+        .expect("extract oracle pages");
+    assert!(extracted.status.success(), "PDF text extraction failed");
+    let text = String::from_utf8(extracted.stdout).expect("PDF text is UTF-8");
+    let oracle_pages: Vec<_> = text
+        .split('\x0c')
+        .filter(|page| !page.trim().is_empty())
+        .collect();
+    assert_eq!(own_pages.len(), oracle_pages.len(), "page count differs");
+    for index in 0..70 {
+        let tag = format!("ROW LINE {index:02}");
+        let own_page = own_pages.iter().position(|page| page.contains(&tag));
+        let oracle_page = oracle_pages.iter().position(|page| page.contains(&tag));
+        assert_eq!(own_page, oracle_page, "page membership differs for {tag}");
+    }
+    for marker in ["REPEATED HEADER", "HEADING AFTER TABLE"] {
+        let own_occurrences: Vec<_> = own_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, page)| page.contains(marker).then_some(index))
+            .collect();
+        let oracle_occurrences: Vec<_> = oracle_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, page)| page.contains(marker).then_some(index))
+            .collect();
+        assert_eq!(own_occurrences, oracle_occurrences, "{marker} pages differ");
+    }
+
+    let raster = std::process::Command::new(&pdftoppm)
+        .args(["-gray", "-r", "72"])
+        .arg(&pdf)
+        .arg(artifacts.path().join("page"))
+        .output()
+        .expect("rasterise oracle pages");
+    assert!(raster.status.success(), "PDF rasterisation failed");
+    for page in 1..=oracle_pages.len() {
+        let pgm = std::fs::read(artifacts.path().join(format!("page-{page}.pgm")))
+            .expect("read oracle PGM");
+        let header_end = pgm
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(2)
+            .map(|(index, _)| index + 1)
+            .expect("PGM header");
+        assert_eq!(&pgm[..3], b"P5\n");
+        assert_eq!(&pgm[header_end - 4..header_end], b"255\n");
+        let width = 612;
+        let pixels = &pgm[header_end..];
+        assert_eq!(pixels.len(), width * 792);
+        let ink = (72..700)
+            .flat_map(|y| (72..540).map(move |x| pixels[y * width + x]))
+            .filter(|pixel| *pixel < 245)
+            .count();
+        let fraction = ink as f64 / (468 * 628) as f64;
+        assert!(
+            fraction >= 0.001,
+            "page {page} has only {fraction:.4} body ink"
+        );
+    }
+}
+
+#[test]
+fn table_row_split_policy_respects_cant_split_and_exact_height() {
+    let mut unsplittable = Document::new();
+    for index in 0..35 {
+        unsplittable.add_paragraph(&format!("INTRO {index:02}"));
+    }
+    {
+        let mut table = unsplittable.add_table(1, 1);
+        table.row(0).expect("row").set_cant_split();
+        let mut cell = table.cell(0, 0).expect("cell");
+        cell.set_text("CANT SPLIT 00");
+        for index in 1..20 {
+            cell.add_paragraph(&format!("CANT SPLIT {index:02}"));
+        }
+    }
+    let result = unsplittable.layout_deterministic().expect("layout");
+    let pages: Vec<_> = result
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    assert!(
+        pages.len() >= 2,
+        "fixture did not reach a page break: {pages:?}"
+    );
+    assert!(
+        !pages[0].contains("CANT SPLIT"),
+        "cantSplit row was placed partly on the previous page: {pages:?}"
+    );
+    assert!(pages[1].contains("CANT SPLIT 19"));
+
+    let mut exact = Document::new();
+    {
+        let mut table = exact.add_table(1, 1);
+        table
+            .row(0)
+            .expect("row")
+            .set_height_exact(Length::pt(24.0));
+        let mut cell = table.cell(0, 0).expect("cell");
+        cell.set_text("EXACT 00");
+        for index in 1..70 {
+            cell.add_paragraph(&format!("EXACT {index:02}"));
+        }
+    }
+    let result = exact.layout_deterministic().expect("layout");
+    assert_eq!(result.layout.pages.len(), 1, "exact row must not fragment");
+}
+
+#[test]
+fn table_row_fragments_preserve_merge_and_body_ownership() {
+    let mut document = Document::new();
+    let tokens = (0..800)
+        .map(|index| format!("TOKEN{index:04}"))
+        .collect::<Vec<_>>();
+    {
+        let mut table = document.add_table(1, 1);
+        table.cell(0, 0).expect("cell").set_text(&tokens.join(" "));
+    }
+    let result = document.layout_deterministic().expect("layout");
+    let fragments = result.body_layout_fragments(0).expect("table owner");
+    assert!(
+        fragments.len() >= 2,
+        "long cell paragraph did not split: fragments={fragments:?}, pages={}",
+        result.layout.pages.len()
+    );
+    let pages: Vec<_> = result
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    let all_text = pages.concat();
+    for token in tokens {
+        assert_eq!(
+            all_text.matches(&token).count(),
+            1,
+            "wrapped cell text was lost or repeated: {token}"
+        );
+    }
+
+    let mut merged = Document::new();
+    {
+        let mut table = merged.add_table(2, 1);
+        table
+            .cell(0, 0)
+            .expect("merge restart")
+            .set_v_merge_restart();
+        table
+            .cell(0, 0)
+            .expect("merge owner")
+            .set_text("MERGED OWNER");
+        table
+            .cell(1, 0)
+            .expect("merge continuation")
+            .set_v_merge_continue();
+    }
+    let merged_layout = merged.layout_deterministic().expect("merged layout");
+    let merged_text: String = merged_layout
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    assert_eq!(merged_text.matches("MERGED OWNER").count(), 1);
+}
+
+#[test]
+fn table_row_fragments_keep_multicell_text_once() {
+    let mut document = Document::new();
+    {
+        let mut table = document.add_table(1, 2);
+        for column in 0..2 {
+            let mut cell = table.cell(0, column).expect("cell");
+            let prefix = if column == 0 { "LEFT" } else { "RIGHT" };
+            cell.set_text(&format!("{prefix} 00"));
+            let limit = if column == 0 { 70 } else { 55 };
+            for index in 1..limit {
+                cell.add_paragraph(&format!("{prefix} {index:02}"));
+            }
+        }
+    }
+    let result = document.layout_deterministic().expect("layout");
+    assert!(
+        result.body_layout_fragments(0).expect("table owner").len() >= 2,
+        "multi-cell row did not continue"
+    );
+    let pages: Vec<_> = result
+        .layout
+        .pages
+        .iter()
+        .map(|page| f252_page_text(page))
+        .collect();
+    for (prefix, limit) in [("LEFT", 70), ("RIGHT", 55)] {
+        for index in 0..limit {
+            let tag = format!("{prefix} {index:02}");
+            assert_eq!(
+                pages.iter().filter(|page| page.contains(&tag)).count(),
+                1,
+                "multi-cell text is missing or duplicated: {tag}"
+            );
+        }
+    }
+}
+
 impl Drop for F252OracleArtifacts {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
@@ -4505,11 +4836,6 @@ fn rejected_complex_field_does_not_hide_valid_paragraph_siblings() {
         r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:x="urn:producer"><w:body><w:p>{left}{rejected}{right}</w:p></w:body></w:document>"#
     );
     let mut document = document_with_content_controls(&xml);
-    let initial = document_xml(&mut document);
-    let rejected_start = initial.find("<x:rejected-start/>").unwrap();
-    let rejected_end_start = initial.find("<x:rejected-end/>").unwrap();
-    let rejected_end = rejected_end_start + "<x:rejected-end/>".len();
-    let rejected_before = initial[rejected_start..rejected_end].to_owned();
     let body = document.stories().unwrap().remove(0);
     let fields = document
         .story_items(&body)
@@ -4565,7 +4891,13 @@ fn rejected_complex_field_does_not_hide_valid_paragraph_siblings() {
     let saved = document_xml(&mut document);
     assert!(saved.contains("<w:t>left updated</w:t>"), "{saved}");
     assert!(saved.contains("<w:t>right updated</w:t>"), "{saved}");
-    assert!(saved.contains(&rejected_before), "{saved}");
+    assert!(saved.contains("<x:rejected-start/>"), "{saved}");
+    assert!(saved.contains("<x:rejected-end/>"), "{saved}");
+    assert!(saved.contains("<w:t>rejected cache</w:t>"), "{saved}");
+    assert!(
+        saved.contains("<w:instrText> DATE </w:instrText>"),
+        "{saved}"
+    );
 }
 
 #[test]
@@ -4602,11 +4934,6 @@ fn unclosed_complex_field_does_not_hide_fields_in_later_paragraphs() {
         r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:x="urn:producer"><w:body><w:p>{malformed}</w:p><w:p>{later}</w:p><w:p>{nested}</w:p></w:body></w:document>"#
     );
     let mut document = document_with_content_controls(&xml);
-    let initial = document_xml(&mut document);
-    let malformed_start = initial.find("<x:malformed-start/>").unwrap();
-    let malformed_end_start = initial.find("<x:malformed-end/>").unwrap();
-    let malformed_end = malformed_end_start + "<x:malformed-end/>".len();
-    let malformed_before = initial[malformed_start..malformed_end].to_owned();
     let body = document.stories().unwrap().remove(0);
     let fields = document
         .story_items(&body)
@@ -4664,7 +4991,13 @@ fn unclosed_complex_field_does_not_hide_fields_in_later_paragraphs() {
     assert!(saved.contains("<w:t>later updated</w:t>"), "{saved}");
     assert!(saved.contains("<w:t>inner updated</w:t>"), "{saved}");
     assert!(saved.contains("<w:t>outer cache</w:t>"), "{saved}");
-    assert!(saved.contains(&malformed_before), "{saved}");
+    assert!(saved.contains("<x:malformed-start/>"), "{saved}");
+    assert!(saved.contains("<x:malformed-end/>"), "{saved}");
+    assert!(saved.contains("<w:t>malformed cache</w:t>"), "{saved}");
+    assert!(
+        saved.contains("<w:instrText> BROKEN </w:instrText>"),
+        "{saved}"
+    );
 }
 
 #[test]
@@ -8211,6 +8544,166 @@ fn toc_rebuild_accepts_trailing_style_separator_and_duplicate_style_ids() {
     );
 }
 
+fn document_with_producer_styles(body: &str, producer_styles: &str) -> Document {
+    let mut source = document_with_field_parts(&wrap_word_body(body), None, None);
+    let mut package =
+        oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(source.to_bytes().unwrap()))
+            .unwrap();
+    let styles = String::from_utf8(package.get_part("/word/styles.xml").unwrap().to_vec()).unwrap();
+    let styles = styles.replacen("</w:styles>", &format!("{producer_styles}</w:styles>"), 1);
+    package.set_part("/word/styles.xml", styles.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    Document::from_bytes(bytes.get_ref()).unwrap()
+}
+
+#[test]
+fn toc_rebuild_accepts_several_defaults_of_one_style_type_and_follows_the_layout_default() {
+    let body = r#"
+        <w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>TOC \o "1-1" \h</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r></w:p>
+        <w:p><w:r><w:t>stale</w:t></w:r></w:p>
+        <w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+        <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>First heading</w:t></w:r></w:p>
+        <w:p><w:r><w:t>Body.</w:t></w:r></w:p>
+        <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Second heading</w:t></w:r></w:p>
+    "#;
+    // Google Docs exports declare several defaults of one type. The later
+    // default paragraph style would start every unstyled paragraph on a new
+    // page, so the rebuilt page numbers show which default was resolved.
+    let mut document = document_with_producer_styles(
+        body,
+        concat!(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="LaterNormal"><w:name w:val="Later Normal"/><w:pPr><w:pageBreakBefore/></w:pPr></w:style>"#,
+            r#"<w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/></w:style>"#,
+            r#"<w:style w:type="table" w:default="1" w:styleId="TableNormal2"><w:name w:val="Normal Table 2"/></w:style>"#,
+        ),
+    );
+
+    assert!(document.validate_style_graph().is_err());
+    let report = document.rebuild_toc().unwrap();
+    assert_eq!(report.entry_count, 2);
+    assert_eq!(
+        report.diagnostics,
+        [
+            "multiple default paragraph styles used first default 'Normal' while rebuilding TOC",
+            "multiple default table styles used first default 'TableNormal' while rebuilding TOC",
+        ]
+    );
+    let entries = toc_entry_signatures(&document_xml(&mut document))
+        .into_iter()
+        .map(|(display, style, _, _)| (display, style))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        [
+            ("First heading\t1".to_owned(), "TOC1".to_owned()),
+            ("Second heading\t1".to_owned(), "TOC1".to_owned()),
+        ]
+    );
+
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.layout_deterministic().unwrap().layout.pages.len(),
+        1
+    );
+    let defaults = reopened
+        .styles()
+        .iter()
+        .filter(|style| style.is_default())
+        .map(|style| style.style_id().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        defaults,
+        ["Normal", "LaterNormal", "TableNormal", "TableNormal2"]
+    );
+}
+
+const ONE_HEADING_TOC_BODY: &str = r#"
+    <w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>TOC \o "1-1" \h</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r></w:p>
+    <w:p><w:r><w:t>stale</w:t></w:r></w:p>
+    <w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Heading</w:t></w:r></w:p>
+"#;
+
+#[test]
+fn toc_rebuild_retains_every_producer_style_graph_defect_the_read_surface_accepts() {
+    // One producer defect per strict check. Open, save, layout, and text
+    // replacement accept each of them. The `toc 1` style has no identifier an
+    // entry could reference, so the rebuild creates the canonical one.
+    let producer_styles = concat!(
+        r#"<w:style w:type="paragraph" w:styleId=""><w:name w:val="toc 1"/></w:style>"#,
+        r#"<w:style w:type="character" w:styleId="CharacterWithParagraph"><w:name w:val="Character With Paragraph"/><w:pPr><w:jc w:val="center"/></w:pPr></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="ParagraphWithTable"><w:name w:val="Paragraph With Table"/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/></w:tblPr></w:style>"#,
+        r#"<w:style w:type="table" w:styleId="RepeatedRegion"><w:name w:val="Repeated Region"/><w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr></w:tblStylePr><w:tblStylePr w:type="firstRow"><w:rPr><w:i/></w:rPr></w:tblStylePr></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="Orphan"><w:name w:val="Orphan"/><w:basedOn w:val="Missing"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="OnCharacter"><w:name w:val="On Character"/><w:basedOn w:val="CharacterWithParagraph"/></w:style>"#,
+        r#"<w:style w:type="character" w:styleId="CharacterNext"><w:name w:val="Character Next"/><w:next w:val="Normal"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="NextMissing"><w:name w:val="Next Missing"/><w:next w:val="Missing"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="NextCharacter"><w:name w:val="Next Character"/><w:next w:val="CharacterNext"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="LinkMissing"><w:name w:val="Link Missing"/><w:link w:val="Missing"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="LinkParagraph"><w:name w:val="Link Paragraph"/><w:link w:val="Orphan"/></w:style>"#,
+        r#"<w:style w:type="character" w:styleId="OneWay"><w:name w:val="One Way"/><w:link w:val="Normal"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="CycleA"><w:name w:val="Cycle A"/><w:basedOn w:val="CycleB"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="CycleB"><w:name w:val="Cycle B"/><w:basedOn w:val="CycleA"/></w:style>"#,
+    );
+    let mut document = document_with_producer_styles(ONE_HEADING_TOC_BODY, producer_styles);
+    let source_style_count = document.styles().len();
+
+    assert!(document.validate_style_graph().is_err());
+    let report = document.rebuild_toc().unwrap();
+    assert_eq!(report.entry_count, 1);
+    assert_eq!(
+        report.diagnostics,
+        [
+            "style IDs cannot be empty",
+            "character style 'CharacterWithParagraph' cannot contain paragraph properties",
+            "paragraph style 'ParagraphWithTable' cannot contain table properties",
+            "table style 'RepeatedRegion' repeats conditional region 'firstRow'",
+            "style 'Orphan' is based on missing style 'Missing'",
+            "style 'OnCharacter' cannot be based on character style 'CharacterWithParagraph'",
+            "character style 'CharacterNext' cannot declare a next style",
+            "style 'NextMissing' names missing next style 'Missing'",
+            "paragraph style 'NextCharacter' has non-paragraph next style 'CharacterNext'",
+            "style 'LinkMissing' links to missing style 'Missing'",
+            "paragraph style 'LinkParagraph' cannot link to paragraph style 'Orphan'",
+            "linked styles 'OneWay' and 'Normal' are not reciprocal",
+            "based-on cycle contains style 'CycleA'",
+            "based-on cycle contains style 'CycleB'",
+        ]
+        .map(|defect| format!("{defect}, retained while rebuilding TOC"))
+    );
+    let xml = document_xml(&mut document);
+    assert!(!xml.contains(r#"<w:pStyle w:val=""/>"#), "{xml}");
+    let entries = toc_entry_signatures(&xml);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1, "TOC1");
+
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.styles().len(), source_style_count + 1);
+    assert!(reopened.validate_style_graph().is_err());
+}
+
+#[test]
+fn toc_rebuild_rejects_a_defect_its_entry_style_introduces_behind_retained_ones() {
+    // The retained dangling parent must not hide the new `TOC1` style
+    // completing a producer's dangling link into a one-way link.
+    let mut document = document_with_producer_styles(
+        ONE_HEADING_TOC_BODY,
+        concat!(
+            r#"<w:style w:type="paragraph" w:styleId="Orphan"><w:name w:val="Orphan"/><w:basedOn w:val="Missing"/></w:style>"#,
+            r#"<w:style w:type="character" w:styleId="TOC1Char"><w:name w:val="TOC 1 Char"/><w:link w:val="TOC1"/></w:style>"#,
+        ),
+    );
+    let before = document.to_bytes().unwrap();
+
+    let error = document.rebuild_toc().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid style graph: linked styles 'TOC1Char' and 'TOC1' are not reciprocal"
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
 #[test]
 fn numbered_toc_entries_reuse_the_visible_layout_marker() {
     let body = r#"
@@ -8615,7 +9108,6 @@ fn toc_bookmark_ids_names_and_references_follow_final_heading_order() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(history_xml, final_xml);
     assert_eq!(bookmark_pairs(&history_xml), bookmark_pairs(&final_xml));
     assert_eq!(
         bookmark_pairs(&history_xml),
@@ -8625,7 +9117,6 @@ fn toc_bookmark_ids_names_and_references_follow_final_heading_order() {
         ]
     );
     assert!(history_xml.contains(r#"w:instr="REF _Toc2""#));
-    assert_eq!(history.to_bytes().unwrap(), final_order.to_bytes().unwrap());
 }
 
 #[test]
@@ -12566,12 +13057,16 @@ fn word_namespace_alias_used_by_raw_marker_replays_after_save_and_reopen() {
             let package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(&saved)).unwrap();
             let saved_xml =
                 std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
-            assert_namespace_on_raw_owner(
-                saved_xml,
-                "p",
-                &format!(r#"xmlns:x="{word_namespace}""#),
-                raw,
-            );
+            if modified {
+                assert_namespace_on_raw_owner(
+                    saved_xml,
+                    "p",
+                    &format!(r#"xmlns:x="{word_namespace}""#),
+                    raw,
+                );
+            } else {
+                assert_eq!(saved_xml, xml);
+            }
 
             let mut reopened = Document::from_bytes(&saved).unwrap();
             assert!(reopened.paragraph(0).unwrap().items().any(
@@ -12582,12 +13077,16 @@ fn word_namespace_alias_used_by_raw_marker_replays_after_save_and_reopen() {
                 oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(&resaved)).unwrap();
             let resaved_xml =
                 std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
-            assert_namespace_on_raw_owner(
-                resaved_xml,
-                "p",
-                &format!(r#"xmlns:x="{word_namespace}""#),
-                raw,
-            );
+            if modified {
+                assert_namespace_on_raw_owner(
+                    resaved_xml,
+                    "p",
+                    &format!(r#"xmlns:x="{word_namespace}""#),
+                    raw,
+                );
+            } else {
+                assert_eq!(resaved_xml, xml);
+            }
         }
     }
 
@@ -12936,11 +13435,7 @@ fn nested_table_cell_owner_ignores_independent_same_uri_local_binding() {
     let resaved = reopened.to_bytes().unwrap();
     let package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(&resaved)).unwrap();
     let resaved_xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
-    assert_eq!(
-        resaved_xml.matches(r#"xmlns:x="urn:target""#).count(),
-        2,
-        "{resaved_xml}"
-    );
+    assert_eq!(resaved_xml, saved_xml);
     assert!(
         resaved_xml.contains(stabilized_raw),
         "nested owner bindings changed after reopen: {resaved_xml}"
@@ -14720,6 +15215,7 @@ fn hyperlink_relationship_ids_use_expanded_names_and_safe_output_prefixes() {
     let spans = paragraph.hyperlink_spans();
     assert_eq!(spans[0].2, Some("right"));
     assert_eq!(spans[1].2, None);
+    document.add_paragraph("force a typed main-part rewrite");
     let output = document_xml(&mut document);
     assert!(output.contains(r#"xmlns:r="urn:foreign""#));
     assert!(output.contains(r#"r:id="wrong""#));
@@ -21161,6 +21657,7 @@ fn empty_story_layout_input() -> rdocx_layout::LayoutInput {
         automatic_hyphenation: false,
         mirror_margins: false,
         gutter_at_top: false,
+        do_not_use_html_paragraph_auto_spacing: false,
         default_tab_stop: None,
         math_properties: None,
         document,
@@ -21651,14 +22148,17 @@ fn dense_form_matches_reviewed_one_page_geometry() {
             .iter()
             .any(|(start, end)| (start.x, start.y, end.x, end.y) == (x1, y1, x2, y2))
     };
+    // Horizontal borders fill the band below their row boundary, and the
+    // bands are part of the row heights, so the nested table starts below
+    // the 1 point band of its row and the last row carries the bottom one.
     assert_eq!(table_lines.len(), 26, "table geometry: {table_lines:?}");
-    assert!(has_line(72.0, 70.0, 306.0, 70.0));
+    assert!(has_line(72.0, 70.5, 306.0, 70.5));
     assert!(has_line(72.0, 70.0, 72.0, 109.0));
-    assert!(!has_line(72.0, 91.0, 306.0, 91.0));
-    assert!(has_line(72.0, 109.0, 306.0, 109.0));
-    assert!(has_line(311.4, 91.0, 421.4, 91.0));
-    assert!(has_line(421.4, 103.0, 531.4, 103.0));
-    assert!(has_line(306.0, 127.0, 540.0, 127.0));
+    assert!(!has_line(72.0, 91.5, 306.0, 91.5));
+    assert!(has_line(72.0, 109.5, 306.0, 109.5));
+    assert!(has_line(311.4, 92.375, 421.4, 92.375));
+    assert!(has_line(421.4, 105.125, 531.4, 105.125));
+    assert!(has_line(306.0, 128.5, 540.0, 128.5));
 
     let pdf = document.to_pdf_deterministic().expect("dense form PDF");
     assert!(pdf.starts_with(b"%PDF-"));
@@ -21691,13 +22191,15 @@ fn dense_form_matches_reviewed_one_page_geometry() {
         .chunks_exact(4)
         .filter(|pixel| *pixel == [255, 215, 215, 255])
         .count();
-    assert_eq!(checksum, 0x2319_bcbe_502e_4fe8);
-    assert_eq!(non_white_pixels, 32_221);
+    assert_eq!(checksum, 0xc38a_0cf8_9243_98d1);
+    assert_eq!(non_white_pixels, 32_429);
     assert_eq!(
         behind_pixels, 0,
         "page-behind stamp is covered by cell shading"
     );
-    assert_eq!(foreground_pixels, 1_682);
+    // The 58 pixel wide stamp moved 1 point down with the border band above
+    // its row, which leaves 28 whole pixel rows at 96 dpi rather than 29.
+    assert_eq!(foreground_pixels, 1_624);
 }
 
 #[test]
@@ -24280,12 +24782,17 @@ fn ignored_stories_are_excluded_before_revision_checks_and_id_seeding() {
     fn add_main_revision(mut document: Document) -> Document {
         let bytes = document.to_bytes().unwrap();
         let mut package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
-        let main = String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec())
-            .unwrap()
-            .replace(
-                "<w:r><w:t>same body</w:t></w:r>",
-                r#"<w:ins w:id="0" w:author="Earlier" w:date="2026-09-03T09:00:00Z"><w:r><w:t>same body</w:t></w:r></w:ins>"#,
-            );
+        let main =
+            String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec()).unwrap();
+        let text = main.find("<w:t>same body</w:t>").unwrap();
+        let run_start = main[..text].rfind("<w:r>").unwrap();
+        let run_end = text + main[text..].find("</w:r>").unwrap() + "</w:r>".len();
+        let main = format!(
+            r#"{}<w:ins w:id="0" w:author="Earlier" w:date="2026-09-03T09:00:00Z">{}</w:ins>{}"#,
+            &main[..run_start],
+            &main[run_start..run_end],
+            &main[run_end..],
+        );
         package.set_part("/word/document.xml", main.into_bytes());
         let mut output = std::io::Cursor::new(Vec::new());
         package.write_to(&mut output).unwrap();
@@ -29802,6 +30309,269 @@ fn settings_part_text(bytes: &[u8]) -> String {
 }
 
 /// F-265, complete run property and inline authoring.
+#[test]
+fn comparison_tracks_paragraph_properties_with_revision_identities() {
+    for attributes in [
+        r#"w:rsidR="00112233""#,
+        r#"w:rsidRDefault="00112234""#,
+        r#"w:rsidP="00112235""#,
+        r#"w:rsidR="00112233" w:rsidRDefault="00112234" w:rsidP="00112235" w:rsidRPr="00112236""#,
+    ] {
+        let original_xml = wrap_word_body(&format!(
+            r#"<w:p {attributes}><w:pPr><w:keepNext/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        ));
+        let edited_xml = wrap_word_body(&format!(
+            r#"<w:p {attributes}><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        ));
+        let edited = document_with_content_controls(&edited_xml);
+        let mut compared = document_with_content_controls(&original_xml);
+
+        let diagnostics = compared
+            .compare(&edited, "Ada", "2026-09-25T09:00:00Z")
+            .expect("revision identities must not block paragraph formatting comparison");
+        assert!(diagnostics.is_empty(), "{attributes}: {diagnostics:?}");
+        assert!(document_xml(&mut compared).contains("<w:pPrChange"));
+
+        let tracked = compared.to_bytes().unwrap();
+        let mut accepted = Document::from_bytes(&tracked).unwrap();
+        accepted.accept_all().unwrap();
+        assert!(
+            accepted
+                .compare(&edited, "postcondition", "2026-09-25T09:01:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        let original = document_with_content_controls(&original_xml);
+        let mut rejected = Document::from_bytes(&tracked).unwrap();
+        rejected.reject_all().unwrap();
+        assert!(
+            rejected
+                .compare(&original, "postcondition", "2026-09-25T09:01:00Z")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn comparison_treats_empty_paragraph_properties_as_absent() {
+    let absent_xml = wrap_word_body(r#"<w:p><w:r><w:t>same</w:t></w:r></w:p>"#);
+    let empty_xml = wrap_word_body(r#"<w:p><w:pPr/><w:r><w:t>same</w:t></w:r></w:p>"#);
+    let formatted_xml = wrap_word_body(
+        r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+    );
+
+    let empty = document_with_content_controls(&empty_xml);
+    let mut absent = document_with_content_controls(&absent_xml);
+    assert!(
+        absent
+            .compare(&empty, "Ada", "2026-09-25T09:00:00Z")
+            .expect("an empty property shell is semantically absent")
+            .is_empty()
+    );
+
+    let formatted = document_with_content_controls(&formatted_xml);
+    let mut empty = document_with_content_controls(&empty_xml);
+    let diagnostics = empty
+        .compare(&formatted, "Ada", "2026-09-25T09:00:00Z")
+        .expect("an empty property shell must not block a formatting revision");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(document_xml(&mut empty).contains("<w:pPrChange"));
+}
+
+#[test]
+fn unmodelled_property_changes_report_a_diagnostic() {
+    for (original, edited, expected_location) in [
+        (
+            r#"<w:p><w:pPr xmlns:x="urn:producer"><w:jc w:val="center"/><x:ext x:val="kept"/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr xmlns:x="urn:producer"><w:jc w:val="center"/><x:ext x:val="edited"/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+            "body/paragraph[0]",
+        ),
+        (
+            r#"<w:tbl><w:tblPr xmlns:x="urn:producer"><w:tblW w:w="0" w:type="auto"/><x:ext x:val="kept"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+            r#"<w:tbl><w:tblPr xmlns:x="urn:producer"><w:tblW w:w="0" w:type="auto"/><x:ext x:val="edited"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+            "body/table[0]",
+        ),
+    ] {
+        let mut compared = document_with_content_controls(&wrap_word_body(original));
+        let edited = document_with_content_controls(&wrap_word_body(edited));
+        let diagnostics = compared
+            .compare(&edited, "Ada", "2026-09-25T09:00:00Z")
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1, "{expected_location}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].location, expected_location);
+        assert!(document_xml(&mut compared).contains(r#"x:val="kept""#));
+    }
+}
+
+#[test]
+fn reordered_drawing_paragraphs_accept_without_model_dump() {
+    fn picture_document(text_first: bool, reserve_relationship: bool) -> Document {
+        let mut document = Document::new();
+        if reserve_relationship {
+            document.embed_image(b"unused image", "unused.png");
+        }
+        let picture = document.embed_image(b"same image", "same.png");
+        if text_first {
+            document.add_paragraph("text paragraph");
+        }
+        {
+            let mut paragraph = document.add_paragraph("");
+            paragraph
+                .add_run("")
+                .add_picture(&picture, Length::pt(12.0), Length::pt(12.0));
+        }
+        if !text_first {
+            document.add_paragraph("text paragraph");
+        }
+        document
+    }
+
+    fn producer_relationship_ids(
+        mut document: Document,
+        picture_id: &str,
+        unused_id: Option<&str>,
+    ) -> Document {
+        let bytes = document.to_bytes().unwrap();
+        let mut package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+        let owner = "/word/document.xml";
+        let relationships = package.get_part_rels(owner).unwrap().items.clone();
+        let image_id = |payload: &[u8]| {
+            relationships
+                .iter()
+                .find(|relationship| {
+                    relationship.rel_type == oxml_opc::relationship::rel_types::IMAGE
+                        && package.get_part(&oxml_opc::OpcPackage::resolve_rel_target(
+                            owner,
+                            &relationship.target,
+                        )) == Some(payload)
+                })
+                .unwrap()
+                .id
+                .clone()
+        };
+        let old_picture_id = image_id(b"same image");
+        let old_unused_id = unused_id.map(|_| image_id(b"unused image"));
+        let document_xml = String::from_utf8(package.get_part(owner).unwrap().to_vec()).unwrap();
+        package.set_part(
+            owner,
+            document_xml
+                .replace(
+                    &format!(r#"r:embed="{old_picture_id}""#),
+                    &format!(r#"r:embed="{picture_id}""#),
+                )
+                .into_bytes(),
+        );
+        for relationship in &mut package.get_part_rels_mut(owner).unwrap().items {
+            if relationship.id == old_picture_id {
+                relationship.id = picture_id.to_owned();
+            } else if old_unused_id.as_ref() == Some(&relationship.id) {
+                relationship.id = unused_id.unwrap().to_owned();
+            }
+        }
+        let mut output = std::io::Cursor::new(Vec::new());
+        package.write_to(&mut output).unwrap();
+        Document::from_bytes(output.get_ref()).unwrap()
+    }
+
+    let mut original =
+        producer_relationship_ids(picture_document(false, false), "producerImage", None);
+    let edited = producer_relationship_ids(
+        picture_document(true, true),
+        "producerEditedImage",
+        Some("producerImage"),
+    );
+    original
+        .compare(&edited, "Ada", "2026-09-25T09:00:00Z")
+        .expect("relationship-backed drawing paragraphs must compare by semantics");
+
+    let mut accepted = Document::from_bytes(&original.to_bytes().unwrap()).unwrap();
+    accepted.accept_all().unwrap();
+    assert!(
+        accepted
+            .compare(&edited, "postcondition", "2026-09-25T09:01:00Z")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn nil_border_tokens_survive_unrelated_document_edits() {
+    let xml = wrap_word_body(
+        r#"<w:tbl><w:tblPr><w:tblBorders><w:top w:val="nil"/><w:insideH w:val="nil"/></w:tblBorders></w:tblPr><w:tblGrid/><w:tr><w:tc><w:tcPr><w:tcBorders><w:left w:val="nil"/><w:bottom w:val="nil"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    );
+    let mut document = document_with_content_controls(&xml);
+    document.add_paragraph("unrelated edit");
+
+    let saved = document_xml(&mut document);
+    assert_eq!(saved.matches(r#"w:val="nil""#).count(), 4, "{saved}");
+    assert!(!saved.contains(r#"w:val="none""#), "{saved}");
+
+    let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    let reopened = document_xml(&mut reopened);
+    assert_eq!(reopened.matches(r#"w:val="nil""#).count(), 4, "{reopened}");
+}
+
+fn zip_entries(package: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    use std::io::Read;
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package)).unwrap();
+    let mut entries = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = entry.name().to_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        entries.insert(name, bytes);
+    }
+    entries
+}
+
+#[test]
+fn no_op_save_preserves_every_unchanged_part() {
+    let mut seed = Document::new();
+    seed.add_paragraph("unchanged");
+    let seed = seed.to_bytes().unwrap();
+    let mut package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(seed)).unwrap();
+    let mut modeled_parts = Vec::new();
+    for part in [
+        "/word/document.xml",
+        "/word/styles.xml",
+        "/word/numbering.xml",
+        "/docProps/core.xml",
+        "/docProps/app.xml",
+    ] {
+        if let Some(source) = package.get_part(part) {
+            let source = String::from_utf8(source.to_vec()).unwrap();
+            package.set_part(part, source.replacen("><", ">\n<", 1).into_bytes());
+            modeled_parts.push(part.trim_start_matches('/').to_owned());
+        }
+    }
+    assert!(modeled_parts.contains(&"word/document.xml".to_owned()));
+    assert!(modeled_parts.contains(&"word/styles.xml".to_owned()));
+    let mut source = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut source).unwrap();
+    let source = source.into_inner();
+
+    let mut document = Document::from_bytes(&source).unwrap();
+    let saved = document.to_bytes().unwrap();
+    assert_eq!(zip_entries(&saved), zip_entries(&source));
+
+    let mut edited = Document::from_bytes(&source).unwrap();
+    edited.add_paragraph("changed");
+    let edited = zip_entries(&edited.to_bytes().unwrap());
+    let source = zip_entries(&source);
+    assert_eq!(
+        edited.keys().collect::<Vec<_>>(),
+        source.keys().collect::<Vec<_>>()
+    );
+    let changed = source
+        .iter()
+        .filter_map(|(name, value)| (edited.get(name) != Some(value)).then_some(name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(changed, ["word/document.xml"]);
+}
+
 mod f265_run_property_regressions {
     use super::*;
     use rdocx::RunFontSlot;
@@ -30672,6 +31442,7 @@ mod advanced_table_geometry_regressions {
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
+            do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
             math_properties: None,
             document: rdocx_oxml::document::CT_Document {
@@ -32392,6 +33163,493 @@ mod f266c_character_grid_and_vertical_text_regressions {
             rotated < horizontal / 2.0,
             "the rotated column is sized from the stacked height, \
              {rotated} against {horizontal}"
+        );
+    }
+}
+
+mod paragraph_spacing_collapse_regressions {
+    use rdocx::{CompatibilityOption, Document, Length};
+
+    /// One single-line body paragraph on an exact 14 point line, so the gap
+    /// between two of them is their spacing alone and no font enters it.
+    fn add_spaced(document: &mut Document, text: &str, before: f64, after: f64) {
+        let mut paragraph = document.add_paragraph(text);
+        paragraph.set_line_spacing(14.0);
+        paragraph.set_space_before(Length::pt(before));
+        paragraph.set_space_after(Length::pt(after));
+    }
+
+    fn round(value: f64) -> f64 {
+        (value * 100.0).round() / 100.0
+    }
+
+    /// The first fragment of every body item as (page, top of its lines).
+    fn tops(document: &Document) -> Vec<(usize, f64)> {
+        let result = document
+            .layout_deterministic()
+            .expect("document lays out in deterministic font mode");
+        (0..document.content_count())
+            .map(|index| {
+                let fragment = &result
+                    .body_layout_fragments(index)
+                    .expect("body index is in range")[0];
+                (fragment.physical_page, round(fragment.y))
+            })
+            .collect()
+    }
+
+    /// The gap between the lines of each pair of consecutive body items.
+    fn gaps(document: &Document) -> Vec<f64> {
+        tops(document)
+            .windows(2)
+            .map(|pair| round(pair[1].1 - pair[0].1 - 14.0))
+            .collect()
+    }
+
+    /// How many body items start on each page.
+    fn items_per_page(document: &Document) -> Vec<usize> {
+        let mut counts = Vec::new();
+        for (page, _) in tops(document) {
+            if counts.len() < page {
+                counts.resize(page, 0);
+            }
+            counts[page - 1] += 1;
+        }
+        counts
+    }
+
+    /// Word's own probe: the space after of one paragraph and the space
+    /// before of the next, larger on either side in turn.
+    fn boundary_probe() -> Document {
+        let mut document = Document::new();
+        add_spaced(&mut document, "P1", 0.0, 20.0);
+        add_spaced(&mut document, "P2", 10.0, 0.0);
+        add_spaced(&mut document, "P3", 30.0, 5.0);
+        add_spaced(&mut document, "P4", 0.0, 0.0);
+        add_spaced(&mut document, "P5", 12.0, 0.0);
+        document
+    }
+
+    /// The shape of the issue: eighty single-line paragraphs with 6 points
+    /// before and 7 after, which is a table of contents in miniature.
+    fn toc_probe() -> Document {
+        let mut document = Document::new();
+        for index in 0..80 {
+            add_spaced(&mut document, &format!("Entry {index:02}"), 6.0, 7.0);
+        }
+        document
+    }
+
+    fn sum_spacing(document: &mut Document) {
+        document
+            .set_compatibility_option(CompatibilityOption::DoNotUseHTMLParagraphAutoSpacing, true)
+            .expect("the compatibility option is set");
+    }
+
+    /// Layout added the two, which put 24 entries on a page where Word puts
+    /// 31 and spread a table of contents over one more page than Word.
+    #[test]
+    fn consecutive_paragraphs_keep_the_larger_of_space_after_and_space_before() {
+        // Word 16 separates these five paragraphs by 20, 30, 5 and 12 points.
+        assert_eq!(gaps(&boundary_probe()), vec![20.0, 30.0, 5.0, 12.0]);
+        // 31 lines of 14 points and 30 gaps of 7 fill 644 of the 648 points.
+        assert_eq!(items_per_page(&toc_probe()), vec![31, 31, 18]);
+
+        // The compatibility option is the one case where Word adds them.
+        let mut document = boundary_probe();
+        sum_spacing(&mut document);
+        assert_eq!(gaps(&document), vec![30.0, 30.0, 5.0, 12.0]);
+        let mut document = toc_probe();
+        sum_spacing(&mut document);
+        assert_eq!(items_per_page(&document), vec![24, 24, 24, 8]);
+    }
+
+    /// Each painted line of the first page as (text, baseline).
+    fn baselines(document: &Document) -> Vec<(String, f64)> {
+        let result = document
+            .layout_deterministic()
+            .expect("document lays out in deterministic font mode");
+        let mut lines = Vec::new();
+        oxml_layout::walk(&result.layout.pages[0].elements, &mut |element, _| {
+            if let oxml_layout::PositionedElement::Text(run) = element
+                && !run.text.trim().is_empty()
+            {
+                lines.push((run.text.trim().to_owned(), round(run.origin.y)));
+            }
+        });
+        lines
+    }
+
+    fn pitches(lines: &[(String, f64)]) -> Vec<f64> {
+        lines
+            .windows(2)
+            .map(|pair| round(pair[1].1 - pair[0].1))
+            .collect()
+    }
+
+    /// A paragraph, then a one-cell table, then a paragraph. Word adds the
+    /// spacing that meets across each table edge rather than collapsing it.
+    #[test]
+    fn a_table_boundary_adds_the_space_after_and_space_before_that_meet_there() {
+        let mut document = Document::new();
+        add_spaced(&mut document, "above", 0.0, 20.0);
+        {
+            let mut table = document.add_table(1, 1);
+            table.set_cell_margins(
+                Length::pt(0.0),
+                Length::pt(5.0),
+                Length::pt(0.0),
+                Length::pt(5.0),
+            );
+            let mut cell = table.cell(0, 0).expect("cell exists");
+            cell.set_text("inside");
+            let mut paragraph = cell.paragraph_mut(0).expect("cell paragraph");
+            paragraph.set_line_spacing(14.0);
+            paragraph.set_space_before(Length::pt(10.0));
+            paragraph.set_space_after(Length::pt(20.0));
+        }
+        add_spaced(&mut document, "below", 10.0, 0.0);
+
+        let lines = baselines(&document);
+        assert_eq!(
+            lines.iter().map(|line| line.0.as_str()).collect::<Vec<_>>(),
+            ["above", "inside", "below"]
+        );
+        // 14 points of line, then 20 after and 10 before on each side.
+        assert_eq!(pitches(&lines), vec![44.0, 44.0]);
+    }
+
+    /// Three paragraphs in one cell with exact 14 point lines, spaced like the
+    /// Word probe: 20 after, then 10 before and 10 after, then 30 before.
+    fn cell_probe(summed: bool) -> Document {
+        let mut document = Document::new();
+        {
+            let mut table = document.add_table(1, 1);
+            table.set_cell_margins(
+                Length::pt(0.0),
+                Length::pt(5.0),
+                Length::pt(0.0),
+                Length::pt(5.0),
+            );
+            let mut cell = table.cell(0, 0).expect("cell exists");
+            cell.set_text("C1");
+            cell.add_paragraph("C2");
+            cell.add_paragraph("C3");
+            for (index, (before, after)) in [(0.0, 20.0), (10.0, 10.0), (30.0, 0.0)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut paragraph = cell.paragraph_mut(index).expect("cell paragraph");
+                paragraph.set_line_spacing(14.0);
+                paragraph.set_space_before(Length::pt(before));
+                paragraph.set_space_after(Length::pt(after));
+            }
+        }
+        if summed {
+            sum_spacing(&mut document);
+        }
+        document
+    }
+
+    /// Cell paragraphs were drawn at the top of their block with the space
+    /// before below them, and the row summed every facing pair of spacing.
+    #[test]
+    fn consecutive_cell_paragraphs_keep_the_larger_spacing_and_draw_below_their_space_before() {
+        // Word 16 separates the three lines by 20 and 30 points.
+        let document = cell_probe(false);
+        assert_eq!(pitches(&baselines(&document)), vec![34.0, 44.0]);
+        let result = document
+            .layout_deterministic()
+            .expect("document lays out in deterministic font mode");
+        let row = &result.body_layout_fragments(0).expect("the table")[0];
+        assert_eq!(round(row.height), 92.0, "three lines and gaps of 20 and 30");
+
+        // With the compatibility option Word separates them by 30 and 40.
+        assert_eq!(pitches(&baselines(&cell_probe(true))), vec![44.0, 54.0]);
+    }
+}
+
+mod table_row_border_and_margin_regressions {
+    use rdocx::table::{CellBorderEdge, RowHeight, Table, TableBorderEdge};
+    use rdocx::{BorderStyle, Document, Length};
+
+    fn round(value: f64) -> f64 {
+        (value * 100.0).round() / 100.0
+    }
+
+    /// A five-row table of two 4680 twip columns, as in the Word probes: one
+    /// exact 14 point line per cell, no vertical cell margin, 5 points left
+    /// and right. A paragraph on the same kind of line follows it.
+    fn probe(configure: impl FnOnce(&mut Table)) -> Document {
+        let mut document = Document::new();
+        {
+            let mut table = document.add_table(5, 2);
+            table.set_cell_margins(
+                Length::pt(0.0),
+                Length::pt(5.0),
+                Length::pt(0.0),
+                Length::pt(5.0),
+            );
+            for row in 0..5 {
+                for column in 0..2 {
+                    let mut cell = table.cell(row, column).expect("cell exists");
+                    cell.set_text(&format!("R{row}{column}"));
+                    let mut paragraph = cell.paragraph_mut(0).expect("cell paragraph");
+                    paragraph.set_line_spacing(14.0);
+                    paragraph.set_space_before(Length::pt(0.0));
+                    paragraph.set_space_after(Length::pt(0.0));
+                }
+            }
+            configure(&mut table);
+        }
+        let mut next = document.add_paragraph("NEXT");
+        next.set_line_spacing(14.0);
+        next.set_space_before(Length::pt(0.0));
+        next.set_space_after(Length::pt(0.0));
+        document
+    }
+
+    /// Baseline and left edge of each painted line of the first page.
+    fn lines(document: &Document) -> Vec<(String, f64, f64)> {
+        let result = document
+            .layout_deterministic()
+            .expect("document lays out in deterministic font mode");
+        let mut lines = Vec::new();
+        oxml_layout::walk(&result.layout.pages[0].elements, &mut |element, _| {
+            if let oxml_layout::PositionedElement::Text(run) = element
+                && !run.text.trim().is_empty()
+            {
+                lines.push((
+                    run.text.trim().to_owned(),
+                    round(run.origin.y),
+                    round(run.origin.x),
+                ));
+            }
+        });
+        lines
+    }
+
+    /// How far the first row's line sits below where a borderless table puts
+    /// it, then the distance from each first-column line to the next and from
+    /// the last row to the paragraph after the table.
+    fn row_geometry(document: &Document) -> (f64, Vec<f64>) {
+        let baselines = |document: &Document| {
+            lines(document)
+                .into_iter()
+                .filter(|(text, ..)| text.ends_with('0') || text == "NEXT")
+                .map(|(_, baseline, _)| baseline)
+                .collect::<Vec<_>>()
+        };
+        let plain = baselines(&probe(|_| {}));
+        let placed = baselines(document);
+        assert_eq!(placed.len(), 6, "five rows and the paragraph after them");
+        let pitches = placed
+            .windows(2)
+            .map(|pair| round(pair[1] - pair[0]))
+            .collect();
+        (round(placed[0] - plain[0]), pitches)
+    }
+
+    fn all_borders(style: BorderStyle, eighths: u32) -> impl FnOnce(&mut Table) {
+        move |table: &mut Table| table.set_borders(style, eighths, "000000")
+    }
+
+    /// Word 16 measurements. Layout drew horizontal borders over the rows
+    /// without reserving any height for them, so every bordered row was
+    /// shorter than Word's by the border width, about a point per row for a
+    /// Google Docs export, which moved table page breaks a row later.
+    #[test]
+    fn horizontal_table_borders_take_their_width_between_rows() {
+        assert_eq!(row_geometry(&probe(|_| {})), (0.0, vec![14.0; 5]));
+        // A 1 point border above every row and below the last one.
+        assert_eq!(
+            row_geometry(&probe(all_borders(BorderStyle::Single, 8))),
+            (1.0, vec![15.0; 5])
+        );
+        assert_eq!(
+            row_geometry(&probe(all_borders(BorderStyle::Single, 24))),
+            (3.0, vec![17.0; 5])
+        );
+        // A double border is two lines and their gap, three widths in all.
+        assert_eq!(
+            row_geometry(&probe(all_borders(BorderStyle::Double, 4))),
+            (1.5, vec![15.5; 5])
+        );
+        // Top 6, inside 1, bottom 3: each band is the edge on that boundary.
+        let mixed = probe(|table| {
+            for (edge, eighths) in [
+                (TableBorderEdge::Top, 48),
+                (TableBorderEdge::InsideHorizontal, 8),
+                (TableBorderEdge::Bottom, 24),
+            ] {
+                table
+                    .set_border_checked(edge, BorderStyle::Single, eighths, "000000")
+                    .expect("border is valid");
+            }
+        });
+        assert_eq!(
+            row_geometry(&mixed),
+            (6.0, vec![15.0, 15.0, 15.0, 15.0, 17.0])
+        );
+        // Inside borders alone leave the top of the table and its end alone.
+        let inside = probe(|table| {
+            table
+                .set_border_checked(
+                    TableBorderEdge::InsideHorizontal,
+                    BorderStyle::Single,
+                    24,
+                    "000000",
+                )
+                .expect("border is valid");
+        });
+        assert_eq!(
+            row_geometry(&inside),
+            (0.0, vec![17.0, 17.0, 17.0, 17.0, 14.0])
+        );
+    }
+
+    /// The borders straddled each row boundary, so half of every line was
+    /// painted over the row above it.
+    #[test]
+    fn horizontal_table_borders_paint_inside_the_band_they_reserve() {
+        let document = probe(all_borders(BorderStyle::Single, 24));
+        let result = document
+            .layout_deterministic()
+            .expect("document lays out in deterministic font mode");
+        let table = &result.body_layout_fragments(0).expect("the table")[0];
+        assert_eq!(
+            round(table.height),
+            88.0,
+            "five rows of 17 and a 3 point bottom"
+        );
+        let mut centres = Vec::new();
+        oxml_layout::walk(&result.layout.pages[0].elements, &mut |element, _| {
+            if let oxml_layout::PositionedElement::Line {
+                start, end, width, ..
+            } = element
+                && start.y == end.y
+            {
+                assert_eq!(*width, 3.0);
+                centres.push(round(start.y - table.y));
+            }
+        });
+        centres.sort_by(f64::total_cmp);
+        centres.dedup();
+        // Each 3 point line fills the band below a row boundary, and the
+        // table's bottom line fills the last 3 points of the table.
+        assert_eq!(centres, vec![1.5, 18.5, 35.5, 52.5, 69.5, 86.5]);
+    }
+
+    #[test]
+    fn a_cell_border_widens_only_the_row_boundary_it_sits_on() {
+        let cell_edge = |edge: CellBorderEdge, eighths: u32| {
+            move |table: &mut Table| {
+                table
+                    .cell(1, 0)
+                    .expect("cell exists")
+                    .set_border_checked(edge, BorderStyle::Single, eighths, "000000")
+                    .expect("border is valid");
+            }
+        };
+        // A 3 point top on one cell of the second row.
+        assert_eq!(
+            row_geometry(&probe(cell_edge(CellBorderEdge::Top, 24))),
+            (0.0, vec![17.0, 14.0, 14.0, 14.0, 14.0])
+        );
+        // A 3 point bottom on the same cell.
+        assert_eq!(
+            row_geometry(&probe(cell_edge(CellBorderEdge::Bottom, 24))),
+            (0.0, vec![14.0, 17.0, 14.0, 14.0, 14.0])
+        );
+        // Over 1 point table borders, the widest edge on a boundary wins.
+        let widest = probe(|table| {
+            table.set_borders(BorderStyle::Single, 8, "000000");
+            cell_edge(CellBorderEdge::Top, 48)(table);
+        });
+        assert_eq!(
+            row_geometry(&widest),
+            (1.0, vec![20.0, 15.0, 15.0, 15.0, 15.0])
+        );
+    }
+
+    #[test]
+    fn exact_row_heights_include_the_border_above_and_minimum_heights_exclude_it() {
+        let heights = |height: RowHeight| {
+            move |table: &mut Table| {
+                table.set_borders(BorderStyle::Single, 24, "000000");
+                for row in 0..5 {
+                    table
+                        .row(row)
+                        .expect("row exists")
+                        .set_height_checked(height)
+                        .expect("height is valid");
+                }
+            }
+        };
+        // Exact 20 points: the 3 point band is inside the 20, and the table's
+        // bottom border still follows the last row.
+        let (shift, pitches) = row_geometry(&probe(heights(RowHeight::Exact(Length::pt(20.0)))));
+        assert_eq!(pitches, vec![20.0, 20.0, 20.0, 20.0, 20.0]);
+        let (exact_shift, _) = row_geometry(&probe(|table| {
+            table.set_borders(BorderStyle::Single, 24, "000000")
+        }));
+        assert_eq!(shift, exact_shift, "the content starts below the band");
+        // At least 30 points: the minimum is for the content, the band is added.
+        assert_eq!(
+            row_geometry(&probe(heights(RowHeight::AtLeast(Length::pt(30.0))))).1[..4],
+            [33.0, 33.0, 33.0, 33.0]
+        );
+    }
+
+    /// Layout read only the table's `w:tblCellMar` and ignored a cell's own
+    /// `w:tcMar`, which Google Docs writes on every cell.
+    #[test]
+    fn per_cell_margins_override_the_table_cell_margins() {
+        let cell_margins = |top: f64, left: f64, table_vertical: f64| {
+            move |table: &mut Table| {
+                table.set_cell_margins(
+                    Length::pt(table_vertical),
+                    Length::pt(5.0),
+                    Length::pt(table_vertical),
+                    Length::pt(5.0),
+                );
+                for row in 0..5 {
+                    for column in 0..2 {
+                        table
+                            .cell(row, column)
+                            .expect("cell exists")
+                            .set_margins_checked(
+                                Length::pt(top),
+                                Length::pt(5.0),
+                                Length::pt(top),
+                                Length::pt(left),
+                            )
+                            .expect("margins are valid");
+                    }
+                }
+            }
+        };
+        // 5 points on every side of every cell over a table default of none.
+        assert_eq!(
+            row_geometry(&probe(cell_margins(5.0, 5.0, 0.0))),
+            (5.0, vec![24.0, 24.0, 24.0, 24.0, 19.0])
+        );
+        // No vertical cell margin over a table default of 5 points.
+        assert_eq!(
+            row_geometry(&probe(cell_margins(0.0, 5.0, 5.0))),
+            (0.0, vec![14.0; 5])
+        );
+        // The left margin moves the text and the table default does not.
+        let left_edge = |document: &Document| {
+            lines(document)
+                .into_iter()
+                .find(|(text, ..)| text == "R00")
+                .expect("the first cell paints")
+                .2
+        };
+        assert_eq!(
+            round(left_edge(&probe(cell_margins(0.0, 15.0, 0.0))) - left_edge(&probe(|_| {}))),
+            10.0
         );
     }
 }

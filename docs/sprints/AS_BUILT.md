@@ -16261,3 +16261,140 @@ ceiling check, and the full workspace verification gate also passed.
 command, date, machine or tool identity, and validation bound can be checked.
 Keep generated Cargo VCS dirtiness out of archive-content comparisons, but do
 not normalize any declared package member.
+
+### F-X134, Keep Python story hyperlink snapshots linear
+
+**Sprint.** S75
+**Completed.** 2026-09-20
+**Size.** S, estimated 1 day, actual 1 day
+
+**What was built.** Native story hyperlink snapshots now batch item and link
+namespace scopes per physical source and extract each link's text from its
+bounded namespace-complete fragment. Both one-story and all-story Python
+snapshot routes retain physical order, nested-owner isolation, relationship
+resolution, and deduplication without reparsing the full story prefix for every
+link.
+
+**Non-obvious choices.** Scope inventory remains native and source-wide, while
+text extraction is fragment-local. A test-only byte counter measures repeated
+prefix work deterministically, so the regression does not depend on machine
+timing.
+
+**Deviations from the design plan.** None.
+
+**Spec sections touched.** `docs/hld/03-architecture.md`,
+`docs/hld/10-bindings-spec.md`, `docs/hld/12-testing-strategy.md`, and
+`docs/hld/14-development-backlog.md`.
+
+**Tests.** `story_link_snapshots_do_not_rescan_story_prefix_per_link` is the
+named gate. The unchanged `test_python_story_inventory_scales_linearly` test
+passed twenty consecutive runs, the complete installed Python suite passed 67
+tests, and the pinned Linux `rdocx` and workspace gates passed.
+
+**Hash harness.** Unchanged, 49 of 49.
+
+**Notes for future sessions.** Hyperlink materialization requires the exact
+namespace scope at the link start. Keep that scope in the source-wide batch if
+new story snapshot routes are added.
+
+### F-X135, Integrate PRs 146 through 151 and resolve unassigned reports
+
+**Sprint.** S75
+**Completed.** 2026-09-26
+**Size.** L, estimated 5 days, actual 6 days
+
+**What was built.** Integrated the reviewed contributor behavior from PRs 146
+through 151 across TOC rebuilding, slide text layout, Word table and spacing
+rendering, PowerPoint Python authoring, and structured PowerPoint CLI commands.
+Source-built regressions and fixes resolve Issues 134 through 136, 139, and
+140 in comparison and package preservation. Late PRs 153 and 154 were audited
+against those fixes, and their useful parser, diagnostic, ignored-story, and
+border-token cases were incorporated without applying overlapping code twice.
+
+**Non-obvious choices.** PR 148's hash and golden changes stayed in separate
+labelled baseline commits. The six branches' package measurements were
+replaced by one measurement from the integrated source. Unchanged modeled
+DOCX and PPTX parts and relationships retain source bytes, while typed edits
+serialize only their owned parts. The existing distinct `Nil` border token
+retains authored spelling without a second spelling field. Issue 138 remains
+open because line-height and row-splitting work is still required.
+
+**Deviations from the design plan.** PRs 153 and 154 arrived after the initial
+integration and supplied additional cases. The user also requested that
+`/complete-feature` use a scoped verification gate. The workflow now reserves
+the full gate for the integrated sprint, and permits `--allow-dirty` only for
+the scoped package dry run on uncommitted source.
+
+**Spec sections touched.** `docs/hld/03-architecture.md`,
+`docs/hld/04-opc-and-packaging.md`, `docs/hld/05-drawingml-model.md`,
+`docs/hld/06-presentationml-model.md`, `docs/hld/08-rendering-spec.md`,
+`docs/hld/10-bindings-spec.md`, `docs/hld/12-testing-strategy.md`,
+`docs/hld/13-risks-and-open-questions.md`,
+`docs/hld/14-development-backlog.md`, and
+`docs/hld/15-build-and-toolchain.md`.
+
+**Tests.** Both `no_op_save_preserves_every_unchanged_part` gates passed and
+would fail against the old unconditional modeled-part serialization paths.
+The scoped feature gate passed with 49 matching hashes, seven matching golden
+buffers, both isolated Python suites, strict typing and stub checks, the
+changed-crate Rust suites, WASM targets, warnings-denied rustdoc, 21 compiled
+README examples, 22 verified packages below 10 MiB, supply-chain checks, and
+the repository workflow suite. Microscope pass 4 had zero defects and smells.
+
+**Hash harness.** PR 148 intentionally changed 15 rendered entries through
+paragraph spacing and table-border layout, with no OOXML-part delta, in its
+separately labelled baseline commit. The integrated final check matched all
+49 entries. The reviewed deterministic raster delta covered `contract`,
+`invoice`, and `quote` only.
+
+**Notes for future sessions.** Run `/verify --scoped F-XXX` at feature
+completion and `/verify --full` once on the integrated sprint. Keep the 22
+archive dry run on uncommitted source honest with `--allow-dirty`, then rerun
+the strict command without that flag at sprint close. PRs 146 through 154 and
+their resolved issues still need main integration and specific contributor
+thanks. Do not close Issue 138 before its remaining pagination work passes.
+The integrated full gate exposed one M21 portable deck SHA made stale by the
+intended PPTX unchanged-part preservation. The active source pin now names the
+new deterministic bytes, while the historical manual PowerPoint oracle keeps
+its original SHA and is not claimed to validate the revised source.
+The packaged `rpptx` integration test changes its archive footprint to
+407,658 compressed bytes and 2,122,094 member bytes across 16 members.
+
+### F-X136, Fix table row breaks and footer-only pages
+
+**Sprint.** S75
+**Completed.** 2026-09-26
+**Size.** L, estimated 5 days, actual 1 day
+
+**What was built.** Ordinary flowed table rows now fragment at paragraph or
+guarded line boundaries when they span pages. The layout retains every source
+line and cell owner once, repeats leading header rows, preserves continuation
+borders and body fragments, and honors authored `w:cantSplit`. Exact-height,
+anchored, nested, merged, and rotated cases keep a bounded whole-row fallback.
+
+**Non-obvious choices.** The source-built acceptance fixture uses explicit
+line spacing for its pinned LibreOffice comparison because host Calibri font
+substitution gives unlike natural line advances. The private 53-page reporter
+file and Microsoft Word were unavailable, so this proves the isolated break
+mechanism rather than claiming to reproduce that package exactly.
+
+**Deviations from the design plan.** The initial 0.2 percent body-ink floor
+would reject a legitimate heading-only page. The observed pinned render led
+to a reviewed 0.1 percent floor. No production line-advance change was needed.
+
+**Spec sections touched.** `docs/hld/08-rendering-spec.md`,
+`docs/hld/10-bindings-spec.md`, `docs/hld/12-testing-strategy.md`, and
+`docs/hld/14-development-backlog.md`.
+
+**Tests.** `table_row_breaks_before_footer_only_page_and_repeats_header` is
+the named gate and failed before the implementation. The changed-crate tests,
+warnings-denied clippy and rustdoc, pinned LibreOffice comparison, seven
+golden buffers, 49 hash entries, repository-policy suite, 27 README pages,
+and locally patched 22-package dry run passed. Microscope pass 3 reported
+zero defects and zero smells.
+
+**Hash harness.** Unchanged, 49 of 49.
+
+**Notes for future sessions.** The original private file still needs reporter
+validation if it becomes available. Keep split-row fallback explicit for
+unsupported ownership and geometry cases rather than duplicating content.

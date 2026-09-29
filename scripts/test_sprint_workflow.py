@@ -8965,6 +8965,68 @@ Pedro Assumpcao and the rdocx maintainers.
             ],
         )
 
+    def test_feature_completion_requires_scoped_verification(self) -> None:
+        verify = (workflow.REPO / ".claude/commands/verify.md").read_text(
+            encoding="utf-8"
+        )
+        complete = (
+            workflow.REPO / ".claude/commands/complete-feature.md"
+        ).read_text(encoding="utf-8")
+        run_sprint = (
+            workflow.REPO / ".claude/commands/run-sprint.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("/verify [--fast | --scoped F-XXX | --full]", verify)
+        self.assertIn("`--scoped F-XXX` is the feature-completion gate", verify)
+        self.assertIn("For an uncommitted `--scoped` feature, add `--allow-dirty`", verify)
+        self.assertIn("without `--allow-dirty`", verify)
+        self.assertIn("`/verify --scoped F-XXX` passes", complete)
+        self.assertIn("Run `/verify --full`. Not per worker", run_sprint)
+        self.assertIn("not `--scoped`", run_sprint)
+
+    def test_worker_handoff_accepts_only_matching_scoped_verification(self) -> None:
+        handoff = """# F-123 ready for integration
+
+**F-ID**: F-123
+**Owner**: codex
+**Branch**: work/f-123-codex
+**Worktree**: /tmp/rdocx-f123
+**Base**: abc123
+**Head**: def456
+**Design plan**: .claude/plans/F-123-design.md
+**Microscope**: .claude/reviews/F-123-all-pass-1.md, 0 defects, 0 smells
+**Verify**: /verify --scoped F-123, pass
+**Hash harness**: unchanged
+**Test gate**: feature_gate, pass
+"""
+        args = argparse.Namespace(path="", fid="F-123")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "F-123-ready.md"
+            args.path = str(path)
+            path.write_text(handoff, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(workflow.cmd_validate_handoff(args), 0)
+
+            for invalid_verify in (
+                "/verify --fast, pass",
+                "/verify --scoped F-124, pass",
+            ):
+                with self.subTest(verify=invalid_verify):
+                    path.write_text(
+                        handoff.replace(
+                            "/verify --scoped F-123, pass", invalid_verify
+                        ),
+                        encoding="utf-8",
+                    )
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertEqual(workflow.cmd_validate_handoff(args), 1)
+                    self.assertIn(
+                        "Verify must record `/verify --scoped F-123, pass`.",
+                        stderr.getvalue(),
+                    )
+
     def test_recorded_evidence_captures_head(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
@@ -9306,7 +9368,11 @@ Pedro Assumpcao and the rdocx maintainers.
         )
         verify_paths = self.assert_repository_path_claims_resolve(
             verify,
-            generated_claims={"*.crate", "target/package"},
+            generated_claims={
+                "*.crate",
+                "target/package",
+                ".claude/scratch/<F-ID>-progress.md",
+            },
         )
         self.assertIn("docs/hld/00-vision.md", claude_paths)
         self.assertIn(".github/workflows/publish.yml", verify_paths)
@@ -9407,6 +9473,14 @@ Pedro Assumpcao and the rdocx maintainers.
                 verify.replace(
                     ".github/workflows/publish.yml",
                     ".github/workflows/missing.yml",
+                    1,
+                ),
+            ),
+            "ignored-scratch-path": (
+                claude,
+                verify.replace(
+                    ".claude/scratch/<F-ID>-progress.md",
+                    ".claude/scratch/<F-ID>-missing.md",
                     1,
                 ),
             ),
@@ -9708,7 +9782,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertTrue(all(len(value) == 1 for value in placements.values()))
         self.assertEqual(
             {sprint for value in placements.values() for sprint, _, _ in value},
-            set(range(70, 81)),
+            set(range(70, 81)) - {75},
         )
 
         backlog_rows: dict[str, list[tuple[int, str, str, str]]] = {

@@ -1010,7 +1010,7 @@ def test_word_structure_snapshots_preserve_order_ownership_and_types():
     assert reopened.sections[0] == rdocx.Section(
         ordinal=0,
         is_final=False,
-        orientation=None,
+        orientation="portrait",
         page_width=7_772_400,
         page_height=10_058_400,
         margin_top=914_400,

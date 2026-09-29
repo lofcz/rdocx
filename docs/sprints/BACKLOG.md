@@ -40,8 +40,8 @@ regenerated, never hand-edited.
 | M22, Word depth                                | 12 | 12 | 0 | 0  |
 | M23, From-scratch business documents           | 24 | 24 | 0 | 0 |
 | M24, Modern DOCX authoring completeness        | 54 | 12 | 0 | 42 |
-| X, Cross-cutting (opportunistic)            | 143 | 138 | 0 | 1  |
-| **Total** | **468** | **400** | **0** | **64** |
+| X, Cross-cutting (opportunistic)            | 146 | 141 | 0 | 1  |
+| **Total** | **471** | **403** | **0** | **64** |
 <!-- AUTOGEN:backlog-summary END -->
 
 ## All F-IDs
@@ -495,13 +495,13 @@ regenerated, never hand-edited.
 | F-268b | Floating table placement and wrap | S74 | M | done |
 | F-269 | Complete section page semantics | S74 | L | done |
 | F-270 | Complete settings and web settings authoring | S74 | L | done |
-| F-271 | Uniform rich header and footer editing | S75 | L | pending |
-| F-272 | Rich footnote authoring | S75 | L | pending |
-| F-273 | Rich endnote authoring | S75 | L | pending |
-| F-274 | Note separators, markers, and restart policy | S75 | L | pending |
-| F-275 | Cross-story bookmarks, ranges, and annotations | S75 | L | pending |
-| F-276 | Complete fragment conflict and dependency policy | S75 | L | pending |
-| F-277 | Glossary and building-block creation | S75 | L | pending |
+| F-271 | Uniform rich header and footer editing | S76 | L | pending |
+| F-272 | Rich footnote authoring | S76 | L | pending |
+| F-273 | Rich endnote authoring | S76 | L | pending |
+| F-274 | Note separators, markers, and restart policy | S76 | L | pending |
+| F-275 | Cross-story bookmarks, ranges, and annotations | S76 | L | pending |
+| F-276 | Complete fragment conflict and dependency policy | S76 | L | pending |
+| F-277 | Glossary and building-block creation | S76 | L | pending |
 | F-278 | General simple and complex field builder | S76 | L | pending |
 | F-279 | Pagination field materialization across stories | S76 | L | pending |
 | F-280 | Captions, sequences, and complete cross-references | S76 | M | pending |
@@ -686,5 +686,8 @@ regenerated, never hand-edited.
 | F-X130 | Show package depth, footprint, and speed | S74 | L | done |
 | F-X131 | Retain only the namespace declarations a root attribute uses | S74 | S | done |
 | F-X132 | Match a retained namespace owner by structure, not by identity | S74 | S | done |
-| F-X133 | Stop rebinding a canonical prefix on every retained element | S75 | S | pending |
+| F-X133 | Stop rebinding a canonical prefix on every retained element | S76 | S | pending |
+| F-X134 | Keep Python story hyperlink snapshots linear | S75 | S | done |
+| F-X135 | Integrate PRs 146 through 151 and resolve unassigned reports | S75 | L | done |
+| F-X136 | Fix table row breaks and footer-only pages | S75 | L | done |
 <!-- AUTOGEN:backlog-MX END -->

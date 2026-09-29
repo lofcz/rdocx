@@ -318,4 +318,35 @@ mod tests {
         assert_eq!(lines[0].height, 26.0);
         assert_eq!(lines[0].line_gap, 0.0);
     }
+
+    #[test]
+    fn table_cell_line_advance_matches_measured_row_height() {
+        let source = LayoutLine {
+            items: Vec::new(),
+            width: 0.0,
+            ascent: 9.0,
+            descent: 3.0,
+            line_gap: 0.0,
+            height: 12.0,
+            indent_left: 0.0,
+            available_width: 400.0,
+            is_last: true,
+            forced_break_after: None,
+        };
+        for (spacing, rule, expected) in [
+            (None, None, 12.0),
+            (Some(Twips(360)), Some("exact"), 18.0),
+            (Some(Twips(400)), Some("atLeast"), 20.0),
+        ] {
+            let mut lines = vec![source.clone(); 3];
+            let properties = CT_PPr {
+                line_spacing: spacing,
+                line_rule: rule.map(str::to_owned),
+                ..Default::default()
+            };
+            restore_word_line_heights(&mut lines, &properties, None);
+            let row_height = 3.0 + lines.iter().map(|line| line.height).sum::<f64>() + 5.0;
+            assert_eq!(row_height, 3.0 + 3.0 * expected + 5.0);
+        }
+    }
 }

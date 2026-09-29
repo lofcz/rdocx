@@ -13,7 +13,7 @@ Every F-ID flows through the same five steps:
 1. /design F-XXX               Write the design plan, get aligned
 2. /start-feature F-XXX        Mark in-progress, create test stubs
 3. ...implement...             Code plus tests
-4. /verify                     The gate must pass
+4. /verify --scoped F-XXX      The feature gate must pass
 5. /complete-feature F-XXX     Update tracking, commit
 ```
 
@@ -55,9 +55,10 @@ that has to come first. The rules that make it safe:
   ledger is a conflict in the one file that must not have one.
 - **The hash-harness baseline is exclusive.** There is one baseline. Two
   stories re-recording it in parallel produces a delta nobody can attribute.
-- **Verification that matters happens once, over the integrated result.** A
-  worker's `/verify` is evidence, not a substitute. Two features that are
-  individually correct and jointly wrong are invisible until they are merged.
+- **Integrated verification happens once, over the integrated result.** A
+  worker's `/verify --scoped F-XXX` is feature evidence, not a substitute for
+  the sprint's full gate. Two features that are individually correct and
+  jointly wrong are invisible until they are merged.
 - **A worker's claims are validated, not trusted.** `/complete-feature
   --prepare` writes `.claude/handoffs/F-XXX-ready.md`, and `/integrate-feature`
   refuses a branch whose handoff does not validate.
@@ -291,7 +292,8 @@ DrawingML text model, and F-098, shape text layout.
 
 1. Read `.claude/plans/F-XXX-design.md`, which is the contract.
 2. Read `.claude/scratch/F-XXX-progress.md`, which is the in-flight memory.
-3. Re-run `/verify --fast` to establish the current state.
+3. Re-run `/verify --fast` to establish the current state. Run `/verify
+   --scoped F-XXX` only when the feature is ready to complete.
 4. Continue.
 
 Never resume from the diff alone.
@@ -301,7 +303,7 @@ Never resume from the diff alone.
 | Signal | Response |
 |--------|----------|
 | An F-ID consistently exceeds 2x its estimate | Split into `F-XXXa`/`b`. Update both backlogs |
-| `/verify` exceeds 10 minutes on changed files | Investigate the slow check, add a `--fast` path |
+| `/verify --scoped` exceeds 10 minutes on changed files | Investigate the slow check and narrow the feature scope without dropping declared risk riders |
 | The hash harness shows an unexplained delta | Stop. Do not proceed until it is explained |
 | Corpus round-trip failures appear with no recent parser change | A corpus deck changed, or a dependency did. Find the root cause |
 | A sprint exceeds 4 calendar weeks with no completion | Replan. Too many F-IDs in flight, or the scope is wrong |

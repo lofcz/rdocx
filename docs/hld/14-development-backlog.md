@@ -5976,6 +5976,81 @@ plain save of a document carrying producer root attributes emits no redundant
 canonical declaration, that the retained attributes still round-trip, and that
 a genuinely new binding is still written.
 
+### F-X134, Keep Python story hyperlink snapshots linear (S)
+
+The owned story hyperlink projection batches story owners, items, and namespace
+scopes, but hyperlink text extraction reparses the complete physical story from
+byte zero for every link. A document with one hyperlink per paragraph therefore
+does quadratic prefix work even though the public Python snapshot API promises
+one bounded native inventory per accessor.
+
+Collect hyperlink spans before materializing their public records, inventory
+the exact namespace scope at every hyperlink start in one source pass, and
+extract each hyperlink text from its namespace-complete bounded fragment. Keep
+relationship resolution, physical source order, nested-owner isolation, and
+deduplication unchanged.
+**Depends on**: F-X116.
+**Test gate**: regression.
+`story_link_snapshots_do_not_rescan_story_prefix_per_link` counts skipped story
+prefix work and proves that doubling a hyperlink-rich story does not restart a
+full-document scan for each link. The installed Python
+`test_python_story_inventory_scales_linearly` gate must pass on the hosted
+macOS binding runner without relaxing its scaling bound.
+
+**Delivered.** Story hyperlink snapshots now inventory each physical source's
+item and hyperlink namespace scopes in bounded passes, then extract link text
+from the namespace-complete hyperlink fragment. The native regression reports
+zero repeated prefix bytes, the unchanged Python scaling test passed twenty
+consecutive runs, and the complete installed Python suite passed 67 tests.
+
+### F-X135, Integrate PRs 146 through 151 and resolve unassigned reports (L)
+
+Integrate the exact reviewed heads of contributor PRs 146 through 151 after
+F-X134 restores the hosted Python gate. Preserve the contributor's focused
+commits where their behavior remains correct, reconcile the overlapping
+PowerPoint facade and binding surfaces as one coherent API, and re-record
+combined package measurements only after the integrated tree is final. PR 148
+also requires the deterministic golden-PNG baseline that its current head did
+not update even though its intentional layout change moves three reviewed
+rasters.
+
+Resolve open Issues 134, 135, 136, 139, and 140. Contributor PRs 153 and 154
+cover the same reports and supply additional regression cases. Comparison must
+track paragraph formatting when producer revision identities are present, treat
+an empty paragraph-property shell as absence, and
+accept a reordered drawing paragraph without printing raw model bytes in a
+failure. A save must retain an authored `nil` border token and preserve every
+unchanged modeled part and relationship part byte for byte. Issue 138 remains
+open because PR 148 addresses only paragraph spacing, cell margins, and border
+bands. It does not implement the reported line-height and row-splitting gaps.
+
+**Depends on**: F-X134.
+**Test gate**: regression.
+`no_op_save_preserves_every_unchanged_part` proves DOCX and PPTX saves retain
+the exact bytes of modeled parts and relationship parts whose typed state did
+not change, while a targeted edit rewrites only its owned part and graph edges.
+
+### F-X136, Fix table row breaks and footer-only pages (L)
+
+Complete Issue 138 after the paragraph-spacing, cell-margin, and border-band
+portion delivered by F-X135. A source-built page-height fixture places a
+repeated-header table before an empty following paragraph and a heading with
+`w:pageBreakBefore`. Correct row measurement and default row fragmentation
+must not leave a page carrying only the footer. Splitting ordinary rows
+preserves cell text order, border ownership, repeated headers, and body-layout
+fragments. Rows with vertical merges remain whole until a safe merge-fragment
+model exists. `w:cantSplit` moves a row whole when
+it fits on the next page. Explicit exact row heights retain their clipping
+contract. The private reporter document is unavailable, so the source-built
+cases pin the reproducible boundary rather than claiming its exact 53-page
+render has been reproduced.
+
+**Depends on**: F-X135.
+**Test gate**: regression.
+`table_row_breaks_before_footer_only_page_and_repeats_header` asserts the
+footer-only page is absent, every body line appears once in reading order,
+and the table header repeats on the continuation page.
+
 ### F-X021, The hash harness should cover PDF output (M)
 The output-stability harness records `page1.png` and three `word/*.xml` parts
 for each of the seven samples, and no PDF. PDF is a first-class output of this

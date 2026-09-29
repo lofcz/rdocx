@@ -1,9 +1,10 @@
 //! Table layout: column widths, cell content, merge handling.
 
+use rdocx_oxml::borders::CT_BorderEdge;
 use rdocx_oxml::content_control::{CT_Sdt, SdtContent};
 use rdocx_oxml::document::CT_DocGrid;
 use rdocx_oxml::drawing::{AnchorAlignH, AnchorAlignV, ST_RelativeFromH, ST_RelativeFromV};
-use rdocx_oxml::shared::ST_Jc;
+use rdocx_oxml::shared::{ST_Border, ST_Jc};
 use rdocx_oxml::styles::{CT_Styles, TableStyleRegion};
 use rdocx_oxml::table::{
     CT_Row, CT_Tbl, CT_TblBorders, CT_TblGrid, CT_TblPPr, CT_TblPr, CT_TblWidth, CT_Tc, CT_TrPr,
@@ -255,6 +256,8 @@ pub struct TableRow {
     /// Word's row-level keep-with-next: every paragraph in the row carries
     /// `keepNext`, so the row must share a page with whatever follows it.
     pub keep_next: bool,
+    /// Whether Word forbids a page break inside this row.
+    pub cant_split: bool,
     /// Distance in points from the table origin to this row's first painted
     /// cell, resolved from the row's omitted grid columns and their width.
     ///
@@ -319,6 +322,12 @@ pub struct TableCell {
     pub margin_top: f64,
     /// Cell margin bottom in points.
     pub margin_bottom: f64,
+    /// Points of horizontal border band above the content, which the row
+    /// height includes.
+    pub border_band_top: f64,
+    /// Points of horizontal border band below the content. Only a cell that
+    /// reaches the table's last row has one, the table's bottom border.
+    pub border_band_bottom: f64,
     /// Whether this cell is in the first row.
     pub is_first_row: bool,
     /// Whether this cell is in the last row.
@@ -607,10 +616,6 @@ fn layout_table_inner(
             .or(table_cell_spacing)
             .unwrap_or(0.0);
         let half_spacing = row_cell_spacing / 2.0;
-        let cell_margin_left = cell_margin_left + half_spacing;
-        let cell_margin_right = cell_margin_right + half_spacing;
-        let cell_margin_top = cell_margin_top + half_spacing;
-        let cell_margin_bottom = cell_margin_bottom + half_spacing;
 
         // Omitted edge columns move the row's own origin. The table origin,
         // the table width and every other row stay where they are.
@@ -673,6 +678,19 @@ fn layout_table_inner(
                 .and_then(|shd| shd.fill.as_ref())
                 .filter(|f| f.as_str() != "auto")
                 .map(|f| Color::from_hex(f));
+
+            // A cell's own `w:tcMar` replaces the table's margins edge by edge.
+            let own_margin = cell
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.cell_margin.as_ref());
+            let margin = |own: Option<rdocx_oxml::Twips>, table: f64| {
+                own.map_or(table, |twips| twips.to_pt()) + half_spacing
+            };
+            let cell_margin_left = margin(own_margin.and_then(|m| m.left), cell_margin_left);
+            let cell_margin_right = margin(own_margin.and_then(|m| m.right), cell_margin_right);
+            let cell_margin_top = margin(own_margin.and_then(|m| m.top), cell_margin_top);
+            let cell_margin_bottom = margin(own_margin.and_then(|m| m.bottom), cell_margin_bottom);
 
             // Calculate cell width from spanned columns
             let cell_width: f64 = (col_index..col_index + grid_span as usize)
@@ -764,6 +782,8 @@ fn layout_table_inner(
                 margin_right: cell_margin_right,
                 margin_top: cell_margin_top,
                 margin_bottom: cell_margin_bottom,
+                border_band_top: 0.0,
+                border_band_bottom: 0.0,
                 is_first_row: row_idx == 0,
                 is_last_row: row_idx == num_rows - 1,
                 v_align,
@@ -801,6 +821,7 @@ fn layout_table_inner(
             height: row_height,
             is_header,
             keep_next,
+            cant_split: row_properties.cant_split.unwrap_or(false),
             offset_left,
         });
         row_semantics.push(RowSemantics {
@@ -847,7 +868,6 @@ fn layout_table_inner(
         }
     }
 
-    let row_heights = rows.iter().map(|row| row.height).collect::<Vec<_>>();
     for row_index in 0..rows.len() {
         let continuing_spans = rows
             .get(row_index + 1)
@@ -861,15 +881,44 @@ fn layout_table_inner(
             })
             .unwrap_or_default();
         for cell in &mut rows[row_index].cells {
-            cell.height = row_heights[row_index];
-            cell.merged_height = row_heights[row_index];
             cell.merge_with_below = continuing_spans.contains(&(cell.col_index, cell.grid_span));
+        }
+    }
+
+    // Word gives a horizontal border its own height between two rows rather
+    // than drawing it over their content. An exact height already includes
+    // the band above its row, and the last row also carries the band below.
+    let bands = border_bands(&rows, table_borders.as_ref());
+    let table_bottom_band = |last_row: usize| {
+        if last_row + 1 == num_rows {
+            bands[num_rows]
+        } else {
+            0.0
+        }
+    };
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        if !exact_rows[row_index] {
+            row.height += bands[row_index];
+        }
+        row.height += table_bottom_band(row_index);
+        for cell in &mut row.cells {
+            cell.border_band_top = bands[row_index];
+            cell.border_band_bottom = table_bottom_band(row_index);
+        }
+    }
+
+    let row_heights = rows.iter().map(|row| row.height).collect::<Vec<_>>();
+    for (row, height) in rows.iter_mut().zip(&row_heights) {
+        for cell in &mut row.cells {
+            cell.height = *height;
+            cell.merged_height = *height;
         }
     }
     for (row_index, cell_index, last_row, required) in spans {
         let restart = &mut rows[row_index].cells[cell_index];
         restart.merged_height = row_heights[row_index..=last_row].iter().sum();
         restart.is_last_row = last_row + 1 == num_rows;
+        restart.border_band_bottom = table_bottom_band(last_row);
         restart.clip_content = required > restart.merged_height;
     }
 
@@ -889,6 +938,84 @@ fn layout_table_inner(
             rows: row_semantics,
         },
     ))
+}
+
+/// The border one side of a cell draws, or `None` when it draws none.
+///
+/// The cell's own edge wins over the table's, except that a `none` cell edge
+/// on the outside of the table falls back to the table's outer edge.
+pub(crate) fn resolved_cell_edge<'a>(
+    cell_edge: Option<&'a CT_BorderEdge>,
+    table_edge: Option<&'a CT_BorderEdge>,
+    outer_edge: bool,
+) -> Option<&'a CT_BorderEdge> {
+    let edge = match cell_edge {
+        Some(edge) if edge.val.is_none() && outer_edge => table_edge?,
+        Some(edge) => edge,
+        None => table_edge?,
+    };
+    (!edge.val.is_none()).then_some(edge)
+}
+
+/// The height in points a horizontal border takes between two rows. A double
+/// border is two lines and the gap between them, each as wide as its size.
+fn border_band(edge: &CT_BorderEdge) -> f64 {
+    let width = edge.sz.unwrap_or(4) as f64 / 8.0;
+    if edge.val == ST_Border::Double {
+        3.0 * width
+    } else {
+        width
+    }
+}
+
+/// The horizontal border band above each row, then the one below the last.
+///
+/// The band between two rows is the widest edge that meets there, from the
+/// bottom edges of the row above and the top edges of the row below, so a
+/// border the two rows share counts once. A vertical merge has no edge where
+/// it continues into the next row.
+fn border_bands(rows: &[TableRow], table_borders: Option<&CT_TblBorders>) -> Vec<f64> {
+    let mut bands = vec![0.0f64; rows.len() + 1];
+    for (row_index, row) in rows.iter().enumerate() {
+        let first_row = row_index == 0;
+        let last_row = row_index + 1 == rows.len();
+        let table_top = table_borders.and_then(|borders| {
+            if first_row {
+                borders.top.as_ref()
+            } else {
+                borders.inside_h.as_ref()
+            }
+        });
+        let table_bottom = table_borders.and_then(|borders| {
+            if last_row {
+                borders.bottom.as_ref()
+            } else {
+                borders.inside_h.as_ref()
+            }
+        });
+        for cell in &row.cells {
+            let cell_borders = cell.borders.as_ref();
+            if !cell.is_vmerge_continue
+                && let Some(edge) = resolved_cell_edge(
+                    cell_borders.and_then(|borders| borders.top.as_ref()),
+                    table_top,
+                    first_row,
+                )
+            {
+                bands[row_index] = bands[row_index].max(border_band(edge));
+            }
+            if !cell.merge_with_below
+                && let Some(edge) = resolved_cell_edge(
+                    cell_borders.and_then(|borders| borders.bottom.as_ref()),
+                    table_bottom,
+                    last_row,
+                )
+            {
+                bands[row_index + 1] = bands[row_index + 1].max(border_band(edge));
+            }
+        }
+    }
+    bands
 }
 
 fn resolve_base_table_properties(table: &CT_Tbl, styles: &CT_Styles) -> CT_TblPr {
@@ -1597,6 +1724,19 @@ fn layout_cell_content(
             )?,
         }
     }
+    // Two consecutive paragraphs of a cell are one flow, so Word keeps the
+    // larger of their facing spacing there as it does in the body. The space
+    // before is reduced here to what it adds below the space after above it,
+    // which keeps the cell height a plain sum. A nested table breaks the run.
+    if !input.do_not_use_html_paragraph_auto_spacing {
+        for index in 1..blocks.len() {
+            if let [CellBlock::Paragraph(previous), CellBlock::Paragraph(next)] =
+                &mut blocks[index - 1..=index]
+            {
+                next.space_before = (next.space_before - previous.space_after).max(0.0);
+            }
+        }
+    }
     Ok((blocks, semantics))
 }
 
@@ -2055,6 +2195,7 @@ mod tests {
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
+            do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
             math_properties: None,
             document: rdocx_oxml::document::CT_Document {
@@ -2245,6 +2386,7 @@ mod tests {
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
+            do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
             math_properties: None,
             document: rdocx_oxml::document::CT_Document {

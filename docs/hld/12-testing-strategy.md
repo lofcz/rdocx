@@ -14,6 +14,15 @@ exactly one as its test gate.
 | `golden` | Byte or pixel comparison against a recorded baseline | the hash harness |
 | `differential` | Compared against an external oracle | LibreOffice for renders, python-docx and python-pptx for the bindings |
 
+The table-row pagination regression uses source-built tagged lines and a
+footer-only-page sentinel because Issue 138's private 53-page package is not
+available. The deterministic layout must place each tag on exactly one page,
+retain table body fragments, and repeat headers only on continuation pages.
+The corresponding LibreOffice comparison requires the pinned 26.2.5.2 build
+and Poppler 26.01.0. It checks tagged-line page membership and a nonempty
+body-ink floor outside the footer. A source-built pass does not claim that the
+unavailable private package has been reproduced.
+
 The complete run-property and inline story compares against the recorded
 WordprocessingML for `EG_RPrBase` rather than a fresh Word save, because Word
 GUI capture is not available on the development machine. The no-repair
@@ -418,6 +427,19 @@ combines a final empty custom-style component with a duplicate `Normal` style.
 It requires two rebuilt entries, one ordered diagnostic, both style definitions
 after save and reopen, and unchanged strict failure from the public style-graph
 validator. Unit controls retain stored display for interior empty components.
+`toc_rebuild_accepts_several_defaults_of_one_style_type_and_follows_the_layout_default`
+adds a later default paragraph style that breaks pages and a second default
+table style. It requires one ordered diagnostic per type naming the first
+default, page numbers and a page count that match that default, and every
+default retained after save and reopen.
+`toc_rebuild_retains_every_producer_style_graph_defect_the_read_surface_accepts`
+carries one defect per remaining strict check, including a `toc 1` style with
+an empty id. It requires the exact ordered diagnostics, an entry that
+references the canonical `TOC1` style, and every producer style after save and
+reopen.
+`toc_rebuild_rejects_a_defect_its_entry_style_introduces_behind_retained_ones`
+requires the one-way link a new `TOC1` style would complete to reject the
+rebuild despite a retained dangling parent, leaving the package unchanged.
 The Word-default instruction case retains argument-free `TOC \\z`, rebuilds
 through an existing content-control payload, and saves and reopens the result.
 A mixed simple and unsupported complex TOC case asserts exact diagnostic text
@@ -1316,14 +1338,12 @@ requires identical dimensions and a zero-pixel-difference digest, then reports
 the first differing sample precisely. Reviewed updates use `--update --reason
 <text>`, and an empty reason is rejected.
 
-The gate deliberately compares pixels rather than PDF bytes. The operator
-stream legitimately changes when the per-element Y flip becomes one global
-CTM. The reviewed Poppler 26.01.0 baseline includes exactly four
-stroke-antialias changes. In `invoice`, pixels `(112, 397)` and `(112, 398)`
-swap `fcf5f5ff` and `ffffffff`. In `quote`, pixels `(112, 303)` and
-`(112, 304)` swap `f4fafaff` and `ffffffff`. The other five samples remain
-exact. This is a baseline, not a tolerance, so check mode still requires exact
-equality for all seven buffers. The regression proof runs `--check
+The gate deliberately compares pixels rather than PDF bytes. The reviewed
+Poppler 26.01.0 baseline includes the intended paragraph-spacing, cell-margin,
+and horizontal-table-border layout for `contract`, `invoice`, and `quote`.
+The other four samples remain exact. This is a baseline, not a tolerance, so
+check mode still requires exact equality for all seven buffers. The regression
+proof runs `--check
 --inject-one-pixel <sample>`, copies that generated PNG to a temporary
 directory, changes exactly one decoded pixel, and requires check mode to fail
 with the sample name.
@@ -1605,7 +1625,10 @@ timeline, three notes pages, and a three-up handout. Save and reopen preserve
 those semantic surfaces and real source mutations change the static, animated,
 notes, and handout outputs. This portable test classifies the minimal SmartArt
 render as an unsupported fallback and does not claim authentic SmartArt raster
-fidelity. A separate ignored macOS reference-only writer reads SHA-256-pinned
+fidelity. The portable source hash tracks current deterministic serialization.
+Its legacy PowerPoint recording retains the historical source hash and is not
+valid evidence for changed source bytes without a new capture. A separate
+ignored macOS reference-only writer reads SHA-256-pinned
 authentic layout, quick-style, and colour resources and emits corrected signed
 and signature-free sources for manual oracle capture. The mandatory ignored
 release oracle does not read those installed resources. It reads the captured
@@ -1928,7 +1951,10 @@ The Python story-scale gate is `python_story_inventory_scales_linearly`. It
 doubles a corpus containing paragraphs, table cells, and hyperlinks, requires
 exact doubled inventory counts, and bounds the elapsed ratio without relying
 on an absolute machine speed. A native counted companion requires one complete
-story-source build for each item or hyperlink snapshot. The binding companion
+story-source build for each item or hyperlink snapshot. The regression
+`story_link_snapshots_do_not_rescan_story_prefix_per_link` separately counts
+skipped prefix bytes and requires zero repeated full-story prefix work while
+retaining ordered hyperlink text and anchors. The binding companion
 interleaves direct, inserted, inline-control, and deleted runs, then proves
 StoryItem text, Paragraph text, and live run handles use the same accepted
 order. Nested formatting and splitting survive save and reopen, while an old
@@ -2697,6 +2723,13 @@ rider asserts the exact oracle version, compares each writer through both
 readers, and directly compares the normalized rpptx-authored and
 python-pptx-authored records. It never compares package bytes and the oracle is
 not a runtime dependency.
+
+The rpptx text-property gate `test_text_properties_agree_with_python_pptx_in_both_directions`
+writes text frame, paragraph, and run font values with each library and reads
+them back with the other. `test_text_enums_match_python_pptx_member_values_and_xml_tokens`
+pins every exported text enum member to its python-pptx 1.0.2 value and to the
+XML token python-pptx writes for it. Both skip when the oracle is absent, like
+the Getting Started rider.
 
 The rpptx extension gate
 `presentation_render_comments_and_notes_match_native_snapshots` compares the

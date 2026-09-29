@@ -118,8 +118,10 @@ reader methods.
 
 At the public low-level Rust boundary, `CT_RPr` includes the complete language
 attribute set and its retained foreign attributes, while `LayoutInput` includes
-the document automatic-hyphenation boolean. Full struct literals must provide
-these fields. These are intentional pre-1.0 source breaks for the next stable
+the document automatic-hyphenation boolean and the
+`w:doNotUseHTMLParagraphAutoSpacing` compatibility boolean, and the laid-out
+`TableCell` includes the horizontal border bands above and below its content.
+Full struct literals must provide these fields. These are intentional pre-1.0 source breaks for the next stable
 family. Established `TextSegment` construction and layout entrypoints retain
 their existing shapes.
 
@@ -278,26 +280,133 @@ source-compatibility surface is the seven python-pptx 1.0.2 Getting Started
 workflows. They change the import namespace and re-fetch through the public
 path after each structural write, because strict global revision invalidation
 intentionally stales every pre-write handle and collection. Pure-Python
-`Length`, `Inches`, `Pt` and the required `MSO_SHAPE` members keep native
-inheritance outside the limited ABI.
+`Length`, `Inches`, `Pt`, `RGBColor`, and the `MSO_SHAPE`, `MSO_SHAPE_TYPE`,
+`MSO_CONNECTOR_TYPE`, and `MSO_FILL_TYPE` enumerations keep native inheritance
+outside the limited ABI. `MSO_SHAPE` carries the 181 python-pptx
+`MSO_AUTO_SHAPE_TYPE` members whose preset rpptx can author, each with its
+preset name as `xml_value`. `UP_ARROW` is absent because the generated preset
+table has no `upArrow`.
 
 Presentation `Shape` handles expose optional `Length` values for left, top,
-width, and height plus optional non-visual id and name. `TextFrame.autofit`
+width, and height plus optional non-visual id and name.
+
+`Presentation.slide_width` and `slide_height` read the optional `p:sldSz` as
+`Length` values. Assigning one keeps the other, and a deck without `p:sldSz`
+pairs the assigned value with the bundled 16:9 size. `Slide.slide_layout`
+returns the layout the slide relates to, equal to the same entry of
+`slide_layouts`, and `SlideLayoutCollection.index` returns its position.
+`Slide.hidden` reads and writes `p:sld/@show`. `Slide.background.fill` is a
+live `FillFormat` over the direct background fill that never changes the slide
+when read, and `follow_master_background` reports and sets whether the slide
+has no `p:bg`. `SlideCollection.remove` and `SlideCollection.move(from_, to)`
+use the native staged slide operations and advance the revision once.
+
+`Shape` geometry, `name`, and `rotation` are writable without a revision bump.
+A missing partner coordinate becomes zero, as in python-pptx, and a negative
+extent is a `ValueError`. `rotation` reads clockwise degrees normalized below
+360 and writes them with round-half-even into the 60000-per-degree angle.
+`shape_type` reports an `MSO_SHAPE_TYPE` member or `None`. `fill` and `line`
+return live `FillFormat` and `LineFormat` views for ordinary shapes, pictures,
+and connectors, and raise `ValueError` for other kinds. `FillFormat` offers
+`type`, `solid()`, `background()`, and `fore_color`. `ColorFormat.rgb` reads an
+sRGB colour as `RGBColor`, or `None` for any other colour, and writing it keeps
+the transforms of an existing sRGB colour. Reading `LineFormat.color` changes
+nothing, and assigning its `rgb` makes the line fill solid. `LineFormat.width`
+reads zero without a width, writes `None` as zero, and rejects values above
+the `ST_LineWidth` maximum. `adjustments` is a live `AdjustmentCollection` of
+the effective preset adjustments, normalized so that 1.0 is 100000, and
+assignment truncates as python-pptx does. `xml` returns the element serialized
+on its own as bytes. A picture's `image` is a frozen `Image` snapshot with
+`blob`, `content_type`, and the python-pptx `ext`, and `replace_image` changes
+only that picture through the native staged replacement.
+
+`ShapeCollection.add_shape` accepts a DrawingML preset name or an `MSO_SHAPE`
+member. `add_connector` follows the python-pptx signature, `add_group_shape`
+appends an empty group, and `add_picture` accepts a path, bytes, or a binary
+file-like object, which is rewound first when it can seek. `remove` deletes one
+shape of a slide with the relationships and parts only it used and advances the
+revision once. Nested collections stay read-only.
+
+`TextFrame.autofit`
 reports `none`, `normal`, or `shape` when the body carries an explicit choice.
 `Run.font` reads the run's direct Latin name, size, and sRGB colour, while the
 `Run.text` setter replaces only that run's text and preserves its typed and
 unmodelled properties.
 
+Text formatting follows python-pptx names and value types. Every property
+reads the direct value only, `None` when the element or attribute is absent,
+and assigning `None` removes the direct value. Setters validate before they
+write, raise `ValueError` for an out-of-range value, and leave the package
+unchanged when the value is rejected or equals the stored one, so clearing an
+absent value inserts no empty `a:pPr` or `a:rPr`. They change properties in
+place and do not advance the revision. `rpptx` and `rpptx.enum.text` export
+`MSO_AUTO_SIZE`, `MSO_ANCHOR`, `PP_ALIGN`, and `MSO_UNDERLINE` with python-pptx
+1.0.2 member values, and `rpptx` and `rpptx.dml.color` export `RGBColor`.
+
+- `TextFrame.margin_left`, `margin_right`, `margin_top`, and `margin_bottom`
+  read the body insets as `Length`, converting a universal measure such as
+  `0.1in` to EMU. python-pptx reports the implied 91440 and 45720 EMU defaults
+  instead of `None`, which a placeholder does not have because it inherits
+  its insets. `vertical_anchor` takes `MSO_ANCHOR`, whose `JUSTIFY` and
+  `DISTRIBUTE` extension members name the `just` and `dist` anchors.
+  `word_wrap` maps `square` to `True` and `none` to `False`. `auto_size` takes
+  `MSO_AUTO_SIZE`, and choosing `TEXT_TO_FIT_SHAPE` again keeps a stored font
+  scale. `autofit` keeps its string values.
+- `Paragraph.alignment` takes `PP_ALIGN`. `line_spacing` reads a float number
+  of lines from `a:spcPct` and a `Length` from `a:spcPts`. Assigning a
+  `Length` writes exact points and any other number writes lines, as in
+  python-pptx. `space_before` and `space_after` write points for an integer or
+  `Length` and lines for a float, and read lines back as a float where
+  python-pptx reports `None`. `left_indent`, `right_indent`, and
+  `first_line_indent` use the python-docx names for `marL`, `marR`, and
+  `indent`, where a negative first-line indent hangs.
+- `Paragraph.bullet` reads the direct bullet choice as its character, `False`
+  for `a:buNone`, `True` for an automatic number or picture bullet, or `None`.
+  Assigning a character keeps the bullet colour, size, and font and replaces
+  a preserved picture bullet. `False` writes `a:buNone`, `None` removes the
+  direct bullet, and `True` raises because automatic numbering is not
+  writable yet.
+- `Paragraph.add_run(text="")` appends a run, advances the revision once, and
+  returns the new run captured at that revision. The paragraph handle it was
+  called on becomes stale, like the text frame after `add_paragraph`.
+- `Font` reads and writes the same properties for a run and for a
+  paragraph's default run properties: `name` (`a:latin` typeface, keeping its
+  other attributes), `size` (1 to 4000 points, as python-pptx validates),
+  `bold`, `italic`, `underline`, `strike`, `all_caps`, and `color`.
+  `underline` reads `True` for `sng`, `False` for `none`, and an
+  `MSO_UNDERLINE` member otherwise. `strike` reads `True` for a single or
+  double strike, and assigning `True` keeps a double strike. `all_caps` does
+  not name `cap="small"`, which is preserved until `all_caps` is assigned.
+  `color` still reads the direct sRGB solid fill as an `RRGGBB` string for
+  compatibility, and the setter takes an `RGBColor`, any triple of 0 to 255
+  integers, or a six-digit hexadecimal string. It changes an existing sRGB
+  value in place, keeping transforms such as `a:alpha`, replaces any other
+  colour, and `None` removes the direct fill.
+
 The presentation binding exposes `to_pdf`, `render_slide_to_png`,
 `render_all_slides`, `to_notes_pdf`, and `render_all_notes` through the native
-deterministic facade. Every render call releases the GIL. A `Slide` exposes
-optional speaker-note text as a readable and writable property. A successful
-notes assignment publishes the native staged mutation, advances the global
-revision once, and makes pre-write handles stale. A rejected assignment leaves
-package bytes and revisions unchanged. A `Slide` also exposes an ordered tuple
-of frozen `Comment` snapshots. Each comment contains an ordered tuple of frozen
-`CommentReply` snapshots, and the presentation exposes an ordered tuple of
-frozen `CommentAuthor` snapshots.
+deterministic facade. Every render call releases the GIL.
+`Presentation.text_layout(*, width_factor=1.0)` returns the native
+deterministic text layout as a tuple of frozen `TextFrameLayout` snapshots in
+slide and draw order. Each carries its zero-based slide index, optional shape
+id and name, the effective autofit mode as `none`, `normal`, or `shape`,
+`frame` and `usable` `BoundingBox` values, `font_scale`, `height`, `overflow`,
+and a tuple of frozen `TextLineLayout` snapshots with paragraph index, text,
+bounds, baseline, and font size. Every value is a float in points, as in the
+rdocx `BoundingBox` and `LayoutFragment`, unlike the EMU `Length` values of
+`Shape` and `Font`. The call releases the GIL, and a width factor that is not
+finite and positive raises `RpptxError`, as an invalid raster DPI does.
+
+A `Slide` exposes optional speaker-note text as a readable and writable
+property. Assigning it on a slide without notes creates the notes slide, and
+the notes master when the deck has none, through
+`Presentation::set_notes_text`. A successful notes assignment publishes the
+native staged mutation, advances the global revision once, and makes pre-write
+handles stale. A rejected assignment leaves package bytes and revisions
+unchanged. A `Slide` also exposes an ordered tuple of frozen `Comment`
+snapshots. Each comment contains an ordered tuple of frozen `CommentReply`
+snapshots, and the presentation exposes an ordered tuple of frozen
+`CommentAuthor` snapshots.
 Author, comment, and reply additions accept native GUID and RFC 3339 strings.
 Comment and reply moves retain native final-position semantics. A successful
 collaboration operation advances the global revision once. Constructor or
@@ -305,6 +414,12 @@ native validation failure publishes no candidate and leaves existing handles
 valid.
 
 ## Native Word facade stability
+
+The pre-1.0 `rdocx-layout::TableRow` projection carries a public
+`cant_split: bool` alongside its header and height facts. Direct and
+style-resolved `w:cantSplit` values therefore reach pagination. External Rust
+struct literals for `TableRow` must name the new field. The authored `rdocx`
+row facade and Python, WASM, and CLI authoring surfaces do not change.
 
 The public `rdocx` facade is the common source for native, Python, WASM, and
 CLI consumers. Custom lists are created with `Document::add_list_definition`
@@ -559,7 +674,10 @@ projection, including when a nested control precedes a link owned by its
 ancestor item. Returned records are detached snapshots, so later document
 mutation cannot alter an earlier result. Each `story_items` or `hyperlinks`
 accessor materializes one native source and owner inventory for the complete
-tuple instead of rebuilding it per returned record.
+tuple instead of rebuilding it per returned record. Hyperlink discovery also
+inventories every exact link namespace scope in one source pass, then extracts
+display text from bounded namespace-complete fragments rather than reparsing
+the story prefix for each record.
 
 `Document::rebuild_toc()` is an additive pre-1.0 native Rust operation. It
 updates only supported existing main-story TOC fields with deterministic
@@ -1353,11 +1471,13 @@ and RFC 3339 timestamps, and mutation returns the ordinary facade `Result`
 without creating an allocator, clock, trait, generic, or builder.
 
 The additive methods are `comment_authors`, `add_comment_author`, `comments`,
-`add_comment`, `reply_to_comment`, `move_comment`, `move_reply`, `sections`,
-`set_sections`, `notes_header_footer_mut`, and `handout_header_footer_mut`.
-They remain native Rust only. Python, WASM, and CLI consumers gain no
-collaboration or navigation methods and continue to preserve these package
-parts through their existing `Presentation` owner.
+`add_comment`, `reply_to_comment`, `resolve_comment`, `remove_comment`,
+`move_comment`, `move_reply`, `sections`, `set_sections`,
+`notes_header_footer_mut`, and `handout_header_footer_mut`. Python exposes the
+comment snapshots, additions, and moves described with the presentation
+binding, and `rpptx comment` exposes the comment operations described under
+CLIs. WASM consumers gain no collaboration or navigation methods and continue
+to preserve these package parts through their existing `Presentation` owner.
 
 The low-level `rpptx-oxml` model adds the approved `comments` module and
 extends existing presentation, notes, slide, relationship, and content-type
@@ -1419,6 +1539,30 @@ These additions are native Rust APIs only. Python, WASM, and CLI surfaces add
 no notes or handout methods and continue to preserve the underlying parts. No
 new public surface is added to `rpptx-layout`, `rpptx-render`, or the OXML
 crates. The additive facade API is reviewed through the pre-1.0 release gate.
+
+## Native PowerPoint text layout
+
+The published pre-1.0 `rpptx` facade exposes the concrete `TextFrameLayout`
+value and one render-feature method:
+
+```rust
+Presentation::text_layout_deterministic(&self, width_factor: f64)
+    -> Result<Vec<TextFrameLayout>>;
+```
+
+`TextFrameLayout` carries the zero-based slide index, the optional shape id and
+name, the effective `AutofitMode`, and an `rpptx_render::ShapeTextLayout`. The
+published pre-1.0 `rpptx-render` crate adds the concrete `ShapeTextLayout` and
+`TextLineLayout` values and `layout_shape_text`, which shares its stacking path
+with slide lowering. `08-rendering-spec.md` owns the coordinate, overflow, and
+width factor semantics.
+
+Python gains `Presentation.text_layout` with frozen `BoundingBox`,
+`TextFrameLayout`, and `TextLineLayout` snapshots, described under the Python
+API shape above. WASM and CLI consumers gain no text layout method. This is an
+additive semver change for `rpptx` and `rpptx-render`. It adds no production
+dependency, feature flag, trait, dynamic dispatch, generic parameter, or
+builder.
 
 ## Native PowerPoint executable-content inventory
 
@@ -1823,12 +1967,26 @@ or tag authority.
 ## CLIs
 
 `rpptx-cli` extends the seven-command `rdocx-cli` surface with `inspect`,
-`text`, `convert`, `diff`, `replace`, `validate`, `render`, `thumbnail`, and
-`outline`. It uses clap derive and `serde_json` for `--json`.
+`text`, `convert`, `diff`, `replace`, `validate`, `render`, `thumbnail`,
+`outline`, and `comment`. It uses clap derive and `serde_json` for `--json`.
 
 `inspect` reports the file, slide and layout counts, slide size, core metadata,
 and each slide's identity, hidden state, and shape count. Its JSON form uses the
-shared schema-1 envelope. `text` emits slide text in presentation order.
+shared schema-1 envelope. Beside each slide's shape count, `shape_details`
+lists every immediate shape in z-order with its index, non-visual id and name,
+kind, placeholder type and index, direct position and size in EMU, rotation in
+degrees, direct autofit mode, paragraphs, table size, and children. A
+placeholder that inherits its transform reports null geometry, and a
+placeholder without an explicit type reports a null type. `text` emits slide
+text in presentation order. `text --json` emits schema-1 slides with a one-based
+slide number, the slide id, paragraphs, and speaker notes, which are null when
+the slide has no notes part. Each paragraph carries a typed zero-based path of
+shape, table row, table cell, and paragraph positions, the owning shape id, its
+level, its visible text, and its regular runs. Run indexes match
+`TextParagraphRef::run`, so fields and line breaks appear only in the paragraph
+text, where a line break is U+000B. Run formatting is null without direct run
+properties. Otherwise it contains nullable direct bold, italic, underline token,
+Latin font, point size, and sRGB colour fields.
 `convert` produces deterministic PDF, PNG, JPEG or TIFF output. Multi-slide PNG
 and JPEG output uses one-based filename suffixes and renders one slide at a
 time, while TIFF writes one multi-page stream. `diff` compares slide text with
@@ -1848,7 +2006,34 @@ wide and preserves the rendered page aspect ratio. Its output defaults through
 the shared extension helper. `outline` prints each slide title once, followed
 by non-title text paragraphs in recursive shape z-order. Tables use row-major
 cell order, paragraph levels add two spaces of indentation, empty text is
-omitted, and embedded paragraph breaks become spaces.
+omitted, and embedded paragraph breaks become spaces. `outline --json` reports
+the same title, or null for an untitled slide, the same items with their
+levels, and the speaker notes. Notes are the plain text of the notes body, with
+paragraphs and line breaks both written as newlines. `text --notes` and
+`outline --notes` print one `Notes:` line for each non-empty notes line after
+the slide's plain output. JSON output always carries the notes.
+
+The structured output reads public facade values only. `ShapeRef` gains
+`rotation` and `placeholder_type`, and `PhType::as_str` and
+`TextUnderline::as_str` become public. These are additive changes to the
+pre-1.0 `rpptx`, `rpptx-oxml`, and `oxml-drawing` crates.
+
+`comment` lists, adds, replies to, resolves, and removes modern PowerPoint
+comments. Legacy comment parts stay preserved and unlisted. `list` shows a
+comment or reply without a status, or with the `active` status, as open, and a
+`resolved` or `closed` one as such. Its JSON carries the `resolved` flag
+beside the raw `status` token. `add` takes a one-based `--slide`. `add` and
+`reply` require an RFC 3339 `--date`, reuse the first author with the given
+name, and otherwise add an author whose `userId` is that name and whose
+`providerId` is `None`. New author, comment, and reply ids are the first
+unused sequential GUIDs, so the output depends on neither a clock nor a random
+source. `resolve` accepts only a thread id. `remove` accepts a thread id,
+which removes its replies, or a reply id. Every mutation requires an explicit
+output, refuses an existing one, and publishes through the shared staged
+output set. Its schema-1 record states the action, comment id, one-based
+slide, and output path. The commands use the additive
+`Presentation::resolve_comment` and `Presentation::remove_comment` facade
+methods, which rest on the new `Comment::remove_reply`.
 
 Shared range parsing, output-path defaulting, and JSON envelope rules live in
 `oxml-cli-support`. Ranges are positive, one-based, comma-separated values and

@@ -754,7 +754,20 @@ row span and suppresses physical horizontal edges inside that span. Ordinary
 cells establish row minima. Merge content grows the last non-exact row in its
 span only when the complete content needs more room. Exact rows stay pinned
 and clip overflow, while minimum rows may grow. Resolved cell margins define
-the local text and drawing content box.
+the local text and drawing content box. A cell's own `w:tcMar` replaces the
+table's `w:tblCellMar` edge by edge.
+
+A horizontal border takes its own height between two rows, as it does in Word,
+rather than being drawn over their content. The band above a row is the widest
+resolved edge on that boundary, from the bottom edges of the row above and the
+top edges of the row below, so a shared border counts once. The table's top
+border is the first row's band, and its bottom border is a band the last row
+adds below its content. A vertical merge has no edge where it continues. A
+border is `w:sz` eighths of a point, and a `double` border counts three times
+that, two lines and their gap. An automatic or minimum row height gains its
+band above, and an exact height already includes it. Content starts below the
+band and each horizontal line fills the band below its boundary. Vertical
+borders do not shift the table or its content.
 
 Borders are physical row or column segments rather than four strokes per cell.
 The renderer maps every logical cell edge onto those segments and emits each
@@ -849,9 +862,18 @@ Facing-page and section-scoped resolution is not modelled.
 
 Two limits are deliberate. A table that does not float still takes the full
 measure beside a float rather than narrowing its columns inside the keep-out
-band, because that is a re-layout rather than a re-position. `w:cantSplit`
-stays a round-trip and reader fact, because making it meaningful needs row
-splitting for the default case.
+band, because that is a re-layout rather than a re-position. A flowed ordinary
+row breaks across pages at complete paragraph boundaries or at line boundaries
+that preserve widow and orphan minima. Each cell advances independently at a
+safe boundary, and a continuation fragment retains the same logical row and
+cell ownership. A page break repeats preceding header rows, records another
+body-layout fragment, and extends vertical borders and fill without adding a
+horizontal border at the artificial break. `w:cantSplit` instead moves the
+whole row when it fits the next page. An unsplittable row taller than a fresh
+page paints once with visible overflow rather than retrying indefinitely.
+Merged, rotated, anchored, nested-table and exact-height rows keep their
+whole-row placement, including exact-height clipping, until those cases have
+a safe fragment model.
 
 A conditional table-style region's `w:trPr` resolves base first, exactly like
 its cell layers. The style's base row properties apply first, then every region
@@ -880,6 +902,9 @@ every `w:cnfStyle` on the row, the cell and the cell's paragraphs. Direct table
 and cell properties remain the final overlay. An explicit
 cell `nil` or `none` border yields to a visible table border only on the exact
 outer edge. The same value remains suppressive on an interior edge.
+The model retains `nil` and `none` as distinct source tokens because an
+unrelated table or document edit must not normalize producer XML. Both tokens
+have the same invisible-border layout behavior.
 
 A table without an explicit style uses the authored default table style.
 Its modeled base width, alignment, indent, borders, shading, look, and cell
@@ -990,6 +1015,57 @@ with nothing measurable keeps its declared grid.
   typically one to three. A per-layout shaping cache makes repeat passes nearly
   free. If the 25 percent candidate still does not fit, draw it visibly without
   clipping.
+
+### Slide text layout as data
+
+The lines a slide draws are also available as data, so a caller can check a
+deck for overflowing text without rasterising it. `rpptx_render::layout_shape_text`
+takes the path shape lowering takes, the content box, its quarter turn for
+vertical text, paragraph stacking, autofit and anchoring, and returns a
+`ShapeTextLayout` instead of positioned elements. Lowering calls the same
+helper with a width factor of one, so the reported lines cannot drift from the
+PNG and PDF output.
+
+Values are points. Rectangles use slide coordinates for the shape's unrotated
+frame, the box `a:xfrm` describes before rotation and flips, moved with the
+shape's centre through its parent groups. `frame` is that box and `usable` is
+its text rectangle minus insets, where lines wrap. Vertical text is reported in
+its reading frame, the usable box turned a quarter turn about its centre, so its
+`height` compares with `usable.height` exactly as horizontal text does.
+
+Each `TextLineLayout` gives its zero-based paragraph, its run and field text as
+drawn without the bullet marker, its bounds, its baseline, and the largest run
+point size on the line after autofit scaling. The bounds span every drawn item,
+bullet included, and the full line height. Rich spans appear in logical order,
+as extraction reads them. Line text keeps the spaces the renderer draws, so a
+line can begin or end with one.
+
+`overflow` applies the test the bare normal-autofit ladder uses to accept a
+candidate. Every line must fit its available width and the whole stack,
+paragraph spacing included, must fit the usable height, each within 0.01 point.
+What that means follows from what each mode draws.
+
+- `a:noAutofit`: the text at its own size. A frame one line too long
+  overflows.
+- `a:normAutofit` with stored values: the text at the stored scale, which
+  `font_scale` reports. Overflow means the stored scale no longer fits, for
+  example after an edit.
+- A bare `a:normAutofit`: the first ladder candidate that fits, reported in
+  `font_scale`. It overflows only when the 25 percent floor still does not fit.
+- `a:spAutoFit`: the stored extent, which the renderer does not grow. Overflow
+  means the stored extent is smaller than the text under the bundled fonts, so
+  a renderer that does not resize would spill it.
+
+A width factor multiplies the usable width before line breaking and keeps its
+left edge. Autofit runs against the narrower box, so `0.95` answers whether the
+frame still fits when another renderer takes five percent of its width.
+
+`Presentation::text_layout_deterministic` resolves the same staged package and
+deterministic fonts as `to_pdf_deterministic`. It reports each text-bearing
+shape of each slide's own shape tree with its slide index, shape id, name, and
+effective autofit mode. Layout and master shapes, SmartArt, table cells, and
+text bodies that draw no visible character are left out, since an empty
+paragraph taller than a thin divider would otherwise read as overflow.
 
 ## Performance
 

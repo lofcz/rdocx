@@ -129,6 +129,7 @@ impl ST_Underline {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ST_Border {
     None,
+    Nil,
     Single,
     Thick,
     Double,
@@ -154,7 +155,8 @@ pub enum ST_Border {
 impl ST_Border {
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
-            "none" | "nil" => Ok(Self::None),
+            "none" => Ok(Self::None),
+            "nil" => Ok(Self::Nil),
             "single" => Ok(Self::Single),
             "thick" => Ok(Self::Thick),
             "double" => Ok(Self::Double),
@@ -179,9 +181,15 @@ impl ST_Border {
         }
     }
 
+    /// Whether this token suppresses border painting.
+    pub fn is_none(self) -> bool {
+        matches!(self, Self::None | Self::Nil)
+    }
+
     pub fn to_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Nil => "nil",
             Self::Single => "single",
             Self::Thick => "thick",
             Self::Double => "double",

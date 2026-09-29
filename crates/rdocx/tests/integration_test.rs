@@ -8546,8 +8546,10 @@ fn independent_nested_tables_measure_to_one_final_height() {
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert!((first[0].height - second[0].height).abs() < 0.001);
+    // A minimum row height excludes the horizontal border bands, as in Word,
+    // so each table keeps its 1 point bottom border below that minimum.
     assert!(
-        (first[0].height - f64::from(final_height_twips) / 20.0).abs() < 0.001,
+        (first[0].height - (f64::from(final_height_twips) / 20.0 + 1.0)).abs() < 0.001,
         "measured {final_height}, rounded to {final_height_twips} twips, laid out {}",
         first[0].height
     );
@@ -8855,6 +8857,7 @@ fn word_fractional_line_spacing_opens_with_nearest_twip_values() {
 
     assert_eq!(multiples, [257.0 / 240.0, 320.0 / 240.0, 343.0 / 240.0]);
 
+    document.add_paragraph("force a typed main-part rewrite");
     let saved = document.to_bytes().unwrap();
     let saved_package = OpcPackage::from_reader(std::io::Cursor::new(&saved)).unwrap();
     let saved_xml =
@@ -8870,6 +8873,7 @@ fn word_fractional_line_spacing_opens_with_nearest_twip_values() {
         reopened
             .paragraphs()
             .iter()
+            .take(3)
             .map(|paragraph| paragraph.line_spacing_multiple().unwrap())
             .collect::<Vec<_>>(),
         multiples
@@ -8886,7 +8890,8 @@ fn word_fractional_line_spacing_opens_with_nearest_twip_values() {
     integer_package.set_part("/word/document.xml", integer_xml.into_bytes());
     let mut integer_bytes = std::io::Cursor::new(Vec::new());
     integer_package.write_to(&mut integer_bytes).unwrap();
-    let integer_document = Document::from_bytes(integer_bytes.get_ref()).unwrap();
+    let mut integer_document = Document::from_bytes(integer_bytes.get_ref()).unwrap();
+    integer_document.add_paragraph("force a typed main-part rewrite");
     assert_eq!(
         document.render_page_to_png_deterministic(0, 72.0).unwrap(),
         integer_document
@@ -11280,6 +11285,7 @@ fn encoded_comment_ids_reopen_as_one_complete_comment_anchor() {
         .collect::<Vec<_>>();
     assert_eq!(reference_ids, [7]);
 
+    document.add_paragraph("force a typed main-part rewrite");
     let saved = document.to_bytes().unwrap();
     let reopened = Document::from_bytes(&saved).expect("saved comment package reopens");
     assert_eq!(reopened.comments()[0].id(), 7);
@@ -16979,6 +16985,7 @@ mod f269_section_page_semantics {
             1,
         );
         let mut reparsed = document_from_xml(&document_with_sect_pr(&aliased));
+        reparsed.add_paragraph("force a typed main-part rewrite");
         assert_eq!(saved_sect_pr(&mut reparsed), sect_pr);
     }
 
@@ -18750,6 +18757,7 @@ mod advanced_table_authoring_and_geometry {
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
+            do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
             math_properties: None,
             document,
@@ -19973,14 +19981,18 @@ mod f266b_ruby_and_emphasis_typography {
         );
         assert_eq!(paragraphs[0].text(), format!("before {RUBY_BASE} after"));
 
-        // The same ruby behind a producer alias reads through that alias and
-        // writes back with the fixed `w:` prefix.
+        // The same ruby behind a producer alias reads through that alias. A
+        // typed main-part edit then writes it back with the fixed `w:` prefix.
         let aliased = producer_document(concat!(
             r#"<w:p><q:ruby xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
             r#"<q:rt><q:r><q:t>かんじ</q:t></q:r></q:rt>"#,
             r#"<q:rubyBase><q:r><q:t>漢字</q:t></q:r></q:rubyBase></q:ruby></w:p>"#,
         ));
         let mut document = Document::from_bytes(&aliased).unwrap();
+        document
+            .paragraph_mut(0)
+            .expect("aliased ruby paragraph")
+            .add_run(" edited");
         let xml = saved_document_xml(&document.to_bytes().unwrap());
         assert!(
             xml.contains(
@@ -21058,9 +21070,13 @@ mod f266c_character_grid_and_vertical_text {
             assert_eq!(paragraph.snap_to_grid_value(), Some(true));
         }
 
-        // A modeled toggle writes the canonical spelling, which is bare for
-        // an on value and `w:val="false"` for an off one, exactly as the
-        // toggles F-264 already modeled do.
+        // A typed main-part edit writes modeled toggles in the canonical
+        // spelling, which is bare for an on value and `w:val="false"` for an
+        // off one, exactly as the toggles F-264 already modeled do.
+        document
+            .paragraph_mut(0)
+            .expect("toggle paragraph")
+            .add_run(" edited");
         let saved = String::from_utf8(
             OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap()))
                 .unwrap()

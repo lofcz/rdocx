@@ -18,7 +18,8 @@ mode" below.
    - `.claude/plans/F-XXX-design.md` exists and every checklist item is ticked.
    - The latest `.claude/reviews/F-XXX-*` pass reports **zero defects and zero
      smells**.
-   - `/verify` passes. Not `--fast`.
+   - `/verify --scoped F-XXX` passes, including every risk rider declared by
+     the approved design plan.
 
    If any fails, say which and stop.
 
@@ -86,7 +87,7 @@ Do steps 1 through 3 and step 7 normally. Then instead of steps 4 to 6 and 9:
    **Head**: <the sha this commit will be>
    **Design plan**: .claude/plans/F-XXX-design.md
    **Microscope**: .claude/reviews/F-XXX-<aspect>-pass-N.md, 0 defects, 0 smells
-   **Verify**: <scope>, pass
+   **Verify**: /verify --scoped F-XXX, pass
    **Hash harness**: unchanged | <delta and its justification>
    **Test gate**: <test name>, pass
    ```
@@ -147,7 +148,7 @@ test gate or to any non-release F-ID.
 - **Completing an F-ID whose hash-harness delta was never declared.**
 - **`--prepare` from the canonical sprint worktree.** It exists for a claimed
   worker branch. Run the normal command instead.
-- **A `--prepare` handoff that records a `--fast` verify.** `--fast` is the
+- **A `--prepare` handoff without `/verify --scoped F-XXX`.** `--fast` is the
   inner loop. `validate-handoff` refuses it, and so should you.
 - **Using release preparation to claim publication succeeded.** The F-ID stays
   reviewed until `/release` verifies the registry and GitHub release.

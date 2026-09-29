@@ -366,31 +366,36 @@ MEASUREMENT_COLUMNS = (
     "Measured on",
 )
 MEASUREMENT_DATE = "2026-09-19"
+ARCHIVE_REMEASUREMENT_DATES = {
+    "rdocx": "2026-09-26",
+    "rdocx-layout": "2026-09-26",
+    "rpptx": "2026-09-26",
+}
 MEASUREMENT_PLATFORM = "macOS 26.6.2, Apple M5 Max, arm64"
 ARCHIVE_COMPRESSION_TOLERANCE_BYTES = 64
 ARCHIVE_MEASUREMENTS = {
     "oxml-chart": (102_042, 659_367, 6),
     "oxml-cli-support": (6_718, 21_586, 6),
     "oxml-core": (20_677, 100_124, 15),
-    "oxml-drawing": (159_703, 1_121_577, 24),
+    "oxml-drawing": (161_119, 1_128_372, 24),
     "oxml-layout": (4_623_324, 9_227_483, 51),
     "oxml-media": (12_252, 50_992, 6),
-    "oxml-opc": (91_907, 354_453, 12),
+    "oxml-opc": (92_122, 355_510, 12),
     "oxml-pdf": (66_015, 304_432, 14),
     "oxml-sml": (12_511, 49_803, 6),
-    "rdocx": (1_076_425, 6_419_062, 36),
+    "rdocx": (1_092_256, 6_498_484, 36),
     "rdocx-cli": (33_805, 145_256, 8),
     "rdocx-html": (15_486, 63_894, 11),
-    "rdocx-layout": (251_566, 1_368_545, 15),
+    "rdocx-layout": (255_752, 1_385_701, 15),
     "rdocx-opc": (3_655, 9_668, 6),
-    "rdocx-oxml": (367_095, 2_377_391, 32),
+    "rdocx-oxml": (367_500, 2_380_047, 32),
     "rdocx-pdf": (8_111, 26_758, 6),
-    "rpptx": (387_762, 2_018_565, 16),
+    "rpptx": (407_658, 2_122_094, 16),
     "rpptx-chart": (6_648, 21_136, 6),
-    "rpptx-cli": (27_236, 108_831, 8),
+    "rpptx-cli": (36_709, 159_585, 8),
     "rpptx-layout": (79_109, 458_112, 11),
-    "rpptx-oxml": (152_243, 1_038_449, 20),
-    "rpptx-render": (57_790, 320_838, 8),
+    "rpptx-oxml": (153_216, 1_042_644, 20),
+    "rpptx-render": (59_928, 329_994, 8),
 }
 PACKAGE_VERSIONS = {
     **{name: "0.12.1" for name, _ in LOCAL_PATCHES if not name.startswith("rdocx")},
@@ -420,7 +425,7 @@ def archive_row(package: str) -> MeasurementRow:
         f"Tracked `{package}` package inventory",
         "`python3 scripts/readme_doctests.py --record-measurements`",
         "gzip archive bytes, tar member bytes, tar member count",
-        MEASUREMENT_DATE,
+        ARCHIVE_REMEASUREMENT_DATES.get(package, MEASUREMENT_DATE),
     )
 
 

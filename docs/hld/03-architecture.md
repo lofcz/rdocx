@@ -591,6 +591,18 @@ carries it into `oxml-layout::LineBreakParams::default_tab_interval_pt`, whose
 `36.0` default is the exact literal it replaced, so a document that says
 nothing keeps Word's half-inch implicit tab grid.
 
+Two consecutive paragraphs of the body, or of one table cell, are separated by
+the larger of the first one's space after and the second one's space before,
+which is what Word does. The paginator reduces a paragraph's space before by
+the space after already above the cursor, because body paragraph blocks are
+cached and must not carry a value that depends on their neighbour. Table
+layout reduces the space before of a cell paragraph that follows another, so a
+row height stays a plain sum. Spacing that meets across a table edge or between
+two rows is added. `w:compat/w:doNotUseHTMLParagraphAutoSpacing` restores the
+sum everywhere and reaches layout as
+`LayoutInput::do_not_use_html_paragraph_auto_spacing`. Space before stays
+suppressed at the top of every page.
+
 The comments model owns typed comment entries and the three body anchor forms.
 Comment bodies retain ordered paragraphs, producer attributes, and unmodelled
 children. Paragraph and run models retain each anchor at its insertion boundary
@@ -1203,6 +1215,12 @@ allocate a collision-safe part only on the first authored value, and the part,
 its relationship and its content-type override are pruned together when the
 last value is removed from a part this facade created.
 
+Facade serialization compares each relationship-resolved typed root with the
+typed state parsed from its current package part. An equal root keeps the exact
+source bytes, including producer formatting and namespace choices. A changed
+root serializes only its owned part. Relationship collections apply the same
+rule to their source `.rels` bytes.
+
 Container-neutral Word story editing also belongs to the `rdocx` facade.
 Concrete `StoryKind`, `StoryId`, `ContentLocation`, `StoryItemKind`, and
 `StoryItemRef` values address the body, cells, headers, footers, ordinary
@@ -1221,9 +1239,10 @@ text boxes remain separate owners and are not folded into the enclosing item.
 and returns each existing `LinkInfo` with its checked `ContentLocation`. This
 keeps nested content-control ownership without reordering interleaved links.
 Owned story-item and story-link snapshots build the package source and owner
-inventory once per accessor. Namespace scopes for all selected owners are
-collected in one source pass, then item text and links are projected from that
-bounded inventory without restarting discovery for each returned value.
+inventory once per accessor. Namespace scopes for all selected owners, items,
+and hyperlink starts are collected in bounded source passes. Item and hyperlink
+text is then projected from namespace-complete fragments without restarting at
+the physical story root for each returned value.
 
 The Python projection materializes each story item as a frozen value with its
 exact XML bytes and the binding revision that produced it. Story mutation

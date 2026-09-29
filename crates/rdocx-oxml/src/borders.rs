@@ -492,6 +492,41 @@ mod tests {
     }
 
     #[test]
+    fn nil_border_spelling_survives_reserialization() {
+        let source = concat!(
+            r#"<q:pBdr xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<q:top q:val="nil"/><q:bottom q:val="none"/></q:pBdr>"#,
+        );
+        let mut reader = Reader::from_str(source);
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(_)) => break,
+                Ok(Event::Eof) => panic!("missing pBdr start"),
+                _ => {}
+            }
+        }
+        let mut borders = CT_PBdr::from_xml_with_prefixes(&mut reader, &["q".to_owned()]).unwrap();
+        let top = borders.top.as_ref().unwrap();
+        assert_eq!(top.val, ST_Border::Nil);
+        assert_eq!(borders.bottom.as_ref().unwrap().val, ST_Border::None);
+
+        let mut output = Vec::new();
+        borders.to_xml(&mut Writer::new(&mut output)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(r#"<w:top w:val="nil"/>"#), "{output}");
+        assert!(output.contains(r#"<w:bottom w:val="none"/>"#), "{output}");
+
+        borders.top.as_mut().unwrap().val = ST_Border::Single;
+        let mut output = Vec::new();
+        borders.to_xml(&mut Writer::new(&mut output)).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains(r#"<w:top w:val="single"/>"#)
+        );
+    }
+
+    #[test]
     fn round_trip_borders() {
         let bdr = CT_PBdr {
             top: Some(CT_BorderEdge {

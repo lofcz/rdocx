@@ -1,21 +1,36 @@
+import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from rpptx import (
+    BoundingBox,
     Comment,
     CommentAuthor,
     CommentReply,
     Inches,
     Length,
+    MSO_ANCHOR,
+    MSO_AUTO_SIZE,
     MSO_SHAPE,
+    MSO_UNDERLINE,
+    PP_ALIGN,
     Presentation,
     Pt,
+    RGBColor,
+    TextFrameLayout,
+    TextLineLayout,
 )
 from rpptx._rpptx import (
+    AdjustmentCollection,
+    Background,
     Cell,
+    ColorFormat,
     Column,
     ColumnCollection,
+    FillFormat,
     Font,
+    Image,
+    LineFormat,
     Paragraph,
     ParagraphCollection,
     PlaceholderCollection,
@@ -30,6 +45,8 @@ from rpptx._rpptx import (
     Table,
     TextFrame,
 )
+from rpptx.enum.dml import MSO_FILL_TYPE
+from rpptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE_TYPE
 
 
 def exercise_rpptx_types(path: Path) -> None:
@@ -59,6 +76,60 @@ def exercise_rpptx_types(path: Path) -> None:
     run_font_name: str | None = run.font.name
     run_font_size: Length | None = run.font.size
     run_font_color: str | None = run.font.color
+    frame: TextFrame = presentation.slides[0].shapes[-1].text_frame
+    frame.margin_left = Inches(0.1)
+    frame.margin_right = None
+    frame.margin_top = Pt(2)
+    frame.margin_bottom = 0
+    margins: tuple[Length | None, ...] = (
+        frame.margin_left,
+        frame.margin_right,
+        frame.margin_top,
+        frame.margin_bottom,
+    )
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    anchor: MSO_ANCHOR | None = frame.vertical_anchor
+    frame.word_wrap = True
+    word_wrap: bool | None = frame.word_wrap
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    auto_size: MSO_AUTO_SIZE | None = frame.auto_size
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    alignment: PP_ALIGN | None = paragraph.alignment
+    paragraph.line_spacing = 1.5
+    paragraph.line_spacing = Pt(18)
+    line_spacing: float | Length | None = paragraph.line_spacing
+    paragraph.space_before = Pt(6)
+    paragraph.space_after = 0.5
+    spacing: tuple[Length | float | None, ...] = (
+        paragraph.space_before,
+        paragraph.space_after,
+    )
+    paragraph.left_indent = Inches(0.5)
+    paragraph.right_indent = None
+    paragraph.first_line_indent = -Inches(0.25)
+    indents: tuple[Length | None, ...] = (
+        paragraph.left_indent,
+        paragraph.right_indent,
+        paragraph.first_line_indent,
+    )
+    paragraph.bullet = "-"
+    paragraph.bullet = False
+    bullet: str | bool | None = paragraph.bullet
+    added: Run = paragraph.add_run("added")
+    added = frame.paragraphs[0].add_run()
+    font: Font = added.font
+    font.name = "Arial"
+    font.color = RGBColor(0x12, 0x34, 0x56)
+    font.color = "123456"
+    font.color = None
+    font.italic = True
+    font.underline = True
+    font.underline = MSO_UNDERLINE.DOUBLE_LINE
+    underline: bool | MSO_UNDERLINE | None = font.underline
+    font.strike = False
+    font.all_caps = None
+    font_flags: tuple[bool | None, ...] = (font.italic, font.strike, font.all_caps)
     broad_shape_factory: Callable[[int, int, int, int, int], Shape] = (
         presentation.slides[0].shapes.add_shape  # type: ignore[assignment]
     )
@@ -104,6 +175,60 @@ def exercise_rpptx_types(path: Path) -> None:
     )
     comments: tuple[Comment, ...] = presentation.slides[0].comments
     reply: CommentReply = comments[0].replies[0]
+    slide_width: Length | None = presentation.slide_width
+    presentation.slide_height = Inches(6)
+    current_slide = presentation.slides[0]
+    slide_layout: SlideLayout = current_slide.slide_layout
+    layout_index: int = presentation.slide_layouts.index(slide_layout)
+    same_layout: bool = slide_layout == presentation.slide_layouts[0]
+    hidden: bool = current_slide.hidden
+    current_slide.hidden = True
+    background: Background = current_slide.background
+    background_fill: FillFormat = background.fill
+    follows_master: bool = current_slide.follow_master_background
+    current_slide.follow_master_background = False
+    shape = current_slide.shapes.add_shape(
+        "roundRect", Inches(1), Inches(1), Inches(2), Inches(1)
+    )
+    shape.left = Inches(2)
+    shape.top = Inches(2)
+    shape.width = Inches(3)
+    shape.height = Inches(1)
+    shape.name = "Typed"
+    shape.rotation = 15.0
+    rotation: float = shape.rotation
+    shape_type: MSO_SHAPE_TYPE | None = shape.shape_type
+    adjustments: AdjustmentCollection = shape.adjustments
+    adjustments[0] = 0.25
+    first_adjustment: float = adjustments[0]
+    all_adjustments: list[float] = list(adjustments)
+    fill: FillFormat = shape.fill
+    fill.solid()
+    fill_type: MSO_FILL_TYPE | None = fill.type
+    fore_color: ColorFormat = fill.fore_color
+    fore_color.rgb = RGBColor(0x12, 0x34, 0x56)
+    rgb: RGBColor | None = fore_color.rgb
+    line: LineFormat = shape.line
+    line.width = Pt(1)
+    line.width = None
+    line_width: Length = line.width
+    line.color.rgb = RGBColor.from_string("FF0000")
+    line_fill: FillFormat = line.fill
+    shape_xml: bytes = shape.xml
+    connector: Shape = presentation.slides[0].shapes.add_connector(
+        MSO_CONNECTOR.STRAIGHT, 0, 0, Inches(1), Inches(1)
+    )
+    group: Shape = presentation.slides[0].shapes.add_group_shape()
+    picture = presentation.slides[0].shapes.add_picture(
+        io.BytesIO(b""), 0, 0
+    )
+    image: Image = picture.image
+    blob: bytes = image.blob
+    picture.replace_image(b"")
+    picture.replace_image(path)
+    presentation.slides[0].shapes.remove(group)
+    presentation.slides.move(0, -1)
+    presentation.slides.remove(presentation.slides[0])
     presentation.save(path)
     (
         package_bytes,
@@ -131,11 +256,88 @@ def exercise_rpptx_types(path: Path) -> None:
         run_font_name,
         run_font_size,
         run_font_color,
+        margins,
+        anchor,
+        word_wrap,
+        auto_size,
+        alignment,
+        line_spacing,
+        spacing,
+        indents,
+        bullet,
+        underline,
+        font_flags,
+        slide_width,
+        layout_index,
+        same_layout,
+        hidden,
+        background_fill,
+        follows_master,
+        rotation,
+        shape_type,
+        first_adjustment,
+        all_adjustments,
+        fill_type,
+        rgb,
+        line_width,
+        line_fill,
+        shape_xml,
+        connector,
+        blob,
+        image.content_type,
+        image.ext,
     )
 
 
+def exercise_rpptx_text_layout_types(presentation: Presentation) -> None:
+    frames: tuple[TextFrameLayout, ...] = presentation.text_layout()
+    narrower: tuple[TextFrameLayout, ...] = presentation.text_layout(width_factor=0.95)
+    for frame in frames + narrower:
+        slide_index: int = frame.slide_index
+        shape_id: int | None = frame.shape_id
+        name: str | None = frame.name
+        autofit: str = frame.autofit
+        box: BoundingBox = frame.frame
+        usable: BoundingBox = frame.usable
+        box_edges: tuple[float, float, float, float] = (
+            usable.x,
+            usable.y,
+            usable.width,
+            usable.height,
+        )
+        font_scale: float = frame.font_scale
+        height: float = frame.height
+        overflow: bool = frame.overflow
+        lines: tuple[TextLineLayout, ...] = frame.lines
+        for line in lines:
+            paragraph_index: int = line.paragraph_index
+            text: str = line.text
+            bounds: BoundingBox = line.bounds
+            baseline: float = line.baseline
+            font_size: float = line.font_size
+            (paragraph_index, text, bounds, baseline, font_size)
+        (
+            slide_index,
+            shape_id,
+            name,
+            autofit,
+            box,
+            box_edges,
+            font_scale,
+            height,
+            overflow,
+        )
+
+
 if TYPE_CHECKING:
+    BoundingBox()  # type: ignore[call-arg]
+    AdjustmentCollection()  # type: ignore[call-arg]
+    Background()  # type: ignore[call-arg]
     Cell()  # type: ignore[call-arg]
+    ColorFormat()  # type: ignore[call-arg]
+    FillFormat()  # type: ignore[call-arg]
+    Image()  # type: ignore[call-arg]
+    LineFormat()  # type: ignore[call-arg]
     Comment()  # type: ignore[call-arg]
     CommentAuthor()  # type: ignore[call-arg]
     CommentReply()  # type: ignore[call-arg]
@@ -155,3 +357,5 @@ if TYPE_CHECKING:
     SlideLayoutCollection()  # type: ignore[call-arg]
     Table()  # type: ignore[call-arg]
     TextFrame()  # type: ignore[call-arg]
+    TextFrameLayout()  # type: ignore[call-arg]
+    TextLineLayout()  # type: ignore[call-arg]

@@ -246,7 +246,7 @@ human.
 For the ordinary final gate, only after every branch is integrated or consumed
 by a dependency-prefix checkpoint:
 
-1. Run `/verify --full`. Not per worker, and not `--fast`.
+1. Run `/verify --full`. Not per worker, not `--fast`, and not `--scoped`.
 2. Add the union of every `## Risk routing` rider the sprint's plans declared.
    A rider one story earned runs once here for the whole sprint.
 3. **The hash harness is the step that matters most.** Every delta must trace to

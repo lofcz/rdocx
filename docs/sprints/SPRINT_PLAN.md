@@ -1505,13 +1505,34 @@ F-X130 follows F-264 through F-270 so all 27 package READMEs and both PyPI long
 descriptions can present the completed S74 surface with reproducible feature,
 footprint, and performance evidence.
 
-#### Sprint S75, Related stories, notes, and fragments
+#### Sprint S75, Contribution intake and table pagination correction
 
-**Goal**: make every non-main Word story a first-class authoring location and
-complete rich notes, ranges, fragments, and building blocks.
+**Goal**: restore the hosted Python binding gate, integrate the open
+contribution wave and its unassigned issue reports, then finish Issue 138's
+table pagination correction before one reviewed mid-milestone merge.
 
 | F-ID | Title | Size |
 |------|-------|------|
+| F-X134 | Keep Python story hyperlink snapshots linear | S |
+| F-X135 | Integrate PRs 146 through 151 and resolve unassigned reports | L |
+| F-X136 | Fix table row breaks and footer-only pages | L |
+
+F-X134 restores the hosted Python binding gate before F-X135 integrates the
+six remaining contributor branches and repairs open reports without a pull
+request. F-X136 finishes the distinct Issue 138 line-height and row-splitting
+report after F-X135's spacing and table-margin changes. F-X133 and F-271
+through F-277 carry to S76 at the approved cutoff rather than being described
+as complete in S75.
+
+#### Sprint S76, Related stories, fields, and stable templating
+
+**Goal**: finish rich related stories, notes, ranges, fragments, and glossary
+authoring, then build the field-driven navigation and automation structures
+that depend on them.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X133 | Stop rebinding a canonical prefix on every retained element | S |
 | F-271 | Uniform rich header and footer editing | L |
 | F-272 | Rich footnote authoring | L |
 | F-273 | Rich endnote authoring | L |
@@ -1519,18 +1540,6 @@ complete rich notes, ranges, fragments, and building blocks.
 | F-275 | Cross-story bookmarks, ranges, and annotations | L |
 | F-276 | Complete fragment conflict and dependency policy | L |
 | F-277 | Glossary and building-block creation | L |
-
-Footnotes precede the parallel endnote surface, then F-274 composes both with
-section policy. F-276 and F-277 land after all related-story dependencies can
-be remapped transactionally.
-
-#### Sprint S76, Fields, navigation, and stable templating
-
-**Goal**: author and materialize the field-driven navigation and automation
-structures expected of a complete document-generation engine.
-
-| F-ID | Title | Size |
-|------|-------|------|
 | F-278 | General simple and complex field builder | L |
 | F-279 | Pagination field materialization across stories | L |
 | F-280 | Captions, sequences, and complete cross-references | M |
@@ -1539,9 +1548,13 @@ structures expected of a complete document-generation engine.
 | F-283 | Complete numbering-aware navigation fields | L |
 | F-284 | Stable container-wide template grammar | L |
 
-F-278 is the shared field construction substrate. F-283 integrates numbering
-only after the other navigation structures are complete. F-284 freezes the
-template grammar against the completed container and fragment model.
+F-X133 remains independent. F-272 precedes F-273, and F-274 composes both
+note families with section policy. F-276 follows the related-story work, and
+F-277 uses its transactional remapping. F-278 is the shared field construction
+substrate after those carried stories. F-283 integrates numbering only after
+the other navigation structures are complete. F-284 freezes the template
+grammar against the completed container and fragment model. The enlarged S76
+inventory needs a dependency-aware split before implementation starts.
 
 #### Sprint S77, Content controls, forms, and data binding
 

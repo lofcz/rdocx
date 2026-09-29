@@ -306,6 +306,13 @@ it clamps a traversal that escapes the root rather than allowing zip-slip.
 
 **`rels_path_to_part_name`** and its inverse are generic path algebra.
 
+`Relationships::from_xml` retains the complete source bytes beside the parsed
+relationship list. `to_xml` returns those bytes while the semantic list is
+unchanged and validates identifiers before either path. Adding, removing, or
+editing a relationship switches to schema-ordered serialization. This keeps a
+no-op package save byte-preserving without allowing stale relationship XML
+after a graph mutation.
+
 ## Relationship types
 
 `rel_types` stays one flat module, grouped by comment. The existing thirteen
@@ -1263,6 +1270,12 @@ Tables with different active grids use one deleted-table record followed by
 one inserted-table record at the aligned boundary. Row markers carry the
 revision metadata, so acceptance retains only the edited grid and rejection
 retains only the original grid. Equal-grid tables keep row and cell comparison.
+An attribute-free empty `w:pPr` or paragraph-mark `w:rPr` carries no formatting
+in comparison. An attributed empty element remains opaque so its producer
+attributes survive. A changed unmodelled paragraph or table property reports
+a formatting diagnostic and retains the original bytes. Ignored main stories
+are excluded from acceptance and rejection postconditions after each staged
+revision resolution.
 Generated revisions use canonical `w`, `xml`, and `mc` prefixes in schema
 order, while reparse remains prefix tolerant. Source-span patching interleaves
 changed owner bytes with the exact original gaps, preserving unowned
@@ -1375,18 +1388,27 @@ records exact byte offsets for the owned cached-result range. Bookmark markers
 are inserted at schema-valid unowned boundaries by byte-position edits. Source
 selection retains paragraph, run, and raw-child positions for bookmark scope.
 Each required built-in entry level resolves a paragraph style by the
-case-insensitive built-in name `toc N` and retains the producer's style id. An
-existing canonical `TOCN` id is the collision-safe fallback, and a canonical
-style is created only when neither form exists. Effective paragraph properties
-decide whether the style already owns a right tab. Style-graph validation and
-styles-part serialization complete inside the staged candidate, so unrelated
-styles and unmodelled style children retain their source bytes.
+case-insensitive built-in name `toc N` and retains the producer's style id. A
+style with an empty id is never chosen, because entries reference their style
+by id. An existing canonical `TOCN` id is the collision-safe fallback, and a
+canonical style is created only when neither form exists. Effective paragraph
+properties decide whether the style already owns a right tab. Style-graph
+validation and styles-part serialization complete inside the staged candidate,
+so unrelated styles and unmodelled style children retain their source bytes.
 One final empty component in a custom-style list is a tolerated producer
 separator. Interior empty names, missing levels, and invalid levels remain
 malformed. TOC discovery resolves duplicate style identifiers from the first
-source definition and reports each duplicated identifier once. Validation of
-that staged TOC view ignores later definitions without deleting or rewriting
-them. Public style mutation retains strict duplicate rejection.
+source definition and reports each duplicated identifier once. Several
+defaults of one style type resolve to the one layout applies, the first in
+source order, and each such type is reported once. That staged TOC view ignores
+later definitions and later defaults without deleting or rewriting them.
+Validation compares the view before and after entry styles are staged. Every
+defect the source view already has is one that open, save, layout, and text
+replacement accept, so the rebuild retains it and reports it once in check
+order. A defect only the staged view has was introduced by the rebuild, such
+as a new canonical style completing a dangling producer link into a one-way
+link, and it rejects the rebuild. Public style mutation retains strict
+whole-graph validation.
 Old-result exclusion adds a total nested-run order within each accepted
 revision or content-control owner, so fields on opposite sides of a marker in
 one wrapper remain distinguishable. The outer coordinate is the typed

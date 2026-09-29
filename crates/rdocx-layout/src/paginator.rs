@@ -5,9 +5,9 @@
 
 use crate::block::{
     AnchoredContent, AnchoredDrawing, CellBlockSemantics, LayoutBlock, LayoutBlockLike,
-    ParagraphBlock, ParagraphView, ShapePreset, SharedLayoutBlock, TableView,
+    ParagraphBlock, ParagraphView, RowSemantics, ShapePreset, SharedLayoutBlock, TableView,
 };
-use crate::table::FloatingTable;
+use crate::table::{CellBlock, FloatingTable, TableRow};
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -133,6 +133,13 @@ pub struct PageGeometry {
     /// The gutter is already folded into the inside margin when this is set,
     /// so the swap alone puts it on the binding edge of either page.
     pub mirror_margins: bool,
+    /// Whether two consecutive paragraphs are separated by the sum of the
+    /// first one's space after and the second one's space before, rather than
+    /// by the larger of the two.
+    ///
+    /// A document setting, carried with the geometry like `mirror_margins`
+    /// because every pagination pass reads the geometry.
+    pub do_not_use_html_paragraph_auto_spacing: bool,
     /// Degrees the section's body band rotates for `w:sectPr/w:textDirection`.
     ///
     /// `None` is the horizontal section, which keeps the band and the
@@ -203,6 +210,7 @@ impl Default for PageGeometry {
             line_numbers: None,
             vertical_alignment: None,
             mirror_margins: false,
+            do_not_use_html_paragraph_auto_spacing: false,
             body_rotation: None,
         }
     }
@@ -781,7 +789,6 @@ fn paginate_pass_from<B: LayoutBlockLike>(
                 break;
             }
         } else if let Some(table) = block.table() {
-            let tbl_borders = table.borders.as_ref();
             let body_index = block.body_index();
 
             // A floating table is positioned rather than flowed, so it never
@@ -795,84 +802,67 @@ fn paginate_pass_from<B: LayoutBlockLike>(
             for (row_idx, row) in table.rows.iter().enumerate() {
                 // Read per row, because finishing a page may have moved the
                 // body into the next column track.
-                let table_x = pager.geometry.margin_left + table.table_indent;
                 let row_semantics = table
                     .semantics
                     .and_then(|semantics| semantics.rows.get(row_idx));
-                let needed = if row.keep_next {
-                    row_keep_chain_height(
-                        &table.rows,
-                        row_idx,
-                        blocks,
-                        block_idx,
-                        pager.available_height(),
-                    )
-                } else {
-                    row.height
-                };
-                if pager.cursor_y + needed > pager.available_height() && pager.has_content() {
-                    pager.finish_page();
-
-                    // Repeat header rows
-                    for &hdr_idx in &table.header_row_indices {
-                        if hdr_idx < row_idx {
-                            let hdr_row = &table.rows[hdr_idx];
-                            if let Some(body_index) = body_index {
-                                pager.record_body_fragment(
-                                    body_index,
-                                    table_x,
-                                    pager.geometry.margin_top + pager.cursor_y,
-                                    table.table_width,
-                                    hdr_row.height,
-                                );
-                            }
-                            render_table_row(
-                                hdr_row,
-                                table
-                                    .semantics
-                                    .and_then(|semantics| semantics.rows.get(hdr_idx)),
-                                &table.col_widths,
-                                table_x,
-                                pager.geometry.margin_top + pager.cursor_y,
-                                &pager.geometry,
-                                pager.page_number,
-                                tbl_borders,
-                                table.bidi_visual,
-                                &mut pager.elements,
-                                &mut pager.behind_elements,
-                                pager.media,
-                            );
-                            pager.cursor_y += hdr_row.height;
-                            pager.mark_content();
-                        }
+                let mut pending = row.clone();
+                let mut pending_semantics = row_semantics.cloned();
+                let mut moved_whole = false;
+                let mut first_fragment = true;
+                loop {
+                    let space = pager.available_height() - pager.cursor_y;
+                    let split = split_simple_table_row(&pending, pending_semantics.as_ref(), space);
+                    if let Some((fragment, rest, fragment_semantics, rest_semantics)) = split {
+                        paint_flowed_table_row(
+                            &mut pager,
+                            &table,
+                            &fragment,
+                            fragment_semantics.as_ref(),
+                            body_index,
+                            first_fragment,
+                            false,
+                        );
+                        pending = rest;
+                        pending_semantics = rest_semantics;
+                        first_fragment = false;
+                        moved_whole = false;
+                        pager.finish_page();
+                        repeat_table_headers(&mut pager, &table, row_idx, body_index);
+                        continue;
                     }
-                }
-
-                if let Some(body_index) = body_index {
-                    pager.record_body_fragment(
+                    // A row whose paragraphs all keep with next must share the
+                    // page with the rows (or the following block's first line)
+                    // that close the chain, so the whole chain decides whether
+                    // the row moves. Such a row never splits above, because
+                    // every paragraph in it carries `keepNext`.
+                    let needed = if pending.keep_next {
+                        row_keep_chain_height(
+                            &table.rows,
+                            row_idx,
+                            blocks,
+                            block_idx,
+                            pager.available_height(),
+                        )
+                    } else {
+                        pending.height
+                    };
+                    if needed > space && pager.has_content() && !moved_whole {
+                        moved_whole = true;
+                        pager.finish_page();
+                        repeat_table_headers(&mut pager, &table, row_idx, body_index);
+                        continue;
+                    }
+                    paint_flowed_table_row(
+                        &mut pager,
+                        &table,
+                        &pending,
+                        pending_semantics.as_ref(),
                         body_index,
-                        table_x,
-                        pager.geometry.margin_top + pager.cursor_y,
-                        table.table_width,
-                        row.height,
+                        first_fragment,
+                        true,
                     );
+                    break;
                 }
-                render_table_row(
-                    row,
-                    row_semantics,
-                    &table.col_widths,
-                    table_x,
-                    pager.geometry.margin_top + pager.cursor_y,
-                    &pager.geometry,
-                    pager.page_number,
-                    tbl_borders,
-                    table.bidi_visual,
-                    &mut pager.elements,
-                    &mut pager.behind_elements,
-                    pager.media,
-                );
-                pager.cursor_y += row.height;
-                pager.mark_content();
             }
         }
     }
@@ -896,6 +886,191 @@ fn paginate_pass_from<B: LayoutBlockLike>(
         resolved,
         checkpoints,
         stopped_at,
+    }
+}
+
+/// Split plain flowed cells at paragraph or guarded line boundaries. Rows with
+/// merges, exact-height clipping, rotations, or anchored content retain the
+/// existing whole-row path until those cases have their own safe break model.
+fn split_simple_table_row(
+    row: &TableRow,
+    semantics: Option<&RowSemantics>,
+    space: f64,
+) -> Option<(
+    TableRow,
+    TableRow,
+    Option<RowSemantics>,
+    Option<RowSemantics>,
+)> {
+    if row.height <= space || row.cant_split || row.is_header || row.cells.is_empty() {
+        return None;
+    }
+    let mut first = row.clone();
+    let mut rest = row.clone();
+    let mut first_semantics = semantics.cloned();
+    let mut rest_semantics = semantics.cloned();
+    let mut first_height: f64 = 0.0;
+    let mut rest_height: f64 = 0.0;
+    let mut placed_any = false;
+    let mut remains_any = false;
+    for (cell_index, cell) in row.cells.iter().enumerate() {
+        if cell.is_vmerge_continue
+            || cell.starts_vmerge
+            || cell.merge_with_below
+            || cell.clip_content
+            || cell.rotation.is_some()
+            || cell.v_align.is_some()
+        {
+            return None;
+        }
+        let mut used = cell.margin_top + cell.border_band_top;
+        let mut count = 0;
+        let mut split_lines = None;
+        for block in &cell.blocks {
+            let CellBlock::Paragraph(paragraph) = block else {
+                return None;
+            };
+            if !paragraph.anchored.is_empty() || paragraph.keep_next || paragraph.page_break_before
+            {
+                return None;
+            }
+            if used + paragraph.total_height() > space {
+                if !paragraph.keep_lines && paragraph.lines.len() >= 4 {
+                    let mut line_height =
+                        used + paragraph.space_before + paragraph.content_offset_top;
+                    let mut lines = 0;
+                    for line in &paragraph.lines {
+                        if line_height + line.height > space {
+                            break;
+                        }
+                        line_height += line.height;
+                        lines += 1;
+                    }
+                    let minimum = if paragraph.widow_control { 2 } else { 1 };
+                    if lines >= minimum && paragraph.lines.len() - lines >= minimum {
+                        used = line_height;
+                        split_lines = Some(lines);
+                    }
+                }
+                break;
+            }
+            used += paragraph.total_height();
+            count += 1;
+        }
+        let has_more = count < cell.blocks.len();
+        placed_any |= count > 0 || split_lines.is_some();
+        remains_any |= has_more;
+        if !has_more {
+            used += cell.margin_bottom;
+        }
+        first_height = first_height.max(used);
+        let first_cell = &mut first.cells[cell_index];
+        let rest_cell = &mut rest.cells[cell_index];
+        first_cell
+            .blocks
+            .truncate(count + usize::from(split_lines.is_some()));
+        rest_cell.blocks.drain(..count);
+        if let Some(lines) = split_lines {
+            let CellBlock::Paragraph(first_paragraph) = &mut first_cell.blocks[count] else {
+                unreachable!("checked paragraph blocks above")
+            };
+            first_paragraph.lines.truncate(lines);
+            first_paragraph.space_after = 0.0;
+            let CellBlock::Paragraph(rest_paragraph) = &mut rest_cell.blocks[0] else {
+                unreachable!("checked paragraph blocks above")
+            };
+            rest_paragraph.lines.drain(..lines);
+            rest_paragraph.space_before = 0.0;
+            rest_paragraph.content_offset_top = 0.0;
+        }
+        first_cell.margin_bottom = if has_more { 0.0 } else { cell.margin_bottom };
+        first_cell.border_band_bottom = 0.0;
+        rest_cell.margin_top = 0.0;
+        rest_cell.border_band_top = 0.0;
+        if !has_more {
+            rest_cell.margin_bottom = 0.0;
+        }
+        let remaining_content = rest_cell
+            .blocks
+            .iter()
+            .map(CellBlock::total_height)
+            .sum::<f64>();
+        rest_height = rest_height
+            .max(remaining_content + rest_cell.margin_bottom + rest_cell.border_band_bottom);
+        if let Some(row_semantics) = &mut first_semantics {
+            row_semantics.cells[cell_index]
+                .blocks
+                .truncate(count + usize::from(split_lines.is_some()));
+        }
+        if let Some(row_semantics) = &mut rest_semantics {
+            row_semantics.cells[cell_index].blocks.drain(..count);
+        }
+    }
+    if !placed_any || !remains_any || first_height > space {
+        return None;
+    }
+    first.height = first_height;
+    rest.height = rest_height.max(row.height - first_height);
+    for cell in &mut first.cells {
+        cell.height = first.height;
+        cell.merged_height = first.height;
+    }
+    for cell in &mut rest.cells {
+        cell.height = rest.height;
+        cell.merged_height = rest.height;
+    }
+    Some((first, rest, first_semantics, rest_semantics))
+}
+
+fn paint_flowed_table_row(
+    pager: &mut Pager<'_>,
+    table: &TableView<'_>,
+    row: &TableRow,
+    semantics: Option<&RowSemantics>,
+    body_index: Option<usize>,
+    draw_top_border: bool,
+    draw_bottom_border: bool,
+) {
+    let table_x = pager.geometry.margin_left + table.table_indent;
+    let row_y = pager.geometry.margin_top + pager.cursor_y;
+    if let Some(body_index) = body_index {
+        pager.record_body_fragment(body_index, table_x, row_y, table.table_width, row.height);
+    }
+    render_table_row(
+        row,
+        semantics,
+        &table.col_widths,
+        table_x,
+        row_y,
+        &pager.geometry,
+        pager.page_number,
+        table.borders.as_ref(),
+        table.bidi_visual,
+        &mut pager.elements,
+        &mut pager.behind_elements,
+        pager.media,
+        draw_top_border,
+        draw_bottom_border,
+    );
+    pager.cursor_y += row.height;
+    pager.previous_space_after = 0.0;
+    pager.mark_content();
+}
+
+fn repeat_table_headers(
+    pager: &mut Pager<'_>,
+    table: &TableView<'_>,
+    before_row: usize,
+    body_index: Option<usize>,
+) {
+    for &header_index in &table.header_row_indices {
+        if header_index < before_row {
+            let row = &table.rows[header_index];
+            let semantics = table
+                .semantics
+                .and_then(|semantics| semantics.rows.get(header_index));
+            paint_flowed_table_row(pager, table, row, semantics, body_index, true, true);
+        }
     }
 }
 
@@ -979,6 +1154,10 @@ struct Pager<'a> {
     /// would let it eat into the height that was reserved, which is enough to
     /// push a note off the page its own reference sits on.
     ink_bottom: f64,
+    /// Space after of the paragraph that ends the flow above the cursor, which
+    /// `cursor_y` already includes. Zero after a table row, because Word
+    /// collapses spacing only between two paragraphs of the same flow.
+    previous_space_after: f64,
     /// Where the previous pass placed each paragraph-relative wrapping drawing.
     /// Empty on the first pass, which is what makes that pass identical to a
     /// single-pass run.
@@ -1042,6 +1221,7 @@ impl<'a> Pager<'a> {
             page_wraps: Vec::new(),
             page_floats: Vec::new(),
             ink_bottom: 0.0,
+            previous_space_after: 0.0,
             resolved_in,
             resolved_out: ResolvedWraps::new(),
             body_fragments: Vec::new(),
@@ -1153,6 +1333,22 @@ impl<'a> Pager<'a> {
 
     fn has_content(&self) -> bool {
         self.has_content_flag
+    }
+
+    /// The space a paragraph adds above itself at the cursor.
+    ///
+    /// Nothing at the top of a page. Word otherwise keeps the larger of the
+    /// previous paragraph's space after and this space before, so only the
+    /// part of `before` that exceeds the space after already below the cursor
+    /// is added, unless the document asks for the two to be summed.
+    fn space_before(&self, before: f64) -> f64 {
+        if self.cursor_y == 0.0 {
+            0.0
+        } else if self.geometry.do_not_use_html_paragraph_auto_spacing {
+            before
+        } else {
+            (before - self.previous_space_after).max(0.0)
+        }
     }
 
     fn consume_trailing_run_page_break_before(&mut self, block_index: usize) -> bool {
@@ -1581,6 +1777,8 @@ impl<'a> Pager<'a> {
                 &mut self.elements,
                 &mut self.behind_elements,
                 self.media,
+                true,
+                true,
             );
             row_y += row.height;
         }
@@ -3001,11 +3199,7 @@ fn paginate_paragraph<B: LayoutBlockLike>(
     blocks: &[B],
     pager: &mut Pager,
 ) {
-    let space_before = if pager.cursor_y == 0.0 {
-        0.0
-    } else {
-        para.space_before
-    };
+    let space_before = pager.space_before(para.space_before);
 
     // Flow the paragraph around anything floating in its band of the page,
     // before anything is measured. A reflow changes the paragraph's height, so
@@ -3143,12 +3337,7 @@ fn paginate_paragraph<B: LayoutBlockLike>(
     }
 
     // Render the paragraph
-    let space = if pager.cursor_y == 0.0 {
-        0.0
-    } else {
-        para.space_before
-    };
-    pager.cursor_y += space;
+    pager.cursor_y += pager.space_before(para.space_before);
 
     if let Some(body_index) = body_index {
         pager.record_body_fragment(
@@ -3213,6 +3402,7 @@ fn paginate_paragraph<B: LayoutBlockLike>(
     pager.cursor_y += para.content_height();
     pager.ink_bottom = pager.cursor_y;
     pager.cursor_y += para.space_after;
+    pager.previous_space_after = para.space_after;
     pager.mark_content();
 }
 
@@ -3382,6 +3572,7 @@ fn render_para_split(
     pager.claim_notes(remaining_lines);
     pager.ink_bottom = remaining_height;
     pager.cursor_y = remaining_height + para.space_after;
+    pager.previous_space_after = para.space_after;
     pager.mark_content();
     if ends_with_run_page_break {
         pager.trailing_run_page_break_before = Some(block_idx + 1);
@@ -4378,6 +4569,8 @@ fn render_table_row(
     elements: &mut Vec<PositionedElement>,
     behind_elements: &mut Vec<PositionedElement>,
     media: &HashMap<MediaId, ImageData>,
+    draw_top_border: bool,
+    draw_bottom_border: bool,
 ) {
     let mut cell_x = table_x + row.offset_left;
     let num_cells = row.cells.len();
@@ -4424,6 +4617,8 @@ fn render_table_row(
             num_cells,
             cell.is_first_row,
             cell.is_last_row,
+            draw_top_border,
+            draw_bottom_border,
             elements,
         );
 
@@ -4449,12 +4644,15 @@ fn render_table_row(
             .iter()
             .map(crate::table::CellBlock::total_height)
             .sum::<f64>();
-        // A rotated cell is laid out in a same-centre transposed box and the
-        // result is rotated back over the cell. A horizontal cell's box is the
-        // cell itself, so it keeps the arithmetic it always had.
+        // The content sits between the horizontal border bands the row
+        // height includes. A rotated cell is laid out in a same-centre
+        // transposed box and the result is rotated back over the cell. A
+        // horizontal cell's box is the cell itself less those bands.
+        let band_y = row_y + cell.border_band_top;
+        let band_height = (paint_height - cell.border_band_top - cell.border_band_bottom).max(0.0);
         let (box_x, box_y, box_width, box_height) = match cell.rotation {
-            Some(_) => crate::table::transposed_box(cell_x, row_y, cell.width, paint_height),
-            None => (cell_x, row_y, cell.width, paint_height),
+            Some(_) => crate::table::transposed_box(cell_x, band_y, cell.width, band_height),
+            None => (cell_x, band_y, cell.width, band_height),
         };
         let v_offset = match cell.v_align {
             Some(rdocx_oxml::table::ST_VerticalJc::Center) => {
@@ -4470,6 +4668,8 @@ fn render_table_row(
             let block_semantics = cell_semantics.and_then(|cell| cell.blocks.get(block_index));
             match block {
                 crate::table::CellBlock::Paragraph(paragraph) => {
+                    // The space before sits above the lines, as in the body.
+                    content_y += paragraph.space_before;
                     let semantics = match block_semantics {
                         Some(CellBlockSemantics::Paragraph(semantics)) => Some(semantics),
                         _ => None,
@@ -4518,8 +4718,8 @@ fn render_table_row(
                     // geometry it already built instead of cloning it.
                     let (furniture_y, furniture_height) = if rotated {
                         (
-                            row_y - geometry.margin_top + cell.margin_top,
-                            (paint_height - cell.margin_top - cell.margin_bottom).max(0.0),
+                            band_y - geometry.margin_top + cell.margin_top,
+                            (band_height - cell.margin_top - cell.margin_bottom).max(0.0),
                         )
                     } else {
                         (content_y, paragraph.content_height())
@@ -4551,6 +4751,7 @@ fn render_table_row(
                         );
                         change_bar_drawn |= rotated && paragraph.has_visible_revision;
                     }
+                    content_y += paragraph.content_height() + paragraph.space_after;
                 }
                 crate::table::CellBlock::Table(table) => {
                     let semantics = match block_semantics {
@@ -4573,12 +4774,14 @@ fn render_table_row(
                             elements,
                             behind_elements,
                             media,
+                            true,
+                            true,
                         );
                         nested_y += nested_row.height;
                     }
+                    content_y += table.total_height();
                 }
             }
-            content_y += block.total_height();
         }
         // Rotate the cell's painted content about the box centre, which is
         // the cell centre, so the transposed layout lands back in the cell.
@@ -4586,7 +4789,7 @@ fn render_table_row(
             let transform = Transform::rotate_about(
                 degrees,
                 cell_x + cell.width / 2.0,
-                row_y + paint_height / 2.0,
+                band_y + band_height / 2.0,
             );
             let rotate = |source: &mut Vec<PositionedElement>, start: usize| {
                 let children = source.split_off(start);
@@ -4694,6 +4897,8 @@ fn render_cell_borders(
     num_cells: usize,
     is_first_row: bool,
     is_last_row: bool,
+    draw_top_border: bool,
+    draw_bottom_border: bool,
     elements: &mut Vec<PositionedElement>,
 ) {
     // Determine effective border for each edge (cell overrides table)
@@ -4701,14 +4906,7 @@ fn render_cell_borders(
                     table_edge: Option<&rdocx_oxml::borders::CT_BorderEdge>,
                     outer_edge: bool|
      -> Option<BorderEdge> {
-        let edge = match cell_edge {
-            Some(edge) if edge.val == ST_Border::None && outer_edge => table_edge?,
-            Some(edge) => edge,
-            None => table_edge?,
-        };
-        if edge.val == ST_Border::None {
-            return None;
-        }
+        let edge = crate::table::resolved_cell_edge(cell_edge, table_edge, outer_edge)?;
         let thickness = edge.sz.unwrap_or(4) as f64 / 8.0; // sz is in 1/8 pt
         let color = edge
             .color
@@ -4728,11 +4926,19 @@ fn render_cell_borders(
             b.inside_h.as_ref()
         }
     });
+    // A horizontal border fills the band below the row boundary it sits on,
+    // which the row heights reserve, rather than straddling the boundary.
     let cell_top = cell_borders.as_ref().and_then(|b| b.top.as_ref());
-    if let Some((thickness, color, dash_pattern)) = get_edge(cell_top, table_top, is_first_row) {
+    if draw_top_border
+        && let Some((thickness, color, dash_pattern)) = get_edge(cell_top, table_top, is_first_row)
+    {
+        let line_y = y + thickness / 2.0;
         elements.push(PositionedElement::Line {
-            start: Point { x, y },
-            end: Point { x: x + w, y },
+            start: Point { x, y: line_y },
+            end: Point {
+                x: x + w,
+                y: line_y,
+            },
             width: thickness,
             color,
             dash_pattern,
@@ -4748,11 +4954,23 @@ fn render_cell_borders(
         }
     });
     let cell_bottom = cell_borders.as_ref().and_then(|b| b.bottom.as_ref());
-    if let Some((thickness, color, dash_pattern)) = get_edge(cell_bottom, table_bottom, is_last_row)
+    if draw_bottom_border
+        && let Some((thickness, color, dash_pattern)) =
+            get_edge(cell_bottom, table_bottom, is_last_row)
     {
+        // The table's bottom band is the last row's own, so its line sits
+        // inside the row. Any other bottom edge is in the next row's band.
+        let line_y = if is_last_row {
+            y + h - thickness / 2.0
+        } else {
+            y + h + thickness / 2.0
+        };
         elements.push(PositionedElement::Line {
-            start: Point { x, y: y + h },
-            end: Point { x: x + w, y: y + h },
+            start: Point { x, y: line_y },
+            end: Point {
+                x: x + w,
+                y: line_y,
+            },
             width: thickness,
             color,
             dash_pattern,
@@ -4813,7 +5031,7 @@ fn render_border_edges(
                        start: Point,
                        end: Point,
                        elements: &mut Vec<PositionedElement>| {
-        if edge.val == ST_Border::None {
+        if edge.val.is_none() {
             return;
         }
         let thickness = edge.sz.unwrap_or(4) as f64 / 8.0; // sz is in eighths of a point
@@ -6968,6 +7186,8 @@ mod tests {
                 margin_right: 0.0,
                 margin_top: 0.0,
                 margin_bottom: 0.0,
+                border_band_top: 0.0,
+                border_band_bottom: 0.0,
                 is_first_row: true,
                 is_last_row: true,
                 v_align: None,
@@ -6976,6 +7196,7 @@ mod tests {
             height: 10.0,
             is_header: false,
             keep_next: false,
+            cant_split: false,
             offset_left: 0.0,
         };
         let mut elements = Vec::new();
@@ -6992,6 +7213,8 @@ mod tests {
             &mut elements,
             &mut Vec::new(),
             &HashMap::new(),
+            true,
+            true,
         );
         let [PositionedElement::Group(group)] = elements.as_slice() else {
             panic!("exact cell content is one clipped group: {elements:?}");
@@ -7044,6 +7267,8 @@ mod tests {
             1,
             true,
             true,
+            true,
+            true,
             &mut outer,
         );
         assert_eq!(outer.len(), 4, "four outer edges fall back to the table");
@@ -7060,6 +7285,8 @@ mod tests {
             3,
             false,
             false,
+            true,
+            true,
             &mut interior,
         );
         assert!(interior.is_empty(), "interior nil remains suppressive");
@@ -7236,6 +7463,7 @@ mod tests {
                 height: 12.0,
                 is_header: false,
                 keep_next: false,
+                cant_split: false,
                 offset_left: 0.0,
             }],
             header_row_indices: Vec::new(),

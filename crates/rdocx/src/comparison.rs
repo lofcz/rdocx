@@ -13,12 +13,13 @@ use rdocx_oxml::namespace::W_NS;
 use rdocx_oxml::properties::CT_PPr;
 use rdocx_oxml::table::{CT_Row, CT_Tbl, CT_TblPr, CT_Tc, CT_TrPr, CellContent};
 use rdocx_oxml::text::{CT_P, CT_R, CT_Text, RunContent};
+use sha2::{Digest, Sha256};
 
 use crate::revision::validate_revision_timestamp;
 use crate::{Document, Error, Result};
 
 use oxml_opc::OpcPackage;
-use oxml_opc::relationship::rel_types;
+use oxml_opc::relationship::{Relationship, rel_types};
 
 #[cfg(test)]
 thread_local! {
@@ -242,7 +243,7 @@ impl Document {
         validate_revision_timestamp(timestamp)?;
         validate_comparison_options(options)?;
         let original = comparison_input(self)?;
-        let edited = comparison_input(edited)?;
+        let mut edited = comparison_input(edited)?;
         let original_stories = story_parts_with_options(&original, options)?;
         let edited_stories = story_parts_with_options(&edited, options)?;
         if original_stories != edited_stories {
@@ -250,6 +251,12 @@ impl Document {
                 "document comparison requires identical related-story shells".to_owned(),
             ));
         }
+        remap_equivalent_story_relationships(
+            &original,
+            &mut edited,
+            &original_stories,
+            &edited_stories,
+        )?;
         if contains_modeled_revisions(&original, &original_stories, options)?
             || contains_modeled_revisions(&edited, &edited_stories, options)?
         {
@@ -351,7 +358,8 @@ impl Document {
             )?
         };
         let tracked_xml = replace_body_inner(original_xml, &tracked_body)?;
-        let tracked_model_xml = close_drawing_namespaces(tracked_xml.as_bytes().to_vec(), true)?;
+        let tracked_xml = crate::document::uniquify_drawing_ids_in_xml(tracked_xml.as_bytes())?;
+        let tracked_model_xml = close_drawing_namespaces(tracked_xml, true)?;
         let tracked = CT_Document::from_xml(&tracked_model_xml)?;
         tracked.to_xml()?;
         let mut candidate = original.clone_for_staging();
@@ -379,31 +387,46 @@ impl Document {
             }
             Ok(())
         })?;
-        let mut accepted = candidate.clone_for_staging();
-        accepted.accept_all()?;
-        let accepted_body =
-            normalized_package(&accepted, &original_stories, options, &text_box_markers)?;
+        let accepted_body = resolved_package(
+            &candidate,
+            Document::accept_all,
+            &original_stories,
+            options,
+            &text_box_markers,
+        )?;
         let mut edited_package =
             normalized_package(&edited, &edited_stories, options, &text_box_markers)?;
-        if story_ignored(options, ComparisonStoryKind::Main) {
-            edited_package.0 =
-                normalized_package(&original, &original_stories, options, &text_box_markers)?.0;
+        let main_ignored = story_ignored(options, ComparisonStoryKind::Main);
+        if main_ignored {
+            edited_package.0 = accepted_body.0.clone();
         }
         if accepted_body != edited_package {
-            return Err(Error::Other(format!(
-                "comparison acceptance does not reproduce the edited stories: {accepted_body:?} != {edited_package:?}"
-            )));
+            return Err(comparison_postcondition_error(
+                "acceptance",
+                "edited",
+                &accepted_body,
+                &edited_package,
+            ));
         }
-        let mut rejected = candidate.clone_for_staging();
-        rejected.reject_all()?;
-        let rejected_package =
-            normalized_package(&rejected, &original_stories, options, &text_box_markers)?;
-        let original_package =
+        let rejected_package = resolved_package(
+            &candidate,
+            Document::reject_all,
+            &original_stories,
+            options,
+            &text_box_markers,
+        )?;
+        let mut original_package =
             normalized_package(&original, &original_stories, options, &text_box_markers)?;
+        if main_ignored {
+            original_package.0 = rejected_package.0.clone();
+        }
         if rejected_package != original_package {
-            return Err(Error::Other(format!(
-                "comparison rejection does not reproduce the original stories: {rejected_package:?} != {original_package:?}"
-            )));
+            return Err(comparison_postcondition_error(
+                "rejection",
+                "original",
+                &rejected_package,
+                &original_package,
+            ));
         }
 
         self.commit_staged_mutation(candidate);
@@ -562,6 +585,129 @@ fn story_xml<'a>(document: &'a Document, story: &StoryPart) -> Result<&'a [u8]> 
     })
 }
 
+fn remap_equivalent_story_relationships(
+    original: &Document,
+    edited: &mut Document,
+    original_stories: &[StoryPart],
+    edited_stories: &[StoryPart],
+) -> Result<()> {
+    remap_equivalent_owner_relationships(
+        original,
+        edited,
+        &original.doc_part_name,
+        &edited.doc_part_name.clone(),
+    )?;
+    for (left, right) in original_stories.iter().zip(edited_stories) {
+        remap_equivalent_owner_relationships(original, edited, &left.part_name, &right.part_name)?;
+    }
+    Ok(())
+}
+
+fn remap_equivalent_owner_relationships(
+    original: &Document,
+    edited: &mut Document,
+    original_owner: &str,
+    edited_owner: &str,
+) -> Result<()> {
+    let original_relationships = original
+        .package
+        .get_part_rels(original_owner)
+        .cloned()
+        .unwrap_or_default();
+    let edited_relationships = edited
+        .package
+        .get_part_rels(edited_owner)
+        .cloned()
+        .unwrap_or_default();
+    let mut used = HashSet::new();
+    let mut remap = HashMap::new();
+    for right in &edited_relationships.items {
+        if right.rel_type != rel_types::IMAGE {
+            continue;
+        }
+        let right_payload = relationship_payload(edited, edited_owner, right);
+        let Some((index, left)) =
+            original_relationships
+                .items
+                .iter()
+                .enumerate()
+                .find(|(index, left)| {
+                    !used.contains(index)
+                        && left.rel_type == right.rel_type
+                        && left.target_mode == right.target_mode
+                        && relationship_payload(original, original_owner, left) == right_payload
+                })
+        else {
+            continue;
+        };
+        used.insert(index);
+        if left.id != right.id {
+            remap.insert(right.id.clone(), left.id.clone());
+        }
+    }
+    if remap.is_empty() {
+        return Ok(());
+    }
+    let mut occupied = edited_relationships
+        .items
+        .iter()
+        .map(|relationship| relationship.id.clone())
+        .chain(remap.values().cloned())
+        .collect::<HashSet<_>>();
+    let mut collision_remap = HashMap::new();
+    let remapped_sources = remap.keys().cloned().collect::<HashSet<_>>();
+    for target in remap.values() {
+        if remapped_sources.contains(target)
+            || edited_relationships
+                .items
+                .iter()
+                .all(|relationship| relationship.id != *target)
+        {
+            continue;
+        }
+        let mut ordinal = collision_remap.len() + 1;
+        let replacement = loop {
+            let candidate = format!("rdocxComparison{ordinal}");
+            if occupied.insert(candidate.clone()) {
+                break candidate;
+            }
+            ordinal += 1;
+        };
+        collision_remap.insert(target.clone(), replacement);
+    }
+    collision_remap.extend(remap);
+    let source = edited
+        .package
+        .get_part(edited_owner)
+        .ok_or_else(|| Error::Other(format!("missing comparison story {edited_owner}")))?;
+    let updated = crate::document::remap_xml_relationship_ids(source, &collision_remap)?;
+    if edited_owner == edited.doc_part_name {
+        edited.document = CT_Document::from_xml(&updated)?;
+    }
+    edited.package.set_part(edited_owner, updated);
+    if let Some(relationships) = edited.package.get_part_rels_mut(edited_owner) {
+        for relationship in &mut relationships.items {
+            if let Some(updated) = collision_remap.get(&relationship.id) {
+                relationship.id.clone_from(updated);
+            }
+        }
+        relationships.to_xml()?;
+    }
+    Ok(())
+}
+
+fn relationship_payload(
+    document: &Document,
+    owner: &str,
+    relationship: &Relationship,
+) -> Option<Vec<u8>> {
+    if !crate::document::relationship_is_internal(relationship) {
+        return Some(relationship.target.as_bytes().to_vec());
+    }
+    let target = OpcPackage::resolve_rel_target(owner, &relationship.target);
+    document.package.get_part(&target).map(<[u8]>::to_vec)
+}
+
 fn contains_modeled_revisions(
     document: &Document,
     stories: &[StoryPart],
@@ -622,11 +768,25 @@ fn reject_cross_story_moves(
         };
         original_by_story.push((
             identity.clone(),
-            normalized_story_part(original_xml, story.kind, options, marker.as_deref())?,
+            normalized_story_part(
+                original,
+                &story.part_name,
+                original_xml,
+                story.kind,
+                options,
+                marker.as_deref(),
+            )?,
         ));
         edited_by_story.push((
             identity,
-            normalized_story_part(edited_xml, story.kind, options, marker.as_deref())?,
+            normalized_story_part(
+                edited,
+                &story.part_name,
+                edited_xml,
+                story.kind,
+                options,
+                marker.as_deref(),
+            )?,
         ));
     }
 
@@ -1820,10 +1980,60 @@ fn normal_note_owner(xml: &str) -> Result<bool> {
 }
 
 pub(crate) fn reopen_staged(candidate: Document) -> Result<Document> {
-    candidate.reopen_prepared_staged()
+    candidate.prepare_and_reopen_staged()
 }
 
 type NormalizedPackage = (Vec<String>, Vec<(ComparisonStoryKind, String, Vec<String>)>);
+
+fn comparison_postcondition_error(
+    outcome: &str,
+    expected: &str,
+    actual: &NormalizedPackage,
+    wanted: &NormalizedPackage,
+) -> Error {
+    Error::Other(format!(
+        "comparison {outcome} does not reproduce the {expected} stories at {}",
+        first_normalized_mismatch(actual, wanted)
+    ))
+}
+
+fn first_normalized_mismatch(left: &NormalizedPackage, right: &NormalizedPackage) -> String {
+    let main_count = left.0.len().min(right.0.len());
+    for index in 0..main_count {
+        if left.0[index] != right.0[index] {
+            return format!("body story item[{index}]");
+        }
+    }
+    if left.0.len() != right.0.len() {
+        return format!("body story item[{main_count}]");
+    }
+    let story_count = left.1.len().min(right.1.len());
+    for story_index in 0..story_count {
+        let (left_kind, left_part, left_items) = &left.1[story_index];
+        let (right_kind, right_part, right_items) = &right.1[story_index];
+        if left_kind != right_kind || left_part != right_part {
+            return format!("story inventory[{story_index}]");
+        }
+        let item_count = left_items.len().min(right_items.len());
+        for item_index in 0..item_count {
+            if left_items[item_index] != right_items[item_index] {
+                return format!(
+                    "{} story {} item[{item_index}]",
+                    left_kind.label(),
+                    left_part
+                );
+            }
+        }
+        if left_items.len() != right_items.len() {
+            return format!(
+                "{} story {} item[{item_count}]",
+                left_kind.label(),
+                left_part
+            );
+        }
+    }
+    format!("story inventory[{story_count}]")
+}
 
 fn comparison_text_box_markers(
     original: &Document,
@@ -1860,6 +2070,18 @@ fn comparison_text_box_markers(
     Ok(markers)
 }
 
+fn resolved_package(
+    candidate: &Document,
+    resolve: fn(&mut Document) -> Result<usize>,
+    stories: &[StoryPart],
+    options: &ComparisonOptions,
+    text_box_markers: &TextBoxMarkers,
+) -> Result<NormalizedPackage> {
+    let mut resolved = candidate.clone_for_staging();
+    resolve(&mut resolved)?;
+    normalized_package(&resolved, stories, options, text_box_markers)
+}
+
 fn normalized_package(
     document: &Document,
     stories: &[StoryPart],
@@ -1872,6 +2094,8 @@ fn normalized_package(
             story.kind,
             story.part_name.clone(),
             normalized_story_part(
+                document,
+                &story.part_name,
                 story_xml(document, story)?,
                 story.kind,
                 options,
@@ -1896,12 +2120,15 @@ fn normalized_package(
         source
     };
     let bindings = root_namespace_bindings(source, "document", &[])?;
-    let main_document = story_document(extract_body_inner(source.as_bytes())?, &bindings)?;
+    let mut main_document = story_document(extract_body_inner(source.as_bytes())?, &bindings)?;
+    normalize_drawing_relationships(&mut main_document, document, &document.doc_part_name);
     let main = normalized_body_with_options(&main_document, options);
     Ok((main, related))
 }
 
 fn normalized_story_part(
+    document: &Document,
+    physical_owner: &str,
     xml: &[u8],
     kind: ComparisonStoryKind,
     options: &ComparisonOptions,
@@ -1933,17 +2160,67 @@ fn normalized_story_part(
             let inner = element_inner_range_any_prefix(owner_xml, owner_local)?;
             let root_bindings = root_namespace_bindings(xml, kind.root_local(), &[])?;
             let owner_bindings = root_namespace_bindings(owner_xml, owner_local, &root_bindings)?;
-            let document = story_document(&owner_xml[inner], &owner_bindings)?;
-            normalized.extend(normalized_body_with_options(&document, options));
+            let mut model = story_document(&owner_xml[inner], &owner_bindings)?;
+            normalize_drawing_relationships(&mut model, document, physical_owner);
+            normalized.extend(normalized_body_with_options(&model, options));
         }
         Ok(normalized)
     } else {
         let bindings = root_namespace_bindings(xml, kind.root_local(), &[])?;
-        Ok(normalized_body_with_options(
-            &story_document(&xml[root], &bindings)?,
-            options,
-        ))
+        let mut model = story_document(&xml[root], &bindings)?;
+        normalize_drawing_relationships(&mut model, document, physical_owner);
+        Ok(normalized_body_with_options(&model, options))
     }
+}
+
+fn normalize_drawing_relationships(model: &mut CT_Document, document: &Document, owner: &str) {
+    crate::document::visit_all_drawings_mut(&mut model.body.content, &mut |drawing| {
+        if let Some(inline) = &mut drawing.inline {
+            inline.doc_pr_id = 0;
+            normalize_relationship_id(&mut inline.embed_id, document, owner);
+            if let Some(id) = &mut inline.chart_rel_id {
+                normalize_relationship_id(id, document, owner);
+            }
+        }
+        if let Some(anchor) = &mut drawing.anchor {
+            anchor.doc_pr_id = 0;
+            normalize_relationship_id(&mut anchor.embed_id, document, owner);
+            if let Some(id) = &mut anchor.chart_rel_id {
+                normalize_relationship_id(id, document, owner);
+            }
+        }
+    });
+}
+
+fn normalize_relationship_id(id: &mut String, document: &Document, owner: &str) {
+    let Some(relationship) = document
+        .package
+        .get_part_rels(owner)
+        .and_then(|relationships| relationships.get_by_id(id))
+    else {
+        return;
+    };
+    let signature = if crate::document::relationship_is_internal(relationship) {
+        let target = OpcPackage::resolve_rel_target(owner, &relationship.target);
+        let Some(bytes) = document.package.get_part(&target) else {
+            return;
+        };
+        let digest = Sha256::digest(bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        format!("internal:{}:{hex}", relationship.rel_type)
+    } else {
+        format!(
+            "external:{}:{}:{}",
+            relationship.rel_type,
+            relationship.target_mode.as_deref().unwrap_or(""),
+            relationship.target
+        )
+    };
+    *id = signature;
 }
 
 fn compare_body(
@@ -2513,8 +2790,14 @@ fn compare_paragraph(
         || !edited.bookmark_markers.is_empty()
         || !original.content_controls.is_empty()
         || !edited.content_controls.is_empty()
-        || !original.extra_xml.is_empty()
-        || !edited.extra_xml.is_empty()
+        || original
+            .extra_xml
+            .iter()
+            .any(|(position, raw)| !CT_P::raw_is_root_attributes(*position, raw))
+        || edited
+            .extra_xml
+            .iter()
+            .any(|(position, raw)| !CT_P::raw_is_root_attributes(*position, raw))
     {
         return compare_complex_paragraph(
             original,
@@ -2526,7 +2809,7 @@ fn compare_paragraph(
         );
     }
 
-    let mut output = String::from("<w:p>");
+    let (mut output, paragraph_close) = paragraph_shell(original_source)?;
     output.push_str(&paragraph_properties_xml(
         original,
         edited,
@@ -2634,8 +2917,28 @@ fn compare_paragraph(
             (None, None) => unreachable!(),
         }
     }
-    output.push_str("</w:p>");
+    output.push_str(&paragraph_close);
     Ok(output)
+}
+
+fn paragraph_shell(source: Option<&str>) -> Result<(String, String)> {
+    let Some(source) = source else {
+        return Ok(("<w:p>".to_owned(), "</w:p>".to_owned()));
+    };
+    let open_end = source
+        .find('>')
+        .ok_or_else(|| Error::Other("paragraph XML has no start tag".to_owned()))?;
+    let name_end = source[1..]
+        .find(|character: char| character.is_ascii_whitespace() || matches!(character, '/' | '>'))
+        .map(|offset| offset + 1)
+        .ok_or_else(|| Error::Other("paragraph XML has no qualified name".to_owned()))?;
+    let name = &source[1..name_end];
+    let mut opening = source[..=open_end].to_owned();
+    if opening.ends_with("/>") {
+        opening.truncate(opening.len() - 2);
+        opening.push('>');
+    }
+    Ok((opening, format!("</{name}>")))
 }
 
 fn uses_attributed_run_path(options: &ComparisonOptions) -> bool {
@@ -3391,9 +3694,20 @@ fn compare_complex_paragraph(
     if original.hyperlinks != edited.hyperlinks
         || (!metadata.options.ignore_comments && original.comment_ranges != edited.comment_ranges)
         || original.bookmark_markers != edited.bookmark_markers
-        || original.extra_xml != edited.extra_xml
+        || original
+            .extra_xml
+            .iter()
+            .filter(|(position, raw)| !CT_P::raw_is_root_attributes(*position, raw))
+            .ne(edited
+                .extra_xml
+                .iter()
+                .filter(|(position, raw)| !CT_P::raw_is_root_attributes(*position, raw)))
         || paragraph_control_boundaries(original) != paragraph_control_boundaries(edited)
-        || (!metadata.options.ignore_formatting && original.properties != edited.properties)
+        || (!metadata.options.ignore_formatting
+            && paragraph_properties_differ(
+                original.properties.as_ref(),
+                edited.properties.as_ref(),
+            ))
     {
         return Err(Error::Other(format!(
             "comparison cannot revise paragraph boundary structures at {location}"
@@ -3594,11 +3908,12 @@ fn paragraph_properties_xml(
             )
         })
         .unwrap_or_default();
-    if current.numbering_revision_xml != original_numbering_xml
-        || current.numbering_revision_xml_positions != original_numbering_positions
-        || current.numbering_revision_position != original_numbering_position
-        || current.revision_xml != original_revision_xml
-        || current.revision_xml_positions != original_revision_positions
+    let edited_properties = edited.properties.as_ref().cloned().unwrap_or_default();
+    if edited_properties.numbering_revision_xml != original_numbering_xml
+        || edited_properties.numbering_revision_xml_positions != original_numbering_positions
+        || edited_properties.numbering_revision_position != original_numbering_position
+        || edited_properties.revision_xml != original_revision_xml
+        || edited_properties.revision_xml_positions != original_revision_positions
     {
         formatting_diagnostic(diagnostics, location.to_owned());
     }
@@ -3635,7 +3950,7 @@ fn paragraph_properties_xml(
 }
 
 fn modeled_paragraph_properties(properties: Option<&CT_PPr>) -> Option<CT_PPr> {
-    properties.cloned().map(|mut properties| {
+    properties.cloned().and_then(|mut properties| {
         properties.sect_pr = None;
         properties.num_ilvl_raw = None;
         properties.num_id_raw = None;
@@ -3646,8 +3961,24 @@ fn modeled_paragraph_properties(properties: Option<&CT_PPr>) -> Option<CT_PPr> {
         properties.change = None;
         properties.revision_xml.clear();
         properties.revision_xml_positions.clear();
-        properties
+        nonempty_paragraph_properties(properties)
     })
+}
+
+fn nonempty_paragraph_properties(mut properties: CT_PPr) -> Option<CT_PPr> {
+    if properties
+        .rpr
+        .as_ref()
+        .is_some_and(|mark| *mark == rdocx_oxml::properties::CT_RPr::default())
+    {
+        properties.rpr = None;
+    }
+    (properties != CT_PPr::default()).then_some(properties)
+}
+
+fn paragraph_properties_differ(original: Option<&CT_PPr>, edited: Option<&CT_PPr>) -> bool {
+    original.cloned().and_then(nonempty_paragraph_properties)
+        != edited.cloned().and_then(nonempty_paragraph_properties)
 }
 
 fn section_properties_xml(
@@ -3888,6 +4219,15 @@ fn table_properties_xml(
     }
     let original_modeled = modeled_table_properties(original);
     let edited_modeled = modeled_table_properties(edited);
+    let unmodeled = |properties: &CT_TblPr| {
+        (
+            properties.extra_xml.clone(),
+            properties.revision_xml.clone(),
+        )
+    };
+    if original.map(unmodeled).unwrap_or_default() != edited.map(unmodeled).unwrap_or_default() {
+        formatting_diagnostic(diagnostics, location.to_owned());
+    }
     if original_modeled == edited_modeled {
         return original
             .map(table_property_xml)
@@ -3896,17 +4236,7 @@ fn table_properties_xml(
     }
     let mut current = edited.cloned().unwrap_or_default();
     current.change = None;
-    let (original_extra_xml, original_revision_xml) = original
-        .map(|properties| {
-            (
-                properties.extra_xml.clone(),
-                properties.revision_xml.clone(),
-            )
-        })
-        .unwrap_or_default();
-    if current.extra_xml != original_extra_xml || current.revision_xml != original_revision_xml {
-        formatting_diagnostic(diagnostics, location.to_owned());
-    }
+    let (original_extra_xml, original_revision_xml) = original.map(unmodeled).unwrap_or_default();
     current.extra_xml = original_extra_xml;
     current.revision_xml = original_revision_xml;
     let previous = original_modeled
@@ -5080,6 +5410,7 @@ fn semantic_run_raw(run: &CT_R) -> Vec<(&[u8], usize)> {
 fn run_content_signature(content: &RunContent) -> String {
     match content {
         RunContent::Field(_) => "field-owner".to_owned(),
+        RunContent::Drawing(drawing) => format!("Drawing({:?})", drawing_signature(drawing)),
         content => format!("{content:?}"),
     }
 }
@@ -5956,7 +6287,7 @@ fn utf8_error(error: impl std::fmt::Display) -> Error {
 mod tests {
     use super::{
         ComparisonGranularity, ComparisonOptions, FAIL_AFTER_COMPARISON_STAGING,
-        attributed_run_units, story_document, word_fragments,
+        attributed_run_units, comparison_postcondition_error, story_document, word_fragments,
     };
     use crate::Document;
     use rdocx_oxml::document::BodyContent;
@@ -6072,5 +6403,23 @@ mod tests {
         );
         assert_eq!(original.to_bytes().unwrap(), before);
         assert!(std::sync::Arc::ptr_eq(&layout, &original.layout().unwrap()));
+    }
+
+    #[test]
+    fn comparison_postcondition_diagnostic_names_one_item_without_model_bytes() {
+        let actual = (
+            vec!["Drawing(CT_Drawing { huge model })".to_owned()],
+            Vec::new(),
+        );
+        let wanted = (vec!["different".to_owned()], Vec::new());
+        let message =
+            comparison_postcondition_error("acceptance", "edited", &actual, &wanted).to_string();
+
+        assert_eq!(
+            message,
+            "comparison acceptance does not reproduce the edited stories at body story item[0]"
+        );
+        assert!(!message.contains("CT_Drawing"));
+        assert!(message.len() < 1_000);
     }
 }

@@ -2,27 +2,45 @@
 description: The gate. Runs formatting, lints, tests, the hash harness and the prose rules.
 ---
 
-# /verify [--fast] [--full]
+# /verify [--fast | --scoped F-XXX | --full]
 
-The gate that must pass before `/complete-feature`. `--fast` runs steps 1 to 4
-against changed crates only, for the inner loop. `--full` runs everything across
-the workspace, which is what `/close-sprint` requires.
+There are three deliberately different verification scopes:
+
+- `--fast` is the inner loop. It runs formatting, changed-crate linting, and
+  changed-crate tests.
+- `--scoped F-XXX` is the feature-completion gate. It runs the fast checks,
+  the hash and repository-policy checks, and the exact risk riders declared by
+  that feature's approved design plan.
+- `--full` is the integrated sprint gate. It runs everything across the
+  workspace and is required by `/close-sprint`.
+
+Do not silently widen `--scoped` to `--full`. Feature completion proves the
+feature contract. Sprint closure proves that the integrated result works as a
+whole.
 
 ## Steps
 
 1. **Format.** `cargo fmt --all --check`.
 
-2. **Lint.** `cargo clippy --workspace --all-targets --all-features --exclude
-   rdocx-py --exclude rpptx-py -- -D warnings`.
+2. **Lint.** For `--fast` and `--scoped`, run `cargo clippy -p <crate>
+   --all-targets --all-features -- -D warnings` for each changed crate. For
+   `--full`, run `cargo clippy --workspace --all-targets --all-features
+   --exclude rdocx-py --exclude rpptx-py -- -D warnings`.
 
 3. **Test the changed crates.** `cargo test -p <crate>` for each crate touched.
-   Determine the set from `git diff --name-only` against the sprint base.
+   For `--scoped`, determine the set from `git diff --name-only` against the
+   feature's starting commit in `.claude/scratch/<F-ID>-progress.md`, or the
+   handoff `Base` for a worker. Do not use the sprint base because that reruns
+   every earlier story in the sprint. For `rdocx-py` and `rpptx-py`, run the
+   isolated Python suite declared by the design plan instead. Their
+   `pyo3/extension-module` configuration cannot link a Rust test binary.
 
 4. **Test the workspace.**
    `cargo test --workspace --all-features --exclude rdocx-py --exclude rpptx-py`.
-   Skipped by `--fast`.
+   `--full` only.
 
-5. **The hash harness.** `python3 scripts/hash_harness.py --check`.
+5. **The hash harness.** `python3 scripts/hash_harness.py --check`. Skipped by
+   `--fast` and required by `--scoped` and `--full`.
 
    **Mandatory for every story in M1 through M6.** An unexplained delta fails
    the gate. An expected delta must be declared in the design plan's
@@ -30,8 +48,11 @@ the workspace, which is what `/close-sprint` requires.
    declared. A delta that is real but undeclared is a failure, not a prompt to
    update the baseline.
 
-6. **The prose rules.** `python3 scripts/prose_check.py` over tracked Markdown
-   and the commit message. No em-dash, no en-dash, no prose semicolon.
+6. **The repository-policy checks.** Skipped by `--fast` and required by
+   `--scoped` and `--full`.
+
+   Run `python3 scripts/prose_check.py` over tracked Markdown and the commit
+   message. No em-dash, no en-dash, no prose semicolon.
 
    Then `python3 scripts/sync_agent_skills.py --check`. The `.agents/skills/`
    adapters are generated from `.claude/commands/` and `.claude/skills/`, and
@@ -54,14 +75,18 @@ the workspace, which is what `/close-sprint` requires.
 7. **The no-default-features path.**
    `cargo test -p oxml-layout --no-default-features`. This is the only thing
    that exercises system font discovery being off while bundled fonts remain
-   available.
+   available. Run it under `--full`, or under `--scoped` when the design
+   plan's risk routing requires it. Skip it under `--fast`.
 
 8. **The wasm targets.**
    `cargo check --target wasm32-unknown-unknown -p rdocx-wasm -p rpptx-wasm`.
-   Skipped by `--fast`.
+   Run under `--full`, or under `--scoped` when the design plan's risk routing
+   requires it. Skip under `--fast`.
 
 9. **Docs.** `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS=-D warnings`,
-   then `python3 scripts/readme_doctests.py`. Skipped by `--fast`.
+   then `python3 scripts/readme_doctests.py`. Run under `--full`, or under
+   `--scoped` when the design plan's risk routing requires it. Skip under
+   `--fast`.
 
 10. **Packaging.** Run the workspace dry run with every publishable internal
     crate patched to its reviewed local source:
@@ -106,9 +131,16 @@ the workspace, which is what `/close-sprint` requires.
     fi
     ```
 
-    `--full` only. This is what `--no-verify` used to hide.
+    Run under `--full`, or under `--scoped` when the design plan's risk routing
+    requires it. For an uncommitted `--scoped` feature, add `--allow-dirty` to
+    the command above so Cargo verifies the actual working source. Record that
+    flag in the feature evidence. The `--full` gate on the clean integrated
+    tree must use the command above without `--allow-dirty`. Skip packaging
+    under `--fast`. This is what `--no-verify` used to hide.
 
-11. **Supply chain.** `cargo deny check`. `--full` only.
+11. **Supply chain.** `cargo deny check`. Run under `--full`, or under
+    `--scoped` when the design plan's risk routing requires it. Skip under
+    `--fast`.
 
 ## Reporting
 
@@ -121,6 +153,9 @@ skipped and why.
 
 ## Refused situations
 
-- **`--fast` as the gate for `/complete-feature`.** It is the inner loop only.
+- **`--fast` as the gate for `/complete-feature`.** Run `/verify --scoped
+  F-XXX` instead.
+- **`--scoped` without the feature's declared risk riders.** The plan defines
+  the scope. Omitting a matched rider is a failed gate.
 - **Updating the hash baseline to make step 5 pass.** The baseline changes only
   through a declared, reviewed delta.

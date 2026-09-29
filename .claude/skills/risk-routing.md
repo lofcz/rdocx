@@ -46,11 +46,11 @@ whole sprint rather than once per worker.
 
 ## Why a router instead of running everything
 
-`/verify --full` is the floor and it already runs on every completion. The rows
-above are the checks that are either slow, or manual, or impossible to express
-as a workspace-wide command, such as opening a corpus deck in PowerPoint. The
-router exists so those are chosen deliberately at design time rather than
-remembered at review time.
+`/verify --scoped F-XXX` is the feature-completion floor, and `/verify --full`
+is the integrated sprint floor. The rows above add checks to the scoped gate
+when the feature earns them. They also join the consolidated sprint gate. The
+router exists so slow, manual, or environment-specific checks are chosen at
+design time rather than remembered at review time.
 
 ## Related
 

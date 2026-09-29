@@ -1153,12 +1153,27 @@ impl<'a> StoryItemRef<'a> {
     /// Return modeled hyperlinks in source order with story-scoped targets.
     pub fn links(&self) -> Result<Vec<LinkInfo>> {
         let (source, item) = self.document.story_item_source(&self.location)?;
-        let links = scan_story_item_links(source.xml.as_ref(), &item)?;
+        let item_scopes = story_namespace_scopes_at(source.xml.as_ref(), [item.scan.start])?;
+        let item_scope = item_scopes.get(&item.scan.start).ok_or_else(|| {
+            Error::Other("story item namespace scope was not inventoried".to_owned())
+        })?;
+        let links = scan_story_item_links_with_scope(source.xml.as_ref(), &item, item_scope)?;
+        let link_scopes = story_namespace_scopes_at(
+            source.xml.as_ref(),
+            links.iter().map(|link| link.full.start),
+        )?;
         links
             .into_iter()
             .map(|link| {
-                self.document
-                    .story_link_info(&self.location.story, source.xml.as_ref(), link)
+                let scope = link_scopes.get(&link.full.start).ok_or_else(|| {
+                    Error::Other("story hyperlink namespace scope was not inventoried".to_owned())
+                })?;
+                self.document.story_link_info(
+                    &self.location.story,
+                    source.xml.as_ref(),
+                    link,
+                    scope,
+                )
             })
             .collect()
     }
@@ -4605,8 +4620,94 @@ fn drawing_ids_in_xml(xml: &[u8]) -> Result<HashSet<u32>> {
     }
 }
 
-fn remap_xml_relationship_ids(xml: &[u8], remap: &HashMap<String, String>) -> Result<Vec<u8>> {
+pub(crate) fn remap_xml_relationship_ids(
+    xml: &[u8],
+    remap: &HashMap<String, String>,
+) -> Result<Vec<u8>> {
     remap_xml_relationship_ids_with_bindings(xml, remap, &[])
+}
+
+pub(crate) fn uniquify_drawing_ids_in_xml(xml: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut occurrences = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("invalid story XML: {error}")))?;
+        let after = reader.buffer_position() as usize;
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let namespace = reader.resolver().resolve_element(element.name()).0;
+                if matches!(namespace, ResolveResult::Bound(value) if value.as_ref() == drawing_ns::WP.as_bytes())
+                    && element.local_name().as_ref() == b"docPr"
+                {
+                    for attribute in element.attributes() {
+                        let attribute = attribute
+                            .map_err(|error| Error::Other(format!("invalid story XML: {error}")))?;
+                        let (attribute_namespace, local) =
+                            reader.resolver().resolve_attribute(attribute.key);
+                        if matches!(attribute_namespace, ResolveResult::Unbound)
+                            && local.as_ref() == b"id"
+                        {
+                            let value = attribute
+                                .decoded_and_normalized_value(
+                                    XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| {
+                                    Error::Other(format!("invalid drawing id: {error}"))
+                                })?
+                                .parse::<u32>()
+                                .map_err(|_| Error::Other("invalid drawing id".to_owned()))?;
+                            let Some((start, end)) = story_attribute_value_span(
+                                &xml[before..after],
+                                attribute.key.as_ref(),
+                            ) else {
+                                return Err(Error::Other(
+                                    "story drawing id source was not found".to_owned(),
+                                ));
+                            };
+                            occurrences.push((before + start, before + end, value));
+                        }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    let mut next = occurrences
+        .iter()
+        .map(|(_, _, value)| *value)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Other("drawing id range is exhausted".to_owned()))?;
+    let mut seen = HashSet::new();
+    let mut edits = Vec::new();
+    for (start, end, value) in occurrences {
+        if seen.insert(value) {
+            continue;
+        }
+        while !seen.insert(next) {
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("drawing id range is exhausted".to_owned()))?;
+        }
+        edits.push((start, end, next.to_string().into_bytes()));
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("drawing id range is exhausted".to_owned()))?;
+    }
+    let mut updated = xml.to_vec();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        updated.splice(start..end, replacement);
+    }
+    Ok(updated)
 }
 
 fn remap_xml_relationship_ids_with_bindings(
@@ -4921,6 +5022,7 @@ thread_local! {
     static LAYOUT_INVOCATIONS: Cell<usize> = const { Cell::new(0) };
     static FAIL_NEXT_HEADER_FOOTER_SERIALIZATION: Cell<bool> = const { Cell::new(false) };
     static STORY_SOURCE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static STORY_TEXT_PREFIX_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -7827,6 +7929,8 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
         let after = reader.buffer_position() as usize;
         if !active {
             if before != item.scan.start {
+                #[cfg(test)]
+                STORY_TEXT_PREFIX_BYTES.set(STORY_TEXT_PREFIX_BYTES.get() + after - before);
                 if matches!(event, Event::Eof) {
                     break;
                 }
@@ -12117,7 +12221,15 @@ impl Document {
                 Error::Other(format!("styles relationship allocation failed: {error}"))
             })?;
         self.styles_part_name = Some(styles_part.clone());
-        self.package.set_part(&styles_part, styles_xml);
+        let styles_changed = self
+            .package
+            .get_part(&styles_part)
+            .and_then(|xml| CT_Styles::from_xml(xml).ok())
+            .as_ref()
+            != Some(&self.styles);
+        if styles_changed {
+            self.package.set_part(&styles_part, styles_xml);
+        }
 
         // Serialize numbering definitions if we have any
         if let Some(numbering_xml) = self
@@ -12138,20 +12250,44 @@ impl Document {
                     Error::Other(format!("numbering relationship allocation failed: {error}"))
                 })?;
             self.numbering_part_name = Some(numbering_part.clone());
-            self.package.set_part(&numbering_part, numbering_xml);
+            let numbering_changed = self
+                .package
+                .get_part(&numbering_part)
+                .and_then(|xml| CT_Numbering::from_xml(xml).ok())
+                .as_ref()
+                != self.numbering.as_ref();
+            if numbering_changed {
+                self.package.set_part(&numbering_part, numbering_xml);
+            }
         }
 
         // F-155 exposes settings as a read-only projection. Parsed settings
         // retain their complete producer bytes and are written back only to
         // the relationship-resolved part they came from.
         if let (Some(settings), Some(part_name)) = (&self.settings, &self.settings_part_name) {
-            self.package.set_part(part_name, settings.to_xml()?);
+            let changed = self
+                .package
+                .get_part(part_name)
+                .and_then(|xml| CT_Settings::from_xml(xml).ok())
+                .as_ref()
+                != Some(settings);
+            if changed {
+                self.package.set_part(part_name, settings.to_xml()?);
+            }
         }
 
         if let (Some(web_settings), Some(part_name)) =
             (&self.web_settings, &self.web_settings_part_name)
         {
-            self.package.set_part(part_name, web_settings.to_xml()?);
+            let changed = self
+                .package
+                .get_part(part_name)
+                .and_then(|xml| CT_WebSettings::from_xml(xml).ok())
+                .as_ref()
+                != Some(web_settings);
+            if changed {
+                self.package.set_part(part_name, web_settings.to_xml()?);
+            }
         }
 
         if self.theme_dirty {
@@ -12189,8 +12325,15 @@ impl Document {
             &self.comments_extended,
             self.comments_extended_part_name.clone(),
         ) {
-            let xml = comments.to_xml()?;
-            self.package.set_part(&part_name, xml);
+            let changed = self
+                .package
+                .get_part(&part_name)
+                .and_then(|xml| rdocx_oxml::comments_extended::CT_CommentsEx::from_xml(xml).ok())
+                .as_ref()
+                != Some(comments);
+            if changed {
+                self.package.set_part(&part_name, comments.to_xml()?);
+            }
             self.ensure_part_relationship_checked(
                 &part_name,
                 crate::comments::COMMENTS_EXTENDED_REL_TYPE,
@@ -12223,7 +12366,15 @@ impl Document {
             .transpose()?
         {
             let core_part = self.reserve_core_properties_bundle()?;
-            self.package.set_part(&core_part, core_xml);
+            let changed = self
+                .package
+                .get_part(&core_part)
+                .and_then(|xml| CoreProperties::from_xml(xml).ok())
+                .as_ref()
+                != self.core_properties.as_ref();
+            if changed {
+                self.package.set_part(&core_part, core_xml);
+            }
         }
         if let Some(application_xml) = self
             .application_properties
@@ -12232,7 +12383,15 @@ impl Document {
             .transpose()?
         {
             let application_part = self.reserve_application_properties_bundle()?;
-            self.package.set_part(&application_part, application_xml);
+            let changed = self
+                .package
+                .get_part(&application_part)
+                .and_then(|xml| AppProperties::from_xml(xml).ok())
+                .as_ref()
+                != self.application_properties.as_ref();
+            if changed {
+                self.package.set_part(&application_part, application_xml);
+            }
         }
         if let Some(custom_xml) = self
             .custom_properties
@@ -12241,7 +12400,15 @@ impl Document {
             .transpose()?
         {
             let custom_part = self.reserve_custom_properties_bundle()?;
-            self.package.set_part(&custom_part, custom_xml);
+            let changed = self
+                .package
+                .get_part(&custom_part)
+                .and_then(|xml| CustomProperties::from_xml(xml).ok())
+                .as_ref()
+                != self.custom_properties.as_ref();
+            if changed {
+                self.package.set_part(&custom_part, custom_xml);
+            }
         }
 
         Ok(())
@@ -12344,7 +12511,7 @@ impl Document {
             existing_document_xml,
         )
         .or_else(|| unsafe_nested_namespace_prefix(&nested_namespace_owners));
-        let doc_xml = if typed_document_is_unchanged && unsafe_prefix.is_some() {
+        let doc_xml = if typed_document_is_unchanged {
             existing_document_xml
                 .expect("compared existing document XML")
                 .to_vec()
@@ -13213,6 +13380,7 @@ impl Document {
         story: &StoryId,
         xml: &[u8],
         link: StoryLinkSpan,
+        scope: &BTreeMap<String, String>,
     ) -> Result<LinkInfo> {
         let text_item = StoryItemSpan {
             kind: StoryItemKind::Paragraph,
@@ -13223,7 +13391,7 @@ impl Document {
             complex_ancestors: Vec::new(),
             sdt_context: None,
         };
-        let text = story_item_text(xml, &text_item)?.unwrap_or_default();
+        let text = story_item_text_with_scope(xml, &text_item, scope)?.unwrap_or_default();
         let url = link
             .rel_id
             .as_deref()
@@ -13242,13 +13410,19 @@ impl Document {
     pub fn story_links(&self, story: &StoryId) -> Result<Vec<(ContentLocation, LinkInfo)>> {
         let (source, owner) = self.story_source_and_owner(story)?;
         let items = scan_story_items(source.xml.as_ref(), &owner)?;
+        let item_scopes = story_namespace_scopes_at(
+            source.xml.as_ref(),
+            items.iter().map(|item| item.scan.start),
+        )?;
         let mut links = Vec::new();
         for (index, item) in items.into_iter().enumerate() {
-            for link in scan_story_item_links(source.xml.as_ref(), &item)? {
+            let scope = item_scopes.get(&item.scan.start).ok_or_else(|| {
+                Error::Other("story item namespace scope was not inventoried".to_owned())
+            })?;
+            for link in scan_story_item_links_with_scope(source.xml.as_ref(), &item, scope)? {
                 let source_position = link.full.start;
                 let source_end = link.full.end;
                 let owner_width = item.full.end - item.full.start;
-                let info = self.story_link_info(story, source.xml.as_ref(), link)?;
                 links.push((
                     source_position,
                     source_end,
@@ -13259,10 +13433,28 @@ impl Document {
                         index_path: vec![index],
                         is_end: false,
                     },
-                    info,
+                    link,
                 ));
             }
         }
+        let link_scopes = story_namespace_scopes_at(
+            source.xml.as_ref(),
+            links.iter().map(|(_, _, _, _, link)| link.full.start),
+        )?;
+        let mut links = links
+            .into_iter()
+            .map(
+                |(source_position, source_end, owner_width, location, link)| {
+                    let scope = link_scopes.get(&link.full.start).ok_or_else(|| {
+                        Error::Other(
+                            "story hyperlink namespace scope was not inventoried".to_owned(),
+                        )
+                    })?;
+                    let info = self.story_link_info(story, source.xml.as_ref(), link, scope)?;
+                    Ok((source_position, source_end, owner_width, location, info))
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
         links.sort_by_key(|(source_position, _, owner_width, _, _)| {
             (*source_position, *owner_width)
         });
@@ -13307,6 +13499,7 @@ impl Document {
                     .iter()
                     .flat_map(|(_, items)| items.iter().map(|item| item.scan.start)),
             )?;
+            let mut link_inventories = Vec::new();
             for (story, items) in inventories {
                 let mut links = Vec::new();
                 for (index, item) in items.into_iter().enumerate() {
@@ -13318,7 +13511,6 @@ impl Document {
                         let source_position = link.full.start;
                         let source_end = link.full.end;
                         let owner_width = item.full.end - item.full.start;
-                        let info = self.story_link_info(&story, source.xml.as_ref(), link)?;
                         links.push((
                             source_position,
                             source_end,
@@ -13329,10 +13521,35 @@ impl Document {
                                 index_path: vec![index],
                                 is_end: false,
                             },
-                            info,
+                            link,
                         ));
                     }
                 }
+                link_inventories.push((story, links));
+            }
+            let link_scopes = story_namespace_scopes_at(
+                source.xml.as_ref(),
+                link_inventories
+                    .iter()
+                    .flat_map(|(_, links)| links.iter().map(|(_, _, _, _, link)| link.full.start)),
+            )?;
+            for (story, links) in link_inventories {
+                let mut links = links
+                    .into_iter()
+                    .map(
+                        |(source_position, source_end, owner_width, location, link)| {
+                            let scope = link_scopes.get(&link.full.start).ok_or_else(|| {
+                                Error::Other(
+                                    "story hyperlink namespace scope was not inventoried"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let info =
+                                self.story_link_info(&story, source.xml.as_ref(), link, scope)?;
+                            Ok((source_position, source_end, owner_width, location, info))
+                        },
+                    )
+                    .collect::<Result<Vec<_>>>()?;
                 links.sort_by_key(|(source_position, _, owner_width, _, _)| {
                     (*source_position, *owner_width)
                 });
@@ -22408,6 +22625,14 @@ impl Document {
                 .as_ref()
                 .and_then(CT_Settings::gutter_at_top)
                 .unwrap_or(false),
+            do_not_use_html_paragraph_auto_spacing: self
+                .settings
+                .as_ref()
+                .and_then(|settings| {
+                    settings
+                        .compatibility_option(CompatibilityOption::DoNotUseHTMLParagraphAutoSpacing)
+                })
+                .unwrap_or(false),
             math_properties: self
                 .settings
                 .as_ref()
@@ -24870,6 +25095,25 @@ mod tests {
             assert!(document.story_link_snapshots().unwrap().is_empty());
             assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
         }
+    }
+
+    #[test]
+    fn story_link_snapshots_do_not_rescan_story_prefix_per_link() {
+        let mut document = Document::new();
+        let relationship_id = document.add_hyperlink_relationship("https://example.com");
+        for index in 0..64 {
+            document
+                .add_paragraph("")
+                .add_hyperlink(&format!("link {index}"), &relationship_id);
+        }
+
+        STORY_TEXT_PREFIX_BYTES.set(0);
+        let links = document.story_link_snapshots().unwrap();
+
+        assert_eq!(links.len(), 64);
+        assert_eq!(links.first().unwrap().1.text, "link 0");
+        assert_eq!(links.last().unwrap().1.text, "link 63");
+        assert_eq!(STORY_TEXT_PREFIX_BYTES.get(), 0);
     }
 
     #[test]
@@ -29084,7 +29328,7 @@ mod tests {
         const WORD_SHA256: &str =
             "9acea62539e90e39078a3502c2f2a109073d60497a50db89bac065bd2b4785cf";
         const POWERPOINT_SHA256: &str =
-            "f8bcefb13777e423714493a292966d0214298adc826d5487e4bfbea0f36e4582";
+            "8edda1371d1da30b937108fc1cfa3366467c9dbeb90934391c160b532781eef1";
 
         let data = f158_chart_data(2);
         let evidence_dir = std::env::temp_dir();
