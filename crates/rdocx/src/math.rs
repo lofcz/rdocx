@@ -2229,6 +2229,9 @@ impl<'a> LatexParser<'a> {
         self.bump();
         let command = self.read_command_name();
         match command.as_str() {
+            // OMML runs already use math italic by default. Pandoc emits this
+            // wrapper for multi-character italic MathML identifiers.
+            "mathit" => self.parse_required_group(),
             "frac" => {
                 let numerator = self.parse_required_group()?;
                 let denominator = self.parse_required_group()?;
@@ -2268,16 +2271,20 @@ impl<'a> LatexParser<'a> {
                     MathBorderBox::new(base),
                 )]))
             }
-            "underline" => {
+            "underline" | "bar" | "overline" => {
                 let base = self.parse_required_argument()?;
                 self.add_node()?;
                 Ok(MathArgument::new(vec![MathExpression::Bar(MathBar::new(
-                    BarPosition::Bottom,
+                    if command == "underline" {
+                        BarPosition::Bottom
+                    } else {
+                        BarPosition::Top
+                    },
                     base,
                 ))]))
             }
-            "hat" | "widehat" | "bar" | "overline" | "vec" | "overrightarrow" | "tilde"
-            | "widetilde" | "dot" | "ddot" => {
+            "hat" | "widehat" | "vec" | "overrightarrow" | "tilde" | "widetilde" | "dot"
+            | "ddot" => {
                 let base = self.parse_required_argument()?;
                 self.add_node()?;
                 Ok(MathArgument::new(vec![MathExpression::Accent(
@@ -3919,14 +3926,18 @@ mod tests {
             coverage.value.expressions[3],
             MathExpression::Nary(_)
         ));
-        assert!(
+        assert_eq!(
+            coverage.value.expressions[4],
+            MathExpression::Bar(MathBar::new(BarPosition::Top, MathArgument::text("x")))
+        );
+        assert_eq!(
             coverage
                 .value
                 .expressions
                 .iter()
                 .filter(|value| matches!(value, MathExpression::Accent(_)))
-                .count()
-                >= 5
+                .count(),
+            4
         );
         assert!(
             coverage
@@ -4599,23 +4610,14 @@ mod tests {
             } else {
                 assert_eq!(ours, oracle.value, "Pandoc structure for {latex}");
             }
-            assert_eq!(oracle.diagnostics[0].path, "/math[1]/@display");
             assert_eq!(
-                oracle.diagnostics[1],
-                MathConversionDiagnostic {
+                oracle.diagnostics,
+                vec![MathConversionDiagnostic {
                     path: "/math[1]/semantics[1]".to_owned(),
                     message: "MathML semantics metadata was discarded".to_owned(),
-                }
+                }],
+                "Pandoc presentation hints are accepted silently for {latex}",
             );
-            if latex.contains("matrix") {
-                assert_eq!(oracle.diagnostics.len(), 10);
-                assert!(oracle.diagnostics[2..].iter().all(|value| {
-                    value.path.contains("/mtd[")
-                        && value.message == "unsupported MathML attribute was discarded"
-                }));
-            } else {
-                assert_eq!(oracle.diagnostics.len(), 2);
-            }
 
             let mathml = equation_to_mathml(&ours);
             assert!(mathml.diagnostics.is_empty());
@@ -4627,15 +4629,7 @@ mod tests {
                 .and_then(|value| value.strip_suffix("\\)"))
                 .expect("Pandoc inline LaTeX wrapper");
             let reopened = equation_from_latex(oracle_latex).expect("Pandoc LaTeX conversion");
-            if latex.starts_with("\\left") {
-                assert_eq!(
-                    reopened.value,
-                    MathArgument::text("(a+b)"),
-                    "Pandoc intentionally removes explicit delimiter scope"
-                );
-            } else {
-                assert_eq!(ours, reopened.value, "Pandoc reverse structure for {latex}");
-            }
+            assert_eq!(ours, reopened.value, "Pandoc reverse structure for {latex}");
             if ours
                 .expressions
                 .iter()
