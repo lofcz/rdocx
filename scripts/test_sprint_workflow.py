@@ -386,7 +386,10 @@ class SprintWorkflowTests(unittest.TestCase):
 
         ci_gate = self.yaml_block(ci, "  ci-gate:")
         self.assertIn("name: CI gate", self.yaml_direct_lines(ci_gate, 4))
-        self.assertIn("if: always()", self.yaml_direct_lines(ci_gate, 4))
+        self.assertIn(
+            "if: always() && github.event_name != 'workflow_dispatch'",
+            self.yaml_direct_lines(ci_gate, 4),
+        )
 
     def test_ci_gate_rejects_failed_selected_jobs_and_accepts_unselected_skips(
         self,
@@ -568,7 +571,7 @@ class SprintWorkflowTests(unittest.TestCase):
             f"fonts/{path.name}"
             for path in sorted((*fonts.glob("LICENSE-*"), *fonts.glob("NOTICE-*")))
         )
-        self.assertEqual(len(expected_fonts), 27)
+        self.assertEqual(len(expected_fonts), 28)
         self.assertEqual(len(expected_legal), 6)
         self.assertEqual(listed_fonts, expected_fonts)
         self.assertEqual(listed_legal, expected_legal)
@@ -709,7 +712,10 @@ class SprintWorkflowTests(unittest.TestCase):
                 '--output-dir "${RUNNER_TEMP}/word-fidelity"',
             ),
         )
-        self.assertIn("if: always()", self.operative_lines(upload))
+        self.assertIn(
+            "if: always() && github.event_name != 'workflow_dispatch'",
+            self.operative_lines(upload),
+        )
         self.assertIn(
             "${{ runner.temp }}/word-fidelity/gate-evidence.json", upload
         )
@@ -836,7 +842,9 @@ class SprintWorkflowTests(unittest.TestCase):
             line.split(":", 1)[0]
             for line in self.yaml_direct_lines(triggers, 2)
         )
-        self.assertEqual(trigger_keys, ("push", "pull_request", "schedule"))
+        self.assertEqual(
+            trigger_keys, ("workflow_dispatch", "push", "pull_request", "schedule")
+        )
         pull_request = self.yaml_block(triggers, "  pull_request:")
         self.assertEqual(self.yaml_direct_lines(pull_request, 4), ())
 
@@ -2162,7 +2170,9 @@ class SprintWorkflowTests(unittest.TestCase):
             line.split(":", 1)[0]
             for line in self.yaml_direct_lines(triggers, 2)
         )
-        self.assertEqual(trigger_keys, ("push", "pull_request", "schedule"))
+        self.assertEqual(
+            trigger_keys, ("workflow_dispatch", "push", "pull_request", "schedule")
+        )
         pull_request = self.yaml_block(triggers, "  pull_request:")
         self.assertEqual(self.yaml_direct_lines(pull_request, 4), ())
 
@@ -8453,6 +8463,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertEqual(
             direct,
             (
+                "if: github.event_name != 'workflow_dispatch'",
                 "name: Release regressions",
                 "runs-on: ubuntu-latest",
                 "steps:",
@@ -9405,7 +9416,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertIn("system-fonts", features)
         self.assertNotIn("bundled-fonts", features)
         claimed_font_count = re.findall(r"([0-9]+) bundled TTFs", claude)
-        self.assertEqual(claimed_font_count, ["27"])
+        self.assertEqual(claimed_font_count, ["28"])
         fonts = font_path / "fonts"
         self.assertEqual(len(tuple(fonts.glob("*.ttf"))), int(claimed_font_count[0]))
         for legal_file in (

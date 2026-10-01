@@ -420,9 +420,11 @@ def test_run_text_replaces_in_place_and_keeps_every_handle_live():
 
     for value in ("HELLO", "line\nfeed", "vertical\vtab", "tab\tstop", ""):
         first.text = value
-        assert first.text == value
+        # A run stores XML-forbidden controls with python-pptx's OOXML spelling.
+        expected = value.replace("\v", "_x000B_")
+        assert first.text == expected
         assert second.text == " world"
-        assert paragraph.text == frame.text == shape.text == value + " world"
+        assert paragraph.text == frame.text == shape.text == expected + " world"
         assert len(runs) == 2
         assert shape.left == left
         assert len(slides) == len(shapes) == len(slide.shapes) == 1
