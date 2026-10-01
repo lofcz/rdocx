@@ -1,5 +1,6 @@
 //! Text content elements: `CT_P` (paragraph), `CT_R` (run), `CT_Text`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,7 +23,7 @@ use crate::table::{CT_Row, CT_Tbl, CT_Tc, CellContent};
 static NEXT_FIELD_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 const ROOT_ATTRIBUTES_ELEMENT: &[u8] = b"rdocxRootAttributes";
-const ROOT_ATTRIBUTES_POSITION: usize = usize::MAX;
+pub(crate) const ROOT_ATTRIBUTES_POSITION: usize = usize::MAX;
 const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
 
 fn namespace_declaration(name: &[u8]) -> bool {
@@ -53,7 +54,19 @@ pub(crate) fn capture_root_attribute_record(
     start: &BytesStart<'_>,
     prefixes: &[String],
 ) -> Result<Option<Vec<u8>>> {
-    let bindings = namespace_bindings(prefixes);
+    let mut bindings = namespace_bindings(prefixes);
+    // A plain scope entry names a Word prefix. `word_prefixes_at` adds one
+    // only beside its binding, but the default scope of the public `from_xml`
+    // entrypoints, `CT_P::from_xml` among them, names `w` by convention and
+    // binds nothing. A caller that parses a paragraph cut out of its part in
+    // that scope, as the text-box replacement and template walkers do, reaches
+    // this capture with it, so the Word prefix resolves here instead of
+    // failing on the first `w:rsidR`. An explicit binding always wins.
+    for prefix in prefixes {
+        if !prefix.starts_with('\0') && !bindings.iter().any(|(bound, _)| bound == prefix) {
+            bindings.push((prefix.clone(), crate::namespace::W_NS.to_owned()));
+        }
+    }
     let mut attributes = Vec::new();
     let mut expanded = HashSet::new();
     let mut used_prefixes = Vec::new();
@@ -176,6 +189,138 @@ pub(crate) fn push_root_attribute_record(
     Ok(())
 }
 
+/// Remove `w14:paraId` and `w14:textId` from the retained start-tag
+/// attributes of a paragraph or table row, given its `extra_xml`.
+///
+/// A copy must not share them with its source, and Word assigns new ones to
+/// an element that has none. Every other retained attribute stays, with the
+/// declarations its prefix needs.
+#[doc(hidden)]
+pub fn drop_w14_paragraph_identities(extra_xml: &mut Vec<(usize, Vec<u8>)>) -> Result<()> {
+    let mut index = 0;
+    while index < extra_xml.len() {
+        let (position, raw) = &extra_xml[index];
+        if *position == ROOT_ATTRIBUTES_POSITION && is_root_attribute_record(raw) {
+            match root_attribute_record_without_w14_identities(raw)? {
+                Some(record) => extra_xml[index].1 = record,
+                None => {
+                    extra_xml.remove(index);
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Return the record without its w14 identities, or `None` when nothing else
+/// is left in it.
+fn root_attribute_record_without_w14_identities(raw: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut reader = NsReader::from_reader(raw);
+    let mut buffer = Vec::new();
+    let element = loop {
+        match reader.read_resolved_event_into(&mut buffer)? {
+            (_, Event::Empty(element)) if element.name().as_ref() == ROOT_ATTRIBUTES_ELEMENT => {
+                break element.into_owned();
+            }
+            (_, Event::Eof) => {
+                return Err(OxmlError::InvalidValue(
+                    "invalid retained root-attribute record".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        buffer.clear();
+    };
+    let mut dropped = false;
+    let mut attributes = Vec::new();
+    let mut declarations = Vec::new();
+    for attribute in element.attributes() {
+        let attribute = attribute?;
+        let name = std::str::from_utf8(attribute.key.as_ref())?.to_owned();
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, element.decoder())?
+            .into_owned();
+        if namespace_declaration(name.as_bytes()) {
+            declarations.push((name, value));
+            continue;
+        }
+        let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+        if matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W14_NS.as_bytes())
+            && matches!(local.as_ref(), b"paraId" | b"textId")
+        {
+            dropped = true;
+            continue;
+        }
+        attributes.push((name, value));
+    }
+    if !dropped {
+        return Ok(Some(raw.to_vec()));
+    }
+    if attributes.is_empty() {
+        return Ok(None);
+    }
+    let mut record = BytesStart::new(std::str::from_utf8(ROOT_ATTRIBUTES_ELEMENT)?);
+    for (name, value) in &attributes {
+        record.push_attribute((name.as_str(), value.as_str()));
+    }
+    // The record declares exactly the prefixes its attributes use, so a
+    // declaration only the dropped identities used goes with them.
+    for (name, value) in &declarations {
+        let prefix = name.strip_prefix("xmlns:").unwrap_or_default();
+        if attributes.iter().any(|(attribute, _)| {
+            attribute
+                .split_once(':')
+                .is_some_and(|(used, _)| used == prefix)
+        }) {
+            record.push_attribute((name.as_str(), value.as_str()));
+        }
+    }
+    let mut writer = Writer::new(Vec::new());
+    writer.write_event(Event::Empty(record))?;
+    Ok(Some(writer.into_inner()))
+}
+
+/// Declare the canonical `w14` prefix on the root of a serialized part whose
+/// content uses the prefix while the root does not bind it.
+///
+/// A retained root-attribute record writes `w14:paraId` and `w14:textId`
+/// without their declaration, because Word and python-docx declare `w14` on
+/// the part root. A root rdocx wrote does not, and a producer may declare the
+/// prefix on the element that uses it, so the part declares it here once. A
+/// root that binds `w14` itself is left as it is.
+#[doc(hidden)]
+pub fn declare_w14_on_part_root(xml: &mut Vec<u8>) -> Result<()> {
+    let mut reader = Reader::from_reader(xml.as_slice());
+    let mut buffer = Vec::new();
+    let root_end = loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(root) => {
+                for attribute in root.attributes() {
+                    if attribute?.key.as_ref() == b"xmlns:w14" {
+                        return Ok(());
+                    }
+                }
+                break reader.buffer_position() as usize;
+            }
+            Event::Empty(_) | Event::Eof => return Ok(()),
+            _ => {}
+        }
+        buffer.clear();
+    };
+    // A qualified name starts after `<`, `</` or the whitespace before an
+    // attribute. Text that happens to match only adds a declaration.
+    let uses_w14 = xml[root_end..].windows(5).any(|window| {
+        matches!(window[0], b'<' | b'/' | b' ' | b'\t' | b'\r' | b'\n') && &window[1..] == b"w14:"
+    });
+    if uses_w14 {
+        let declaration = format!(r#" xmlns:w14="{W14_NS}""#);
+        xml.splice(root_end - 1..root_end - 1, declaration.into_bytes());
+    }
+    Ok(())
+}
+
 /// `CT_Text` — The text content of a run, with optional xml:space="preserve".
 #[derive(Debug, Clone, PartialEq)]
 pub struct CT_Text {
@@ -224,6 +369,23 @@ pub struct Field {
     legacy_form_parse_error: bool,
     nested_order: Vec<NestedFieldPosition>,
     source: FieldSource,
+    /// The physical run this field shares with text outside it, if any.
+    span: Option<Box<FieldRunSpan>>,
+}
+
+/// The model runs a physical field span was split into on read.
+///
+/// A run such as `Page {PAGE} of the report` holds text outside the field.
+/// The reader turns it into sibling runs so every consumer sees that text,
+/// and the writer puts the original bytes back while the runs are untouched.
+#[derive(Debug, Clone)]
+struct FieldRunSpan {
+    /// The span's runs in order, `None` where a field of the span sits.
+    runs: Vec<Option<CT_R>>,
+    /// Where this field sits among `runs`.
+    position: usize,
+    /// Which field of the span this is, counted from the first.
+    field_index: usize,
 }
 
 /// The bounded legacy form kind projected from `w:ffData`.
@@ -274,6 +436,7 @@ impl Field {
             legacy_form: None,
             legacy_form_parse_error: false,
             nested_order: Vec::new(),
+            span: None,
         }
     }
 
@@ -305,6 +468,7 @@ impl Field {
             legacy_form: legacy_form.clone(),
             legacy_form_parse_error,
             nested_order: Vec::new(),
+            span: None,
             source: FieldSource::Parsed {
                 source_id,
                 owner_id: source_id,
@@ -568,6 +732,18 @@ impl Field {
         let mut writer = Writer::new(Vec::new());
         write_field(&mut writer, self, None)?;
         Ok(Some((raw_xml, writer.into_inner())))
+    }
+
+    /// Return what this field writes on its own when it was read from a run
+    /// that also held content outside it.
+    #[doc(hidden)]
+    pub fn detached_source(&self) -> Result<Option<Vec<u8>>> {
+        if self.span.is_none() {
+            return Ok(None);
+        }
+        let mut writer = Writer::new(Vec::new());
+        write_run_field(&mut writer, self, None, None)?;
+        Ok(Some(writer.into_inner()))
     }
 
     /// Return the retained physical XML owner identity for a parsed field.
@@ -3205,10 +3381,12 @@ fn project_complex_fields(projection: ComplexFieldProjection<'_>) -> Result<()> 
 
     let mut grouped = Vec::<(usize, usize, Vec<(Field, Option<CT_RPr>)>)>::new();
     for (start, end, field, properties) in completed {
-        if let Some((group_start, group_end, fields)) = grouped.last_mut()
-            && *group_start == start
-            && *group_end == end
+        // Fields that share a physical run form one span, so the splice of
+        // one never removes the run that holds the next.
+        if let Some((_, group_end, fields)) = grouped.last_mut()
+            && start <= *group_end
         {
+            *group_end = end.max(*group_end);
             fields.push((field, properties));
         } else {
             grouped.push((start, end, vec![(field, properties)]));
@@ -3253,13 +3431,9 @@ fn project_complex_fields(projection: ComplexFieldProjection<'_>) -> Result<()> 
             });
         }
 
-        let replacement_count = fields.len();
-        runs.splice(
-            start..=end,
-            fields
-                .into_iter()
-                .map(|(field, properties)| field_run(field, properties)),
-        );
+        let replacement = field_span_runs(&raw_xml, fields, word_prefixes);
+        let replacement_count = replacement.len();
+        runs.splice(start..=end, replacement);
         run_sources.splice(start..=end, std::iter::repeat_n(None, replacement_count));
         remap_complex_field_boundaries(
             start,
@@ -3336,6 +3510,363 @@ fn complex_field_source(
         }
     }
     source
+}
+
+/// One part of a physical field span: a whole field with its bytes, or the
+/// run read from content outside any field.
+enum FieldSpanPart {
+    Field(Vec<u8>),
+    Outside(CT_R),
+}
+
+/// Split the exact bytes of a complex field span into its fields and the run
+/// content outside them, in order.
+///
+/// Each part is written as its own runs, so a part taken from a shared run
+/// repeats that run's start tag and `w:rPr`. Returns `None` for a shape this
+/// does not model, which leaves the span as it was read.
+fn field_span_parts(raw: &[u8], word_prefixes: &[String]) -> Result<Option<Vec<FieldSpanPart>>> {
+    use std::ops::Range;
+
+    // A run's start tag, `w:rPr` and end tag.
+    let mut runs = Vec::<(Range<usize>, Option<Range<usize>>, Range<usize>)>::new();
+    // Each part: whether it is a field, and its children (run index, bytes).
+    let mut parts = Vec::<(bool, Vec<(Option<usize>, Range<usize>)>)>::new();
+    let mut current: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader.read_event_into(&mut buffer)?;
+        let (run_start, run_prefixes) = match event {
+            Event::Start(start) => {
+                let prefixes = word_prefixes_at(&start, word_prefixes)?;
+                if is_word_element(start.name().as_ref(), b"r", &prefixes) {
+                    (before..reader.buffer_position() as usize, prefixes)
+                } else {
+                    reader.read_to_end_into(start.name(), &mut Vec::new())?;
+                    let range = before..reader.buffer_position() as usize;
+                    let Some(part) = current.filter(|_| depth > 0) else {
+                        return Ok(None);
+                    };
+                    parts[part].1.push((None, range));
+                    buffer.clear();
+                    continue;
+                }
+            }
+            Event::Eof => break,
+            _ => {
+                let range = before..reader.buffer_position() as usize;
+                let Some(part) = current.filter(|_| depth > 0) else {
+                    return Ok(None);
+                };
+                parts[part].1.push((None, range));
+                buffer.clear();
+                continue;
+            }
+        };
+        let run = runs.len();
+        runs.push((run_start, None, 0..0));
+        let mut children = 0usize;
+        loop {
+            buffer.clear();
+            let child_start = reader.buffer_position() as usize;
+            let kind = match reader.read_event_into(&mut buffer)? {
+                Event::Start(child) => {
+                    let prefixes = word_prefixes_at(&child, &run_prefixes)?;
+                    let kind = field_span_child_kind(&child, &prefixes);
+                    reader.read_to_end_into(child.name(), &mut Vec::new())?;
+                    kind
+                }
+                Event::Empty(child) => {
+                    let prefixes = word_prefixes_at(&child, &run_prefixes)?;
+                    field_span_child_kind(&child, &prefixes)
+                }
+                Event::End(_) => {
+                    let end = reader.buffer_position() as usize;
+                    if children == 0 {
+                        let Some(part) = current.filter(|_| depth > 0) else {
+                            return Ok(None);
+                        };
+                        parts[part].1.push((Some(run), child_start..child_start));
+                    }
+                    runs[run].2 = child_start..end;
+                    break;
+                }
+                Event::Eof => return Ok(None),
+                _ => FieldSpanChild::Other,
+            };
+            let range = child_start..reader.buffer_position() as usize;
+            if kind == FieldSpanChild::Properties {
+                runs[run].1 = Some(range);
+                continue;
+            }
+            children += 1;
+            let inside = match kind {
+                FieldSpanChild::Begin => {
+                    if depth == 0 {
+                        parts.push((true, Vec::new()));
+                        current = Some(parts.len() - 1);
+                    }
+                    depth += 1;
+                    true
+                }
+                FieldSpanChild::End => {
+                    if depth == 0 {
+                        return Ok(None);
+                    }
+                    depth -= 1;
+                    true
+                }
+                FieldSpanChild::FieldMarker => {
+                    if depth == 0 {
+                        return Ok(None);
+                    }
+                    true
+                }
+                FieldSpanChild::Other | FieldSpanChild::Properties => depth > 0,
+            };
+            if !inside && current.is_none_or(|part| parts[part].0) {
+                parts.push((false, Vec::new()));
+                current = Some(parts.len() - 1);
+            }
+            let part = current.expect("a part is open");
+            parts[part].1.push((Some(run), range));
+            if kind == FieldSpanChild::End && depth == 0 {
+                current = None;
+            }
+        }
+        buffer.clear();
+    }
+    if depth != 0 {
+        return Ok(None);
+    }
+
+    let materialize = |children: &[(Option<usize>, Range<usize>)]| {
+        let mut bytes = Vec::new();
+        let mut open = None;
+        for (run, range) in children {
+            if *run != open {
+                if let Some(open) = open {
+                    bytes.extend_from_slice(&raw[runs[open].2.clone()]);
+                }
+                if let Some(run) = *run {
+                    bytes.extend_from_slice(&raw[runs[run].0.clone()]);
+                    if let Some(properties) = runs[run].1.clone() {
+                        bytes.extend_from_slice(&raw[properties]);
+                    }
+                }
+                open = *run;
+            }
+            bytes.extend_from_slice(&raw[range.clone()]);
+        }
+        if let Some(open) = open {
+            bytes.extend_from_slice(&raw[runs[open].2.clone()]);
+        }
+        bytes
+    };
+
+    // Content outside every field that no reader sees, such as whitespace or
+    // an unknown element, stays with its neighbouring field as before.
+    let mut outside = Vec::with_capacity(parts.len());
+    let mut index = 0;
+    while index < parts.len() {
+        if parts[index].0 {
+            outside.push(None);
+            index += 1;
+            continue;
+        }
+        if let Ok(run) = parse_run_raw(&materialize(&parts[index].1), word_prefixes)
+            && !run.content.is_empty()
+        {
+            outside.push(Some(run));
+            index += 1;
+            continue;
+        }
+        let (_, children) = parts.remove(index);
+        if let Some(next) = parts.get_mut(index) {
+            next.1.splice(0..0, children);
+        } else if let Some(previous) = index.checked_sub(1).and_then(|at| parts.get_mut(at)) {
+            previous.1.extend(children);
+        }
+    }
+    Ok(Some(
+        parts
+            .iter()
+            .zip(outside)
+            .map(|((_, children), run)| match run {
+                Some(run) => FieldSpanPart::Outside(run),
+                None => FieldSpanPart::Field(materialize(children)),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldSpanChild {
+    Properties,
+    Begin,
+    End,
+    /// A separator or instruction text, which only ever sits inside a field.
+    FieldMarker,
+    Other,
+}
+
+fn field_span_child_kind(element: &BytesStart<'_>, word_prefixes: &[String]) -> FieldSpanChild {
+    let name = element.name();
+    if is_word_element(name.as_ref(), b"rPr", word_prefixes) {
+        return FieldSpanChild::Properties;
+    }
+    if is_word_element(name.as_ref(), b"instrText", word_prefixes) {
+        return FieldSpanChild::FieldMarker;
+    }
+    if !is_word_element(name.as_ref(), b"fldChar", word_prefixes) {
+        return FieldSpanChild::Other;
+    }
+    match optional_word_attribute(element, b"fldCharType", word_prefixes).as_deref() {
+        Some("begin") => FieldSpanChild::Begin,
+        Some("end") => FieldSpanChild::End,
+        _ => FieldSpanChild::FieldMarker,
+    }
+}
+
+/// Whether one field's span starts with its begin marker and ends with its
+/// end marker, the shape Word writes, so no run content sits outside it.
+///
+/// Only the first and last run children are read. Any other shape answers
+/// `false` and takes the full split.
+fn field_span_is_bare(raw: &[u8], word_prefixes: &[String]) -> bool {
+    let marker = |element: &BytesStart<'_>, prefixes: &[String], kind: &str| {
+        is_word_element(element.name().as_ref(), b"fldChar", prefixes)
+            && optional_word_attribute(element, b"fldCharType", prefixes).as_deref() == Some(kind)
+    };
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut run_prefixes = None;
+    let begins = loop {
+        let Ok(event) = reader.read_event_into(&mut buffer) else {
+            return false;
+        };
+        match event {
+            Event::Start(element) => {
+                let Ok(prefixes) = word_prefixes_at(&element, word_prefixes) else {
+                    return false;
+                };
+                if run_prefixes.is_none() {
+                    if !is_word_element(element.name().as_ref(), b"r", &prefixes) {
+                        return false;
+                    }
+                    run_prefixes = Some(prefixes);
+                } else if is_word_element(element.name().as_ref(), b"rPr", &prefixes) {
+                    if reader
+                        .read_to_end_into(element.name(), &mut Vec::new())
+                        .is_err()
+                    {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            Event::Empty(element) => {
+                let Some(inherited) = run_prefixes.as_deref() else {
+                    return false;
+                };
+                let Ok(prefixes) = word_prefixes_at(&element, inherited) else {
+                    return false;
+                };
+                break marker(&element, &prefixes, "begin");
+            }
+            _ => return false,
+        }
+        buffer.clear();
+    };
+    if !begins {
+        return false;
+    }
+    // The last run child is the empty element before the closing run tag.
+    let body = raw.trim_ascii_end();
+    let Some(close) = body.iter().rposition(|byte| *byte == b'<') else {
+        return false;
+    };
+    let Some(last) = body[..close].iter().rposition(|byte| *byte == b'<') else {
+        return false;
+    };
+    let mut reader = Reader::from_reader(&body[last..close]);
+    let mut buffer = Vec::new();
+    let Some(prefixes) = run_prefixes else {
+        return false;
+    };
+    matches!(
+        reader.read_event_into(&mut buffer),
+        Ok(Event::Empty(element))
+            if word_prefixes_at(&element, &prefixes)
+                .is_ok_and(|prefixes| marker(&element, &prefixes, "end"))
+    ) && body[last..close].trim_ascii_end().ends_with(b"/>")
+}
+
+/// Turn a projected field span into model runs, splitting out the run
+/// content that sits outside its fields.
+///
+/// Without such content the span stays one run per field, as before.
+fn field_span_runs(
+    raw: &[u8],
+    fields: Vec<(Field, Option<CT_RPr>)>,
+    word_prefixes: &[String],
+) -> Vec<CT_R> {
+    let one_run_per_field = |fields: Vec<(Field, Option<CT_RPr>)>| {
+        fields
+            .into_iter()
+            .map(|(field, properties)| field_run(field, properties))
+            .collect()
+    };
+    if fields.len() == 1 && field_span_is_bare(raw, word_prefixes) {
+        return one_run_per_field(fields);
+    }
+    let parts = match field_span_parts(raw, word_prefixes) {
+        Ok(Some(parts))
+            if (fields.len() > 1
+                || parts
+                    .iter()
+                    .any(|part| matches!(part, FieldSpanPart::Outside(_))))
+                && parts
+                    .iter()
+                    .filter(|part| matches!(part, FieldSpanPart::Field(_)))
+                    .count()
+                    == fields.len() =>
+        {
+            parts
+        }
+        _ => return one_run_per_field(fields),
+    };
+    let shape = parts
+        .into_iter()
+        .map(|part| match part {
+            FieldSpanPart::Field(_) => None,
+            FieldSpanPart::Outside(run) => Some(run),
+        })
+        .collect::<Vec<_>>();
+    let mut fields = fields.into_iter().enumerate();
+    shape
+        .iter()
+        .enumerate()
+        .map(|(position, run)| match run {
+            Some(run) => run.clone(),
+            None => {
+                let (field_index, (mut field, properties)) =
+                    fields.next().expect("one field per field part");
+                field.span = Some(Box::new(FieldRunSpan {
+                    runs: shape.clone(),
+                    position,
+                    field_index,
+                }));
+                field_run(field, properties)
+            }
+        })
+        .collect()
 }
 
 fn has_typed_boundary_inside(
@@ -3462,6 +3993,58 @@ pub enum RunSplitError {
     BookmarkProjection,
 }
 
+/// The range kind that [`CT_P::anchor_accepted_range`] writes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeAnchor<'a> {
+    /// Comment range markers, with the reference run right after the end.
+    Comment(i32),
+    /// Bookmark markers.
+    Bookmark { id: i32, name: &'a str },
+}
+
+/// Why [`CT_P::anchor_accepted_range`] could not place a range exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RangeAnchorError {
+    #[error("run boundary {boundary} exceeds the paragraph run count {run_count}")]
+    OutOfRange { boundary: usize, run_count: usize },
+    #[error("run range {start}..{end} ends before it starts")]
+    Reversed { start: usize, end: usize },
+    #[error("run range {start}..{end} crosses the edge of an inline content control")]
+    CrossesControl { start: usize, end: usize },
+    #[error(
+        "run boundary {boundary} falls inside an inline content control, where a range that continues into another paragraph cannot start or end"
+    )]
+    InsideControl { boundary: usize },
+    #[error("run boundary {boundary} falls inside a tracked insertion or move")]
+    InsideRevision { boundary: usize },
+    #[error("run boundary {boundary} sits next to a tracked change inside a hyperlink")]
+    HyperlinkRevision { boundary: usize },
+    #[error("range markers could not be written into the paragraph")]
+    Write,
+}
+
+/// One physical place for a range marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkerSite {
+    /// A position among the paragraph-level children at a direct run boundary.
+    Paragraph { boundary: usize, position: usize },
+    /// A `w:sdtContent` child index in the inline control that `controls`
+    /// reaches: a paragraph control index, then nested content indexes.
+    Control { controls: Vec<usize>, index: usize },
+}
+
+/// A direct run boundary and a position among its paragraph-level children.
+type ChildPosition = (usize, usize);
+
+/// One paragraph-level child at a direct run boundary, in serialization order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundaryItem {
+    Control(usize),
+    Marker(usize),
+    Raw(usize),
+}
+
 /// `CT_P` — A paragraph element containing runs and properties.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(non_snake_case)]
@@ -3523,6 +4106,229 @@ impl AcceptedRunPath {
     }
 }
 
+/// A content control or a revision wrapper at a run boundary of a paragraph.
+#[derive(Clone, Copy)]
+pub(crate) enum BoundaryOwner {
+    /// An index into [`CT_P::content_controls`].
+    ContentControl(usize),
+    /// An index into [`CT_P::revisions`].
+    Revision(usize),
+    /// An index into [`CT_P::extra_xml`] of a smart tag or an inline custom
+    /// XML element, see [`run_wrapper_paragraph`].
+    Wrapper(usize),
+}
+
+/// The content controls, revision wrappers, smart tags and inline custom
+/// XML elements at run `boundary` of `paragraph`, in document order.
+pub(crate) fn boundary_owners(paragraph: &CT_P, boundary: usize) -> Vec<BoundaryOwner> {
+    let mut owners = paragraph
+        .content_controls
+        .iter()
+        .enumerate()
+        .filter(|(_, (at, _, _, _))| *at == boundary)
+        .map(|(index, (_, raw_before, _, _))| {
+            (
+                AcceptedOwnerOrder::Raw(*raw_before),
+                BoundaryOwner::ContentControl(index),
+            )
+        })
+        .chain(
+            paragraph
+                .revisions
+                .iter()
+                .enumerate()
+                .filter(|(_, (at, _, _))| *at == boundary)
+                .map(|(index, (_, slot, _))| {
+                    let order = if let Some(hyperlink_index) = hyperlink_revision_index(*slot) {
+                        if let Some(raw_before) = paragraph
+                            .hyperlinks
+                            .get(hyperlink_index)
+                            .and_then(|hyperlink| hyperlink.preserved_raw_before)
+                        {
+                            AcceptedOwnerOrder::Raw(raw_before)
+                        } else if paragraph
+                            .hyperlinks
+                            .get(hyperlink_index)
+                            .is_some_and(|hyperlink| boundary == hyperlink.run_end)
+                        {
+                            AcceptedOwnerOrder::BeforeRaw
+                        } else {
+                            AcceptedOwnerOrder::AfterRaw
+                        }
+                    } else {
+                        AcceptedOwnerOrder::Raw(*slot)
+                    };
+                    (order, BoundaryOwner::Revision(index))
+                }),
+        )
+        .chain(
+            paragraph
+                .extra_xml
+                .iter()
+                .enumerate()
+                .filter(|(_, (at, _))| *at == boundary)
+                .enumerate()
+                .filter(|(_, (_, (_, raw)))| is_run_wrapper(raw))
+                .map(|(slot, (index, _))| {
+                    (AcceptedOwnerOrder::Raw(slot), BoundaryOwner::Wrapper(index))
+                }),
+        )
+        .collect::<Vec<_>>();
+    // A control goes before the raw child of the same slot.
+    owners
+        .sort_by_key(|(order, owner)| (*order, !matches!(owner, BoundaryOwner::ContentControl(_))));
+    owners.into_iter().map(|(_, owner)| owner).collect()
+}
+
+/// Whether `raw` is a smart tag or an inline custom XML element with
+/// content, read with the conventional `w` prefix and those it declares.
+fn is_run_wrapper(raw: &[u8]) -> bool {
+    let mut reader = Reader::from_reader(raw);
+    let mut buffer = Vec::new();
+    let Ok(Event::Start(start)) = reader.read_event_into(&mut buffer) else {
+        return false;
+    };
+    let Ok(prefixes) = word_prefixes_at(&start, &["w".to_owned()]) else {
+        return false;
+    };
+    is_word_element(start.name().as_ref(), b"smartTag", &prefixes)
+        || is_word_element(start.name().as_ref(), b"customXml", &prefixes)
+}
+
+/// The content of a smart tag, an inline custom XML element or a simple
+/// field, parsed as a paragraph from its preserved source `raw` in the scope
+/// of the Word prefixes `inherited`. Its runs are the text a reader sees
+/// inside the wrapper. None for any other element, and for a wrapper whose
+/// content [`with_run_wrapper_content`] could not write back, because `w`
+/// does not name WordprocessingML there.
+pub(crate) fn run_wrapper_paragraph(raw: &[u8], inherited: &[String]) -> Option<CT_P> {
+    let mut reader = Reader::from_reader(raw);
+    let mut buffer = Vec::new();
+    let Ok(Event::Start(start)) = reader.read_event_into(&mut buffer) else {
+        return None;
+    };
+    let prefixes = word_prefixes_at(&start, inherited).ok()?;
+    if !["smartTag", "customXml", "fldSimple"]
+        .iter()
+        .any(|local| is_word_element(start.name().as_ref(), local.as_bytes(), &prefixes))
+        || !prefixes.iter().any(|prefix| prefix == "w")
+    {
+        return None;
+    }
+    let (content_start, content_end) = run_wrapper_content_bounds(raw)?;
+    let mut paragraph_xml = b"<w:p>".to_vec();
+    paragraph_xml.extend_from_slice(&raw[content_start..content_end]);
+    paragraph_xml.extend_from_slice(b"</w:p>");
+    let mut paragraph_reader = Reader::from_reader(paragraph_xml.as_slice());
+    let mut paragraph_buffer = Vec::new();
+    let Ok(Event::Start(paragraph_start)) = paragraph_reader.read_event_into(&mut paragraph_buffer)
+    else {
+        return None;
+    };
+    CT_P::from_xml_with_prefixes_and_root(&mut paragraph_reader, &prefixes, Some(&paragraph_start))
+        .ok()
+}
+
+/// The source `raw` of a wrapper that [`run_wrapper_paragraph`] read, with
+/// `paragraph` written back as its content between its own start and end
+/// tags.
+pub(crate) fn with_run_wrapper_content(raw: &[u8], paragraph: &CT_P) -> Result<Vec<u8>> {
+    let missing = || OxmlError::MissingElement("wrapper content".to_owned());
+    let mut writer = Writer::new(Vec::new());
+    paragraph.to_xml(&mut writer)?;
+    let paragraph_xml = writer.into_inner();
+    // A paragraph without any content is written as `<w:p/>`.
+    let content = match paragraph_xml.iter().position(|byte| *byte == b'>') {
+        Some(end) if paragraph_xml[..end].ends_with(b"/") => &[][..],
+        Some(end) => paragraph_xml[end + 1..]
+            .strip_suffix(b"</w:p>")
+            .ok_or_else(missing)?,
+        None => return Err(missing()),
+    };
+    let (content_start, content_end) = run_wrapper_content_bounds(raw).ok_or_else(missing)?;
+    let mut updated = raw[..content_start].to_vec();
+    updated.extend_from_slice(content);
+    updated.extend_from_slice(&raw[content_end..]);
+    Ok(updated)
+}
+
+/// The byte range of the content of the element `raw`, between the end of
+/// its start tag and the start of its end tag.
+fn run_wrapper_content_bounds(raw: &[u8]) -> Option<(usize, usize)> {
+    let mut reader = Reader::from_reader(raw);
+    let mut buffer = Vec::new();
+    let Ok(Event::Start(_)) = reader.read_event_into(&mut buffer) else {
+        return None;
+    };
+    let content_start = reader.buffer_position() as usize;
+    let content_end = raw.iter().rposition(|byte| *byte == b'<')?;
+    (content_start <= content_end).then_some((content_start, content_end))
+}
+
+/// The preserved source of a run that holds only an unchanged simple field,
+/// with the Word prefixes it was read with.
+pub(crate) fn simple_field_source(run: &CT_R) -> Option<(&[u8], &[String])> {
+    let [RunContent::Field(field)] = run.content.as_slice() else {
+        return None;
+    };
+    match &field.source {
+        FieldSource::Parsed {
+            form: FieldForm::Simple,
+            raw_xml,
+            word_prefixes,
+            ..
+        } if field.is_unchanged() => Some((raw_xml, word_prefixes)),
+        _ => None,
+    }
+}
+
+/// Read the simple field of `run` again from the source `raw`, which
+/// [`with_run_wrapper_content`] wrote. Returns false, and changes nothing,
+/// when `run` holds no unchanged simple field or `raw` is not one.
+pub(crate) fn set_simple_field_source(run: &mut CT_R, raw: &[u8]) -> Result<bool> {
+    let Some((_, prefixes)) = simple_field_source(run) else {
+        return Ok(false);
+    };
+    let Some(field) = parse_simple_field(raw, prefixes)? else {
+        return Ok(false);
+    };
+    run.content = vec![RunContent::Field(field)];
+    Ok(true)
+}
+
+/// Append the text of the accepted view of `paragraph` to `output`, see
+/// [`CT_P::accepted_text`].
+fn append_accepted_text(paragraph: &CT_P, output: &mut String) {
+    let wrapper_text = |raw: &[u8], prefixes: &[String], output: &mut String| {
+        if let Some(content) = run_wrapper_paragraph(raw, prefixes) {
+            append_accepted_text(&content, output);
+        }
+    };
+    for boundary in 0..=paragraph.runs.len() {
+        for owner in boundary_owners(paragraph, boundary) {
+            let mut runs = Vec::new();
+            match owner {
+                BoundaryOwner::ContentControl(index) => {
+                    append_accepted_control_runs(&paragraph.content_controls[index].3, &mut runs);
+                }
+                BoundaryOwner::Revision(index) => {
+                    append_accepted_revision_runs(&paragraph.revisions[index].2, &mut runs);
+                }
+                BoundaryOwner::Wrapper(index) => {
+                    wrapper_text(&paragraph.extra_xml[index].1, &["w".to_owned()], output);
+                }
+            }
+            output.extend(runs.iter().map(|run| run.text()));
+        }
+        if let Some(run) = paragraph.runs.get(boundary) {
+            match simple_field_source(run) {
+                Some((raw, prefixes)) => wrapper_text(raw, prefixes, output),
+                None => output.push_str(&run.text()),
+            }
+        }
+    }
+}
+
 fn accepted_paragraph_run_paths(paragraph: &CT_P) -> Vec<AcceptedRunPath> {
     let mut output = Vec::new();
     let mut prefix = Vec::new();
@@ -3536,56 +4342,21 @@ pub(crate) fn append_accepted_paragraph_run_paths(
     output: &mut Vec<AcceptedRunPath>,
 ) {
     for boundary in 0..=paragraph.runs.len() {
-        let mut owners = paragraph
-            .content_controls
-            .iter()
-            .enumerate()
-            .filter(|(_, (at, _, _, _))| *at == boundary)
-            .map(|(index, (_, raw_before, _, _))| {
-                (AcceptedOwnerOrder::Raw(*raw_before), 0u8, index)
-            })
-            .chain(
-                paragraph
-                    .revisions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (at, _, _))| *at == boundary)
-                    .map(|(index, (_, slot, _))| {
-                        let order = if let Some(hyperlink_index) = hyperlink_revision_index(*slot) {
-                            if let Some(raw_before) = paragraph
-                                .hyperlinks
-                                .get(hyperlink_index)
-                                .and_then(|hyperlink| hyperlink.preserved_raw_before)
-                            {
-                                AcceptedOwnerOrder::Raw(raw_before)
-                            } else if paragraph
-                                .hyperlinks
-                                .get(hyperlink_index)
-                                .is_some_and(|hyperlink| boundary == hyperlink.run_end)
-                            {
-                                AcceptedOwnerOrder::BeforeRaw
-                            } else {
-                                AcceptedOwnerOrder::AfterRaw
-                            }
-                        } else {
-                            AcceptedOwnerOrder::Raw(*slot)
-                        };
-                        (order, 1u8, index)
-                    }),
-            )
-            .collect::<Vec<_>>();
-        owners.sort_by_key(|(order, kind, _)| (*order, *kind));
-        for (_, kind, index) in owners {
-            if kind == 0 {
-                prefix.push(AcceptedRunPathSegment::ContentControl(index));
-                paragraph.content_controls[index]
-                    .3
-                    .append_accepted_run_paths(prefix, output);
-            } else {
-                prefix.push(AcceptedRunPathSegment::Revision(index));
-                paragraph.revisions[index]
-                    .2
-                    .append_accepted_run_paths(prefix, output);
+        for owner in boundary_owners(paragraph, boundary) {
+            match owner {
+                BoundaryOwner::ContentControl(index) => {
+                    prefix.push(AcceptedRunPathSegment::ContentControl(index));
+                    paragraph.content_controls[index]
+                        .3
+                        .append_accepted_run_paths(prefix, output);
+                }
+                BoundaryOwner::Revision(index) => {
+                    prefix.push(AcceptedRunPathSegment::Revision(index));
+                    paragraph.revisions[index]
+                        .2
+                        .append_accepted_run_paths(prefix, output);
+                }
+                BoundaryOwner::Wrapper(_) => continue,
             }
             prefix.pop();
         }
@@ -3602,53 +4373,15 @@ pub(crate) fn append_accepted_paragraph_run_paths(
 fn accepted_paragraph_runs(paragraph: &CT_P) -> Vec<&CT_R> {
     let mut output = Vec::new();
     for boundary in 0..=paragraph.runs.len() {
-        let mut owners = paragraph
-            .content_controls
-            .iter()
-            .filter(|(at, _, _, _)| *at == boundary)
-            .map(|(_, raw_before, _, control)| {
-                (
-                    AcceptedOwnerOrder::Raw(*raw_before),
-                    0u8,
-                    Some(control),
-                    None,
-                )
-            })
-            .chain(
-                paragraph
-                    .revisions
-                    .iter()
-                    .filter(|(at, _, _)| *at == boundary)
-                    .map(|(_, slot, revision)| {
-                        let order = if let Some(index) = hyperlink_revision_index(*slot) {
-                            if let Some(raw_before) = paragraph
-                                .hyperlinks
-                                .get(index)
-                                .and_then(|hyperlink| hyperlink.preserved_raw_before)
-                            {
-                                AcceptedOwnerOrder::Raw(raw_before)
-                            } else if paragraph
-                                .hyperlinks
-                                .get(index)
-                                .is_some_and(|hyperlink| boundary == hyperlink.run_end)
-                            {
-                                AcceptedOwnerOrder::BeforeRaw
-                            } else {
-                                AcceptedOwnerOrder::AfterRaw
-                            }
-                        } else {
-                            AcceptedOwnerOrder::Raw(*slot)
-                        };
-                        (order, 1u8, None, Some(revision))
-                    }),
-            )
-            .collect::<Vec<_>>();
-        owners.sort_by_key(|(order, kind, _, _)| (*order, *kind));
-        for (_, _, control, revision) in owners {
-            if let Some(control) = control {
-                append_accepted_control_runs(control, &mut output);
-            } else if let Some(revision) = revision {
-                append_accepted_revision_runs(revision, &mut output);
+        for owner in boundary_owners(paragraph, boundary) {
+            match owner {
+                BoundaryOwner::ContentControl(index) => {
+                    append_accepted_control_runs(&paragraph.content_controls[index].3, &mut output);
+                }
+                BoundaryOwner::Revision(index) => {
+                    append_accepted_revision_runs(&paragraph.revisions[index].2, &mut output);
+                }
+                BoundaryOwner::Wrapper(_) => {}
             }
         }
         if let Some(run) = paragraph.runs.get(boundary) {
@@ -3721,53 +4454,15 @@ fn append_accepted_cell_runs<'a>(cell: &'a CT_Tc, output: &mut Vec<&'a CT_R>) {
 fn tracked_paragraph_runs(paragraph: &CT_P) -> Vec<&CT_R> {
     let mut output = Vec::new();
     for boundary in 0..=paragraph.runs.len() {
-        let mut owners = paragraph
-            .content_controls
-            .iter()
-            .filter(|(at, _, _, _)| *at == boundary)
-            .map(|(_, raw_before, _, control)| {
-                (
-                    AcceptedOwnerOrder::Raw(*raw_before),
-                    0u8,
-                    Some(control),
-                    None,
-                )
-            })
-            .chain(
-                paragraph
-                    .revisions
-                    .iter()
-                    .filter(|(at, _, _)| *at == boundary)
-                    .map(|(_, slot, revision)| {
-                        let order = if let Some(index) = hyperlink_revision_index(*slot) {
-                            if let Some(raw_before) = paragraph
-                                .hyperlinks
-                                .get(index)
-                                .and_then(|hyperlink| hyperlink.preserved_raw_before)
-                            {
-                                AcceptedOwnerOrder::Raw(raw_before)
-                            } else if paragraph
-                                .hyperlinks
-                                .get(index)
-                                .is_some_and(|hyperlink| boundary == hyperlink.run_end)
-                            {
-                                AcceptedOwnerOrder::BeforeRaw
-                            } else {
-                                AcceptedOwnerOrder::AfterRaw
-                            }
-                        } else {
-                            AcceptedOwnerOrder::Raw(*slot)
-                        };
-                        (order, 1u8, None, Some(revision))
-                    }),
-            )
-            .collect::<Vec<_>>();
-        owners.sort_by_key(|(order, kind, _, _)| (*order, *kind));
-        for (_, _, control, revision) in owners {
-            if let Some(control) = control {
-                append_tracked_control_runs(control, &mut output);
-            } else if let Some(revision) = revision {
-                append_tracked_revision_runs(revision, &mut output);
+        for owner in boundary_owners(paragraph, boundary) {
+            match owner {
+                BoundaryOwner::ContentControl(index) => {
+                    append_tracked_control_runs(&paragraph.content_controls[index].3, &mut output);
+                }
+                BoundaryOwner::Revision(index) => {
+                    append_tracked_revision_runs(&paragraph.revisions[index].2, &mut output);
+                }
+                BoundaryOwner::Wrapper(_) => {}
             }
         }
         if let Some(run) = paragraph.runs.get(boundary) {
@@ -3949,6 +4644,124 @@ impl CT_P {
         runs
     }
 
+    /// Return the text of the accepted view, as `Paragraph::text` reads it:
+    /// the text of [`Self::accepted_bookmark_runs`], and that of the runs
+    /// inside smart tags, inline custom XML elements and simple fields, in
+    /// document order, nested ones included. The runs of a wrapper inside a
+    /// content control, a revision or a hyperlink are not read.
+    #[doc(hidden)]
+    pub fn accepted_text(&self) -> String {
+        let mut text = String::new();
+        append_accepted_text(self, &mut text);
+        text
+    }
+
+    /// Return the accepted view as a paragraph of plain runs, for the
+    /// exporters: the runs whose text [`Self::accepted_text`] reads, in
+    /// document order. Those of content controls, tracked insertions and
+    /// moves in, smart tags, inline custom XML elements and simple fields
+    /// are included, deleted and moved-away runs are left out, and the
+    /// hyperlink spans cover the same runs as in the source. Content
+    /// controls, revisions, wrappers and markers are not kept. Borrowed when
+    /// the paragraph holds none of them, since its runs are then the view.
+    #[doc(hidden)]
+    pub fn accepted_view(&self) -> Cow<'_, CT_P> {
+        if self.content_controls.is_empty()
+            && self.revisions.is_empty()
+            && !self.extra_xml.iter().any(|(_, raw)| is_run_wrapper(raw))
+            && !self
+                .runs
+                .iter()
+                .any(|run| simple_field_source(run).is_some())
+        {
+            return Cow::Borrowed(self);
+        }
+        let mut runs = Vec::new();
+        // The index into `self.hyperlinks` of the hyperlink each run is in.
+        let mut links = Vec::new();
+        for boundary in 0..=self.runs.len() {
+            for owner in boundary_owners(self, boundary) {
+                let mut owned = Vec::new();
+                let link = match owner {
+                    BoundaryOwner::ContentControl(index) => {
+                        append_accepted_control_runs(&self.content_controls[index].3, &mut owned);
+                        None
+                    }
+                    BoundaryOwner::Revision(index) => {
+                        let (_, slot, revision) = &self.revisions[index];
+                        append_accepted_revision_runs(revision, &mut owned);
+                        hyperlink_revision_index(*slot)
+                    }
+                    BoundaryOwner::Wrapper(index) => {
+                        if let Some(content) =
+                            run_wrapper_paragraph(&self.extra_xml[index].1, &["w".to_owned()])
+                        {
+                            let view = content.accepted_view().into_owned();
+                            links.extend(std::iter::repeat_n(None, view.runs.len()));
+                            runs.extend(view.runs);
+                        }
+                        continue;
+                    }
+                };
+                links.extend(std::iter::repeat_n(link, owned.len()));
+                runs.extend(owned.into_iter().cloned());
+            }
+            if let Some(run) = self.runs.get(boundary) {
+                let link = self.hyperlinks.iter().position(|hyperlink| {
+                    hyperlink.run_start <= boundary && boundary < hyperlink.run_end
+                });
+                // A simple field reads as the runs of its result, as in
+                // `Self::accepted_text`, so a revision inside it is resolved.
+                let field = simple_field_source(run)
+                    .and_then(|(raw, prefixes)| run_wrapper_paragraph(raw, prefixes));
+                match field {
+                    Some(content) => {
+                        let view = content.accepted_view().into_owned();
+                        links.extend(std::iter::repeat_n(link, view.runs.len()));
+                        runs.extend(view.runs);
+                    }
+                    None => {
+                        runs.push(run.clone());
+                        links.push(link);
+                    }
+                }
+            }
+        }
+        let mut hyperlinks = Vec::new();
+        let mut start = 0;
+        while start < runs.len() {
+            let mut end = start + 1;
+            while end < runs.len() && links[end] == links[start] {
+                end += 1;
+            }
+            if let Some(link) = links[start] {
+                hyperlinks.push(HyperlinkSpan {
+                    run_start: start,
+                    run_end: end,
+                    ..self.hyperlinks[link].clone()
+                });
+            }
+            start = end;
+        }
+        Cow::Owned(CT_P {
+            properties: self.properties.clone(),
+            runs,
+            hyperlinks,
+            ..CT_P::new()
+        })
+    }
+
+    /// Return the content of a preserved smart tag or inline custom XML
+    /// element, which [`Self::accepted_view`] reads in place. None for any
+    /// other raw paragraph child.
+    #[doc(hidden)]
+    pub fn raw_run_wrapper_content(raw: &[u8]) -> Option<CT_P> {
+        if !is_run_wrapper(raw) {
+            return None;
+        }
+        run_wrapper_paragraph(raw, &["w".to_owned()])
+    }
+
     /// Return accepted-view runs in the same order as bookmark projections.
     #[doc(hidden)]
     pub fn accepted_bookmark_runs(&self) -> Vec<&CT_R> {
@@ -4055,6 +4868,109 @@ impl CT_P {
                 "accepted run path is stale".to_owned(),
             ))
         }
+    }
+
+    /// Return the literal text of the accepted-view runs, the text that
+    /// split offsets count. Tabs, breaks and other non-text content have no
+    /// width.
+    #[doc(hidden)]
+    pub fn accepted_literal_text(&self) -> String {
+        accepted_paragraph_runs(self)
+            .into_iter()
+            .flat_map(|run| run.content.iter().map(CT_R::literal_text))
+            .collect()
+    }
+
+    /// Return the text of every `t` element, in any namespace, between the
+    /// range markers of comment `id`, or `None` when this paragraph does not
+    /// hold both markers.
+    ///
+    /// Unlike [`Self::accepted_literal_text`], this includes the text of
+    /// preserved children that the accepted view leaves out, such as a
+    /// `w:fldSimple` result, so it is the text the commented range shows.
+    #[doc(hidden)]
+    pub fn comment_range_text(&self, id: i32) -> Option<String> {
+        let mut xml = Vec::new();
+        self.to_xml(&mut Writer::new(&mut xml)).ok()?;
+        let is_marker = |element: &BytesStart<'_>, local: &[u8]| {
+            matches_local_name(element.name().as_ref(), local)
+                && element
+                    .attributes()
+                    .flatten()
+                    .find(|attribute| matches_local_name(attribute.key.as_ref(), b"id"))
+                    .and_then(|attribute| std::str::from_utf8(&attribute.value).ok()?.parse().ok())
+                    == Some(id)
+        };
+        let mut reader = Reader::from_reader(xml.as_slice());
+        let mut buffer = Vec::new();
+        let mut text = None::<String>;
+        loop {
+            match reader.read_event_into(&mut buffer).ok()? {
+                Event::Start(element) | Event::Empty(element)
+                    if is_marker(&element, b"commentRangeStart") =>
+                {
+                    text = Some(String::new());
+                }
+                Event::Start(element) | Event::Empty(element)
+                    if is_marker(&element, b"commentRangeEnd") =>
+                {
+                    return text;
+                }
+                Event::Start(element) if matches_local_name(element.name().as_ref(), b"t") => {
+                    let content = crate::xml_text::read_element_text(&mut reader, element.name());
+                    if let Some(text) = text.as_mut() {
+                        text.push_str(&content);
+                    }
+                }
+                Event::Eof => return None,
+                _ => {}
+            }
+            buffer.clear();
+        }
+    }
+
+    /// Split accepted-view runs so that the non-empty literal text span
+    /// `[start, end)`, in Unicode scalar values of
+    /// [`Self::accepted_literal_text`], covers whole runs, and return the run
+    /// boundaries around it.
+    #[doc(hidden)]
+    pub fn split_accepted_literal_span(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<(usize, usize)> {
+        let lengths = accepted_paragraph_runs(self)
+            .into_iter()
+            .map(CT_R::literal_len)
+            .collect::<Vec<_>>();
+        // The run holding one literal character and its offset in that run.
+        let locate = |character: usize| {
+            let mut run_start = 0;
+            lengths.iter().enumerate().find_map(|(index, len)| {
+                let found = (character < run_start + len).then_some((index, character - run_start));
+                run_start += len;
+                found
+            })
+        };
+        let outside = || {
+            OxmlError::InvalidValue(format!(
+                "literal span {start}..{end} is not inside the paragraph text"
+            ))
+        };
+        let ((start_run, start_offset), (end_run, end_offset)) = match end.checked_sub(1) {
+            Some(last) if start < end => (
+                locate(start).ok_or_else(outside)?,
+                locate(last).ok_or_else(outside)?,
+            ),
+            _ => return Err(outside()),
+        };
+        // The end goes first, so the start run keeps its index.
+        let path = self.accepted_run_paths()[end_run].clone();
+        let end_boundary = self.split_accepted_run(&path, end_run, end_offset + 1)?;
+        let path = self.accepted_run_paths()[start_run].clone();
+        let start_boundary = self.split_accepted_run(&path, start_run, start_offset)?;
+        // A split inside the start run adds one run before the end boundary.
+        Ok((start_boundary, end_boundary + usize::from(start_offset > 0)))
     }
 
     pub(crate) fn split_accepted_run_segments(
@@ -4320,10 +5236,19 @@ impl CT_P {
         if removed.iter().all(|remove| !remove) {
             return;
         }
+        self.remove_runs(&removed);
+    }
+
+    /// Remove the direct runs flagged in `removed` and move every run-boundary
+    /// projection onto the boundary that remains. Raw children, comment
+    /// markers, bookmarks and controls of the boundaries that collapse into
+    /// one keep their order, and a hyperlink or a ruby annotation left
+    /// without runs is dropped.
+    pub(crate) fn remove_runs(&mut self, removed: &[bool]) {
         let removed_run_addresses = self
             .runs
             .iter()
-            .zip(&removed)
+            .zip(removed)
             .filter_map(|(run, remove)| remove.then_some(std::ptr::from_ref(run)))
             .collect::<Vec<_>>();
         let removed_projected_indices = accepted_paragraph_runs(self)
@@ -4470,6 +5395,12 @@ impl CT_P {
             *position = boundary_map[old_boundary];
             *raw_before = raw_prefixes[old_boundary] + (*raw_before).min(raw_counts[old_boundary]);
         }
+        for ruby in &mut self.rubies {
+            ruby.base_start = boundary_map[ruby.base_start.min(old_run_count)];
+            ruby.base_end = boundary_map[ruby.base_end.min(old_run_count)];
+        }
+        // An annotation over no base run is not written, so drop it.
+        self.rubies.retain(|ruby| ruby.base_start < ruby.base_end);
         let old_hyperlinks = std::mem::take(&mut self.hyperlinks);
         let mut hyperlink_map = vec![None; old_hyperlinks.len()];
         for (old_index, mut hyperlink) in old_hyperlinks.into_iter().enumerate() {
@@ -4517,7 +5448,7 @@ impl CT_P {
             .runs
             .drain(..)
             .zip(removed)
-            .filter_map(|(run, remove)| (!remove).then_some(run))
+            .filter_map(|(run, remove)| (!*remove).then_some(run))
             .collect();
         let _ = self.refresh_bookmark_projection();
     }
@@ -4569,6 +5500,497 @@ impl CT_P {
         projected
     }
 
+    /// Write range markers at accepted-view run boundaries, the run index
+    /// space of [`Self::accepted_run_paths`].
+    ///
+    /// The markers go inside `w:sdtContent` when the range starts or ends
+    /// between two runs of an inline content control, and around the whole
+    /// control when the range covers it. A missing side means the range
+    /// continues into another paragraph, so that side must not fall inside a
+    /// control. A comment reference run follows the comment end marker. A
+    /// range that cannot be written exactly is refused and the paragraph is
+    /// unchanged.
+    #[doc(hidden)]
+    pub fn anchor_accepted_range(
+        &mut self,
+        start: Option<usize>,
+        end: Option<usize>,
+        anchor: RangeAnchor<'_>,
+    ) -> std::result::Result<(), RangeAnchorError> {
+        let (start_site, end_site) = self.accepted_range_sites(start, end)?;
+        let mut paragraph = self.clone();
+        // The end goes first. A start site never follows it, so the end and
+        // its reference run leave the start site where it was.
+        if let Some(site) = end_site {
+            paragraph.insert_range_marker(site, anchor, false)?;
+        }
+        if let Some(site) = start_site {
+            paragraph.insert_range_marker(site, anchor, true)?;
+        }
+        if !paragraph.refresh_bookmark_projection() {
+            return Err(RangeAnchorError::Write);
+        }
+        *self = paragraph;
+        Ok(())
+    }
+
+    /// Resolve where the start and end markers of a range go.
+    fn accepted_range_sites(
+        &self,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> std::result::Result<(Option<MarkerSite>, Option<MarkerSite>), RangeAnchorError> {
+        let paths = self.accepted_run_paths();
+        let run_count = paths.len();
+        for boundary in [start, end].into_iter().flatten() {
+            if boundary > run_count {
+                return Err(RangeAnchorError::OutOfRange {
+                    boundary,
+                    run_count,
+                });
+            }
+        }
+        // The recursive owner of a run is its path without the final run step.
+        let owner = |index: usize| {
+            let segments = paths[index].segments();
+            &segments[..segments.len() - 1]
+        };
+        // The deepest owner holding the runs on both sides of a boundary.
+        let shared = |boundary: usize| match boundary.checked_sub(1) {
+            Some(left) if boundary < run_count => {
+                &owner(left)[..common_prefix_len(owner(left), owner(boundary))]
+            }
+            _ => &[] as &[AcceptedRunPathSegment],
+        };
+        let (owner_path, blamed) = match (start, end) {
+            (Some(start), Some(end)) if start > end => {
+                return Err(RangeAnchorError::Reversed { start, end });
+            }
+            (Some(start), Some(end)) if start == end => (shared(start), start),
+            (Some(start), Some(end)) => {
+                // The outermost owner that holds the first and the last run
+                // of the range and reaches both boundaries.
+                let (start_depth, end_depth) = (shared(start).len(), shared(end).len());
+                let depth = start_depth.max(end_depth);
+                let first = owner(start);
+                if depth > common_prefix_len(first, owner(end - 1)) {
+                    return Err(RangeAnchorError::CrossesControl { start, end });
+                }
+                let blamed = if start_depth >= end_depth { start } else { end };
+                (&first[..depth], blamed)
+            }
+            (Some(boundary), None) | (None, Some(boundary)) => {
+                let shared = shared(boundary);
+                if shared
+                    .iter()
+                    .any(|segment| matches!(segment, AcceptedRunPathSegment::Revision(_)))
+                {
+                    return Err(RangeAnchorError::InsideRevision { boundary });
+                } else if !shared.is_empty() {
+                    return Err(RangeAnchorError::InsideControl { boundary });
+                }
+                (shared, boundary)
+            }
+            (None, None) => return Ok((None, None)),
+        };
+        let mut controls = Vec::with_capacity(owner_path.len());
+        for segment in owner_path {
+            match *segment {
+                AcceptedRunPathSegment::ContentControl(index) => controls.push(index),
+                AcceptedRunPathSegment::Revision(_) | AcceptedRunPathSegment::Run(_) => {
+                    return Err(RangeAnchorError::InsideRevision { boundary: blamed });
+                }
+            }
+        }
+
+        let end_site = end
+            .map(|boundary| self.marker_site(&paths, &controls, boundary, false))
+            .transpose()?;
+        let start_site = match (start, end) {
+            (Some(start), Some(end)) if start == end => end_site.clone(),
+            _ => start
+                .map(|boundary| self.marker_site(&paths, &controls, boundary, true))
+                .transpose()?,
+        };
+        Ok((start_site, end_site))
+    }
+
+    /// Place a marker just before the run after `boundary` for a start, or
+    /// just after the run before it for an end, inside the owner `controls`.
+    fn marker_site(
+        &self,
+        paths: &[AcceptedRunPath],
+        controls: &[usize],
+        boundary: usize,
+        start: bool,
+    ) -> std::result::Result<MarkerSite, RangeAnchorError> {
+        if !controls.is_empty() {
+            let path = if start {
+                paths.get(boundary)
+            } else {
+                boundary.checked_sub(1).map(|index| &paths[index])
+            }
+            .ok_or(RangeAnchorError::Write)?;
+            let control = self.control_at(controls).ok_or(RangeAnchorError::Write)?;
+            let index = match path.segments()[controls.len()] {
+                AcceptedRunPathSegment::Run(index)
+                | AcceptedRunPathSegment::ContentControl(index) => index,
+                AcceptedRunPathSegment::Revision(index) => {
+                    control
+                        .revisions()
+                        .get(index)
+                        .ok_or(RangeAnchorError::Write)?
+                        .0
+                }
+            };
+            return Ok(MarkerSite::Control {
+                controls: controls.to_vec(),
+                index: index + usize::from(!start),
+            });
+        }
+        // A paragraph-level marker must fall between the top-level owners of
+        // both neighbouring runs, which a revision inside a hyperlink can
+        // prevent.
+        let before_right = paths
+            .get(boundary)
+            .map(|path| self.paragraph_owner_positions(path).0);
+        let after_left = boundary
+            .checked_sub(1)
+            .map(|index| self.paragraph_owner_positions(&paths[index]).1);
+        let (Some(before_right), Some(after_left)) = (
+            before_right.unwrap_or(Some((
+                self.runs.len(),
+                self.boundary_items(self.runs.len()).len(),
+            ))),
+            after_left.unwrap_or(Some((0, 0))),
+        ) else {
+            return Err(RangeAnchorError::HyperlinkRevision { boundary });
+        };
+        let (boundary, position) = if start { before_right } else { after_left };
+        Ok(MarkerSite::Paragraph { boundary, position })
+    }
+
+    /// Positions just before and just after the paragraph-level owner of one
+    /// accepted run, or `None` where no paragraph-level child can go.
+    fn paragraph_owner_positions(
+        &self,
+        path: &AcceptedRunPath,
+    ) -> (Option<ChildPosition>, Option<ChildPosition>) {
+        let around = |boundary: usize, item: BoundaryItem| {
+            let items = self.boundary_items(boundary);
+            match items.iter().position(|candidate| *candidate == item) {
+                Some(position) => (Some((boundary, position)), Some((boundary, position + 1))),
+                None => (None, None),
+            }
+        };
+        let raw_at = |boundary: usize, slot: usize| {
+            self.extra_xml
+                .iter()
+                .enumerate()
+                .filter(|(_, (position, _))| *position == boundary)
+                .nth(slot)
+                .map(|(index, _)| BoundaryItem::Raw(index))
+        };
+        match path.segments()[0] {
+            AcceptedRunPathSegment::Run(index) => (
+                Some((index, self.boundary_items(index).len())),
+                Some((index + 1, 0)),
+            ),
+            AcceptedRunPathSegment::ContentControl(index) => self
+                .content_controls
+                .get(index)
+                .map_or((None, None), |(boundary, _, _, _)| {
+                    around(*boundary, BoundaryItem::Control(index))
+                }),
+            AcceptedRunPathSegment::Revision(index) => {
+                let Some((boundary, slot, _)) = self.revisions.get(index) else {
+                    return (None, None);
+                };
+                let boundary = *boundary;
+                let Some(hyperlink) = hyperlink_revision_index(*slot) else {
+                    return raw_at(boundary, *slot)
+                        .map_or((None, None), |item| around(boundary, item));
+                };
+                match self.hyperlinks.get(hyperlink) {
+                    Some(hyperlink) if hyperlink.preserved_raw_before.is_some() => {
+                        raw_at(boundary, hyperlink.preserved_raw_before.unwrap_or_default())
+                            .map_or((None, None), |item| around(boundary, item))
+                    }
+                    // A closing hyperlink writes its revision before the
+                    // paragraph children at its end boundary, and an open
+                    // one writes it after them.
+                    Some(hyperlink)
+                        if hyperlink.run_start < hyperlink.run_end
+                            && boundary == hyperlink.run_end =>
+                    {
+                        (None, Some((boundary, 0)))
+                    }
+                    Some(hyperlink) if hyperlink.run_start < hyperlink.run_end => {
+                        (Some((boundary, self.boundary_items(boundary).len())), None)
+                    }
+                    _ => (None, None),
+                }
+            }
+        }
+    }
+
+    /// Reach the inline control that `controls` names.
+    fn control_at(&self, controls: &[usize]) -> Option<&CT_Sdt> {
+        let (first, rest) = controls.split_first()?;
+        let mut control = &self.content_controls.get(*first)?.3;
+        for index in rest {
+            let SdtContent::ContentControl(nested) = control.content.get(*index)? else {
+                return None;
+            };
+            control = nested;
+        }
+        Some(control)
+    }
+
+    fn control_at_mut(&mut self, controls: &[usize]) -> Option<&mut CT_Sdt> {
+        let (first, rest) = controls.split_first()?;
+        let mut control = &mut self.content_controls.get_mut(*first)?.3;
+        for index in rest {
+            let SdtContent::ContentControl(nested) = control.content.get_mut(*index)? else {
+                return None;
+            };
+            control = nested;
+        }
+        Some(control)
+    }
+
+    fn insert_range_marker(
+        &mut self,
+        site: MarkerSite,
+        anchor: RangeAnchor<'_>,
+        start: bool,
+    ) -> std::result::Result<(), RangeAnchorError> {
+        let marker_xml = range_marker_xml(anchor, start).ok_or(RangeAnchorError::Write)?;
+        let reference = match anchor {
+            RangeAnchor::Comment(id) if !start => Some(CT_R {
+                properties: None,
+                content: vec![RunContent::CommentReference { id, raw_before: 0 }],
+                extra_xml: Vec::new(),
+                extra_xml_positions: Vec::new(),
+                alt_drawings: Vec::new(),
+            }),
+            RangeAnchor::Comment(_) | RangeAnchor::Bookmark { .. } => None,
+        };
+        let inserted = match site {
+            MarkerSite::Control { controls, index } => {
+                let mut children = vec![SdtContent::RawXml(marker_xml)];
+                children.extend(reference.map(SdtContent::Run));
+                self.control_at_mut(&controls)
+                    .is_some_and(|control| control.insert_content(index, children))
+            }
+            MarkerSite::Paragraph { boundary, position } => {
+                let mut items = self.boundary_items(boundary);
+                let item = match anchor {
+                    RangeAnchor::Comment(id) => {
+                        self.comment_ranges.push(if start {
+                            CommentRangeMarker::Start {
+                                id,
+                                run_index: boundary,
+                                raw_before: 0,
+                                has_child_content: false,
+                            }
+                        } else {
+                            CommentRangeMarker::End {
+                                id,
+                                run_index: boundary,
+                                raw_before: 0,
+                                has_child_content: false,
+                            }
+                        });
+                        BoundaryItem::Marker(self.comment_ranges.len() - 1)
+                    }
+                    RangeAnchor::Bookmark { .. } => {
+                        self.extra_xml.push((boundary, marker_xml));
+                        BoundaryItem::Raw(self.extra_xml.len() - 1)
+                    }
+                };
+                items.insert(position.min(items.len()), item);
+                self.place_boundary_items(&[(boundary, items)]);
+                match reference {
+                    Some(run) => self.insert_run_after_boundary_items(boundary, position + 1, run),
+                    None => true,
+                }
+            }
+        };
+        if inserted {
+            Ok(())
+        } else {
+            Err(RangeAnchorError::Write)
+        }
+    }
+
+    /// List the paragraph-level children at one direct run boundary in the
+    /// order that serialization writes them.
+    fn boundary_items(&self, boundary: usize) -> Vec<BoundaryItem> {
+        let raws = self
+            .extra_xml
+            .iter()
+            .enumerate()
+            .filter(|(_, (position, _))| *position == boundary)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        for raw_slot in 0..=raws.len() {
+            let markers = self
+                .comment_ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, marker)| {
+                    marker.run_index() == boundary
+                        && marker.raw_before().min(raws.len()) == raw_slot
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            for marker_slot in 0..=markers.len() {
+                items.extend(
+                    self.content_controls
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (at, raw_before, markers_before, _))| {
+                            *at == boundary
+                                && (*raw_before).min(raws.len()) == raw_slot
+                                && (*markers_before).min(markers.len()) == marker_slot
+                        })
+                        .map(|(index, _)| BoundaryItem::Control(index)),
+                );
+                if let Some(marker) = markers.get(marker_slot) {
+                    items.push(BoundaryItem::Marker(*marker));
+                }
+            }
+            if let Some(raw) = raws.get(raw_slot) {
+                items.push(BoundaryItem::Raw(*raw));
+            }
+        }
+        items
+    }
+
+    /// Give each listed direct run boundary exactly its listed children in
+    /// order, and move every projection that names a moved raw child.
+    fn place_boundary_items(&mut self, boundaries: &[(usize, Vec<BoundaryItem>)]) {
+        let mut raw_moves = Vec::new();
+        let mut placed_raws = Vec::new();
+        let mut placed_markers = Vec::new();
+        for (boundary, items) in boundaries {
+            let (mut raws, mut markers) = (0, 0);
+            for item in items {
+                match *item {
+                    BoundaryItem::Control(index) => {
+                        let control = &mut self.content_controls[index];
+                        (control.0, control.1, control.2) = (*boundary, raws, markers);
+                    }
+                    BoundaryItem::Marker(index) => {
+                        match &mut self.comment_ranges[index] {
+                            CommentRangeMarker::Start {
+                                run_index,
+                                raw_before,
+                                ..
+                            }
+                            | CommentRangeMarker::End {
+                                run_index,
+                                raw_before,
+                                ..
+                            } => (*run_index, *raw_before) = (*boundary, raws),
+                        }
+                        markers += 1;
+                        placed_markers.push(index);
+                    }
+                    BoundaryItem::Raw(index) => {
+                        let old_boundary = self.extra_xml[index].0;
+                        let old_slot = self.extra_xml[..index]
+                            .iter()
+                            .filter(|(position, _)| *position == old_boundary)
+                            .count();
+                        raw_moves.push(((old_boundary, old_slot), (*boundary, raws)));
+                        placed_raws.push(index);
+                        raws += 1;
+                        markers = 0;
+                    }
+                }
+            }
+        }
+        // Serialization reads the raw children and markers of one boundary in
+        // vector order, so the placed ones move to the end in list order.
+        let mut extra_xml = std::mem::take(&mut self.extra_xml)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let placed = placed_raws
+            .iter()
+            .zip(&raw_moves)
+            .filter_map(|(index, (_, (boundary, _)))| {
+                extra_xml[*index].take().map(|(_, raw)| (*boundary, raw))
+            })
+            .collect::<Vec<_>>();
+        self.extra_xml = extra_xml.into_iter().flatten().chain(placed).collect();
+        let mut comment_ranges = std::mem::take(&mut self.comment_ranges)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let placed = placed_markers
+            .iter()
+            .filter_map(|index| comment_ranges[*index].take())
+            .collect::<Vec<_>>();
+        self.comment_ranges = comment_ranges.into_iter().flatten().chain(placed).collect();
+
+        let moved = |at: usize, slot: usize| {
+            raw_moves
+                .iter()
+                .find(|(old, _)| *old == (at, slot))
+                .map(|(_, new)| *new)
+        };
+        let mut moved_hyperlinks = Vec::new();
+        for (hyperlink_index, hyperlink) in self.hyperlinks.iter_mut().enumerate() {
+            if hyperlink.run_start == hyperlink.run_end
+                && let Some(slot) = hyperlink.preserved_raw_before
+                && let Some((boundary, slot)) = moved(hyperlink.run_start, slot)
+            {
+                moved_hyperlinks.push((hyperlink_index, hyperlink.run_start, boundary));
+                (hyperlink.run_start, hyperlink.run_end) = (boundary, boundary);
+                hyperlink.preserved_raw_before = Some(slot);
+            }
+        }
+        for (at, slot, _) in &mut self.revisions {
+            if let Some(hyperlink) = hyperlink_revision_index(*slot) {
+                if let Some((_, _, boundary)) = moved_hyperlinks
+                    .iter()
+                    .find(|(index, old, _)| *index == hyperlink && *old == *at)
+                {
+                    *at = *boundary;
+                }
+            } else if let Some(new) = moved(*at, *slot) {
+                (*at, *slot) = new;
+            }
+        }
+        for (at, slot, _) in &mut self.equations {
+            if let Some(new) = moved(*at, *slot) {
+                (*at, *slot) = new;
+            }
+        }
+    }
+
+    /// Insert a direct run at `boundary` after the first `kept` children
+    /// there, so the remaining children follow the new run.
+    fn insert_run_after_boundary_items(&mut self, boundary: usize, kept: usize, run: CT_R) -> bool {
+        let items = self.boundary_items(boundary);
+        // The insertion moves every child of the boundary after the new run.
+        if !self.insert_unwrapped_run(boundary, run) {
+            return false;
+        }
+        let (before, after) = items.split_at(kept.min(items.len()));
+        if !before.is_empty() {
+            self.place_boundary_items(&[
+                (boundary, before.to_vec()),
+                (boundary + 1, after.to_vec()),
+            ]);
+        }
+        true
+    }
+
     /// Remap facade-authored bookmark marker ids without reserializing any
     /// unrelated preserved child XML.
     #[doc(hidden)]
@@ -4577,30 +5999,11 @@ impl CT_P {
         remap: &std::collections::HashMap<i32, i32>,
     ) -> bool {
         for (_, raw) in &mut self.extra_xml {
-            let Ok(text) = std::str::from_utf8(raw) else {
-                continue;
-            };
-            if !(text.starts_with("<w:bookmarkStart ") || text.starts_with("<w:bookmarkEnd ")) {
-                continue;
-            }
-            let Some(attribute) = text.find("w:id=\"") else {
-                continue;
-            };
-            let value_start = attribute + "w:id=\"".len();
-            let Some(value_end) = text[value_start..].find('"').map(|end| value_start + end) else {
-                continue;
-            };
-            let Ok(old) = text[value_start..value_end].parse::<i32>() else {
-                continue;
-            };
-            let Some(updated) = remap.get(&old) else {
-                continue;
-            };
-            let mut replaced = Vec::with_capacity(raw.len());
-            replaced.extend_from_slice(&raw[..value_start]);
-            replaced.extend_from_slice(updated.to_string().as_bytes());
-            replaced.extend_from_slice(&raw[value_end..]);
-            *raw = replaced;
+            remap_authored_bookmark_marker(raw, remap);
+        }
+        // Markers anchored inside an inline control are its content children.
+        for (_, _, _, control) in &mut self.content_controls {
+            control.remap_authored_bookmark_ids(remap);
         }
         self.refresh_bookmark_projection()
     }
@@ -4611,10 +6014,17 @@ impl CT_P {
             format!("\0r\0{R_NS}"),
             format!("\0mc\0{}", crate::namespace::MC_NS),
         ];
+        // Inline controls keep the source prefix of their preserved runs,
+        // which the isolated paragraph no longer declares.
         for prefix in self
             .bookmark_markers
             .iter()
             .flat_map(|marker| marker.word_prefixes.iter())
+            .chain(
+                self.content_controls
+                    .iter()
+                    .flat_map(|(_, _, _, control)| control.word_prefixes()),
+            )
         {
             if !word_prefixes.contains(prefix) {
                 word_prefixes.push(prefix.clone());
@@ -4996,6 +6406,8 @@ impl CT_P {
                         if let Some(field) = field {
                             runs.push(field_run(field, None));
                             run_sources.push(None);
+                            projected_run_count += 1;
+                            tracked_run_count += 1;
                         } else {
                             extra_xml.push((runs.len(), raw));
                         }
@@ -5155,7 +6567,11 @@ impl CT_P {
         let mut current_hyperlink: Option<usize> = None;
         let mut current_ruby: Option<usize> = None;
         let mut written_field_owner = None;
+        let mut written_span_end = 0;
         for (run_idx, run) in self.runs.iter().enumerate() {
+            if run_idx < written_span_end {
+                continue;
+            }
             let in_hl = hyperlink_runs.get(&run_idx).copied();
 
             // A ruby annotation wraps its base runs, so it closes before any
@@ -5217,11 +6633,30 @@ impl CT_P {
                 )?;
             }
 
+            let foreign_word_namespace = current_hyperlink
+                .and_then(|index| shadowed_word_namespace(&self.hyperlinks[index]));
+            if let Some((span_end, raw, true)) = self.field_span_at(run_idx) {
+                write_raw_with_word_override(writer, raw, foreign_word_namespace)?;
+                written_field_owner = None;
+                written_span_end = span_end;
+                continue;
+            }
+
             // Fields are paragraph children even though the facade stores them
             // in synthetic runs for the existing inline traversal contract.
             if run.content.len() == 1
                 && let RunContent::Field(field) = &run.content[0]
             {
+                if field.span.is_some() {
+                    write_run_field(
+                        writer,
+                        field,
+                        foreign_word_namespace,
+                        run.properties.as_ref(),
+                    )?;
+                    written_field_owner = None;
+                    continue;
+                }
                 let owner_id = field.source_owner_id();
                 if owner_id.is_some() && owner_id == written_field_owner {
                     continue;
@@ -5354,6 +6789,138 @@ impl CT_P {
         Ok(())
     }
 
+    /// Each untouched field span's source bytes, with the bytes that write its
+    /// split runs as separate physical runs.
+    #[doc(hidden)]
+    pub fn detached_field_spans(&self) -> Result<Vec<(&[u8], Vec<u8>)>> {
+        let mut spans = Vec::new();
+        let mut run_idx = 0;
+        while run_idx < self.runs.len() {
+            let Some((end, raw, true)) = self.field_span_at(run_idx) else {
+                run_idx += 1;
+                continue;
+            };
+            spans.push((raw, self.detached_field_span(run_idx..end)?));
+            run_idx = end;
+        }
+        Ok(spans)
+    }
+
+    /// Append the field source replacements that start at run `run_idx`, and
+    /// return the number of runs they cover.
+    ///
+    /// A field read from a run it shared with text is replaced together with
+    /// that text, as one physical span, so every field of the span can change.
+    #[doc(hidden)]
+    pub fn field_source_replacements_at(
+        &self,
+        run_idx: usize,
+        output: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<usize> {
+        if let Some((end, raw, untouched)) = self.field_span_at(run_idx) {
+            let replacement = if untouched {
+                raw.to_vec()
+            } else {
+                self.detached_field_span(run_idx..end)?
+            };
+            output.push((raw.to_vec(), replacement));
+            return Ok(end - run_idx);
+        }
+        for content in self.runs.get(run_idx).map_or(&[][..], |run| &run.content) {
+            let RunContent::Field(field) = content else {
+                continue;
+            };
+            let (source, replacement) = field.source_replacement()?.ok_or_else(|| {
+                OxmlError::MissingElement("the source of a parsed field".to_owned())
+            })?;
+            output.push((source.to_vec(), replacement));
+        }
+        Ok(1)
+    }
+
+    /// Write the runs of one field span as separate physical runs.
+    fn detached_field_span(&self, runs: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(Vec::new());
+        for run in &self.runs[runs] {
+            match run.content.as_slice() {
+                [RunContent::Field(field)] => {
+                    write_run_field(&mut writer, field, None, run.properties.as_ref())?
+                }
+                _ => run.to_xml(&mut writer)?,
+            }
+        }
+        Ok(writer.into_inner())
+    }
+
+    /// The field span whose runs start at `run_idx`, while they are still the
+    /// runs the reader split it into: its end, source bytes, and whether its
+    /// fields are unchanged too.
+    ///
+    /// The reader splits a run shared by a field and text into sibling runs.
+    /// While those runs, their fields and the boundaries between them are as
+    /// read, the span is written back as its original bytes.
+    fn field_span_at(&self, run_idx: usize) -> Option<(usize, &[u8], bool)> {
+        for lead in 0..=1 {
+            let [RunContent::Field(field)] = self.runs.get(run_idx + lead)?.content.as_slice()
+            else {
+                continue;
+            };
+            let Some(span) = field.span.as_deref() else {
+                continue;
+            };
+            let FieldSource::Parsed {
+                raw_xml, owner_id, ..
+            } = &field.source
+            else {
+                continue;
+            };
+            if span.position != lead || span.field_index != 0 {
+                continue;
+            }
+            let end = run_idx + span.runs.len();
+            let runs = self.runs.get(run_idx..end)?;
+            let in_place = runs.iter().zip(&span.runs).all(|(run, shape)| match shape {
+                Some(shape) => run == shape,
+                None => matches!(
+                    run.content.as_slice(),
+                    [RunContent::Field(candidate)]
+                        if candidate.source_owner_id() == Some(*owner_id)
+                ),
+            });
+            let last = end - 1;
+            let inside = |at: usize| at > run_idx && at <= last;
+            let bounded = has_typed_boundary_inside(
+                run_idx,
+                last,
+                &self.comment_ranges,
+                &self.bookmark_markers,
+                &self.content_controls,
+                &self.revisions,
+                &self.hyperlinks,
+            ) || self.extra_xml.iter().any(|(at, _)| inside(*at))
+                || self.equations.iter().any(|(at, _, _)| inside(*at))
+                || self
+                    .rubies
+                    .iter()
+                    .any(|ruby| ruby.base_start < end && ruby.base_end > run_idx)
+                || self.hyperlinks.iter().any(|hyperlink| {
+                    hyperlink
+                        .extra_xml
+                        .iter()
+                        .any(|(boundary, _, _)| inside(hyperlink.run_start + *boundary))
+                });
+            if !in_place || bounded {
+                return None;
+            }
+            let unchanged = runs.iter().all(|run| match run.content.as_slice() {
+                [RunContent::Field(field)] => field.is_unchanged(),
+                _ => true,
+            });
+            return Some((end, raw_xml.as_slice(), unchanged));
+        }
+        None
+    }
+
     pub(crate) fn collect_runs<'a>(&'a self, runs: &mut Vec<&'a CT_R>) {
         for index in 0..=self.runs.len() {
             for (_, _, _, sdt) in self
@@ -5377,6 +6944,53 @@ impl CT_P {
     }
 }
 
+/// Write one field, leaving out the run content the reader split off it.
+///
+/// A field read from a run it shared with text or another field keeps that
+/// whole span as its source. Once the span is edited the text is written by
+/// its own runs, so this field writes only its own part of the source, with
+/// its own cache and dirty updates.
+fn write_run_field<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    field: &Field,
+    foreign_word_namespace: Option<&str>,
+    result_properties: Option<&CT_RPr>,
+) -> Result<()> {
+    let Some(span) = &field.span else {
+        return write_field_with_result_properties(
+            writer,
+            field,
+            foreign_word_namespace,
+            result_properties,
+        );
+    };
+    let mut own = field.clone();
+    own.span = None;
+    if let FieldSource::Parsed {
+        raw_xml,
+        word_prefixes,
+        ..
+    } = &mut own.source
+    {
+        *raw_xml = field_span_parts(raw_xml, word_prefixes)?
+            .and_then(|parts| {
+                parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        FieldSpanPart::Field(bytes) => Some(bytes),
+                        FieldSpanPart::Outside(_) => None,
+                    })
+                    .nth(span.field_index)
+            })
+            .ok_or_else(|| {
+                OxmlError::InvalidValue(
+                    "a field could not be separated from its physical run".to_owned(),
+                )
+            })?;
+    }
+    write_field_with_result_properties(writer, &own, foreign_word_namespace, result_properties)
+}
+
 fn write_mixed_field_run<W: std::io::Write>(
     writer: &mut Writer<W>,
     run: &CT_R,
@@ -5396,7 +7010,7 @@ fn write_mixed_field_run<W: std::io::Write>(
             false,
             foreign_word_namespace,
         )?;
-        write_field_with_result_properties(
+        write_run_field(
             writer,
             field,
             foreign_word_namespace,
@@ -7406,6 +9020,90 @@ fn raw_xml_count_at(extra_xml: &[(usize, Vec<u8>)], run_index: usize) -> usize {
         .count()
 }
 
+fn common_prefix_len(left: &[AcceptedRunPathSegment], right: &[AcceptedRunPathSegment]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// Serialize one canonical comment or bookmark range marker.
+fn range_marker_xml(anchor: RangeAnchor<'_>, start: bool) -> Option<Vec<u8>> {
+    let (tag, id, name) = match anchor {
+        RangeAnchor::Comment(id) if start => ("w:commentRangeStart", id, None),
+        RangeAnchor::Comment(id) => ("w:commentRangeEnd", id, None),
+        RangeAnchor::Bookmark { id, name } if start => ("w:bookmarkStart", id, Some(name)),
+        RangeAnchor::Bookmark { id, .. } => ("w:bookmarkEnd", id, None),
+    };
+    let mut value = itoa::Buffer::new();
+    let mut element = BytesStart::new(tag);
+    element.push_attribute(("w:id", value.format(id)));
+    if let Some(name) = name {
+        element.push_attribute(("w:name", name));
+    }
+    let mut raw = Vec::new();
+    Writer::new(&mut raw)
+        .write_event(Event::Empty(element))
+        .ok()?;
+    Some(raw)
+}
+
+/// Rewrite the id of one facade-authored bookmark marker through `remap`,
+/// leaving any other raw child unchanged.
+pub(crate) fn remap_authored_bookmark_marker(
+    raw: &mut Vec<u8>,
+    remap: &std::collections::HashMap<i32, i32>,
+) {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return;
+    };
+    if !(text.starts_with("<w:bookmarkStart ") || text.starts_with("<w:bookmarkEnd ")) {
+        return;
+    }
+    let Some(attribute) = text.find("w:id=\"") else {
+        return;
+    };
+    let value_start = attribute + "w:id=\"".len();
+    let Some(value_end) = text[value_start..].find('"').map(|end| value_start + end) else {
+        return;
+    };
+    let Ok(old) = text[value_start..value_end].parse::<i32>() else {
+        return;
+    };
+    let Some(updated) = remap.get(&old) else {
+        return;
+    };
+    let mut replaced = Vec::with_capacity(raw.len());
+    replaced.extend_from_slice(&raw[..value_start]);
+    replaced.extend_from_slice(updated.to_string().as_bytes());
+    replaced.extend_from_slice(&raw[value_end..]);
+    *raw = replaced;
+}
+
+/// Return the id of a preserved comment range marker, or `None` for any
+/// other raw child.
+pub(crate) fn raw_comment_marker_id(raw: &[u8], word_prefixes: &[String]) -> Option<i32> {
+    let mut reader = Reader::from_reader(raw);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer).ok()? {
+            Event::Start(element) | Event::Empty(element) => {
+                let prefixes = word_prefixes_at(&element, word_prefixes).ok()?;
+                let name = element.name();
+                if !is_word_element(name.as_ref(), b"commentRangeStart", &prefixes)
+                    && !is_word_element(name.as_ref(), b"commentRangeEnd", &prefixes)
+                {
+                    return None;
+                }
+                return required_word_i32_attribute(&element, b"id", &prefixes).ok();
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
 fn parse_hyperlink_children(
     raw: &[u8],
     word_prefixes: &[String],
@@ -8424,7 +10122,7 @@ fn required_word_i32_attribute(
     )))
 }
 
-fn optional_word_attribute(
+pub(crate) fn optional_word_attribute(
     element: &BytesStart<'_>,
     local: &[u8],
     word_prefixes: &[String],
@@ -8712,6 +10410,64 @@ mod tests {
     }
 
     #[test]
+    fn dropping_w14_identities_keeps_every_other_retained_attribute() {
+        // An alias prefix goes with the identities it bound, and a record
+        // left with nothing else goes away.
+        let w_ns = crate::namespace::W_NS;
+        let source = format!(
+            r#"<w:p xmlns:w="{w_ns}" xmlns:i="{W14_NS}" xmlns:x="urn:producer" i:paraId="11111111" w:rsidR="00A1B2C3" i:textId="22222222" x:keep="yes"/>"#
+        );
+        let mut paragraph = CT_P::from_xml_fragment(source.as_bytes()).unwrap();
+        drop_w14_paragraph_identities(&mut paragraph.extra_xml).unwrap();
+        let mut output = Vec::new();
+        paragraph.to_xml(&mut Writer::new(&mut output)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.starts_with(r#"<w:p w:rsidR="00A1B2C3" x:keep="yes""#),
+            "{output}"
+        );
+        assert!(output.contains(r#"xmlns:x="urn:producer""#), "{output}");
+        assert!(!output.contains("Id="), "{output}");
+        assert!(!output.contains("xmlns:i="), "{output}");
+
+        let source = format!(
+            r#"<w:p xmlns:w="{w_ns}" xmlns:w14="{W14_NS}" w14:paraId="11111111" w14:textId="22222222"/>"#
+        );
+        let mut paragraph = CT_P::from_xml_fragment(source.as_bytes()).unwrap();
+        drop_w14_paragraph_identities(&mut paragraph.extra_xml).unwrap();
+        assert!(paragraph.extra_xml.is_empty(), "{:?}", paragraph.extra_xml);
+    }
+
+    #[test]
+    fn a_part_root_declares_w14_only_when_its_content_needs_it() {
+        let w_ns = crate::namespace::W_NS;
+        let part = |root: &str, body: &str| {
+            format!(
+                r#"<?xml version="1.0"?><w:document xmlns:w="{w_ns}"{root}><w:body>{body}</w:body></w:document>"#
+            )
+            .into_bytes()
+        };
+        let identity = r#"<w:p w14:paraId="00000001"/>"#;
+        let mut unbound = part("", identity);
+        declare_w14_on_part_root(&mut unbound).unwrap();
+        assert_eq!(
+            unbound,
+            part(&format!(r#" xmlns:w14="{W14_NS}""#), identity)
+        );
+        crate::document::CT_Document::from_xml(&unbound).unwrap();
+
+        for unchanged in [
+            part(&format!(r#" xmlns:w14="{W14_NS}""#), identity),
+            part(r#" xmlns:w14="urn:other""#, identity),
+            part("", r#"<w:p><w:r><w:t>w14</w:t></w:r></w:p>"#),
+        ] {
+            let mut xml = unchanged.clone();
+            declare_w14_on_part_root(&mut xml).unwrap();
+            assert_eq!(xml, unchanged);
+        }
+    }
+
+    #[test]
     fn a_root_with_only_namespace_declarations_records_nothing() {
         let start = BytesStart::from_content(
             r#"w:sectPr xmlns:sa="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:sx="urn:section""#,
@@ -8720,6 +10476,54 @@ mod tests {
         let record =
             capture_root_attribute_record(&start, &["w".to_owned()]).expect("capture succeeds");
         assert!(record.is_none(), "{record:?}");
+    }
+
+    #[test]
+    fn a_run_identity_resolves_the_word_prefix_the_default_scope_names() {
+        // `CT_P::from_xml` names `w` as the Word prefix without binding it,
+        // which is the scope a paragraph cut out of its part can be parsed in.
+        // A run identity under it used to fail the paragraph as unbound.
+        let paragraph = parse_paragraph(
+            r#"<w:r w:rsidR="00A1B2C3" w:rsidRPr="00D4E5F6"><w:t>entry</w:t></w:r>"#,
+        );
+        assert_eq!(paragraph.text(), "entry");
+        let mut output = Vec::new();
+        paragraph.to_xml(&mut Writer::new(&mut output)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(r#"<w:r w:rsidR="00A1B2C3" w:rsidRPr="00D4E5F6""#),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn the_default_word_prefix_records_what_its_explicit_binding_records() {
+        // The fallback must produce the record a part that binds `w` produces,
+        // must never override an explicit binding, and must not reach a
+        // prefix the scope does not name as Word.
+        let start = BytesStart::from_content(r#"w:r w:rsidR="00A1B2C3""#, "w:r".len());
+        let default_scope = capture_root_attribute_record(&start, &["w".to_owned()]).unwrap();
+        let bound = capture_root_attribute_record(
+            &start,
+            &[format!("\0w\0{}", crate::namespace::W_NS), "w".to_owned()],
+        )
+        .unwrap();
+        assert!(default_scope.is_some());
+        assert_eq!(default_scope, bound);
+
+        let rebound =
+            capture_root_attribute_record(&start, &["w".to_owned(), "\0w\0urn:other".to_owned()])
+                .unwrap()
+                .unwrap();
+        let rebound = String::from_utf8(rebound).unwrap();
+        assert!(rebound.contains(r#"xmlns:w="urn:other""#), "{rebound}");
+
+        let foreign = BytesStart::from_content(r#"w:r x:id="1""#, "w:r".len());
+        let error = capture_root_attribute_record(&foreign, &["w".to_owned()]).unwrap_err();
+        assert!(
+            error.to_string().contains("prefix `x` is unbound"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -9335,13 +11139,14 @@ mod tests {
             panic!("expected second sibling field")
         };
         field.cached_result = "changed".to_owned();
-        let mut output = Vec::new();
-        let error = changed.to_xml(&mut Writer::new(&mut output)).unwrap_err();
+        let output = serialized_paragraph(&changed);
+        assert_eq!(output.matches("<w:r>").count(), 2, "{output}");
+        assert_eq!(output.matches("first").count(), 1, "{output}");
+        assert_eq!(output.matches("changed").count(), 1, "{output}");
+        assert!(!output.contains("second"), "{output}");
         assert!(
-            error
-                .to_string()
-                .contains("field sharing one physical run was changed"),
-            "{error}"
+            output.find("PAGE").unwrap() < output.find("bookmarkStart").unwrap(),
+            "{output}"
         );
     }
 
@@ -11160,6 +12965,29 @@ mod tests {
         assert!(reopened.equations[0].2.has_unsupported_content());
         let second = serialized_paragraph(&reopened);
         assert!(second.contains(&equation), "{second}");
+    }
+
+    #[test]
+    fn self_closing_simple_fields_count_in_bookmark_run_projections() {
+        for field in [
+            r#"<w:fldSimple w:instr=" PAGE "/>"#,
+            r#"<w:fldSimple w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple>"#,
+        ] {
+            let paragraph = parse_paragraph(&format!(
+                r#"{field}<w:bookmarkStart w:id="1" w:name="after"/><w:r><w:t>text</w:t></w:r><w:bookmarkEnd w:id="1"/>"#
+            ));
+
+            assert_eq!(paragraph.runs.len(), 2, "{field}");
+            let marker = &paragraph.bookmark_markers[0];
+            assert_eq!(marker.run_index(), 1, "{field}");
+            assert_eq!(marker.projected_run_index(), 1, "{field}");
+            assert_eq!(marker.tracked_run_index(), 1, "{field}");
+            assert_eq!(
+                paragraph.bookmark_markers[1].projected_run_index(),
+                2,
+                "{field}"
+            );
+        }
     }
 
     #[test]

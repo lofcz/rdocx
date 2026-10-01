@@ -20,7 +20,7 @@ replaces text, and produces deterministic fixed output.
 
 | Measurement | Value | Version | Platform | Build mode | Input | Command | Statistic | Measured on |
 |---|---|---|---|---|---|---|---|---|
-| Crates.io archive: rpptx-cli | 36,709 compressed bytes, 159,585 member bytes, 8 members | 0.12.1 | macOS 26.6.2, Apple M5 Max, arm64 | `cargo package --locked --no-verify` | Tracked `rpptx-cli` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-09-19 |
+| Crates.io archive: rpptx-cli | 40,733 compressed bytes, 178,874 member bytes, 8 members | 0.12.1 | macOS 26.6.2, Apple M5 Max, arm64 | `cargo package --locked --no-verify` | Tracked `rpptx-cli` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-09-30 |
 
 ## Use it when
 
@@ -51,6 +51,13 @@ degrees, direct autofit mode, paragraphs, table size, and children. A
 placeholder that inherits its geometry from its layout reports `null` geometry,
 and a placeholder without an explicit type reports a `null` type.
 
+Both inspection forms report every core property the deck sets. Beside title,
+creator, subject, description, keywords, last modified by, created and
+modified, they report category, content status, identifier, language, last
+printed, revision and version, which `inspect --json` adds to its `metadata`
+object. Human-readable inspection prints `(none)` when the deck sets no core
+property.
+
 `text --json` reports each slide's one-based number, slide id, paragraphs, and
 speaker notes, or `null` notes when the slide has no notes part. Each paragraph
 has a typed zero-based `path` of shape, table row, table cell, and paragraph
@@ -77,5 +84,17 @@ neither a clock nor a random source. `resolve` takes a thread id. `remove`
 takes a thread id, which also removes its replies, or a reply id. Every
 mutation requires `-o/--output`, refuses an existing output, publishes only a
 complete presentation, and supports a schema-1 record through `--json`.
+
+`convert`, `render`, and `thumbnail` refuse an output file that already exists
+unless `--force` is given. Even with `--force` they refuse their own input file
+under any spelling of its path, and an output that is not a regular file, such
+as a directory, a symbolic link, a FIFO, or a device like `/dev/null`. A run
+checks every file it would write before it writes the first one, and publishes
+each file only once it is complete, so a failed run leaves no truncated output.
+
+The output extension of `replace` and of every comment mutation selects the
+package class the output declares. A `.potx` template written to `deck.pptx`
+becomes a presentation, and a deck that carries a VBA project cannot change to
+a macro-free extension.
 
 Run `rpptx --help` or `rpptx <command> --help` for the complete command surface.

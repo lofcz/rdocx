@@ -3,11 +3,10 @@ use oxml_layout::{
     Transform,
 };
 use rdocx_oxml::math::{
-    BarPosition, FractionType, LimitLocation, MathAccent, MathArgument, MathBar, MathBorderBox, MathDelimiter,
-    MathExpression,
-    MathFraction, MathJustification, MathLimit, MathMatrix, MathNary, MathPreSubSuperscript,
-    MathProperties, MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
-    MatrixBaseJustification, OfficeMath,
+    BarPosition, FractionType, LimitLocation, MathAccent, MathArgument, MathBar, MathBorderBox,
+    MathDelimiter, MathExpression, MathFraction, MathJustification, MathLimit, MathMatrix,
+    MathNary, MathPreSubSuperscript, MathProperties, MathRadical, MathRun, MathScript, MathStyle,
+    MathSubSuperscript, MatrixBaseJustification, OfficeMath,
 };
 
 const DEFAULT_MATH_FONT: &str = "Caladea";
@@ -456,9 +455,15 @@ fn layout_expression(
             source_path,
             diagnostics,
         ),
-        MathExpression::BorderBox(value) => {
-            layout_border_box(value, fm, font_family, font_size, color, source_path, diagnostics)
-        }
+        MathExpression::BorderBox(value) => layout_border_box(
+            value,
+            fm,
+            font_family,
+            font_size,
+            color,
+            source_path,
+            diagnostics,
+        ),
         MathExpression::Bar(value) => layout_bar(
             value,
             fm,
@@ -581,7 +586,16 @@ fn layout_run(
     source_path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<MeasuredMath> {
-    layout_run_with_context(run, false, fm, font_family, font_size, color, source_path, diagnostics)
+    layout_run_with_context(
+        run,
+        false,
+        fm,
+        font_family,
+        font_size,
+        color,
+        source_path,
+        diagnostics,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,7 +608,16 @@ fn layout_run_after_operand(
     source_path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<MeasuredMath> {
-    layout_run_with_context(run, true, fm, font_family, font_size, color, source_path, diagnostics)
+    layout_run_with_context(
+        run,
+        true,
+        fm,
+        font_family,
+        font_size,
+        color,
+        source_path,
+        diagnostics,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -728,7 +751,11 @@ impl MathAtom {
             let decimal = index > 0
                 && chars[index - 1].is_ascii_digit()
                 && chars.get(index + 1).is_some_and(char::is_ascii_digit);
-            return if decimal { Self::Ordinary } else { Self::Punctuation };
+            return if decimal {
+                Self::Ordinary
+            } else {
+                Self::Punctuation
+            };
         }
         Self::classify(ch)
     }
@@ -740,8 +767,8 @@ impl MathAtom {
             '+' | '−' | '-' | '×' | '⋅' | '·' | '÷' | '±' | '∓' | '∗' | '∘' | '∖' | '∧' | '∨'
             | '∩' | '∪' | '⊕' | '⊗' | '⊙' => Self::Binary,
             '=' | '≠' | '<' | '>' | '≤' | '≥' | '≪' | '≫' | '≈' | '≐' | '≡' | '≢' | '∼' | '≃'
-            | '≅' | '∝' | '∈' | '∉' | '∋' | '⊂' | '⊃' | '⊆' | '⊇' | '∥' | '⊥' | '→' | '←'
-            | '↔' | '⇒' | '⇐' | '⇔' | '⟶' | '⟵' | '⟹' | '⟸' | '⟺' | '↦' | '⇌' | '≔' => {
+            | '≅' | '∝' | '∈' | '∉' | '∋' | '⊂' | '⊃' | '⊆' | '⊇' | '∥' | '⊥' | '→' | '←' | '↔'
+            | '⇒' | '⇐' | '⇔' | '⟶' | '⟵' | '⟹' | '⟸' | '⟺' | '↦' | '⇌' | '≔' => {
                 Self::Relation
             }
             _ => Self::Ordinary,
@@ -1145,7 +1172,8 @@ fn layout_measured_scripts(
     // Tall scripts such as boxed answers need disjoint bounds, not just
     // the baseline offsets used for ordinary letters and digits.
     if subscript.height().max(superscript.height()) > font_size * SCRIPT_SCALE * 1.2 {
-        subscript_shift = subscript_shift.max(subscript.ascent + superscript.descent + font_size * GAP_EM - superscript_shift);
+        subscript_shift = subscript_shift
+            .max(subscript.ascent + superscript.descent + font_size * GAP_EM - superscript_shift);
     }
     let ascent = base.ascent.max(superscript_shift + superscript.ascent);
     let descent = base.descent.max(subscript_shift + subscript.descent);
@@ -1937,8 +1965,18 @@ mod tests {
                 (nested.clone(), script.clone()),
                 (script.clone(), nested.clone()),
                 (nested.clone(), nested.clone()),
-                (MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text("  ")))]), text("15")),
-                (text("15"), MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text(" ")))])),
+                (
+                    MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text(
+                        "  ",
+                    )))]),
+                    text("15"),
+                ),
+                (
+                    text("15"),
+                    MathArgument::new(vec![MathExpression::BorderBox(MathBorderBox::new(text(
+                        " ",
+                    )))]),
+                ),
             ] {
                 let numerator = layout_argument(
                     &num,
@@ -2191,9 +2229,16 @@ mod tests {
         // `2x+1`: only `x` is italic; `+` is a binary operator with a medium space each side.
         let runs = glyph_runs(&layout_plain_run(&mut fm, "2x+1").group);
         let slanted: Vec<(&str, bool)> = runs.iter().map(|r| (r.text.as_str(), r.italic)).collect();
-        assert_eq!(slanted, vec![("2", false), ("x", true), ("+", false), ("1", false)]);
-        let tight = layout_plain_run(&mut fm, "2x").width + layout_plain_run(&mut fm, "1").width
-            + glyph_runs(&layout_plain_run(&mut fm, "+").group)[0].advances.iter().sum::<f64>()
+        assert_eq!(
+            slanted,
+            vec![("2", false), ("x", true), ("+", false), ("1", false)]
+        );
+        let tight = layout_plain_run(&mut fm, "2x").width
+            + layout_plain_run(&mut fm, "1").width
+            + glyph_runs(&layout_plain_run(&mut fm, "+").group)[0]
+                .advances
+                .iter()
+                .sum::<f64>()
                 * MATH_TEXT_X_SCALE;
         let spaced = layout_plain_run(&mut fm, "2x+1").width;
         assert!(
@@ -2204,26 +2249,47 @@ mod tests {
         // A leading minus is unary and gets no space; a decimal comma is not punctuation.
         let unary = layout_plain_run(&mut fm, "-3").width;
         let bare = layout_plain_run(&mut fm, "3").width
-            + glyph_runs(&layout_plain_run(&mut fm, "-").group)[0].advances.iter().sum::<f64>()
+            + glyph_runs(&layout_plain_run(&mut fm, "-").group)[0]
+                .advances
+                .iter()
+                .sum::<f64>()
                 * MATH_TEXT_X_SCALE;
-        assert!((unary - bare).abs() < 0.05, "unary minus: {unary} vs {bare}");
+        assert!(
+            (unary - bare).abs() < 0.05,
+            "unary minus: {unary} vs {bare}"
+        );
         let decimal = glyph_runs(&layout_plain_run(&mut fm, "12,01").group);
-        assert_eq!(decimal.len(), 1, "decimal number stays one run: {decimal:?}");
+        assert_eq!(
+            decimal.len(),
+            1,
+            "decimal number stays one run: {decimal:?}"
+        );
 
         // A symbol the math font lacks falls back on its own; the digits keep the math font.
         let mixed = glyph_runs(&layout_plain_run(&mut fm, "267⋅35").group);
         let digits: Vec<&GlyphRun> = mixed.iter().filter(|r| r.text != "⋅").collect();
         assert_eq!(digits.len(), 2);
         assert_eq!(digits[0].font_id, digits[1].font_id);
-        assert!(digits.iter().all(|r| !r.glyph_ids.contains(&0)), "digits have glyphs");
+        assert!(
+            digits.iter().all(|r| !r.glyph_ids.contains(&0)),
+            "digits have glyphs"
+        );
 
         // Typographic spaces are fixed gaps, never .notdef glyphs.
         let thin = layout_plain_run(&mut fm, "80\u{2009}000");
-        assert!(glyph_runs(&thin.group).iter().all(|r| !r.text.contains('\u{2009}')));
+        assert!(
+            glyph_runs(&thin.group)
+                .iter()
+                .all(|r| !r.text.contains('\u{2009}'))
+        );
         let expected = layout_plain_run(&mut fm, "80").width
             + layout_plain_run(&mut fm, "000").width
             + 11.0 / 6.0;
-        assert!((thin.width - expected).abs() < 0.05, "thin space: {} vs {expected}", thin.width);
+        assert!(
+            (thin.width - expected).abs() < 0.05,
+            "thin space: {} vs {expected}",
+            thin.width
+        );
     }
 
     #[test]
@@ -2232,7 +2298,10 @@ mod tests {
         let mut diagnostics = Vec::new();
         let script = MathExpression::Superscript(MathScript::new(text("x"), text("2")));
         let with_plus = layout_argument(
-            &MathArgument::new(vec![script.clone(), MathExpression::Run(MathRun::new("+1"))]),
+            &MathArgument::new(vec![
+                script.clone(),
+                MathExpression::Run(MathRun::new("+1")),
+            ]),
             &mut fm,
             None,
             11.0,
@@ -2272,7 +2341,10 @@ mod tests {
         .expect("bar layout");
         assert!((under.width - base.width).abs() < 1e-6);
         assert!(under.descent > base.descent, "underbar adds descent");
-        assert!((under.ascent - base.ascent).abs() < 1e-6, "underbar leaves ascent alone");
+        assert!(
+            (under.ascent - base.ascent).abs() < 1e-6,
+            "underbar leaves ascent alone"
+        );
         let over = layout_expression(
             &MathExpression::Bar(MathBar::new(BarPosition::Top, text("AB"))),
             &mut fm,
@@ -2795,5 +2867,4 @@ mod tests {
             assert!(upper.transform.f + sup_height < lower.transform.f);
         }
     }
-
 }

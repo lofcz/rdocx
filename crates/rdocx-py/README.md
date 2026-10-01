@@ -43,14 +43,29 @@ with open("report.pdf", "wb") as output:
 
 - File and byte-based DOCX input and output.
 - Paragraphs, runs, fonts, tables, rows, cells, sections, and styles.
-- Rich headers, footers, related stories, and resolved hyperlinks.
+- Rich per-section headers and footers, related stories, and hyperlinks
+  resolved, retargeted, or removed in any story.
+- Paragraph text replacement that keeps paragraph formatting, comments, and
+  bookmarks.
+- Paragraph style assignment by style ID or name, checked against the styles
+  the document defines.
+- New documents with Word's usual styles, such as `Heading 2`, `Title`,
+  `List Paragraph`, `Caption`, and `Table Grid`.
+- Style creation with a font, spacing, and indentation through
+  `Document.add_style`, plus style removal and default selection.
+- Numbering definitions and instances built from `ListLevel` values, and
+  paragraph styles linked to a numbering level.
+- Core document properties such as title, author, and revision, read and
+  written through `Document.core_properties` under python-docx's names.
+- Picture replacement and resizing by image relationship.
 - Complete paragraph and run formatting, multilingual and vertical typography,
   conditional and floating tables, section semantics, settings, fields, forms,
   equations, drawings, comments, and metadata.
-- Tracked comparison, main-body comment threads, revision resolution, and TOC
-  rebuilding.
-- Deterministic layout fragments, page geometry, and PDF, PNG, JPEG, and TIFF
-  output through the native document engine.
+- Tracked comparison, main-body comment threads, bookmarks, revision
+  resolution, and TOC insertion and rebuilding.
+- Deterministic layout fragments, page geometry, and PDF, PDF/A, SVG, PNG,
+  JPEG, and TIFF output through the native document engine, with caller fonts
+  or a font directory for PDF.
 - Python collections with negative indexes, slices, iteration, and explicit
   stale-handle errors after structural changes.
 

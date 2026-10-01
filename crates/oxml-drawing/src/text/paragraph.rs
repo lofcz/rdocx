@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write;
 
 use oxml_core::OxmlError;
@@ -28,6 +29,12 @@ pub enum TextSpace {
 }
 
 /// One DrawingML `a:t` value and its source whitespace intent.
+///
+/// `value` is the text as the part stores it and PowerPoint shows it. The
+/// text setters store a character XML 1.0 cannot carry, such as U+0001, as
+/// `_xHHHH_` with four uppercase hexadecimal digits, as python-pptx does, and
+/// reading never decodes that form, as neither python-pptx nor PowerPoint
+/// does.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TextValue {
     pub value: String,
@@ -112,6 +119,24 @@ impl TextValue {
             .map_err(OxmlError::from)?;
         write_end(writer, "a:t")
     }
+}
+
+/// Spells each character XML 1.0 cannot carry as `_xHHHH_`, as python-pptx's
+/// run text setter does, so text holding one can still be saved.
+pub fn escape_invalid_xml_characters(text: &str) -> Cow<'_, str> {
+    let is_invalid = |character: char| !oxml_core::xml::is_xml_1_0_character(character);
+    if !text.chars().any(is_invalid) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 6);
+    for character in text.chars() {
+        if is_invalid(character) {
+            escaped.push_str(&format!("_x{:04X}_", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 /// The seven members of `ST_TextAlignType`.
@@ -805,6 +830,14 @@ impl CT_TextCharacterProperties {
     pub fn raw_children(&self) -> &OrderedRawChildren {
         &self.raw_children
     }
+
+    /// Returns these properties as formatting for new text, without the click
+    /// and mouse-over hyperlinks, which name relationships rather than format.
+    pub(crate) fn without_hyperlinks(mut self) -> Self {
+        self.hyperlink_click = None;
+        self.hyperlink_mouse_over = None;
+        self
+    }
 }
 
 fn character_property_slot(name: &[u8]) -> Option<usize> {
@@ -1157,7 +1190,7 @@ impl CT_RegularTextRun {
         Self {
             properties: None,
             text: TextValue {
-                value: text.into(),
+                value: escape_invalid_xml_characters(&text.into()).into_owned(),
                 ..TextValue::default()
             },
             raw_children: OrderedRawChildren::default(),
@@ -1165,8 +1198,11 @@ impl CT_RegularTextRun {
     }
 
     /// Replaces the run text while retaining properties and unmodelled XML.
+    ///
+    /// A character XML 1.0 cannot carry is stored as `_xHHHH_`, as
+    /// python-pptx stores it.
     pub fn set_text(&mut self, text: &str) {
-        self.text.value = text.to_owned();
+        self.text.value = escape_invalid_xml_characters(text).into_owned();
     }
 
     /// Parses one complete `a:r` element with any prefix.
@@ -1513,10 +1549,15 @@ impl CT_TextParagraph {
             .expect("paragraph properties were inserted")
     }
 
-    /// Replaces ordered text choices with one regular run.
+    /// Replaces ordered text choices with one regular run, split at each
+    /// vertical tab by an `a:br` with the run's formatting, since a vertical
+    /// tab is how the paragraph text reports a line break.
     ///
     /// The first existing regular run supplies direct formatting and
-    /// unmodelled run content for the replacement.
+    /// unmodelled run content for the replacement. A paragraph without one
+    /// formats the new run with its end-of-paragraph properties, without
+    /// their hyperlinks, as PowerPoint formats text typed into an empty
+    /// paragraph.
     pub fn set_text(&mut self, text: &str) {
         let old_run_count = self.runs.len();
         let retained_run = self.runs.iter().find_map(|run| match run {
@@ -1537,9 +1578,45 @@ impl CT_TextParagraph {
             }
         }
         self.raw_children = raw_children;
-        let mut run = retained_run.unwrap_or_else(|| CT_RegularTextRun::new(text));
+        let mut run = retained_run.unwrap_or_else(|| CT_RegularTextRun {
+            properties: self
+                .end_properties
+                .clone()
+                .map(CT_TextCharacterProperties::without_hyperlinks),
+            ..CT_RegularTextRun::new(text)
+        });
         run.set_text(text);
         self.runs = vec![TextRun::Run(run)];
+        self.split_line_breaks(text);
+    }
+
+    /// Splits the one run `set_text` leaves at each vertical tab of `text`.
+    /// A later run that would be empty is left out, as python-pptx leaves it
+    /// out, and content preserved after the old runs stays after the new ones.
+    fn split_line_breaks(&mut self, text: &str) {
+        let [TextRun::Run(first)] = self.runs.as_mut_slice() else {
+            return;
+        };
+        if !text.contains('\u{b}') {
+            return;
+        }
+        let mut lines = text.split('\u{b}');
+        first.set_text(lines.next().unwrap_or_default());
+        let properties = first.properties.clone();
+        for line in lines {
+            self.raw_children.shift_boundaries_from(2);
+            self.runs.push(TextRun::Break(CT_TextLineBreak {
+                properties: properties.clone(),
+                ..CT_TextLineBreak::default()
+            }));
+            if !line.is_empty() {
+                self.raw_children.shift_boundaries_from(2);
+                self.runs.push(TextRun::Run(CT_RegularTextRun {
+                    properties: properties.clone(),
+                    ..CT_RegularTextRun::new(line)
+                }));
+            }
+        }
     }
 
     /// Appends one regular run after the existing ordered text choices.
@@ -1566,18 +1643,22 @@ impl CT_TextParagraph {
                 .read_event_into(&mut buffer)
                 .map_err(OxmlError::from)?
             {
-                Event::Start(element) if matches_local_name(element.name().as_ref(), b"pPr") => {
-                    if paragraph.properties.is_some() {
-                        return Err(duplicate("pPr"));
-                    }
+                // The schema allows one leading pPr, but real decks carry a
+                // later one between runs. The first governs the paragraph and
+                // every later one falls through to verbatim preservation at
+                // its position, which is also how python-pptx treats it.
+                Event::Start(element)
+                    if matches_local_name(element.name().as_ref(), b"pPr")
+                        && paragraph.properties.is_none() =>
+                {
                     paragraph.properties =
                         Some(CT_TextParagraphProperties::from_element(reader, &element)?);
                     boundary = boundary.max(1);
                 }
-                Event::Empty(element) if matches_local_name(element.name().as_ref(), b"pPr") => {
-                    if paragraph.properties.is_some() {
-                        return Err(duplicate("pPr"));
-                    }
+                Event::Empty(element)
+                    if matches_local_name(element.name().as_ref(), b"pPr")
+                        && paragraph.properties.is_none() =>
+                {
                     paragraph.properties = Some(CT_TextParagraphProperties::from_start(&element)?);
                     boundary = boundary.max(1);
                 }
@@ -2005,8 +2086,8 @@ mod tests {
     use std::panic;
 
     use super::{
-        CT_TextCharacterProperties, CT_TextParagraph, CT_TextParagraphProperties, TextRun,
-        TextSpace, TextSpacing,
+        CT_TextCharacterProperties, CT_TextParagraph, CT_TextParagraphProperties, TextAlignment,
+        TextRun, TextSpace, TextSpacing,
     };
     use crate::color::ColorChoice;
     use crate::text::CT_TextBody;
@@ -2092,6 +2173,36 @@ mod tests {
     }
 
     #[test]
+    fn text_written_into_an_empty_paragraph_takes_its_end_formatting() {
+        let mut paragraph = CT_TextParagraph::from_xml(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:pPr algn="r"/><a:endParaRPr sz="1500" b="1"><a:hlinkClick r:id="rId9"/></a:endParaRPr></a:p>"#,
+        )
+        .unwrap();
+        paragraph.set_text("Risk");
+        assert_eq!(
+            String::from_utf8(paragraph.to_xml().unwrap()).unwrap(),
+            r#"<a:p><a:pPr algn="r"/><a:r><a:rPr sz="1500" b="1"/><a:t>Risk</a:t></a:r><a:endParaRPr sz="1500" b="1"><a:hlinkClick r:id="rId9"/></a:endParaRPr></a:p>"#
+        );
+
+        let mut formatted = CT_TextParagraph::from_xml(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr i="1"/><a:t>old</a:t></a:r><a:endParaRPr sz="1500"/></a:p>"#,
+        )
+        .unwrap();
+        formatted.set_text("new");
+        assert_eq!(
+            String::from_utf8(formatted.to_xml().unwrap()).unwrap(),
+            r#"<a:p><a:r><a:rPr i="1"/><a:t>new</a:t></a:r><a:endParaRPr sz="1500"/></a:p>"#
+        );
+
+        let mut bare = CT_TextParagraph::default();
+        bare.set_text("plain");
+        assert_eq!(
+            bare.to_xml().unwrap(),
+            br#"<a:p><a:r><a:t>plain</a:t></a:r></a:p>"#
+        );
+    }
+
+    #[test]
     fn paragraph_runs_fields_and_breaks_round_trip_structurally() {
         let xml = br#"<q:p><x:before/><q:pPr algn="ctr"/><x:afterPPr/><q:r><q:rPr b="1"><q:hlinkClick x:id="not-a-relationship" r:id="rId7" action="ppaction://hlinksldjump" tooltip="go &amp; stay" history="0" highlightClick="1" endSnd="0"><x:sound/></q:hlinkClick></q:rPr><q:t>one</q:t></q:r><x:between/><q:br><q:rPr i="true"/></q:br><q:fld id="{00112233-4455-6677-8899-AABBCCDDEEFF}" type="slidenum"><q:rPr sz="1200"/><q:pPr lvl="1"/><q:t>2</q:t></q:fld><q:endParaRPr sz="1400"/><x:after/></q:p>"#;
         let paragraph = CT_TextParagraph::from_xml(xml).unwrap();
@@ -2117,6 +2228,56 @@ mod tests {
         assert_eq!(
             writer.into_inner(),
             br#"<a:rPr><a:hlinkClick x:id="not-a-relationship"/></a:rPr>"#
+        );
+    }
+
+    #[test]
+    fn a_later_paragraph_properties_element_is_preserved_where_it_stands() {
+        let xml = br#"<a:p><a:pPr algn="l"/><a:r><a:t>One.</a:t></a:r><a:pPr algn="r"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:pPr><a:r><a:t>Two.</a:t></a:r><a:pPr/><a:endParaRPr lang="en-US"/></a:p>"#;
+        let mut paragraph = CT_TextParagraph::from_xml(xml).unwrap();
+        let properties = paragraph.properties.as_ref().unwrap();
+        assert_eq!(properties.alignment, Some(TextAlignment::Left));
+        assert_eq!(properties.line_spacing, None);
+        let texts = paragraph
+            .runs
+            .iter()
+            .map(|run| match run {
+                TextRun::Run(run) => run.text.value.as_str(),
+                TextRun::Break(_) | TextRun::Field(_) => panic!("expected regular runs"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["One.", "Two."]);
+        assert_eq!(paragraph.to_xml().unwrap(), xml);
+        assert_eq!(CT_TextParagraph::from_xml(xml).unwrap(), paragraph);
+
+        let TextRun::Run(first) = &mut paragraph.runs[0] else {
+            panic!("expected regular run");
+        };
+        first.set_text("Uno.");
+        paragraph.properties_mut().level = Some(1);
+        paragraph.add_run("Three.");
+        assert_eq!(
+            paragraph.to_xml().unwrap(),
+            br#"<a:p><a:pPr lvl="1" algn="l"/><a:r><a:t>Uno.</a:t></a:r><a:pPr algn="r"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:pPr><a:r><a:t>Two.</a:t></a:r><a:pPr/><a:r><a:t>Three.</a:t></a:r><a:endParaRPr lang="en-US"/></a:p>"#
+        );
+
+        paragraph.set_text("Whole.");
+        assert_eq!(
+            paragraph.to_xml().unwrap(),
+            br#"<a:p><a:pPr lvl="1" algn="l"/><a:r><a:t>Whole.</a:t></a:r><a:pPr algn="r"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:pPr><a:pPr/><a:endParaRPr lang="en-US"/></a:p>"#
+        );
+
+        let late = CT_TextParagraph::from_xml(
+            br#"<a:p><a:r><a:t>One.</a:t></a:r><a:pPr algn="l"/><a:r><a:t>Two.</a:t></a:r><a:pPr algn="r"/></a:p>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            late.properties.as_ref().unwrap().alignment,
+            Some(TextAlignment::Left)
+        );
+        assert_eq!(
+            late.to_xml().unwrap(),
+            br#"<a:p><a:pPr algn="l"/><a:r><a:t>One.</a:t></a:r><a:r><a:t>Two.</a:t></a:r><a:pPr algn="r"/></a:p>"#
         );
     }
 
@@ -2415,5 +2576,61 @@ mod tests {
             assert!(result.is_ok(), "text parser panicked");
             assert!(result.unwrap().is_err(), "malformed text parsed");
         }
+    }
+
+    #[test]
+    fn characters_xml_cannot_carry_are_stored_escaped_and_never_decoded() {
+        let mut paragraph = CT_TextParagraph::default();
+        paragraph.add_run("a\u{1}b\u{b}c\u{1f}d\u{fffe}e\u{0}");
+        let TextRun::Run(run) = &paragraph.runs[0] else {
+            panic!("expected a run");
+        };
+        assert_eq!(
+            run.text.value, "a_x0001_b_x000B_c_x001F_d_xFFFE_e_x0000_",
+            "the setter stores the escaped form, as python-pptx does"
+        );
+        let written = paragraph.to_xml().unwrap();
+        assert_eq!(
+            written,
+            br#"<a:p><a:r><a:t>a_x0001_b_x000B_c_x001F_d_xFFFE_e_x0000_</a:t></a:r></a:p>"#
+        );
+        let declared = [
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#.as_slice(),
+            &written[4..],
+        ]
+        .concat();
+        oxml_core::xml::validate_strict_xml_1_0(&declared)
+            .expect("the written paragraph is XML 1.0");
+        assert_eq!(CT_TextParagraph::from_xml(&written).unwrap(), paragraph);
+
+        // Reading keeps every `_xHHHH_` spelling as text, as PowerPoint shows
+        // it and python-pptx reads it.
+        let xml = br#"<a:p><a:r><a:t>C_x0041_D bell_x0007_ _x000b_ _x0001</a:t></a:r></a:p>"#;
+        let paragraph = CT_TextParagraph::from_xml(xml).unwrap();
+        let TextRun::Run(run) = &paragraph.runs[0] else {
+            panic!("expected a run");
+        };
+        assert_eq!(run.text.value, "C_x0041_D bell_x0007_ _x000b_ _x0001");
+        assert_eq!(paragraph.to_xml().unwrap(), xml);
+    }
+
+    #[test]
+    fn a_vertical_tab_set_as_paragraph_text_becomes_a_line_break() {
+        let mut paragraph = CT_TextParagraph::from_xml(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:x="urn:x"><a:r><a:rPr b="1"/><a:t>old</a:t></a:r><x:after/><a:endParaRPr sz="1200"/><x:end/></a:p>"#,
+        )
+        .unwrap();
+        paragraph.set_text("one\u{b}two\u{1}\u{b}");
+        assert_eq!(
+            String::from_utf8(paragraph.to_xml().unwrap()).unwrap(),
+            r#"<a:p><a:r><a:rPr b="1"/><a:t>one</a:t></a:r><a:br><a:rPr b="1"/></a:br><a:r><a:rPr b="1"/><a:t>two_x0001_</a:t></a:r><a:br><a:rPr b="1"/></a:br><x:after/><a:endParaRPr sz="1200"/><x:end/></a:p>"#
+        );
+
+        let mut plain = CT_TextParagraph::default();
+        plain.set_text("\u{b}");
+        assert_eq!(
+            plain.to_xml().unwrap(),
+            br#"<a:p><a:r><a:t/></a:r><a:br/></a:p>"#
+        );
     }
 }

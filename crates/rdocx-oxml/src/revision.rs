@@ -223,26 +223,39 @@ impl CT_Revision {
         path: &[AcceptedRunPathSegment],
         replacement: CT_R,
     ) -> crate::Result<bool> {
-        if !matches!(self.kind, RevisionKind::Insertion | RevisionKind::MoveTo) {
-            return Ok(false);
-        }
-        ensure_revision_word_prefix_is_mutable(&self.raw_xml)?;
-        let mut candidate = self.clone();
-        let Some(paragraph) = candidate.content_paragraph.as_deref_mut() else {
-            return Ok(false);
-        };
-        if !paragraph.replace_accepted_run_segments(path, replacement)? {
-            return Ok(false);
-        }
-        candidate.refresh_accepted_content()?;
-        *self = candidate;
-        Ok(true)
+        self.edit_accepted_paragraph(|paragraph| {
+            paragraph.replace_accepted_run_segments(path, replacement)
+        })
     }
 
     pub(crate) fn split_accepted_run_segments(
         &mut self,
         path: &[AcceptedRunPathSegment],
         offset: usize,
+    ) -> crate::Result<bool> {
+        self.edit_accepted_paragraph(|paragraph| {
+            paragraph.split_accepted_run_segments(path, offset)
+        })
+    }
+
+    /// The paragraph of an insertion or a move destination, when
+    /// [`Self::edit_accepted_paragraph`] can write an edit of it back.
+    pub(crate) fn editable_accepted_paragraph(&self) -> Option<&CT_P> {
+        if !matches!(self.kind, RevisionKind::Insertion | RevisionKind::MoveTo)
+            || ensure_revision_word_prefix_is_mutable(&self.raw_xml).is_err()
+        {
+            return None;
+        }
+        self.content_paragraph.as_deref()
+    }
+
+    /// Apply `edit` to the paragraph of an insertion or a move destination
+    /// and, when it reports a change, write its runs back inside the
+    /// wrapper, whose start tag keeps its id, author and date. Returns false
+    /// for any other revision.
+    pub(crate) fn edit_accepted_paragraph(
+        &mut self,
+        edit: impl FnOnce(&mut CT_P) -> crate::Result<bool>,
     ) -> crate::Result<bool> {
         if !matches!(self.kind, RevisionKind::Insertion | RevisionKind::MoveTo) {
             return Ok(false);
@@ -252,7 +265,7 @@ impl CT_Revision {
         let Some(paragraph) = candidate.content_paragraph.as_deref_mut() else {
             return Ok(false);
         };
-        if !paragraph.split_accepted_run_segments(path, offset)? {
+        if !edit(paragraph)? {
             return Ok(false);
         }
         candidate.refresh_accepted_content()?;
@@ -1089,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_accepted_revision_refresh_keeps_the_original_projection() {
+    fn accepted_revision_refresh_changes_one_field_of_a_shared_run() {
         let raw = format!(
             concat!(
                 r#"<w:ins xmlns:w="{}" w:id="7" w:author="Ada"><w:r>"#,
@@ -1124,22 +1137,26 @@ mod tests {
             .expect("replacement contains a field");
         field.cached_result = "changed".to_owned();
 
-        let error = revision
-            .replace_accepted_run_segments(&[AcceptedRunPathSegment::Run(page_index)], replacement)
-            .expect_err("shared physical field mutation must fail");
-
         assert!(
-            error
-                .to_string()
-                .contains("field sharing one physical run was changed")
+            revision
+                .replace_accepted_run_segments(
+                    &[AcceptedRunPathSegment::Run(page_index)],
+                    replacement
+                )
+                .expect("one field of a shared physical run can change")
         );
+
         assert_eq!(
             revision
                 .content_paragraph()
-                .expect("original accepted content remains")
+                .expect("accepted content remains")
                 .text(),
-            "firstsecond"
+            "firstchanged"
         );
+        let raw = std::str::from_utf8(&revision.raw_xml).unwrap();
+        assert!(raw.contains("<w:instrText>DATE</w:instrText>"), "{raw}");
+        assert!(raw.contains("<w:t>first</w:t>"), "{raw}");
+        assert!(!raw.contains("second"), "{raw}");
     }
 
     #[test]

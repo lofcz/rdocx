@@ -1,4 +1,10 @@
 import importlib.metadata
+import re
+import struct
+import zipfile
+import zlib
+
+import pytest
 
 
 ORACLE_DISTRIBUTION = "python-docx"
@@ -618,3 +624,399 @@ def test_rdocx_and_python_docx_round_trip_the_same_normalized_content(tmp_path):
         assert rdocx_record[1][0][0] == "LightShading-Accent1"
         records.append(rdocx_record)
     assert records[0] == records[1]
+
+# Issues 157, 159 and 160: the attached producer and identity matrices are
+# built in source so every row exercises the same document operations.
+_MATRIX_TIMESTAMP = "2026-09-27T12:00:00Z"
+_MATRIX_W14 = "{http://schemas.microsoft.com/office/word/2010/wordml}"
+_MATRIX_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+_MATRIX_IDENTITY_ROWS = (
+    ("paragraphs", "w:rsidR"),
+    ("paragraphs", "w:rsidRDefault"),
+    ("paragraphs", "w:rsidP"),
+    ("paragraphs", "w14:paraId"),
+    ("paragraphs", "w14:textId"),
+    ("runs", "w:rsidR"),
+    ("runs", "w:rsidRPr"),
+    ("runs", "w:rsidDel"),
+    ("field runs", "w:rsidR"),
+    ("field runs", "w:rsidRPr"),
+    ("footer field runs", "w:rsidR"),
+    ("footer field runs", "w:rsidRPr"),
+    ("content control", "w:id"),
+    ("content control", "w:tag"),
+    ("table rows", "w:rsidR"),
+    ("table rows", "w:rsidTr"),
+    ("table rows", "w14:paraId"),
+)
+_MATRIX_PRODUCER_ROWS = (
+    "control: none",
+    "xml:space=preserve on every w:t",
+    'w:val="0" toggles on every run',
+    "empty <w:pPr/> on plain paragraphs",
+    'pageBreakBefore/keepNext w:val="0"',
+    'w:orient="portrait" on pgSz',
+    "default namespace on the root",
+    "packed TOC field run",
+    "packed footer fields, no cached result",
+    "inline content control on first runs",
+    "empty comments part",
+)
+
+
+def _matrix_field(paragraph, instruction, cached=None):
+    from docx.oxml.ns import qn
+
+    result = []
+    for kind, text in (("begin", None), ("instr", instruction), ("separate", None)):
+        run = paragraph.makeelement(qn("w:r"), {})
+        if kind == "instr":
+            item = run.makeelement(qn("w:instrText"), {})
+            item.text = text
+            item.set(_MATRIX_XML_SPACE, "preserve")
+        else:
+            item = run.makeelement(qn("w:fldChar"), {})
+            item.set(qn("w:fldCharType"), kind)
+        run.append(item)
+        paragraph.append(run)
+        result.append(run)
+    if cached is not None:
+        run = paragraph.makeelement(qn("w:r"), {})
+        text = run.makeelement(qn("w:t"), {})
+        text.text = cached
+        run.append(text)
+        paragraph.append(run)
+        run = paragraph.makeelement(qn("w:r"), {})
+        end = run.makeelement(qn("w:fldChar"), {})
+        end.set(qn("w:fldCharType"), "end")
+        run.append(end)
+        paragraph.append(run)
+        result.append(run)
+    return result
+
+
+def _matrix_fixture(path, where=None, attr=None, word="alpha"):
+    from docx import Document as OracleDocument
+    from docx.oxml.ns import qn
+
+    document = OracleDocument()
+    body = document.element.body
+    field_runs = []
+    entries = ["Chapter 1", "Section 1.1", "Chapter 2", "Section 2.1", "Chapter 3", "Section 3.1"]
+    for index, title in enumerate(entries):
+        paragraph = document.add_paragraph()
+        if index == 0:
+            field_runs.extend(_matrix_field(paragraph._p, ' TOC \\o "1-3" \\h \\z \\u '))
+        paragraph.add_run(title + "\t1")
+        if index == len(entries) - 1:
+            run = paragraph._p.makeelement(qn("w:r"), {})
+            end = run.makeelement(qn("w:fldChar"), {})
+            end.set(qn("w:fldCharType"), "end")
+            run.append(end)
+            paragraph._p.append(run)
+            field_runs.append(run)
+    for index in range(1, 4):
+        document.add_heading(f"Chapter {index}", level=1)
+        document.add_paragraph(
+            f"Body text of chapter {index}, lorem {word if index == 2 else 'ipsum'} dolor."
+        )
+        document.add_heading(f"Section {index}.1", level=2)
+        document.add_paragraph(f"Body text of section {index}.1.")
+    table = document.add_table(rows=2, cols=2)
+    for cell in table._cells:
+        cell.text = "cell"
+    control = body.makeelement(qn("w:sdt"), {})
+    properties = control.makeelement(qn("w:sdtPr"), {})
+    tag = properties.makeelement(qn("w:tag"), {})
+    tag.set(qn("w:val"), "block")
+    properties.append(tag)
+    control.append(properties)
+    content = control.makeelement(qn("w:sdtContent"), {})
+    for value in ("Inside the content control, one.", "Inside the content control, two."):
+        paragraph = document.add_paragraph(value)._p
+        body.remove(paragraph)
+        content.append(paragraph)
+    control.append(content)
+    body.find(qn("w:tbl")).addnext(control)
+    footer = document.sections[0].footer.paragraphs[0]._p
+    run = footer.makeelement(qn("w:r"), {})
+    text = run.makeelement(qn("w:t"), {})
+    text.text = "Page "
+    text.set(_MATRIX_XML_SPACE, "preserve")
+    run.append(text)
+    footer.append(run)
+    footer_runs = _matrix_field(footer, " PAGE ", "1") + _matrix_field(footer, " NUMPAGES ", "1")
+    targets = {
+        "paragraphs": list(body.iter(qn("w:p"))),
+        "runs": list(body.iter(qn("w:r"))),
+        "field runs": field_runs,
+        "footer field runs": footer_runs,
+        "content control": [properties],
+        "table rows": list(body.iter(qn("w:tr"))),
+    }
+    if where:
+        assert targets[where], where
+        for element in targets[where]:
+            if attr == "w:tag":
+                element.find(qn("w:tag")).set(qn("w:val"), "block-2")
+            elif attr == "w:id":
+                identity = element.makeelement(qn("w:id"), {})
+                identity.set(qn("w:val"), "-2000000001")
+                element.insert(0, identity)
+            elif attr.startswith("w14:"):
+                element.set(_MATRIX_W14 + attr[4:], "1A2B3C4D")
+            else:
+                element.set(qn(attr), "00A1B2C3")
+    document.save(path)
+    return path
+
+
+def _matrix_part(path, part):
+    with zipfile.ZipFile(path) as package:
+        return package.read(part)
+
+
+def _matrix_attribute_count(path, attr):
+    data = _matrix_part(path, "word/document.xml") + _matrix_part(path, "word/footer1.xml")
+    if attr == "w:tag":
+        return data.count(b"<w:tag ")
+    if attr == "w:id":
+        return data.count(b"<w:id ")
+    return data.count(b" " + attr.encode() + b"=")
+
+
+def _matrix_comparison_count(original, edited):
+    import rdocx
+
+    compared = rdocx.Document(original)
+    compared.compare(rdocx.Document(edited), "R", _MATRIX_TIMESTAMP)
+    return len(compared.revisions)
+
+
+@pytest.mark.parametrize("where,attr", _MATRIX_IDENTITY_ROWS)
+def test_issue_159_identity_matrix_across_operations(tmp_path, where, attr):
+    _assert_oracle_version()
+    import rdocx
+
+    plain = _matrix_fixture(tmp_path / "plain.docx")
+    source = _matrix_fixture(tmp_path / "source.docx", where, attr)
+    edited = _matrix_fixture(tmp_path / "edited.docx", where, attr, word="ALPHA")
+    assert _matrix_attribute_count(source, attr) > 0
+    if attr == "w:tag":
+        assert b'block-2' in _matrix_part(source, "word/document.xml")
+    document = rdocx.Document(source)
+    assert document.try_replace_text("Body text of section 3.1.", "Body text of section three.") == 1
+    saved = tmp_path / "saved.docx"
+    document.save(saved)
+    assert _matrix_attribute_count(source, attr) == _matrix_attribute_count(saved, attr)
+
+    document = rdocx.Document(source)
+    assert document.try_replace_text("lorem", "LOREM") == 3
+    document.save(tmp_path / "replaced.docx")
+    assert rdocx.Document(source).rebuild_toc().entry_count == 6
+    assert rdocx.Document(source).update_page_fields() >= 0
+    assert rdocx.Document(source).to_pdf().startswith(b"%PDF")
+    assert _matrix_comparison_count(plain, source) == 0
+    assert _matrix_comparison_count(source, edited) == 2
+
+
+def _matrix_rewrite(path, trait):
+    empty_comments = trait == "empty comments part"
+    with zipfile.ZipFile(path) as package:
+        items = [(item, package.read(item.filename)) for item in package.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
+        for item, data in items:
+            if item.filename == "word/document.xml":
+                xml = data.decode()
+                if trait == "xml:space=preserve on every w:t":
+                    xml = xml.replace("<w:t>", '<w:t xml:space="preserve">')
+                elif trait == 'w:val="0" toggles on every run':
+                    xml = xml.replace("<w:r>", '<w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/></w:rPr>')
+                elif trait == "empty <w:pPr/> on plain paragraphs":
+                    xml = xml.replace("<w:p><w:r>", "<w:p><w:pPr/><w:r>")
+                elif trait == 'pageBreakBefore/keepNext w:val="0"':
+                    xml = xml.replace("<w:p><w:r>", '<w:p><w:pPr><w:keepNext w:val="0"/><w:pageBreakBefore w:val="0"/></w:pPr><w:r>')
+                elif trait == 'w:orient="portrait" on pgSz':
+                    xml = xml.replace("<w:pgSz ", '<w:pgSz w:orient="portrait" ')
+                elif trait == "default namespace on the root":
+                    xml = xml.replace("<w:document ", '<w:document xmlns="http://schemas.microsoft.com/office/tasks/2019/documenttasks" ', 1)
+                elif trait == "packed TOC field run":
+                    xml = re.sub(
+                        r'<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r>(<w:instrText[^>]*>[^<]*</w:instrText>)</w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>',
+                        r'<w:r><w:fldChar w:fldCharType="begin"/>\1<w:fldChar w:fldCharType="separate"/></w:r>',
+                        xml,
+                    )
+                elif trait == "inline content control on first runs":
+                    xml = re.sub(
+                        r'(<w:p>(?:<w:pPr>.*?</w:pPr>)?)(<w:r>.*?</w:r>)',
+                        r'\1<w:sdt><w:sdtPr><w:tag w:val="goog_rdk_0"/></w:sdtPr><w:sdtContent>\2</w:sdtContent></w:sdt>',
+                        xml,
+                    )
+                data = xml.encode()
+            elif item.filename == "word/footer1.xml" and trait == "packed footer fields, no cached result":
+                xml = data.decode()
+                xml = re.sub(
+                    r'<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r>(<w:instrText[^>]*>[^<]*</w:instrText>)</w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>',
+                    r'<w:r><w:fldChar w:fldCharType="begin"/>\1<w:fldChar w:fldCharType="separate"/></w:r>',
+                    xml,
+                )
+                xml = xml.replace(
+                    '<w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>',
+                    '<w:fldChar w:fldCharType="separate"/><w:fldChar w:fldCharType="end"/></w:r>',
+                )
+                data = xml.encode()
+            if empty_comments and item.filename == "[Content_Types].xml":
+                data = data.replace(b"</Types>", b'<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/></Types>')
+            if empty_comments and item.filename == "word/_rels/document.xml.rels":
+                data = data.replace(b"</Relationships>", b'<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/></Relationships>')
+            package.writestr(item, data)
+        if empty_comments:
+            package.writestr(
+                "word/comments.xml",
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"/>',
+            )
+    _matrix_assert_trait(path, trait)
+    return path
+
+
+def _matrix_assert_trait(path, trait):
+    empty_comments = trait == "empty comments part"
+    document = _matrix_part(path, "word/document.xml")
+    footer = _matrix_part(path, "word/footer1.xml")
+    signatures = {
+        "xml:space=preserve on every w:t": (document, b'xml:space="preserve">Body text'),
+        'w:val="0" toggles on every run': (document, b'<w:b w:val="0"/>'),
+        "empty <w:pPr/> on plain paragraphs": (document, b'<w:p><w:pPr/><w:r>'),
+        'pageBreakBefore/keepNext w:val="0"': (document, b'<w:pageBreakBefore w:val="0"/>'),
+        'w:orient="portrait" on pgSz': (document, b'<w:pgSz w:orient="portrait"'),
+        "default namespace on the root": (document, b'xmlns="http://schemas.microsoft.com/office/tasks/2019/documenttasks"'),
+        "packed TOC field run": (document, b'fldCharType="begin"/><w:instrText'),
+        "packed footer fields, no cached result": (footer, b'fldCharType="begin"/><w:instrText'),
+        "inline content control on first runs": (document, b'goog_rdk_0'),
+        "empty comments part": (_matrix_part(path, "word/comments.xml") if empty_comments else b"", b'<w:comments'),
+    }
+    if trait in signatures:
+        payload, marker = signatures[trait]
+        assert marker in payload, trait
+
+
+def _matrix_png():
+    def chunk(name, data):
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", zlib.crc32(name + data))
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
+
+
+@pytest.mark.parametrize("trait", _MATRIX_PRODUCER_ROWS)
+def test_issue_160_producer_matrix_across_operations_and_picture(tmp_path, trait):
+    _assert_oracle_version()
+    import rdocx
+
+    source = _matrix_rewrite(_matrix_fixture(tmp_path / "source.docx"), trait)
+    edited = _matrix_rewrite(_matrix_fixture(tmp_path / "edited.docx", word="ALPHA"), trait)
+    document = rdocx.Document(source)
+    noop = tmp_path / "noop.docx"
+    document.save(noop)
+    assert _matrix_part(source, "word/document.xml") == _matrix_part(noop, "word/document.xml")
+
+    document = rdocx.Document(source)
+    assert document.try_replace_text("alpha", "ALPHA") == 1
+    replaced = tmp_path / "replaced.docx"
+    document.save(replaced)
+    assert rdocx.Document(source).rebuild_toc().entry_count == 6
+    fields = rdocx.Document(source)
+    fields.update_page_fields()
+    refreshed = tmp_path / "refreshed.docx"
+    fields.save(refreshed)
+    footer = _matrix_part(refreshed, "word/footer1.xml").decode()
+    assert len(re.findall(r'fldCharType="separate"/>(?:</w:r><w:r>)?<w:t>([^<]*)</w:t>', footer)) == 2
+    assert rdocx.Document(source).to_pdf().startswith(b"%PDF")
+    _matrix_comparison_count(source, refreshed)
+    assert _matrix_comparison_count(source, edited) == 2
+    assert _matrix_comparison_count(source, replaced) == 2
+
+    pictured = rdocx.Document(source)
+    pictured.add_picture(_matrix_png(), "matrix.png", width=914400, height=914400)
+    pictured_path = tmp_path / "pictured.docx"
+    pictured.save(pictured_path)
+    reopened = rdocx.Document(pictured_path)
+    assert "word/media/image1.png" in zipfile.ZipFile(pictured_path).namelist()
+    _matrix_assert_trait(pictured_path, trait)
+    assert reopened.try_replace_text("alpha", "ALPHA") == 1
+    assert reopened.to_pdf().startswith(b"%PDF")
+
+
+def test_issue_161_rebuilt_toc_compares_and_resolves_both_sides(tmp_path):
+    _assert_oracle_version()
+    import rdocx
+    from docx import Document as OracleDocument
+    from docx.oxml import OxmlElement
+
+    source = _matrix_fixture(tmp_path / "source.docx")
+    oracle = OracleDocument(source)
+    body = oracle.element.body
+    control = OxmlElement("w:sdt")
+    control.append(OxmlElement("w:sdtPr"))
+    content = OxmlElement("w:sdtContent")
+    for paragraph in list(body)[:6]:
+        body.remove(paragraph)
+        content.append(paragraph)
+    control.append(content)
+    body.insert(0, control)
+    oracle.save(source)
+    edited = rdocx.Document(source)
+    assert edited.rebuild_toc().entry_count == 6
+    edited_path = tmp_path / "edited.docx"
+    edited.save(edited_path)
+    redline = rdocx.Document(source)
+    assert redline.compare(
+        rdocx.Document(edited_path), "Ada", _MATRIX_TIMESTAMP, granularity="word"
+    ) == ()
+    accepted = rdocx.Document.from_bytes(redline.to_bytes())
+    accepted.accept_all()
+    assert accepted.compare(rdocx.Document(edited_path), "Ada", _MATRIX_TIMESTAMP) == ()
+    rejected = rdocx.Document.from_bytes(redline.to_bytes())
+    rejected.reject_all()
+    assert rejected.compare(rdocx.Document(source), "Ada", _MATRIX_TIMESTAMP) == ()
+
+
+def test_issue_161_toc_entry_hyperlink_transition_tracks_boundary(tmp_path):
+    _assert_oracle_version()
+    import rdocx
+    from docx import Document as OracleDocument
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    original = OracleDocument()
+    original.add_paragraph("Chapter 1")
+    original.add_paragraph("Following body paragraph")
+    original_path = tmp_path / "toc_entry_original.docx"
+    original.save(original_path)
+    edited = OracleDocument(original_path)
+    paragraph = edited.paragraphs[0]._p
+    for child in list(paragraph):
+        paragraph.remove(child)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("w:anchor"), "_Toc1")
+    run = OxmlElement("w:r")
+    text = OxmlElement("w:t")
+    text.text = "Chapter 1"
+    run.append(text)
+    hyperlink.append(run)
+    paragraph.append(hyperlink)
+    edited_path = tmp_path / "toc_entry_edited.docx"
+    edited.save(edited_path)
+
+    redline = rdocx.Document(original_path)
+    assert redline.compare(rdocx.Document(edited_path), "Ada", _MATRIX_TIMESTAMP) == ()
+    accepted = rdocx.Document.from_bytes(redline.to_bytes())
+    accepted.accept_all()
+    assert accepted.compare(rdocx.Document(edited_path), "Ada", _MATRIX_TIMESTAMP) == ()
+    rejected = rdocx.Document.from_bytes(redline.to_bytes())
+    rejected.reject_all()
+    assert rejected.compare(rdocx.Document(original_path), "Ada", _MATRIX_TIMESTAMP) == ()

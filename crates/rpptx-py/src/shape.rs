@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use oxml_py_support::{ContentPath, PathSeg};
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyByteArray, PyBytes, PyIterator, PyList, PySlice, PyString};
+use pyo3::types::{PyAny, PyByteArray, PyBytes, PyIterator, PyList, PySlice, PyString, PyTuple};
 
 use crate::dml::{FillTarget, PyFillFormat, PyLineFormat};
 use crate::normalize_index;
@@ -17,9 +17,21 @@ const MIN_COORDINATE: i64 = -27_273_042_329_600;
 const MAX_COORDINATE: i64 = 27_273_042_316_900;
 const ANGLE_UNITS_PER_DEGREE: f64 = 60_000.0;
 const ANGLE_UNITS_PER_TURN: i64 = 21_600_000;
+/// `a:srcRect` stores a crop inset in thousandths of a percent.
+const CROP_UNITS_PER_FRACTION: f64 = 100_000.0;
+
+/// Left, top, right, and bottom picture crop insets, as the facade reports them.
+type Crop = (
+    rpptx::Percent1000,
+    rpptx::Percent1000,
+    rpptx::Percent1000,
+    rpptx::Percent1000,
+);
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyShape>()?;
+    module.add_class::<PyShapeClickAction>()?;
+    module.add_class::<PyShapeHyperlink>()?;
     module.add_class::<PyShapeCollection>()?;
     module.add_class::<PyPlaceholderCollection>()?;
     module.add_class::<PyImage>()?;
@@ -168,6 +180,55 @@ impl PyShape {
         }
     }
 
+    fn crop(&self, py: Python<'_>) -> PyResult<Crop> {
+        self.read(py, |shape| shape.crop())?
+            .ok_or_else(|| PyValueError::new_err("shape is not a picture"))
+    }
+
+    fn crop_edge(
+        &self,
+        py: Python<'_>,
+        edge: fn(&mut Crop) -> &mut rpptx::Percent1000,
+    ) -> PyResult<f64> {
+        let mut crop = self.crop(py)?;
+        Ok(f64::from(edge(&mut crop).0) / CROP_UNITS_PER_FRACTION)
+    }
+
+    /// Writes one crop inset as python-pptx does, rounding half to even, and
+    /// leaves the picture unchanged when the value equals the stored one.
+    fn set_crop_edge(
+        &self,
+        py: Python<'_>,
+        edge: fn(&mut Crop) -> &mut rpptx::Percent1000,
+        value: f64,
+    ) -> PyResult<()> {
+        let units = (value * CROP_UNITS_PER_FRACTION).round_ties_even();
+        if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&units) {
+            return Err(PyValueError::new_err(format!(
+                "crop must be a finite fraction from -21474.83648 to 21474.83647, got {value}"
+            )));
+        }
+        let current = self.crop(py)?;
+        let mut crop = current;
+        *edge(&mut crop) = rpptx::Percent1000(units as i32);
+        if crop == current {
+            return Ok(());
+        }
+        let (left, top, right, bottom) = crop;
+        self.edit(py, |shape| shape.set_crop(left, top, right, bottom))
+    }
+
+    /// Copies a placeholder's inherited transform onto it before a geometry or rotation edit.
+    fn materialize_geometry(&self, py: Python<'_>) -> PyResult<()> {
+        self.validate(py)?;
+        let shape_path = shape_indices(&self.path).collect::<Vec<_>>();
+        self.presentation
+            .borrow_mut(py)
+            .inner
+            .materialize_geometry(slide_index(&self.path)?, &shape_path)
+            .map_err(|error| rpptx_to_pyerr(py, error))
+    }
+
     fn picture_id(&self, py: Python<'_>) -> PyResult<(usize, u32)> {
         let (kind, id) = self.read(py, |shape| (shape.kind(), shape.non_visual_id()))?;
         match (kind, id) {
@@ -179,6 +240,18 @@ impl PyShape {
 
 #[pymethods]
 impl PyShape {
+    #[getter]
+    fn click_action(&self, py: Python<'_>) -> PyResult<Py<PyShapeClickAction>> {
+        self.validate(py)?;
+        Py::new(
+            py,
+            PyShapeClickAction {
+                presentation: self.presentation.clone_ref(py),
+                path: self.path.clone(),
+            },
+        )
+    }
+
     #[getter]
     fn left(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.validate(py)?;
@@ -223,6 +296,31 @@ impl PyShape {
         length(py, value)
     }
 
+    /// Left, top, width and height as rendering places the shape.
+    ///
+    /// A placeholder without its own transform reports the one it inherits
+    /// from its layout and master, where `left` and the other properties
+    /// report `None`.
+    fn effective_geometry<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        self.validate(py)?;
+        let shape_path = shape_indices(&self.path).collect::<Vec<_>>();
+        let geometry = self
+            .presentation
+            .borrow(py)
+            .inner
+            .effective_geometry(slide_index(&self.path)?, &shape_path)
+            .map_err(|error| rpptx_to_pyerr(py, error))?;
+        let Some((left, top, width, height)) = geometry else {
+            return Ok(None);
+        };
+        let length = py.import("rpptx")?.getattr("Length")?;
+        let values = [left, top, width, height]
+            .into_iter()
+            .map(|value| length.call1((value.0,)))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, values).map(Some)
+    }
+
     #[getter]
     fn shape_id(&self, py: Python<'_>) -> PyResult<Option<u32>> {
         self.validate(py)?;
@@ -235,6 +333,7 @@ impl PyShape {
     #[setter]
     fn set_left(&self, py: Python<'_>, value: i64) -> PyResult<()> {
         check_coordinate("left", value, MIN_COORDINATE)?;
+        self.materialize_geometry(py)?;
         let top = self.read(py, |shape| {
             shape.position().map_or(rpptx::Emu(0), |(_, top)| top)
         })?;
@@ -244,6 +343,7 @@ impl PyShape {
     #[setter]
     fn set_top(&self, py: Python<'_>, value: i64) -> PyResult<()> {
         check_coordinate("top", value, MIN_COORDINATE)?;
+        self.materialize_geometry(py)?;
         let left = self.read(py, |shape| {
             shape.position().map_or(rpptx::Emu(0), |(left, _)| left)
         })?;
@@ -253,6 +353,7 @@ impl PyShape {
     #[setter]
     fn set_width(&self, py: Python<'_>, value: i64) -> PyResult<()> {
         check_coordinate("width", value, 0)?;
+        self.materialize_geometry(py)?;
         let height = self.read(py, |shape| {
             shape.size().map_or(rpptx::Emu(0), |(_, height)| height)
         })?;
@@ -262,6 +363,7 @@ impl PyShape {
     #[setter]
     fn set_height(&self, py: Python<'_>, value: i64) -> PyResult<()> {
         check_coordinate("height", value, 0)?;
+        self.materialize_geometry(py)?;
         let width = self.read(py, |shape| {
             shape.size().map_or(rpptx::Emu(0), |(width, _)| width)
         })?;
@@ -301,6 +403,7 @@ impl PyShape {
         let units = ((value * ANGLE_UNITS_PER_DEGREE).round_ties_even() as i64)
             .rem_euclid(ANGLE_UNITS_PER_TURN);
         let angle = rpptx::Angle(i32::try_from(units).expect("a normalized angle fits in i32"));
+        self.materialize_geometry(py)?;
         self.edit(py, |shape| shape.set_rotation(angle))
     }
 
@@ -361,7 +464,11 @@ impl PyShape {
         self.require_shape_properties(py, "line")?;
         Py::new(
             py,
-            PyLineFormat::new(self.presentation.clone_ref(py), self.path.clone()),
+            PyLineFormat::new(
+                self.presentation.clone_ref(py),
+                self.path.clone(),
+                FillTarget::Line,
+            ),
         )
     }
 
@@ -387,6 +494,50 @@ impl PyShape {
             content_type: image.content_type,
             blob: image.bytes.to_vec(),
         })
+    }
+
+    /// The share of the image cropped from the picture's left edge.
+    #[getter]
+    fn crop_left(&self, py: Python<'_>) -> PyResult<f64> {
+        self.crop_edge(py, |crop| &mut crop.0)
+    }
+
+    #[setter]
+    fn set_crop_left(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+        self.set_crop_edge(py, |crop| &mut crop.0, value)
+    }
+
+    /// The share of the image cropped from the picture's top edge.
+    #[getter]
+    fn crop_top(&self, py: Python<'_>) -> PyResult<f64> {
+        self.crop_edge(py, |crop| &mut crop.1)
+    }
+
+    #[setter]
+    fn set_crop_top(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+        self.set_crop_edge(py, |crop| &mut crop.1, value)
+    }
+
+    /// The share of the image cropped from the picture's right edge.
+    #[getter]
+    fn crop_right(&self, py: Python<'_>) -> PyResult<f64> {
+        self.crop_edge(py, |crop| &mut crop.2)
+    }
+
+    #[setter]
+    fn set_crop_right(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+        self.set_crop_edge(py, |crop| &mut crop.2, value)
+    }
+
+    /// The share of the image cropped from the picture's bottom edge.
+    #[getter]
+    fn crop_bottom(&self, py: Python<'_>) -> PyResult<f64> {
+        self.crop_edge(py, |crop| &mut crop.3)
+    }
+
+    #[setter]
+    fn set_crop_bottom(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+        self.set_crop_edge(py, |crop| &mut crop.3, value)
     }
 
     /// Replaces the picture's image, keeping its position, size, and crop.
@@ -483,6 +634,86 @@ impl PyShape {
     }
 }
 
+#[pyclass(name = "ShapeClickAction")]
+pub struct PyShapeClickAction {
+    presentation: Py<PyPresentation>,
+    path: ContentPath,
+}
+
+#[pymethods]
+impl PyShapeClickAction {
+    #[getter]
+    fn hyperlink(&self, py: Python<'_>) -> PyResult<Py<PyShapeHyperlink>> {
+        let presentation = self.presentation.borrow(py);
+        validate_path(
+            py,
+            &presentation,
+            &self.path,
+            "shape click action",
+            ".click_action",
+        )?;
+        Py::new(
+            py,
+            PyShapeHyperlink {
+                presentation: self.presentation.clone_ref(py),
+                path: self.path.clone(),
+            },
+        )
+    }
+}
+
+#[pyclass(name = "ShapeHyperlink")]
+pub struct PyShapeHyperlink {
+    presentation: Py<PyPresentation>,
+    path: ContentPath,
+}
+
+#[pymethods]
+impl PyShapeHyperlink {
+    #[getter]
+    fn address(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let presentation = self.presentation.borrow(py);
+        validate_path(
+            py,
+            &presentation,
+            &self.path,
+            "shape hyperlink",
+            ".click_action.hyperlink",
+        )?;
+        let shape_id = shape_ref_at(&presentation.inner, &self.path)
+            .and_then(|shape| shape.non_visual_id())
+            .ok_or_else(|| PyValueError::new_err("shape has no id"))?;
+        presentation
+            .inner
+            .shape_hyperlink_address(slide_index(&self.path)?, shape_id)
+            .map(|address| address.map(str::to_owned))
+            .map_err(|error| rpptx_to_pyerr(py, error))
+    }
+
+    #[setter]
+    fn set_address(&self, py: Python<'_>, value: Option<&str>) -> PyResult<()> {
+        let mut presentation = self.presentation.borrow_mut(py);
+        validate_path(
+            py,
+            &presentation,
+            &self.path,
+            "shape hyperlink",
+            ".click_action.hyperlink",
+        )?;
+        let shape_id = shape_ref_at(&presentation.inner, &self.path)
+            .and_then(|shape| shape.non_visual_id())
+            .ok_or_else(|| PyValueError::new_err("shape has no id"))?;
+        presentation
+            .inner
+            .set_shape_hyperlink(
+                slide_index(&self.path)?,
+                shape_id,
+                value.filter(|value| !value.is_empty()),
+            )
+            .map_err(|error| rpptx_to_pyerr(py, error))
+    }
+}
+
 #[pyclass(name = "ShapeCollection")]
 pub struct PyShapeCollection {
     presentation: Py<PyPresentation>,
@@ -526,10 +757,47 @@ impl PyShapeCollection {
             .any(|segment| matches!(segment, PathSeg::Shape(_)))
         {
             return Err(PyValueError::new_err(
-                "nested shape collections are read-only",
+                "nested shape collections cannot remove or move shapes",
             ));
         }
         Ok(())
+    }
+
+    /// Returns the slide index and group path that additions to this
+    /// collection target, or the error an addition raises.
+    fn target(&self, py: Python<'_>) -> PyResult<(usize, Vec<usize>)> {
+        let slide_index = self.validate(py)?;
+        let group = shape_indices(&self.path).collect::<Vec<_>>();
+        let mut presentation = self.presentation.borrow_mut(py);
+        if presentation.inner.shapes_mut(slide_index, &group).is_some() {
+            return Ok((slide_index, group));
+        }
+        let fallback_group = shape_ref_at(&presentation.inner, &self.path)
+            .is_some_and(|shape| shape.kind() == rpptx::ShapeKind::Group);
+        Err(PyValueError::new_err(if fallback_group {
+            "a group inside an mc:AlternateContent fallback cannot take new shapes"
+        } else {
+            "shape is not a group"
+        }))
+    }
+
+    /// Adds one shape to the slide or group this collection holds, advances
+    /// the revision once, and returns the new shape captured at it.
+    fn add(
+        &self,
+        py: Python<'_>,
+        add: impl FnOnce(&mut rpptx::ShapesMut<'_>) -> rpptx::Result<()>,
+    ) -> PyResult<Py<PyShape>> {
+        let (slide_index, group) = self.target(py)?;
+        let index = self.len(py)?;
+        let mut presentation = self.presentation.borrow_mut(py);
+        let mut shapes = presentation
+            .inner
+            .shapes_mut(slide_index, &group)
+            .expect("the target is a slide or a group");
+        add(&mut shapes).map_err(|error| rpptx_to_pyerr(py, error))?;
+        drop(presentation);
+        self.capture_added(py, index)
     }
 
     fn item(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyShape>> {
@@ -626,22 +894,16 @@ impl PyShapeCollection {
         width: i64,
         height: i64,
     ) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .slide_mut(slide_index)
-            .expect("validated slide")
-            .add_textbox(
-                rpptx::Emu(left),
-                rpptx::Emu(top),
-                rpptx::Emu(width),
-                rpptx::Emu(height),
-            )
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| {
+            shapes
+                .add_textbox(
+                    rpptx::Emu(left),
+                    rpptx::Emu(top),
+                    rpptx::Emu(width),
+                    rpptx::Emu(height),
+                )
+                .map(drop)
+        })
     }
 
     fn add_shape(
@@ -653,7 +915,6 @@ impl PyShapeCollection {
         width: i64,
         height: i64,
     ) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
         let preset = if shape_type.is_instance_of::<PyString>() {
             shape_type.extract::<String>()?
         } else {
@@ -665,22 +926,17 @@ impl PyShapeCollection {
                 .getattr("xml_value")?
                 .extract::<String>()?
         };
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .slide_mut(slide_index)
-            .expect("validated slide")
-            .add_shape(
-                &preset,
-                rpptx::Emu(left),
-                rpptx::Emu(top),
-                rpptx::Emu(width),
-                rpptx::Emu(height),
-            )
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| {
+            shapes
+                .add_shape(
+                    &preset,
+                    rpptx::Emu(left),
+                    rpptx::Emu(top),
+                    rpptx::Emu(width),
+                    rpptx::Emu(height),
+                )
+                .map(drop)
+        })
     }
 
     fn add_connector(
@@ -692,44 +948,28 @@ impl PyShapeCollection {
         end_x: i64,
         end_y: i64,
     ) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
         let connector = match connector_type {
             1 => rpptx::ConnectorType::Straight,
             2 => rpptx::ConnectorType::Elbow,
             3 => rpptx::ConnectorType::Curve,
             _ => return Err(PyValueError::new_err("unsupported MSO_CONNECTOR value")),
         };
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .slide_mut(slide_index)
-            .expect("validated slide")
-            .add_connector(
-                connector,
-                rpptx::Emu(begin_x),
-                rpptx::Emu(begin_y),
-                rpptx::Emu(end_x),
-                rpptx::Emu(end_y),
-            )
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| {
+            shapes
+                .add_connector(
+                    connector,
+                    rpptx::Emu(begin_x),
+                    rpptx::Emu(begin_y),
+                    rpptx::Emu(end_x),
+                    rpptx::Emu(end_y),
+                )
+                .map(drop)
+        })
     }
 
-    /// Appends an empty group. Populating groups is not supported yet.
+    /// Appends an empty group, which its own `shapes` collection populates.
     fn add_group_shape(&mut self, py: Python<'_>) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .slide_mut(slide_index)
-            .expect("validated slide")
-            .add_group_shape()
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| shapes.add_group_shape().map(drop))
     }
 
     /// Removes one shape of this slide and the package parts only it used.
@@ -754,6 +994,24 @@ impl PyShapeCollection {
         Ok(())
     }
 
+    /// Moves the shape at `from_` so that it ends up at z-order index `to`,
+    /// where later shapes draw on top.
+    #[pyo3(name = "move")]
+    fn move_shape(&mut self, py: Python<'_>, from_: isize, to: isize) -> PyResult<()> {
+        self.require_slide_root()?;
+        let slide_index = self.validate(py)?;
+        let len = self.len(py)?;
+        let from_ = normalize_index(from_, len, "shape")?;
+        let to = normalize_index(to, len, "shape")?;
+        let mut presentation = self.presentation.borrow_mut(py);
+        presentation
+            .inner
+            .move_shape(slide_index, from_, to)
+            .map_err(|error| rpptx_to_pyerr(py, error))?;
+        presentation.revisions.bump();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_table(
         &mut self,
@@ -765,24 +1023,18 @@ impl PyShapeCollection {
         width: i64,
         height: i64,
     ) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .slide_mut(slide_index)
-            .expect("validated slide")
-            .add_table(
-                rows,
-                cols,
-                rpptx::Emu(left),
-                rpptx::Emu(top),
-                rpptx::Emu(width),
-                rpptx::Emu(height),
-            )
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| {
+            shapes
+                .add_table(
+                    rows,
+                    cols,
+                    rpptx::Emu(left),
+                    rpptx::Emu(top),
+                    rpptx::Emu(width),
+                    rpptx::Emu(height),
+                )
+                .map(drop)
+        })
     }
 
     #[pyo3(signature = (image_file, left, top, width = None, height = None))]
@@ -795,24 +1047,20 @@ impl PyShapeCollection {
         width: Option<i64>,
         height: Option<i64>,
     ) -> PyResult<Py<PyShape>> {
-        self.require_slide_root()?;
-        let slide_index = self.validate(py)?;
-        let index = self.len(py)?;
+        self.target(py)?;
         let (bytes, filename) = image_bytes(image_file)?;
-        self.presentation
-            .borrow_mut(py)
-            .inner
-            .add_picture(
-                slide_index,
-                &bytes,
-                &filename,
-                rpptx::Emu(left),
-                rpptx::Emu(top),
-                width.map(rpptx::Emu),
-                height.map(rpptx::Emu),
-            )
-            .map_err(|error| rpptx_to_pyerr(py, error))?;
-        self.capture_added(py, index)
+        self.add(py, |shapes| {
+            shapes
+                .add_picture(
+                    &bytes,
+                    &filename,
+                    rpptx::Emu(left),
+                    rpptx::Emu(top),
+                    width.map(rpptx::Emu),
+                    height.map(rpptx::Emu),
+                )
+                .map(drop)
+        })
     }
 }
 

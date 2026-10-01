@@ -82,9 +82,13 @@ Presentation::core_properties_mut(&mut self) -> &mut CoreProperties;
 Presentation::replace_text(&mut self, placeholder: &str, value: &str) -> usize;
 Presentation::package_class(&self) -> Result<PresentationPackageClass>;
 Presentation::to_bytes_as(&self, class: PresentationPackageClass) -> Result<Vec<u8>>;
+Presentation::to_bytes_for_path(&self, path: impl AsRef<Path>) -> Result<Vec<u8>>;
 Presentation::save_as_package_class(&self, path: impl AsRef<Path>, class: PresentationPackageClass) -> Result<()>;
 Presentation::save_as_show(&self, path: impl AsRef<Path>) -> Result<()>;
 Presentation::slide_layout_index(&self, slide_index: usize) -> Option<usize>;
+Presentation::set_slide_layout(&mut self, slide_index: usize, layout_index: usize) -> Result<()>;
+Presentation::effective_geometry(&self, slide_index: usize, shape_path: &[usize]) -> Result<Option<(Emu, Emu, Emu, Emu)>>;
+Presentation::materialize_geometry(&mut self, slide_index: usize, shape_path: &[usize]) -> Result<()>;
 Presentation::set_notes_text(&mut self, slide_index: usize, text: &str) -> Result<()>;
 SlideRef::hidden(&self) -> bool;
 SlideRef::has_explicit_background(&self) -> bool;
@@ -100,6 +104,26 @@ layout list the masters reach. `background_fill` reports only a direct
 `p:bgPr` fill, so a theme reference reads as `None`. `clear_background` keeps
 a theme reference, while `remove_background` drops any `p:bg` so the slide
 follows its layout and master.
+
+The two geometry operations need `render`, which carries the placeholder
+matching rule. `shape_path` names a shape by its index in the slide tree, then
+its index in each enclosing group. `effective_geometry` returns the shape's own
+offset and extent, or for a placeholder without a transform, the one
+`rpptx_layout::inherited_xfrm` resolves, which is the transform rendering uses.
+A missing offset reads as zero and a transform without an extent reads as
+`None`. `ShapeRef::position` and `size` keep reporting only direct values.
+`materialize_geometry` copies the missing offset or extent of that inherited
+transform onto a placeholder, or the whole transform with its rotation and
+flips when the placeholder has none, so a later `set_position` or `set_size`
+leaves the other pair in place.
+
+`set_slide_layout` needs `render` as well. It retargets the slide's layout
+relationship to any layout the masters reach, including one of another master.
+A placeholder without its own transform that the new layout chain does not
+place first receives the transform it inherited, and every other placeholder
+follows the new layout. Placeholders of the new layout that the slide lacks
+are not added. The change is staged and publishes only after the staged
+package reopens.
 
 `SlideMut::set_notes_text` edits an existing notes slide and fails without one.
 `Presentation::set_notes_text` also creates the notes slide when it is absent,
@@ -158,6 +182,7 @@ Presentation::comment_authors(&self) -> &[CommentAuthor];
 Presentation::add_comment_author(&mut self, author: CommentAuthor) -> Result<()>;
 Presentation::comments(&self, slide_index: usize) -> Option<&[Comment]>;
 Presentation::add_comment(&mut self, slide_index: usize, comment: Comment) -> Result<()>;
+Presentation::add_comment_at_shape(&mut self, slide_index: usize, comment: Comment, shape_id: u32, text_range: Option<(usize, usize)>) -> Result<()>;
 Presentation::reply_to_comment(&mut self, slide_index: usize, comment_id: &str, reply: CommentReply) -> Result<()>;
 Presentation::move_comment(&mut self, slide_index: usize, from: usize, to: usize) -> Result<()>;
 Presentation::move_reply(&mut self, slide_index: usize, comment_id: &str, from: usize, to: usize) -> Result<()>;
@@ -284,6 +309,7 @@ ShapeRef::shape_type(&self) -> Option<ShapeType>;
 ShapeRef::rotation(&self) -> Option<Angle>;
 ShapeRef::fill(&self) -> Option<&Fill>;
 ShapeRef::line(&self) -> Option<&CT_LineProperties>;
+ShapeRef::crop(&self) -> Option<(Percent1000, Percent1000, Percent1000, Percent1000)>;
 ShapeRef::adjustments(&self) -> Result<Vec<(String, f64)>>;
 ShapeRef::xml(&self) -> Result<Vec<u8>>;
 ```
@@ -306,7 +332,8 @@ a literal `val` guide of the same name in the shape's own `a:avLst`. Only
 ordinary shapes with preset geometry have adjustments. `xml` serializes a
 typed child on its own with the prefixes it uses declared. Alternate content
 returns its preserved bytes, which may rely on prefixes only the slide root
-declares.
+declares. `crop` reads a picture's `a:srcRect` insets in left, top, right,
+bottom order, with zero for an absent edge, and is `None` for other kinds.
 
 `slide_mut(index)` exposes a borrowed `SlideMut` handle. Its `shape(index)`
 method retains read access, while `shape_mut(index)` returns a `ShapeMut` for an
@@ -316,7 +343,11 @@ children only. The selected `mc:Fallback` view remains read-only.
 Position, size, rotation, and name setters support ordinary shapes, pictures,
 graphic frames, groups, and connectors. Fill and line setters support ordinary
 shapes, pictures, and connectors because those kinds own typed shape
-properties. Adjustment mutation supports finite values on preset geometry.
+properties. `ShapeMut::set_crop(left, top, right, bottom)` writes the
+`a:srcRect` of a picture between its blip and fill mode. It keeps the stored
+attribute of an unchanged edge, drops a changed edge of zero, and adds no
+element when a picture without one gets four zero insets. Adjustment mutation
+supports finite values on preset geometry.
 Unsupported shape kinds and unsupported geometry return concrete facade
 errors. Indexed access remains total and returns `Option`.
 
@@ -332,7 +363,10 @@ TextParagraphMut::add_run(&mut self, text: &str) -> TextRunMut<'_>;
 ```
 
 `TextFrame` also reads and replaces whole-frame text. Paragraph handles replace
-text, paragraph properties, and bullets. Run handles replace text, character
+text, paragraph properties, and bullets. Replaced text keeps the formatting of
+the paragraph's first regular run. A paragraph without one formats the new run
+with its `a:endParaRPr`, without hyperlinks, as PowerPoint formats text typed
+into an empty paragraph. Run handles replace text, character
 properties, and the direct Latin font. The typed formatting values are
 re-exported by `rpptx`. Structural append returns the newly inserted borrowed
 item, and Rust's borrow rules prevent a live nested handle from being
@@ -374,19 +408,45 @@ text-frame handle.
 Table graphic frames expose concrete borrowed `TableRef` and `TableMut`
 handles through `ShapeRef::table` and `ShapeMut::table_mut`. Their cell access
 is total and returns `Option`. Table handles expose row and column counts,
-column widths, and the first-row, last-row, first-column, last-column,
-horizontal-banding, and vertical-banding flags. Cell handles expose plain text,
-typed text-frame mutation, direct fill, four optional margins, merge-origin and
-continuation state, and span height and width.
+column widths, row heights, and the first-row, last-row, first-column,
+last-column, horizontal-banding, and vertical-banding flags. Cell handles
+expose plain text, typed text-frame mutation, direct fill, four optional
+margins, the direct line of each edge, merge-origin and continuation state, and
+span height and width.
+
+```rust
+pub enum CellBorder { Left, Right, Top, Bottom }
+
+TableRef::row_height(&self, row: usize) -> Option<Emu>;
+TableMut::set_row_height(&mut self, row: usize, height: Emu) -> Result<()>;
+TableMut::insert_row(&mut self, index: usize) -> Result<()>;
+TableMut::remove_row(&mut self, index: usize) -> Result<()>;
+TableMut::insert_column(&mut self, index: usize) -> Result<()>;
+TableMut::remove_column(&mut self, index: usize) -> Result<()>;
+TableCellRef::border(&self, edge: CellBorder) -> Option<&CT_LineProperties>;
+TableCellMut::set_border(&mut self, edge: CellBorder, line: Option<CT_LineProperties>);
+```
 
 Changing a column width uses a checked sum and synchronizes the graphic-frame
-width. Merge accepts opposite rectangle corners in either order. It validates
+width. Changing a row height does the same for the frame height and requires a
+positive height. The stored height is a minimum, which PowerPoint grows to fit
+the row's text. A width change goes through `CT_Table::set_column_width`, which
+keeps the column's preserved `a:gridCol` content, such as the `a16:colId`
+extension PowerPoint writes, with that column even when other columns share
+its width. `insert_row` and `insert_column` take the index the new row or
+column gets, where the count appends, and run the `CT_Table` operations
+described in `05-drawingml-model.md`. A row edit moves the frame height by the
+height of the inserted or removed row, and a column edit moves the frame width
+by the column's width. PowerPoint keeps the stored row heights when it grows
+rows to fit their text and records the measured height in the frame, so that
+excess is kept. Removing the only row or column is rejected. A border is the `a:lnL`, `a:lnR`, `a:lnT`, or `a:lnB` line of
+`a:tcPr`, written in that order before the cell fill. Merge accepts opposite rectangle corners in either order. It validates
 the complete rectangle before changing state, rejects overlap with an existing
 merge, migrates typed paragraphs in row-major order, and writes the DrawingML
 origin and continuation pattern described in `05-drawingml-model.md`. Split is
 valid only on a checked merge origin. It restores span one and clears
-continuation flags without redistributing content. Fallible width, merge, and
-split operations stage and serialize a table clone before committing it, so an
+continuation flags without redistributing content. Fallible width, height,
+row, column, merge, and split operations stage and serialize a table clone before committing it, so an
 error leaves the table unchanged.
 
 `SlideMut` also exposes the direct shape construction surface:
@@ -445,7 +505,65 @@ an internal image relationship in the target slide's own scope. Package,
 media-store, and relationship changes remain staged until picture construction
 succeeds. The picture receives a tree-wide allocated id and deterministic name,
 then its canonical `p:nvPicPr`, relationship-backed `p:blipFill`, and typed
-`p:spPr` shell append at top z-order.
+`p:spPr` shell append at top z-order. The `p:spPr` holds the transform followed
+by `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`, as python-pptx writes,
+because PowerPoint draws nothing for a picture without geometry. A media
+picture added by `add_media` carries the same geometry.
+
+The owning facade also borrows the shape collection of a slide or of one group
+on it, which populates groups with the same constructors:
+
+```rust
+pub fn shapes_mut(&mut self, slide_index: usize, group: &[usize]) -> Option<ShapesMut<'_>>;
+
+impl ShapesMut<'_> {
+    pub fn add_textbox(&mut self, left: Emu, top: Emu, width: Emu, height: Emu) -> Result<ShapeMut<'_>>;
+    pub fn add_shape(&mut self, preset: &str, left: Emu, top: Emu, width: Emu, height: Emu) -> Result<ShapeMut<'_>>;
+    pub fn add_connector(&mut self, connector: ConnectorType, begin_x: Emu, begin_y: Emu, end_x: Emu, end_y: Emu) -> Result<ShapeMut<'_>>;
+    pub fn add_group_shape(&mut self) -> Result<ShapeMut<'_>>;
+    pub fn add_table(&mut self, rows: usize, columns: usize, left: Emu, top: Emu, width: Emu, height: Emu) -> Result<ShapeMut<'_>>;
+    pub fn add_picture(&mut self, image_data: &[u8], image_filename: &str, left: Emu, top: Emu, width: Option<Emu>, height: Option<Emu>) -> Result<ShapeMut<'_>>;
+}
+```
+
+`group` holds one z-order index per nesting level from the slide's own shapes
+down to the group, and an empty path names the slide's own shapes. A missing
+slide or a path that does not end at a group returns `None`. Each constructor
+builds the member the `SlideMut` or `add_picture` constructor builds, with a
+`p:cNvPr` id unused across the whole slide, groups included.
+`CT_GroupShape::append_child` places it right after the group's last typed
+member, as `CT_ShapeTree::append_child` does on the slide, so preserved
+content after that member stays above it: an unmodelled member such as a
+trailing `p:contentPart`, and schema-final `p:extLst`. python-pptx inserts
+just before `p:extLst`, above a trailing `p:contentPart`. Coordinates are in
+the collection's own space, the member space of a group. A group added inside
+a group gets the zero `a:xfrm` python-pptx writes, with every offset and
+extent zero, because python-pptx cannot refit a group whose member group has
+no transform.
+
+After each addition, the group and then every group enclosing it are refit to
+the union of their members' own offsets and extents, as python-pptx
+`recalculate_extents` does. `a:chOff` and `a:chExt` become the union, and
+`a:off` and `a:ext` follow through the group's current mapping from member
+space to its parent. A group's flips and rotation apply about the centre of
+`a:off` and `a:ext`, which the refit moves, so for a group that already had a
+counted member `a:off` also moves by `(L - I)` times the centre's shift, where
+`L` flips, then rotates, as PowerPoint does. A member drawn before the addition
+therefore stays where PowerPoint drew it, and PowerPoint renders such decks
+unchanged before and after an addition. The rpptx renderer rotates a group
+before it flips it, which agrees with PowerPoint unless a group is both
+rotated and flipped. A group without all four values maps members unchanged,
+so a new group ends with four equal values, as python-pptx writes them, and
+its members keep their slide coordinates. python-pptx instead sets `a:off` to
+`a:chOff` and ignores flips and rotation, which moves the members of a group
+that was moved, resized, rotated, or flipped after it was built. Member
+rotation does not widen the union, as in python-pptx. A member without an
+offset and extent does not count, nor does a group without members, so an
+empty member group does not stretch the union to its zero box as it does in
+python-pptx. A group without a counted member keeps its transform until its
+own first member arrives. Rendering composes the mapping of each enclosing
+group, the identity for a fitted new group, and a member's position and size
+read its own `a:off` and `a:ext` in member space.
 
 The owning facade also reads and replaces a picture's image and removes
 shapes:
@@ -459,6 +577,7 @@ pub struct PictureImage<'a> {
 pub fn picture_image(&self, slide_index: usize, shape_id: u32) -> Result<PictureImage<'_>>;
 pub fn replace_picture_image(&mut self, slide_index: usize, shape_id: u32, image_data: &[u8]) -> Result<()>;
 pub fn remove_shape(&mut self, slide_index: usize, shape_index: usize) -> Result<()>;
+pub fn move_shape(&mut self, slide_index: usize, from_index: usize, to_index: usize) -> Result<()>;
 ```
 
 `picture_image` finds the picture by `p:cNvPr/@id`, including inside groups
@@ -483,6 +602,51 @@ delete. Slide relationships that only the removed subtree referenced are
 deleted, and their internal targets are pruned recursively once unreachable,
 so a removed chart also drops its embedded workbook.
 
+`move_shape` changes the z-order of one immediate slide child so that it ends
+up at `to_index`, where later children draw on top. An index past the last
+child is rejected without change. Animations, connector glue, and
+relationships name shape ids, so they need no rewrite.
+`CT_ShapeTree::move_child` serializes the tree, moves the child's bytes past
+exactly the children between its two indices, and reparses, the technique
+`remove_child_by_id` uses. Unmodelled members such as `p:contentPart` and
+schema-final `p:extLst` content therefore keep their bytes and their place
+among the other children.
+
+The owning facade also resolves and writes run hyperlinks, because their
+relationships belong to the slide part rather than to a borrowed run handle:
+
+```rust
+pub fn hyperlink_address(&self, slide_index: usize, relationship_id: &str) -> Option<&str>;
+pub fn set_run_hyperlink(
+    &mut self,
+    slide_index: usize,
+    shape_id: u32,
+    paragraph_index: usize,
+    run_index: usize,
+    address: Option<&str>,
+) -> Result<()>;
+pub fn shape_hyperlink_address(&self, slide_index: usize, shape_id: u32) -> Result<Option<&str>>;
+pub fn set_shape_hyperlink(&mut self, slide_index: usize, shape_id: u32, address: Option<&str>) -> Result<()>;
+```
+
+`hyperlink_address` returns the target of the relationship an
+`a:hlinkClick/@r:id` names, the URL of an external hyperlink or the stored
+relative target of an internal one, as python-pptx `address` does.
+`set_run_hyperlink` finds the ordinary shape by its `p:cNvPr/@id`, inside
+groups too, and rejects an id that another slide child shares. The regular run
+gets a fresh `a:hlinkClick` that names the slide's external hyperlink
+relationship to the address, reused when the slide has one, and `None` removes
+it. Assigning the current address changes nothing. Validation reports an
+unreferenced hyperlink relationship, so the relationship the old hyperlink
+named is removed once no other element of the slide names it, and one call
+changes the run and the relationships together. An empty address, a control
+character, or a missing shape, paragraph, or run leaves the slide and its
+relationships unchanged.
+Shape click hyperlinks use the same slide relationship rules. The shape API
+reads, adds, retargets, and removes the `a:hlinkClick` in `p:cNvPr` while
+retaining other non-visual properties and unmodelled children. Insertion keeps
+the schema order of `p:cNvPr` children.
+
 An ordinary shape has canonical non-visual properties, a typed transform,
 preset geometry, and a minimal text body. `add_shape` keeps the string API but
 accepts only names in the generated table of all 187 ECMA preset shapes. An
@@ -490,13 +654,19 @@ unknown name returns a contextual error without changing the slide. A textbox
 uses `rect`, sets `txBox="1"`, has `a:noFill`, and contains `a:bodyPr`,
 `a:lstStyle`, and one required paragraph. An empty group contains the required
 `p:nvGrpSpPr` and `p:grpSpPr` shells, with no invented transform or members.
+Only a group added inside a group through `ShapesMut` also gets the zero
+`a:xfrm` described above.
 
 A constructed connector is free-standing and uses `line`, `bentConnector3`,
 or `curvedConnector3` for `Straight`, `Elbow`, or `Curve`. Its transform offset
 is the componentwise minimum endpoint, its extents are the absolute endpoint
 spans, and its horizontal and vertical flips retain endpoint direction. A
 horizontal or vertical connector may have one zero extent. A span that cannot
-fit in the signed EMU representation returns a contextual error.
+fit in the signed EMU representation returns a contextual error. The connector
+carries the `p:style` python-pptx writes after its `p:spPr`: `a:lnRef idx="2"`,
+`a:fillRef idx="0"`, and `a:effectRef idx="1"` in `accent1`, and
+`a:fontRef idx="minor"` in `tx1`. PowerPoint draws no line for a connector with
+neither a style nor a direct `a:ln`, so the style gives it the theme's line.
 
 A constructed table uses a canonical `p:graphicFrame` with deterministic name
 `Table {id}`, a typed transform, the DrawingML table URI, and a rectangular
@@ -572,12 +742,21 @@ mutation instead of publishing invalid XML.
 
 The PPTX, PPTM, POTX, POTM, PPSX, and PPSM distinction lives entirely in this
 part's exact main content type. `PresentationPackageClass` maps those six
-values without inspecting a path extension. Ordinary `save` and `to_bytes`
-retain the opened class. `to_bytes_as` and `save_as_package_class` change only
-the staged output override and leave the live facade unchanged.
+values. `save` and `to_bytes_for_path` write the class that a `.pptx`, `.pptm`,
+`.potx`, `.potm`, `.ppsx`, or `.ppsm` extension names, compared without regard
+to case, so a template saved as `.pptx` declares a presentation. `to_bytes`,
+`save_encrypted`, and a save to any other extension retain the opened class.
+When the class changes, a macro-free extension fails before anything is written
+if the presentation part carries a `vbaProject` relationship, whatever the
+source class, because the project would remain in a file that claims to carry
+none. A macro-enabled package without one converts. `to_bytes_as` and
+`save_as_package_class` stay the explicit conversion. They change only the
+staged output override and leave the live facade unchanged.
 `Presentation::save_as_show()` remains a compatibility wrapper for ordinary
 PPSX output. A class conversion preserves executable payloads and relationships
-and records retained package signature evidence as invalidated.
+and records retained package signature evidence as invalidated. The CLI
+`replace` and comment mutations publish through `to_bytes_for_path`, so their
+output extension selects the class the same way.
 
 ## Notes parts
 
@@ -775,9 +954,12 @@ content-aware image deduplication prevent cross-scope aliasing.
 start and end connections. Each present `a:stCxn` or `a:endCxn` carries the
 required unqualified shape `id` and connection-site `idx` as `u32` values.
 Free-standing, start-only, end-only, and fully connected shapes therefore use
-the same model. Unsupported connector locks, style, extensions, attributes,
-and children remain in their ordered schema slots and round-trip without being
-interpreted.
+the same model. Unsupported connector locks, extensions, attributes, and
+children remain in their ordered schema slots and round-trip without being
+interpreted. The optional `p:style` also round-trips as preserved bytes. When
+it carries `a:lnRef`, `a:fillRef`, `a:effectRef`, and `a:fontRef` in schema
+order, `CT_ConnectionShape::style` also exposes them as a typed
+`CT_ShapeStyle`, the model ordinary shapes use.
 
 **`p:cNvPr/@id` must be unique within one `spTree`**, including inside nested
 groups, preserved raw members, and every branch of `mc:AlternateContent`. A
@@ -880,6 +1062,12 @@ Modern Office 2021 comment authors, comments, threaded replies, and
 `p14:sectionLst` are typed only at the fields callers inspect or mutate. Their
 ordered raw sidecars retain unsupported anchors, attributes, namespace
 bindings, direct events, children, extension lists, and text-body source bytes.
+An added shape comment identifies the slide and drawing element by their
+monikers. A text range instead uses the slide and text range monikers, with
+UTF-16 character positions and the text body's length and hash. The facade
+rejects a missing or ambiguous shape, a duplicated text context on the slide,
+and a range outside its text before mutating the package. Parsed producer anchors
+remain opaque and round-trip without normalization.
 Readers resolve expanded names. Writers use schema order and a safe fixed
 prefix, or fail before changing live state when a producer shadow cannot be
 preserved.

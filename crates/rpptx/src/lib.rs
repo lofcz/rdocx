@@ -22,10 +22,11 @@ use oxml_chart::CT_ChartSpace;
 pub use oxml_chart::{ChartData, ChartKind, RgbColor};
 use oxml_core::OxmlError;
 pub use oxml_core::core_properties::CoreProperties;
-pub use oxml_core::units::{Angle, Emu};
+pub use oxml_core::units::{Angle, Emu, Percent1000};
 pub use oxml_drawing::color::ColorChoice;
 #[cfg(feature = "render")]
 use oxml_drawing::color::ColorMap;
+use oxml_drawing::fill::RelativeRect;
 pub use oxml_drawing::fill::{Fill, NoFill, PatternFill, SolidFill};
 use oxml_drawing::geometry::{Guide, GuideOp, GuideOperand};
 pub use oxml_drawing::line::CT_LineProperties;
@@ -38,7 +39,7 @@ use oxml_drawing::table::{CT_Table, CT_TableCell, CT_TableCellProperties, CT_Tab
 use oxml_drawing::text::CT_TextListStyle;
 use oxml_drawing::text::{
     CT_RegularTextRun, CT_TextBody, CT_TextParagraph, Coordinate32Value, NormalAutofit,
-    TextAutofit, TextRun, TextWrap,
+    TextAutofit, TextHyperlink, TextRun, TextWrap,
 };
 pub use oxml_drawing::text::{
     CT_TextCharacterProperties, CT_TextParagraphProperties, TextAlignment, TextAnchor, TextBullet,
@@ -64,7 +65,11 @@ use oxml_opc::relationship::{Relationship, rel_types};
 pub use oxml_opc::{
     CoveredRelationship, SignatureIssue, SignatureReport, SignerCertificateIdentity,
 };
-use oxml_opc::{OpcError, OpcPackage, Relationships};
+use oxml_opc::{OpcError, OpcPackage, Relationships, write_atomic_file};
+use quick_xml::events::{BytesStart as XmlBytesStart, Event as XmlEvent};
+use quick_xml::name::{Namespace as XmlNamespace, ResolveResult as XmlResolveResult};
+use quick_xml::reader::NsReader;
+use quick_xml::{Writer as XmlWriter, XmlVersion};
 #[cfg(feature = "render")]
 pub use rpptx_layout::timeline::{
     EvaluatedFrameState, EvaluatedMediaState, MediaPlaybackPhase, TimelinePosition,
@@ -75,7 +80,7 @@ use rpptx_layout::timeline::{ResolvedTimelineSlide, evaluate_media_playback};
 use rpptx_layout::{
     ChartResource, FlattenedItem, FlattenedSource, ResolveCtx, ResolvedAutofit, ResolvedContent,
     ResolvedSlide, ResolvedSlideTextDirections, ScopedChartResources, ScopedHyperlinkTargets,
-    ScopedMediaFailures, ScopedMediaIds,
+    ScopedMediaFailures, ScopedMediaIds, inherited_xfrm,
 };
 pub use rpptx_oxml::comments::{Comment, CommentAuthor, CommentReply};
 use rpptx_oxml::comments::{CommentAuthorList, CommentList};
@@ -519,6 +524,28 @@ impl PresentationPackageClass {
             Self::MacroEnabledSlideshow => content_types::SLIDESHOW_MACRO_ENABLED,
         }
     }
+
+    /// The class that a `.pptx`, `.pptm`, `.potx`, `.potm`, `.ppsx`, or `.ppsm` path names.
+    fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "pptx" => Some(Self::Presentation),
+            "pptm" => Some(Self::MacroEnabledPresentation),
+            "potx" => Some(Self::Template),
+            "potm" => Some(Self::MacroEnabledTemplate),
+            "ppsx" => Some(Self::Slideshow),
+            "ppsm" => Some(Self::MacroEnabledSlideshow),
+            _ => None,
+        }
+    }
+
+    fn is_macro_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::MacroEnabledPresentation
+                | Self::MacroEnabledTemplate
+                | Self::MacroEnabledSlideshow
+        )
+    }
 }
 
 /// A package or presentation invariant that would make a saved deck unsafe.
@@ -780,92 +807,6 @@ fn register_content_type(
     }
 }
 
-#[cfg(all(feature = "agile-encryption", not(target_arch = "wasm32")))]
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name")
-    })?;
-    for attempt in 0..128_u8 {
-        let mut temporary_name = std::ffi::OsString::from(".");
-        temporary_name.push(file_name);
-        temporary_name.push(format!(".rpptx-{}-{attempt}.tmp", std::process::id()));
-        let temporary = parent.join(temporary_name);
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        let result = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        let result = result.and_then(|()| replace_file(&temporary, path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        return result;
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate encrypted-save staging file",
-    ))
-}
-
-#[cfg(all(
-    feature = "agile-encryption",
-    not(target_arch = "wasm32"),
-    not(target_os = "windows")
-))]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, destination)
-}
-
-#[cfg(all(
-    feature = "agile-encryption",
-    not(target_arch = "wasm32"),
-    target_os = "windows"
-))]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // SAFETY: both path buffers are NUL-terminated and remain alive for the call.
-    let replaced = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 impl Presentation {
     /// Creates an empty 16:9 presentation from the bundled standard template.
     #[cfg(feature = "default-template")]
@@ -1079,6 +1020,33 @@ impl Presentation {
         let mut output = Cursor::new(Vec::new());
         package.write_to(&mut output)?;
         Ok(output.into_inner())
+    }
+
+    /// Serialises the bytes that [`Presentation::save`] writes to `path`.
+    pub fn to_bytes_for_path<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
+        let Some(target) = PresentationPackageClass::from_path(path.as_ref()) else {
+            return self.to_bytes();
+        };
+        let current = self.package_class()?;
+        if target == current {
+            return self.to_bytes();
+        }
+        let carries_vba = self
+            .package
+            .get_part_rels(&self.presentation_part)
+            .is_some_and(|relationships| {
+                relationships.get_by_type(rel_types::VBA_PROJECT).is_some()
+            });
+        if carries_vba && !target.is_macro_enabled() {
+            return Err(invalid_presentation_mutation(
+                "save",
+                format!(
+                    "{} cannot be written: the presentation carries a VBA project and the extension names a macro-free class, save it as .pptm, .potm, or .ppsm",
+                    path.as_ref().display()
+                ),
+            ));
+        }
+        self.to_bytes_as(target)
     }
 
     /// Serialises the current presentation through the fixed Agile write profile.
@@ -1512,14 +1480,36 @@ impl Presentation {
         Ok(package)
     }
 
-    /// Saves the deterministic package bytes to a `.pptx` path.
+    /// Saves the deterministic package bytes to a path.
+    ///
+    /// The bytes are staged in a synced sibling file and renamed over `path`
+    /// through [`oxml_opc::write_atomic_file`], so a failed save leaves an
+    /// existing file as it was. A symbolic link at `path` is kept and the file
+    /// it names is replaced, and on Unix that file keeps its permission bits.
+    ///
+    /// A `.pptx`, `.pptm`, `.potx`, `.potm`, `.ppsx`, or `.ppsm` extension
+    /// selects the main part content type, so a template saved as `.pptx`
+    /// declares a presentation. Any other extension keeps the opened class,
+    /// and `save_encrypted` ignores the extension. When the class changes, a
+    /// presentation part that carries a VBA project
+    /// cannot be saved under a macro-free extension, because the project
+    /// would remain in a file that claims to carry none.
+    /// [`Presentation::save_as_package_class`] performs that conversion
+    /// explicitly and keeps the VBA part.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         debug_assert!(
             self.validate().is_empty(),
             "invalid presentation at path save boundary: {:?}",
             self.validate()
         );
-        std::fs::write(path, self.to_bytes()?).map_err(OpcError::from)?;
+        write_atomic_file(
+            path.as_ref(),
+            &self.to_bytes_for_path(path.as_ref())?,
+            "rpptx",
+            "invalid PowerPoint package file name",
+            "could not allocate PowerPoint package save staging file",
+        )
+        .map_err(OpcError::from)?;
         Ok(())
     }
 
@@ -1527,7 +1517,14 @@ impl Presentation {
     #[cfg(all(feature = "agile-encryption", not(target_arch = "wasm32")))]
     pub fn save_encrypted<P: AsRef<Path>>(&self, path: P, password: &str) -> Result<()> {
         let bytes = self.to_encrypted_bytes(password)?;
-        write_atomic_file(path.as_ref(), &bytes).map_err(OpcError::from)?;
+        write_atomic_file(
+            path.as_ref(),
+            &bytes,
+            "rpptx",
+            "invalid file name",
+            "could not allocate encrypted-save staging file",
+        )
+        .map_err(OpcError::from)?;
         Ok(())
     }
 
@@ -1537,12 +1534,21 @@ impl Presentation {
     }
 
     /// Saves an output copy with the selected modern package class.
+    ///
+    /// The file is replaced the way [`Presentation::save`] replaces it.
     pub fn save_as_package_class<P: AsRef<Path>>(
         &self,
         path: P,
         class: PresentationPackageClass,
     ) -> Result<()> {
-        std::fs::write(path, self.to_bytes_as(class)?).map_err(OpcError::from)?;
+        write_atomic_file(
+            path.as_ref(),
+            &self.to_bytes_as(class)?,
+            "rpptx",
+            "invalid PowerPoint package file name",
+            "could not allocate PowerPoint package save staging file",
+        )
+        .map_err(OpcError::from)?;
         Ok(())
     }
 
@@ -1781,6 +1787,29 @@ impl Presentation {
         self.slides.get_mut(index).map(slide_mut)
     }
 
+    /// Returns the shapes of one slide, or of one group on it, for adding
+    /// shapes.
+    ///
+    /// `group` holds one z-order index per nesting level, from the slide's
+    /// own shapes down to the group, and is empty for the slide's own shapes.
+    /// A missing slide or a path that does not end at a group returns `None`.
+    pub fn shapes_mut(&mut self, slide_index: usize, group: &[usize]) -> Option<ShapesMut<'_>> {
+        let tree = &mut self
+            .slides
+            .get_mut(slide_index)?
+            .slide
+            .common_slide_data
+            .shape_tree;
+        if !group.is_empty() {
+            group_at_mut(&mut tree.children, group)?;
+        }
+        Some(ShapesMut {
+            presentation: self,
+            slide_index,
+            group: group.to_vec(),
+        })
+    }
+
     /// Iterates slides in `p:sldIdLst` order.
     pub fn slides(&self) -> impl ExactSizeIterator<Item = SlideRef<'_>> {
         self.slides.iter().map(slide_ref)
@@ -1796,6 +1825,8 @@ impl Presentation {
         if placeholder.is_empty() {
             return 0;
         }
+        // Stored as the run text setters store it, so it can be saved.
+        let value = &oxml_drawing::text::escape_invalid_xml_characters(value);
         self.slides
             .iter_mut()
             .map(|record| {
@@ -1887,6 +1918,201 @@ impl Presentation {
         self.layouts
             .iter()
             .position(|layout| layout.part_name.eq_ignore_ascii_case(&layout_part))
+    }
+
+    /// Returns one slide shape's effective offset and extent in EMU.
+    ///
+    /// `shape_path` holds the shape's index in the slide's shape tree, then
+    /// its index within each enclosing group. The shape's own transform wins
+    /// whole. A placeholder without one inherits the transform of its layout
+    /// placeholder, then of that placeholder's master counterpart, as
+    /// rendering resolves it. The result is `(left, top, width, height)`, and
+    /// a missing offset reads as zero, as rendering draws it. `None` means
+    /// the resolved transform has no extent, so the shape is not drawn.
+    /// [`ShapeRef::position`] and [`ShapeRef::size`] keep reporting only the
+    /// shape's own values. An empty `shape_path` or one that names no shape
+    /// is [`Error::InvalidShapeMutation`], as a missing picture is for
+    /// [`Self::picture_image`].
+    #[cfg(feature = "render")]
+    pub fn effective_geometry(
+        &self,
+        slide_index: usize,
+        shape_path: &[usize],
+    ) -> Result<Option<(Emu, Emu, Emu, Emu)>> {
+        let child = self
+            .shape_at(slide_index, shape_path, "read effective geometry")?
+            .child;
+        let own = shape_transform(child);
+        let inherited = match (own, shape_placeholder(child)) {
+            (None, Some(placeholder)) => self.inherited_transform(slide_index, placeholder)?,
+            _ => None,
+        };
+        Ok(own.or(inherited.as_ref()).and_then(|transform| {
+            let offset = transform.offset.unwrap_or_default();
+            let extent = transform.extent?;
+            Some((offset.x, offset.y, extent.cx, extent.cy))
+        }))
+    }
+
+    /// Writes a placeholder's inherited geometry onto the shape itself.
+    ///
+    /// `shape_path` is read as in [`Self::effective_geometry`]. A placeholder
+    /// whose own transform lacks an offset or an extent takes the missing
+    /// part from the transform it inherits, and one without a transform
+    /// copies the inherited transform whole, rotation and flips included.
+    /// [`ShapeMut::set_position`] or [`ShapeMut::set_size`] then changes one
+    /// pair while the shape keeps the other, and [`ShapeMut::set_rotation`]
+    /// changes the angle while it keeps both, where an incomplete transform
+    /// would make rendering skip the shape. Shapes that are not placeholders,
+    /// placeholders with a complete transform and placeholders that inherit
+    /// none are left unchanged.
+    #[cfg(feature = "render")]
+    pub fn materialize_geometry(&mut self, slide_index: usize, shape_path: &[usize]) -> Result<()> {
+        const OPERATION: &str = "materialize geometry";
+        let child = self.shape_at(slide_index, shape_path, OPERATION)?.child;
+        let own = shape_transform(child);
+        if own.is_some_and(|own| own.offset.is_some() && own.extent.is_some()) {
+            return Ok(());
+        }
+        let Some(placeholder) = shape_placeholder(child) else {
+            return Ok(());
+        };
+        let Some(inherited) = self.inherited_transform(slide_index, placeholder)? else {
+            return Ok(());
+        };
+        let mut materialized = own.cloned().unwrap_or_else(|| inherited.clone());
+        materialized.offset = materialized.offset.or(inherited.offset);
+        materialized.extent = materialized.extent.or(inherited.extent);
+        let mut indices = shape_path.iter();
+        let mut shape = indices
+            .next()
+            .and_then(|index| slide_mut(&mut self.slides[slide_index]).into_shape_mut(*index));
+        for index in indices {
+            shape = shape.and_then(|shape| shape.into_child_mut(*index));
+        }
+        let mut shape = shape.ok_or_else(|| {
+            invalid_shape_mutation(
+                OPERATION,
+                format!("slide {slide_index} has no editable shape at path {shape_path:?}"),
+            )
+        })?;
+        *shape.transform_mut(OPERATION)? = materialized;
+        Ok(())
+    }
+
+    /// Changes the layout one slide uses, by zero-based layout index.
+    ///
+    /// The slide's layout relationship is retargeted, so its placeholders
+    /// inherit from the new layout and that layout's master. A placeholder
+    /// without a transform of its own that the new layout does not place
+    /// first receives the transform it inherited from the old layout, so it
+    /// stays where it was drawn. Placeholders of the new layout that the
+    /// slide lacks are not added. The layout may belong to another master,
+    /// whose theme and text styles the slide then follows. The change is
+    /// staged and publishes only after the staged package reopens.
+    #[cfg(feature = "render")]
+    pub fn set_slide_layout(&mut self, slide_index: usize, layout_index: usize) -> Result<()> {
+        const OPERATION: &str = "set slide layout";
+        self.require_slide_index(slide_index)?;
+        if layout_index >= self.layouts.len() {
+            return Err(Error::UnknownLayoutIndex {
+                index: layout_index,
+                layout_count: self.layouts.len(),
+            });
+        }
+        let current = self.slide_layout_index(slide_index).ok_or_else(|| {
+            invalid_slide_mutation(
+                OPERATION,
+                format!("slide {slide_index} has no layout reachable through the slide masters"),
+            )
+        })?;
+        if current == layout_index {
+            return Ok(());
+        }
+        let (old_layout, old_master) = self.layout_and_master(current)?;
+        let (new_layout, new_master) = self.layout_and_master(layout_index)?;
+        let mut staged = self.clone();
+        keep_unplaced_placeholder_transforms(
+            &mut staged.slides[slide_index]
+                .slide
+                .common_slide_data
+                .shape_tree
+                .children,
+            (old_layout, &old_master),
+            (new_layout, &new_master),
+        );
+        let slide_part = &staged.slides[slide_index].part_name;
+        let target = relative_part_target(slide_part, &staged.layouts[layout_index].part_name);
+        staged
+            .package
+            .get_part_rels_mut(slide_part)
+            .and_then(|relationships| {
+                relationships
+                    .items
+                    .iter_mut()
+                    .find(|relationship| relationship.rel_type == rel_types::SLIDE_LAYOUT)
+            })
+            .ok_or_else(|| {
+                invalid_slide_mutation(
+                    OPERATION,
+                    format!("{slide_part} has no layout relationship"),
+                )
+            })?
+            .target = target;
+        self.commit_candidate(staged)
+    }
+
+    #[cfg(feature = "render")]
+    fn shape_at(
+        &self,
+        slide_index: usize,
+        shape_path: &[usize],
+        operation: &'static str,
+    ) -> Result<ShapeRef<'_>> {
+        self.require_slide_index(slide_index)?;
+        let slide = slide_ref(&self.slides[slide_index]);
+        let mut indices = shape_path.iter();
+        let mut shape = indices.next().and_then(|index| slide.shape(*index));
+        for index in indices {
+            shape = shape.and_then(|shape| shape.child(*index));
+        }
+        shape.ok_or_else(|| {
+            invalid_shape_mutation(
+                operation,
+                format!("slide {slide_index} has no shape at path {shape_path:?}"),
+            )
+        })
+    }
+
+    /// Returns the transform a slide placeholder inherits through its layout.
+    #[cfg(feature = "render")]
+    fn inherited_transform(
+        &self,
+        slide_index: usize,
+        placeholder: &CT_Placeholder,
+    ) -> Result<Option<CT_Transform2D>> {
+        let Some(layout_index) = self.slide_layout_index(slide_index) else {
+            return Ok(None);
+        };
+        let (layout, master) = self.layout_and_master(layout_index)?;
+        Ok(inherited_xfrm(placeholder, layout, &master).cloned())
+    }
+
+    #[cfg(feature = "render")]
+    fn layout_and_master(&self, layout_index: usize) -> Result<(&CT_SlideLayout, CT_SlideMaster)> {
+        let record = &self.layouts[layout_index];
+        let master_part =
+            related_internal_part(&self.package, &record.part_name, rel_types::SLIDE_MASTER)?
+                .ok_or_else(|| Error::MalformedPart {
+                    part_name: record.part_name.clone(),
+                    message: "layout has no slide master relationship".to_owned(),
+                })?;
+        let master = CT_SlideMaster::from_xml(required_part(&self.package, &master_part)?)
+            .map_err(|error| Error::MalformedPart {
+                part_name: master_part,
+                message: error.to_string(),
+            })?;
+        Ok((&record.layout, master))
     }
 
     /// Returns modern PowerPoint comment authors in producer order.
@@ -1990,6 +2216,71 @@ impl Presentation {
         comments.dirty = true;
         comments.comments.comments.push(comment);
         self.commit_candidate(staged)
+    }
+
+    /// Adds a modern comment anchored to a shape or its UTF-16 text range.
+    pub fn add_comment_at_shape(
+        &mut self,
+        slide_index: usize,
+        mut comment: Comment,
+        shape_id: u32,
+        text_range: Option<(usize, usize)>,
+    ) -> Result<()> {
+        self.require_slide_index(slide_index)?;
+        let record = &self.slides[slide_index];
+        if shape_id_count(
+            &record.slide.common_slide_data.shape_tree.children,
+            shape_id,
+        ) != 1
+        {
+            return Err(invalid_shape_mutation(
+                "comment anchor",
+                format!("shape id {shape_id} is missing or ambiguous"),
+            ));
+        }
+        let mut monikers = Vec::new();
+        let target = find_comment_anchor_shape(
+            &record.slide.common_slide_data.shape_tree.children,
+            shape_id,
+            &mut monikers,
+        )
+        .expect("unique shape id was checked");
+        let text_context = if let Some((start, length)) = text_range {
+            let ShapeTreeChild::Shape(shape) = target else {
+                return Err(invalid_shape_mutation(
+                    "comment anchor",
+                    "text range requires an ordinary text shape",
+                ));
+            };
+            let text = shape
+                .text_body
+                .as_ref()
+                .map_or_else(String::new, office_art_comment_text);
+            let text_length = text.encode_utf16().count();
+            if start > text_length || length > text_length - start {
+                return Err(invalid_shape_mutation(
+                    "comment anchor",
+                    "text range exceeds shape text",
+                ));
+            }
+            if comment_text_context_count(
+                &record.slide.common_slide_data.shape_tree.children,
+                &text,
+            ) != 1
+            {
+                return Err(invalid_shape_mutation(
+                    "comment anchor",
+                    "text context is ambiguous on the slide",
+                ));
+            }
+            Some(text)
+        } else {
+            None
+        };
+        comment
+            .set_drawing_anchor(record.id, &monikers, text_range, text_context.as_deref())
+            .map_err(|error| invalid_shape_mutation("comment anchor", error.to_string()))?;
+        self.add_comment(slide_index, comment)
     }
 
     /// Appends one caller-identified reply to an existing comment atomically.
@@ -2883,6 +3174,34 @@ impl Presentation {
         width: Option<Emu>,
         height: Option<Emu>,
     ) -> Result<ShapeRef<'_>> {
+        self.append_picture(
+            slide_index,
+            &[],
+            image_data,
+            image_filename,
+            left,
+            top,
+            width,
+            height,
+        )
+        .map(|picture| shape_ref(picture))
+    }
+
+    /// Stages the image part and slide relationship of a new picture, then
+    /// appends it to the slide's own shapes or to the group that `group`
+    /// indexes, which callers have checked.
+    #[allow(clippy::too_many_arguments)]
+    fn append_picture(
+        &mut self,
+        slide_index: usize,
+        group: &[usize],
+        image_data: &[u8],
+        image_filename: &str,
+        left: Emu,
+        top: Emu,
+        width: Option<Emu>,
+        height: Option<Emu>,
+    ) -> Result<&mut ShapeTreeChild> {
         let slide = self
             .slides
             .get(slide_index)
@@ -2929,9 +3248,7 @@ impl Presentation {
         self.package = package;
         self.media_store = media_store;
         let tree = &mut self.slides[slide_index].slide.common_slide_data.shape_tree;
-        Ok(shape_ref(
-            tree.append_child(ShapeTreeChild::Picture(picture)),
-        ))
+        Ok(append_member(tree, group, ShapeTreeChild::Picture(picture)))
     }
 
     /// Returns the embedded image one picture shows, found by shape id.
@@ -3190,6 +3507,286 @@ impl Presentation {
         prune_unreachable_parts(&mut staged.package, &candidates);
         staged.media_store = MediaStore::scan(&staged.package);
         self.commit_candidate(staged)
+    }
+
+    /// Returns the target of one relationship of a slide, the address that a
+    /// hyperlink naming this relationship id opens.
+    ///
+    /// Pass the `r:id` of an `a:hlinkClick`. An external hyperlink returns
+    /// its URL, and an internal relationship, such as a jump to another
+    /// slide, returns its stored relative target, as python-pptx `address`
+    /// does. An unknown slide or id returns `None`.
+    pub fn hyperlink_address(&self, slide_index: usize, relationship_id: &str) -> Option<&str> {
+        let record = self.slides.get(slide_index)?;
+        self.package
+            .get_part_rels(&record.part_name)?
+            .get_by_id(relationship_id)
+            .map(|relationship| relationship.target.as_str())
+    }
+
+    /// Resolves the external click hyperlink of one slide shape by its non-visual id.
+    pub fn shape_hyperlink_address(
+        &self,
+        slide_index: usize,
+        shape_id: u32,
+    ) -> Result<Option<&str>> {
+        const OPERATION: &str = "shape hyperlink";
+        self.require_slide_index(slide_index)?;
+        let record = &self.slides[slide_index];
+        if shape_id_count(
+            &record.slide.common_slide_data.shape_tree.children,
+            shape_id,
+        ) != 1
+        {
+            return Err(invalid_shape_mutation(
+                OPERATION,
+                "shape id is missing or ambiguous",
+            ));
+        }
+        let xml = record
+            .slide
+            .to_xml()
+            .map_err(|error| invalid_shape_mutation(OPERATION, error.to_string()))?;
+        let location = locate_shape_hyperlink(&xml, shape_id)?
+            .ok_or_else(|| invalid_shape_mutation(OPERATION, "shape has no p:cNvPr"))?;
+        Ok(location
+            .relationship_id
+            .as_deref()
+            .and_then(|id| self.hyperlink_address(slide_index, id)))
+    }
+
+    /// Sets or clears the external click hyperlink of one slide shape atomically.
+    pub fn set_shape_hyperlink(
+        &mut self,
+        slide_index: usize,
+        shape_id: u32,
+        address: Option<&str>,
+    ) -> Result<()> {
+        const OPERATION: &str = "set shape hyperlink";
+        self.require_slide_index(slide_index)?;
+        if address.is_some_and(|address| {
+            address.is_empty()
+                || address.chars().any(|character| {
+                    character.is_control() || matches!(character, '\u{FFFE}' | '\u{FFFF}')
+                })
+        }) {
+            return Err(invalid_shape_mutation(
+                OPERATION,
+                "a hyperlink address must be non-empty text without control characters",
+            ));
+        }
+        let record = &self.slides[slide_index];
+        if shape_id_count(
+            &record.slide.common_slide_data.shape_tree.children,
+            shape_id,
+        ) != 1
+        {
+            return Err(invalid_shape_mutation(
+                OPERATION,
+                "shape id is missing or ambiguous",
+            ));
+        }
+        let xml = record
+            .slide
+            .to_xml()
+            .map_err(|error| invalid_shape_mutation(OPERATION, error.to_string()))?;
+        let location = locate_shape_hyperlink(&xml, shape_id)?
+            .ok_or_else(|| invalid_shape_mutation(OPERATION, "shape has no p:cNvPr"))?;
+        let part_name = record.part_name.clone();
+        let mut relationships = self
+            .package
+            .get_part_rels(&part_name)
+            .cloned()
+            .unwrap_or_default();
+        let current = location
+            .relationship_id
+            .as_deref()
+            .and_then(|id| relationships.get_by_id(id))
+            .filter(|relationship| {
+                relationship.rel_type == rel_types::HYPERLINK
+                    && relationship_is_external(relationship)
+            })
+            .map(|relationship| relationship.target.as_str());
+        if (address.is_none() && location.click.is_none())
+            || (address.is_some() && current == address)
+        {
+            return Ok(());
+        }
+        let new_id = address.map(|address| {
+            relationships
+                .items
+                .iter()
+                .find(|relationship| {
+                    relationship.rel_type == rel_types::HYPERLINK
+                        && relationship_is_external(relationship)
+                        && relationship.target == address
+                })
+                .map(|relationship| relationship.id.clone())
+                .unwrap_or_else(|| relationships.add_external(rel_types::HYPERLINK, address))
+        });
+        let rewritten = rewrite_shape_hyperlink(&xml, &location, new_id.as_deref())?;
+        let slide = CT_Slide::from_xml(&rewritten)
+            .map_err(|error| invalid_shape_mutation(OPERATION, error.to_string()))?;
+        let before = slide_relationship_ids(&record.slide)?;
+        let after = slide_relationship_ids(&slide)?;
+        relationships.items.retain(|relationship| {
+            !before.contains(&relationship.id) || after.contains(&relationship.id)
+        });
+        self.slides[slide_index].slide = slide;
+        self.package.set_part_rels(&part_name, relationships);
+        Ok(())
+    }
+
+    /// Points one text run's click hyperlink at an external `address`, or
+    /// removes it with `None`, as python-pptx `hyperlink.address` does.
+    ///
+    /// The run is the zero-based regular run of a paragraph in the ordinary
+    /// shape whose `p:cNvPr/@id` is `shape_id`, inside groups too. It gets an
+    /// `a:hlinkClick` naming the slide's external hyperlink relationship to
+    /// `address`, which is reused when the slide has one. Assigning the
+    /// current address changes nothing. Every relationship that only the old
+    /// hyperlink named, its target or a click sound, is removed, so no
+    /// relationship is left unreferenced. An empty address, one with a
+    /// control character, or a shape id that is missing, shared, or not an
+    /// ordinary shape with that run is rejected without change.
+    pub fn set_run_hyperlink(
+        &mut self,
+        slide_index: usize,
+        shape_id: u32,
+        paragraph_index: usize,
+        run_index: usize,
+        address: Option<&str>,
+    ) -> Result<()> {
+        const OPERATION: &str = "set run hyperlink";
+        self.require_slide_index(slide_index)?;
+        if address.is_some_and(|address| {
+            address.is_empty()
+                || address.chars().any(|character| {
+                    character.is_control() || matches!(character, '\u{FFFE}' | '\u{FFFF}')
+                })
+        }) {
+            return Err(invalid_shape_mutation(
+                OPERATION,
+                "a hyperlink address must be non-empty text without control characters",
+            ));
+        }
+        let record = &self.slides[slide_index];
+        let part_name = record.part_name.clone();
+        if shape_id_count(
+            &record.slide.common_slide_data.shape_tree.children,
+            shape_id,
+        ) > 1
+        {
+            return Err(invalid_shape_mutation(
+                OPERATION,
+                format!("shape id {shape_id} is not unique on the slide"),
+            ));
+        }
+        let mut slide = record.slide.clone();
+        let mut relationships = self
+            .package
+            .get_part_rels(&part_name)
+            .cloned()
+            .unwrap_or_default();
+        let (old, new) = {
+            let missing = || {
+                invalid_shape_mutation(
+                    OPERATION,
+                    format!(
+                        "shape id {shape_id} has no ordinary shape run {run_index} in paragraph {paragraph_index}"
+                    ),
+                )
+            };
+            let body = find_shape_mut(&mut slide.common_slide_data.shape_tree.children, shape_id)
+                .and_then(|shape| shape.text_body.as_mut())
+                .ok_or_else(missing)?;
+            let mut paragraph = TextFrame { body }
+                .into_paragraph_mut(paragraph_index)
+                .ok_or_else(missing)?;
+            let mut run = paragraph.run_mut(run_index).ok_or_else(missing)?;
+            let mut properties = run.properties().cloned().unwrap_or_default();
+            let old = properties
+                .hyperlink_click
+                .as_ref()
+                .and_then(|hyperlink| hyperlink.relationship_id.clone())
+                .filter(|id| !id.is_empty());
+            let current = old
+                .as_deref()
+                .and_then(|id| relationships.get_by_id(id))
+                .filter(|relationship| {
+                    relationship.rel_type == rel_types::HYPERLINK
+                        && relationship_is_external(relationship)
+                })
+                .map(|relationship| relationship.target.as_str());
+            let unchanged = match address {
+                None => properties.hyperlink_click.is_none(),
+                Some(address) => current == Some(address),
+            };
+            if unchanged {
+                return Ok(());
+            }
+            let new = address.map(|address| {
+                relationships
+                    .items
+                    .iter()
+                    .find(|relationship| {
+                        relationship.rel_type == rel_types::HYPERLINK
+                            && relationship_is_external(relationship)
+                            && relationship.target == address
+                    })
+                    .map(|relationship| relationship.id.clone())
+                    .unwrap_or_else(|| relationships.add_external(rel_types::HYPERLINK, address))
+            });
+            properties.hyperlink_click = new.clone().map(|id| {
+                let mut hyperlink = TextHyperlink::default();
+                hyperlink.relationship_id = Some(id);
+                hyperlink
+            });
+            run.set_properties(properties);
+            (old, new)
+        };
+        if old.is_some_and(|old| Some(&old) != new.as_ref()) {
+            // The old a:hlinkClick can carry more than its r:id, such as an
+            // a:snd click sound naming an audio relationship. Remove every
+            // relationship this edit left without a reference.
+            let before = slide_relationship_ids(&self.slides[slide_index].slide)?;
+            let after = slide_relationship_ids(&slide)?;
+            relationships.items.retain(|relationship| {
+                !before.contains(&relationship.id) || after.contains(&relationship.id)
+            });
+        }
+        self.slides[slide_index].slide = slide;
+        self.package.set_part_rels(&part_name, relationships);
+        Ok(())
+    }
+
+    /// Moves one immediate slide child so that it ends up at z-order index
+    /// `to_index`, where later children draw on top.
+    ///
+    /// Animations, connector glue, and relationships refer to shape ids, so
+    /// they follow the moved shape. Unmodelled shape-tree members keep their
+    /// place among the other children.
+    pub fn move_shape(
+        &mut self,
+        slide_index: usize,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<()> {
+        const OPERATION: &str = "move shape";
+        self.require_slide_index(slide_index)?;
+        let tree = &mut self.slides[slide_index].slide.common_slide_data.shape_tree;
+        let count = tree.children.len();
+        if let Some(index) = [from_index, to_index]
+            .into_iter()
+            .find(|index| *index >= count)
+        {
+            return Err(invalid_slide_mutation(
+                OPERATION,
+                format!("shape index {index} is out of range for {count} shapes"),
+            ));
+        }
+        tree.move_child(from_index, to_index)
+            .map_err(|error| invalid_shape_mutation(OPERATION, error.to_string()))
     }
 
     /// Inspects slide, layout, and master SmartArt in producing-scope order.
@@ -4005,6 +4602,324 @@ fn find_picture_mut(children: &mut [ShapeTreeChild], shape_id: u32) -> Option<&m
             ShapeTreeChild::GroupShape(group) => {
                 if let Some(picture) = find_picture_mut(&mut group.children, shape_id) {
                     return Some(picture);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Counts the slide children and group members whose `p:cNvPr/@id` is
+/// `shape_id`.
+struct ShapeHyperlinkLocation {
+    root_start: usize,
+    root_head_end: usize,
+    root_name: String,
+    empty_root: bool,
+    click: Option<(usize, usize, usize, bool)>,
+    relationship_id: Option<String>,
+    relationship_attribute: Option<Vec<u8>>,
+}
+
+fn xml_local_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
+}
+
+fn xml_is(namespace: &XmlResolveResult<'_>, expected: &str) -> bool {
+    matches!(namespace, XmlResolveResult::Bound(XmlNamespace(uri)) if *uri == expected.as_bytes())
+}
+
+fn shape_xml_attribute(
+    reader: &NsReader<&[u8]>,
+    start: &XmlBytesStart<'_>,
+    expected_namespace: Option<&str>,
+    name: &[u8],
+) -> Result<Option<(String, Vec<u8>)>> {
+    for attribute in start.attributes().with_checks(false) {
+        let attribute = attribute
+            .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+        let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+        let matches_namespace = match expected_namespace {
+            Some(expected) => xml_is(&namespace, expected),
+            None => matches!(namespace, XmlResolveResult::Unbound),
+        };
+        if matches_namespace && local.as_ref() == name {
+            let value = attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, start.decoder())
+                .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+            return Ok(Some((value.into_owned(), attribute.key.as_ref().to_vec())));
+        }
+    }
+    Ok(None)
+}
+
+fn locate_shape_hyperlink(xml: &[u8], shape_id: u32) -> Result<Option<ShapeHyperlinkLocation>> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    let mut target_depth = None;
+    let mut click_depth = None;
+    let mut location: Option<ShapeHyperlinkLocation> = None;
+    loop {
+        let start_offset = reader.buffer_position() as usize;
+        let (is_p, is_a, event) = {
+            let (namespace, event) = reader
+                .read_resolved_event_into(&mut buffer)
+                .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+            (xml_is(&namespace, P_NS), xml_is(&namespace, A_NS), event)
+        };
+        let end_offset = reader.buffer_position() as usize;
+        match event {
+            XmlEvent::Start(start) | XmlEvent::Empty(start) => {
+                let empty = xml[start_offset..end_offset].ends_with(b"/>");
+                if target_depth.is_none()
+                    && is_p
+                    && xml_local_name(start.name().as_ref()) == b"cNvPr"
+                    && shape_xml_attribute(&reader, &start, None, b"id")?
+                        .and_then(|(id, _)| id.parse::<u32>().ok())
+                        == Some(shape_id)
+                {
+                    let root_name = std::str::from_utf8(start.name().as_ref())
+                        .map_err(|error| {
+                            invalid_shape_mutation("shape hyperlink", error.to_string())
+                        })?
+                        .to_owned();
+                    location = Some(ShapeHyperlinkLocation {
+                        root_start: start_offset,
+                        root_head_end: end_offset,
+                        root_name,
+                        empty_root: empty,
+                        click: None,
+                        relationship_id: None,
+                        relationship_attribute: None,
+                    });
+                    if empty {
+                        return Ok(location);
+                    }
+                    target_depth = Some(depth + 1);
+                } else if target_depth == Some(depth)
+                    && is_a
+                    && xml_local_name(start.name().as_ref()) == b"hlinkClick"
+                {
+                    let found = location.as_mut().expect("target depth has location");
+                    if found.click.is_some() {
+                        return Err(invalid_shape_mutation(
+                            "shape hyperlink",
+                            "duplicate a:hlinkClick",
+                        ));
+                    }
+                    if let Some((id, attribute)) =
+                        shape_xml_attribute(&reader, &start, Some(R_NS), b"id")?
+                    {
+                        found.relationship_id = Some(id);
+                        found.relationship_attribute = Some(attribute);
+                    }
+                    found.click = Some((start_offset, end_offset, end_offset, empty));
+                    if !empty {
+                        click_depth = Some(depth + 1);
+                    }
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            XmlEvent::End(_) => {
+                if click_depth == Some(depth) {
+                    let found = location.as_mut().expect("click depth has location");
+                    if let Some(click) = found.click.as_mut() {
+                        click.2 = end_offset;
+                    }
+                    click_depth = None;
+                }
+                if target_depth == Some(depth) {
+                    return Ok(location);
+                }
+                depth = depth.saturating_sub(1);
+            }
+            XmlEvent::Eof => return Ok(None),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+fn rewrite_shape_hyperlink(
+    xml: &[u8],
+    location: &ShapeHyperlinkLocation,
+    relationship_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    let Some(id) = relationship_id else {
+        let Some((start, _, end, _)) = location.click else {
+            return Ok(xml.to_vec());
+        };
+        let mut rewritten = Vec::with_capacity(xml.len() - (end - start));
+        rewritten.extend_from_slice(&xml[..start]);
+        rewritten.extend_from_slice(&xml[end..]);
+        return Ok(rewritten);
+    };
+    if let Some((start, head_end, _, empty)) = location.click {
+        let mut reader = quick_xml::Reader::from_reader(&xml[start..head_end]);
+        let mut buffer = Vec::new();
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+        let original = match event {
+            XmlEvent::Start(start) | XmlEvent::Empty(start) => start,
+            _ => {
+                return Err(invalid_shape_mutation(
+                    "shape hyperlink",
+                    "malformed a:hlinkClick",
+                ));
+            }
+        };
+        let name = std::str::from_utf8(original.name().as_ref())
+            .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?
+            .to_owned();
+        let mut replacement = XmlBytesStart::new(name);
+        let mut replaced = false;
+        for attribute in original.attributes().with_checks(false) {
+            let attribute = attribute
+                .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+            if location.relationship_attribute.as_deref() == Some(attribute.key.as_ref()) {
+                let key = std::str::from_utf8(attribute.key.as_ref()).map_err(|error| {
+                    invalid_shape_mutation("shape hyperlink", error.to_string())
+                })?;
+                replacement.push_attribute((key, id));
+                replaced = true;
+            } else {
+                replacement.push_attribute(attribute);
+            }
+        }
+        if !replaced {
+            replacement.push_attribute(("xmlns:r", R_NS));
+            replacement.push_attribute(("r:id", id));
+        }
+        let mut writer = XmlWriter::new(Vec::new());
+        writer
+            .write_event(if empty {
+                XmlEvent::Empty(replacement)
+            } else {
+                XmlEvent::Start(replacement)
+            })
+            .map_err(|error| invalid_shape_mutation("shape hyperlink", error.to_string()))?;
+        let head = writer.into_inner();
+        let mut rewritten = Vec::with_capacity(xml.len() + head.len());
+        rewritten.extend_from_slice(&xml[..start]);
+        rewritten.extend_from_slice(&head);
+        rewritten.extend_from_slice(&xml[head_end..]);
+        return Ok(rewritten);
+    }
+    let click = format!(r#"<a:hlinkClick xmlns:a="{A_NS}" xmlns:r="{R_NS}" r:id="{id}"/>"#);
+    let mut rewritten = Vec::with_capacity(xml.len() + click.len() + location.root_name.len() + 3);
+    if location.empty_root {
+        let head = &xml[location.root_start..location.root_head_end];
+        let open = head
+            .strip_suffix(b"/>")
+            .ok_or_else(|| invalid_shape_mutation("shape hyperlink", "malformed empty p:cNvPr"))?;
+        rewritten.extend_from_slice(&xml[..location.root_start]);
+        rewritten.extend_from_slice(open);
+        rewritten.extend_from_slice(b">");
+        rewritten.extend_from_slice(click.as_bytes());
+        rewritten.extend_from_slice(format!("</{}>", location.root_name).as_bytes());
+        rewritten.extend_from_slice(&xml[location.root_head_end..]);
+    } else {
+        rewritten.extend_from_slice(&xml[..location.root_head_end]);
+        rewritten.extend_from_slice(click.as_bytes());
+        rewritten.extend_from_slice(&xml[location.root_head_end..]);
+    }
+    Ok(rewritten)
+}
+
+fn shape_id_count(children: &[ShapeTreeChild], shape_id: u32) -> usize {
+    children
+        .iter()
+        .map(|child| {
+            let nested = match child {
+                ShapeTreeChild::GroupShape(group) => shape_id_count(&group.children, shape_id),
+                _ => 0,
+            };
+            usize::from(child.non_visual_id() == Some(shape_id)) + nested
+        })
+        .sum()
+}
+
+fn find_comment_anchor_shape<'a>(
+    children: &'a [ShapeTreeChild],
+    shape_id: u32,
+    monikers: &mut Vec<(&'static str, u32)>,
+) -> Option<&'a ShapeTreeChild> {
+    for child in children {
+        let id = child.non_visual_id();
+        let kind = match child {
+            ShapeTreeChild::Shape(_) => Some("spMk"),
+            ShapeTreeChild::Picture(_) => Some("picMk"),
+            ShapeTreeChild::GraphicFrame(_) => Some("graphicFrameMk"),
+            ShapeTreeChild::GroupShape(_) => Some("grpSpMk"),
+            ShapeTreeChild::Connector(_) => Some("cxnSpMk"),
+            ShapeTreeChild::AlternateContent(_) => None,
+        };
+        if id == Some(shape_id) {
+            monikers.push((kind?, shape_id));
+            return Some(child);
+        }
+        if let ShapeTreeChild::GroupShape(group) = child
+            && let Some(group_id) = id
+        {
+            monikers.push(("grpSpMk", group_id));
+            if let Some(found) = find_comment_anchor_shape(&group.children, shape_id, monikers) {
+                return Some(found);
+            }
+            monikers.pop();
+        }
+    }
+    None
+}
+
+fn office_art_comment_text(body: &CT_TextBody) -> String {
+    body.paragraphs()
+        .iter()
+        .map(|paragraph| {
+            paragraph
+                .runs
+                .iter()
+                .map(|run| match run {
+                    TextRun::Run(run) => run.text.value.as_str(),
+                    TextRun::Break(_) => "\u{000b}",
+                    TextRun::Field(field) => {
+                        field.text.as_ref().map_or("", |text| text.value.as_str())
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\r")
+}
+
+fn comment_text_context_count(children: &[ShapeTreeChild], text: &str) -> usize {
+    children
+        .iter()
+        .map(|child| match child {
+            ShapeTreeChild::Shape(shape) => usize::from(
+                shape
+                    .text_body
+                    .as_ref()
+                    .is_some_and(|body| office_art_comment_text(body) == text),
+            ),
+            ShapeTreeChild::GroupShape(group) => comment_text_context_count(&group.children, text),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn find_shape_mut(children: &mut [ShapeTreeChild], shape_id: u32) -> Option<&mut CT_Shape> {
+    for child in children {
+        let id = child.non_visual_id();
+        match child {
+            ShapeTreeChild::Shape(shape) if id == Some(shape_id) => return Some(shape),
+            ShapeTreeChild::GroupShape(group) => {
+                if let Some(shape) = find_shape_mut(&mut group.children, shape_id) {
+                    return Some(shape);
                 }
             }
             _ => {}
@@ -5261,6 +6176,41 @@ fn numeric_relationship_id(relationship_id: &str) -> u32 {
         .unwrap_or_default()
 }
 
+/// Gives placeholders the new layout does not place the transform they inherited.
+///
+/// Only placeholders without a transform of their own are touched, and
+/// only when the old layout chain supplied one.
+#[cfg(feature = "render")]
+fn keep_unplaced_placeholder_transforms(
+    children: &mut [ShapeTreeChild],
+    old: (&CT_SlideLayout, &CT_SlideMaster),
+    new: (&CT_SlideLayout, &CT_SlideMaster),
+) {
+    for child in children {
+        let (placeholder, transform) = match child {
+            ShapeTreeChild::Shape(shape) => (
+                shape.placeholder.as_ref(),
+                &mut shape.shape_properties.transform,
+            ),
+            ShapeTreeChild::Picture(picture) => (
+                picture.placeholder.as_ref(),
+                &mut picture.shape_properties.transform,
+            ),
+            ShapeTreeChild::GroupShape(group) => {
+                keep_unplaced_placeholder_transforms(&mut group.children, old, new);
+                continue;
+            }
+            _ => continue,
+        };
+        if let Some(placeholder) = placeholder
+            && transform.is_none()
+            && inherited_xfrm(placeholder, new.0, new.1).is_none()
+        {
+            *transform = inherited_xfrm(placeholder, old.0, old.1).cloned();
+        }
+    }
+}
+
 fn is_latent_placeholder(placeholder: &CT_Placeholder) -> bool {
     matches!(
         placeholder.ph_type.as_ref(),
@@ -5635,20 +6585,9 @@ impl<'a> SlideMut<'a> {
         width: Emu,
         height: Emu,
     ) -> Result<ShapeMut<'_>> {
-        let table = CT_Table::new(rows, columns, width, height)
-            .map_err(|error| invalid_table_mutation("add table", error.to_string()))?;
-        let tree = &mut self.record.slide.common_slide_data.shape_tree;
-        let id = ShapeIdAllocator::scan(tree).allocate();
-        let frame = CT_GraphicFrame::new_table(
-            id,
-            &format!("Table {id}"),
-            positioned_transform(left, top, width, height),
-            table,
-        )
-        .map_err(|error| invalid_table_mutation("add table", error.to_string()))?;
-        Ok(shape_mut(tree.append_child(ShapeTreeChild::GraphicFrame(
-            Box::new(frame),
-        ))))
+        append_new_member(self.shape_tree(), &[], |id| {
+            table_member(id, rows, columns, left, top, width, height)
+        })
     }
 
     /// Appends a no-fill textbox at the top of the slide's z-order.
@@ -5659,15 +6598,9 @@ impl<'a> SlideMut<'a> {
         width: Emu,
         height: Emu,
     ) -> Result<ShapeMut<'_>> {
-        let tree = &mut self.record.slide.common_slide_data.shape_tree;
-        let id = ShapeIdAllocator::scan(tree).allocate();
-        let shape = CT_Shape::new_textbox(
-            id,
-            &format!("TextBox {id}"),
-            positioned_transform(left, top, width, height),
-        )
-        .map_err(|error| invalid_shape_construction("add textbox", error))?;
-        Ok(shape_mut(tree.append_child(ShapeTreeChild::Shape(shape))))
+        append_new_member(self.shape_tree(), &[], |id| {
+            textbox_member(id, left, top, width, height)
+        })
     }
 
     /// Appends an ordinary preset shape at the top of the slide's z-order.
@@ -5679,19 +6612,15 @@ impl<'a> SlideMut<'a> {
         width: Emu,
         height: Emu,
     ) -> Result<ShapeMut<'_>> {
-        let tree = &mut self.record.slide.common_slide_data.shape_tree;
-        let id = ShapeIdAllocator::scan(tree).allocate();
-        let shape = CT_Shape::new_preset(
-            id,
-            &format!("Shape {id}"),
-            preset,
-            positioned_transform(left, top, width, height),
-        )
-        .map_err(|error| invalid_shape_construction("add shape", error))?;
-        Ok(shape_mut(tree.append_child(ShapeTreeChild::Shape(shape))))
+        append_new_member(self.shape_tree(), &[], |id| {
+            preset_member(id, preset, left, top, width, height)
+        })
     }
 
     /// Appends a free-standing connector at the top of the slide's z-order.
+    ///
+    /// The connector carries the theme style python-pptx writes, so it shows
+    /// the theme's line until a direct line replaces it.
     pub fn add_connector(
         &mut self,
         connector: ConnectorType,
@@ -5700,29 +6629,18 @@ impl<'a> SlideMut<'a> {
         end_x: Emu,
         end_y: Emu,
     ) -> Result<ShapeMut<'_>> {
-        let transform = connector_transform(begin_x, begin_y, end_x, end_y)?;
-        let tree = &mut self.record.slide.common_slide_data.shape_tree;
-        let id = ShapeIdAllocator::scan(tree).allocate();
-        let connector = CT_ConnectionShape::new_free_standing(
-            id,
-            &format!("Connector {id}"),
-            connector.preset_name(),
-            transform,
-        )
-        .map_err(|error| invalid_shape_construction("add connector", error))?;
-        Ok(shape_mut(
-            tree.append_child(ShapeTreeChild::Connector(connector)),
-        ))
+        append_new_member(self.shape_tree(), &[], |id| {
+            connector_member(id, connector, begin_x, begin_y, end_x, end_y)
+        })
     }
 
     /// Appends an empty group at the top of the slide's z-order.
     pub fn add_group_shape(&mut self) -> Result<ShapeMut<'_>> {
-        let tree = &mut self.record.slide.common_slide_data.shape_tree;
-        let id = ShapeIdAllocator::scan(tree).allocate();
-        let group = CT_GroupShape::new_empty(id, &format!("Group {id}"));
-        Ok(shape_mut(
-            tree.append_child(ShapeTreeChild::GroupShape(Box::new(group))),
-        ))
+        append_new_member(self.shape_tree(), &[], |id| Ok(group_member(id, false)))
+    }
+
+    fn shape_tree(&mut self) -> &mut CT_ShapeTree {
+        &mut self.record.slide.common_slide_data.shape_tree
     }
 
     /// Returns one immediate z-order child as a read-only handle.
@@ -5757,6 +6675,403 @@ impl<'a> SlideMut<'a> {
             .get_mut(index)
             .map(shape_mut)
     }
+}
+
+/// The shapes of one slide, or of one group on it, borrowed for adding
+/// shapes.
+///
+/// A new shape takes a `p:cNvPr` id unused across the whole slide, groups
+/// included, and lands at the top of its collection's z-order. Coordinates
+/// are in the collection's own space, which for a group is its member space.
+/// An addition to a group refits that group and every group enclosing it to
+/// the union of their members, as python-pptx does.
+pub struct ShapesMut<'a> {
+    presentation: &'a mut Presentation,
+    slide_index: usize,
+    group: Vec<usize>,
+}
+
+impl ShapesMut<'_> {
+    /// Appends a no-fill textbox.
+    pub fn add_textbox(
+        &mut self,
+        left: Emu,
+        top: Emu,
+        width: Emu,
+        height: Emu,
+    ) -> Result<ShapeMut<'_>> {
+        self.append(|id| textbox_member(id, left, top, width, height))
+    }
+
+    /// Appends an ordinary preset shape.
+    pub fn add_shape(
+        &mut self,
+        preset: &str,
+        left: Emu,
+        top: Emu,
+        width: Emu,
+        height: Emu,
+    ) -> Result<ShapeMut<'_>> {
+        self.append(|id| preset_member(id, preset, left, top, width, height))
+    }
+
+    /// Appends a free-standing connector.
+    pub fn add_connector(
+        &mut self,
+        connector: ConnectorType,
+        begin_x: Emu,
+        begin_y: Emu,
+        end_x: Emu,
+        end_y: Emu,
+    ) -> Result<ShapeMut<'_>> {
+        self.append(|id| connector_member(id, connector, begin_x, begin_y, end_x, end_y))
+    }
+
+    /// Appends an empty group, which the first addition to it fits.
+    ///
+    /// A group added inside a group gets the zero `a:xfrm` python-pptx
+    /// writes, because python-pptx cannot refit a group whose member group
+    /// has none. One added to the slide's own shapes has no transform, as
+    /// [`SlideMut::add_group_shape`] writes it.
+    pub fn add_group_shape(&mut self) -> Result<ShapeMut<'_>> {
+        let nested = !self.group.is_empty();
+        self.append(|id| Ok(group_member(id, nested)))
+    }
+
+    /// Appends a rectangular table.
+    pub fn add_table(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        left: Emu,
+        top: Emu,
+        width: Emu,
+        height: Emu,
+    ) -> Result<ShapeMut<'_>> {
+        self.append(|id| table_member(id, rows, columns, left, top, width, height))
+    }
+
+    /// Appends a relationship-backed picture, sized as
+    /// [`Presentation::add_picture`] sizes it.
+    pub fn add_picture(
+        &mut self,
+        image_data: &[u8],
+        image_filename: &str,
+        left: Emu,
+        top: Emu,
+        width: Option<Emu>,
+        height: Option<Emu>,
+    ) -> Result<ShapeMut<'_>> {
+        self.presentation
+            .append_picture(
+                self.slide_index,
+                &self.group,
+                image_data,
+                image_filename,
+                left,
+                top,
+                width,
+                height,
+            )
+            .map(shape_mut)
+    }
+
+    fn append(
+        &mut self,
+        build: impl FnOnce(u32) -> Result<ShapeTreeChild>,
+    ) -> Result<ShapeMut<'_>> {
+        let tree = &mut self.presentation.slides[self.slide_index]
+            .slide
+            .common_slide_data
+            .shape_tree;
+        append_new_member(tree, &self.group, build)
+    }
+}
+
+fn textbox_member(id: u32, left: Emu, top: Emu, width: Emu, height: Emu) -> Result<ShapeTreeChild> {
+    CT_Shape::new_textbox(
+        id,
+        &format!("TextBox {id}"),
+        positioned_transform(left, top, width, height),
+    )
+    .map(ShapeTreeChild::Shape)
+    .map_err(|error| invalid_shape_construction("add textbox", error))
+}
+
+fn preset_member(
+    id: u32,
+    preset: &str,
+    left: Emu,
+    top: Emu,
+    width: Emu,
+    height: Emu,
+) -> Result<ShapeTreeChild> {
+    CT_Shape::new_preset(
+        id,
+        &format!("Shape {id}"),
+        preset,
+        positioned_transform(left, top, width, height),
+    )
+    .map(ShapeTreeChild::Shape)
+    .map_err(|error| invalid_shape_construction("add shape", error))
+}
+
+fn connector_member(
+    id: u32,
+    connector: ConnectorType,
+    begin_x: Emu,
+    begin_y: Emu,
+    end_x: Emu,
+    end_y: Emu,
+) -> Result<ShapeTreeChild> {
+    let transform = connector_transform(begin_x, begin_y, end_x, end_y)?;
+    let mut connector = CT_ConnectionShape::new_free_standing(
+        id,
+        &format!("Connector {id}"),
+        connector.preset_name(),
+        transform,
+    )
+    .map_err(|error| invalid_shape_construction("add connector", error))?;
+    connector
+        .set_default_style()
+        .map_err(|error| invalid_shape_construction("add connector", error))?;
+    Ok(ShapeTreeChild::Connector(connector))
+}
+
+/// Builds an empty group, with a zero `a:xfrm` when `nested` in a group.
+fn group_member(id: u32, nested: bool) -> ShapeTreeChild {
+    let mut group = CT_GroupShape::new_empty(id, &format!("Group {id}"));
+    if nested {
+        let transform = group.group_transform_mut();
+        transform.offset = Some(CT_Point2D::default());
+        transform.extent = Some(CT_PositiveSize2D::default());
+        transform.child_offset = Some(CT_Point2D::default());
+        transform.child_extent = Some(CT_PositiveSize2D::default());
+    }
+    ShapeTreeChild::GroupShape(Box::new(group))
+}
+
+fn table_member(
+    id: u32,
+    rows: usize,
+    columns: usize,
+    left: Emu,
+    top: Emu,
+    width: Emu,
+    height: Emu,
+) -> Result<ShapeTreeChild> {
+    let table = CT_Table::new(rows, columns, width, height)
+        .map_err(|error| invalid_table_mutation("add table", error.to_string()))?;
+    let frame = CT_GraphicFrame::new_table(
+        id,
+        &format!("Table {id}"),
+        positioned_transform(left, top, width, height),
+        table,
+    )
+    .map_err(|error| invalid_table_mutation("add table", error.to_string()))?;
+    Ok(ShapeTreeChild::GraphicFrame(Box::new(frame)))
+}
+
+/// Appends a new member built with an id that is unused across the slide.
+fn append_new_member<'t>(
+    tree: &'t mut CT_ShapeTree,
+    group: &[usize],
+    build: impl FnOnce(u32) -> Result<ShapeTreeChild>,
+) -> Result<ShapeMut<'t>> {
+    let id = ShapeIdAllocator::scan(tree).allocate();
+    let member = build(id)?;
+    Ok(shape_mut(append_member(tree, group, member)))
+}
+
+/// Appends `member` to the slide's own shapes, for an empty `group`, or to
+/// the group that `group` indexes, then refits that group and each group
+/// enclosing it, innermost first.
+///
+/// Callers pass a path that ends at a group.
+fn append_member<'t>(
+    tree: &'t mut CT_ShapeTree,
+    group: &[usize],
+    member: ShapeTreeChild,
+) -> &'t mut ShapeTreeChild {
+    const CHECKED: &str = "the caller checked the group path";
+    if group.is_empty() {
+        return tree.append_child(member);
+    }
+    // Only a group that already has a counted member has members whose drawn
+    // place its refit must keep.
+    let occupied = (1..=group.len())
+        .map(|depth| {
+            group_at_mut(&mut tree.children, &group[..depth])
+                .expect(CHECKED)
+                .children
+                .iter()
+                .any(|child| member_box(child).is_some())
+        })
+        .collect::<Vec<_>>();
+    group_at_mut(&mut tree.children, group)
+        .expect(CHECKED)
+        .append_child(member);
+    for depth in (1..=group.len()).rev() {
+        fit_group_to_members(
+            group_at_mut(&mut tree.children, &group[..depth]).expect(CHECKED),
+            occupied[depth - 1],
+        );
+    }
+    group_at_mut(&mut tree.children, group)
+        .expect(CHECKED)
+        .children
+        .last_mut()
+        .expect("the member was appended")
+}
+
+/// Returns the group that `path` indexes from `children`, one z-order index
+/// per nesting level.
+fn group_at_mut<'t>(
+    children: &'t mut [ShapeTreeChild],
+    path: &[usize],
+) -> Option<&'t mut CT_GroupShape> {
+    let (index, rest) = path.split_first()?;
+    let ShapeTreeChild::GroupShape(group) = children.get_mut(*index)? else {
+        return None;
+    };
+    if rest.is_empty() {
+        Some(group.as_mut())
+    } else {
+        group_at_mut(&mut group.children, rest)
+    }
+}
+
+/// Returns the offset and extent a member adds to its group's union, or
+/// `None` for a member without both and for a group without members.
+fn member_box(child: &ShapeTreeChild) -> Option<(CT_Point2D, CT_PositiveSize2D)> {
+    if let ShapeTreeChild::GroupShape(group) = child
+        && group.children.is_empty()
+    {
+        return None;
+    }
+    let transform = shape_transform(child)?;
+    Some((transform.offset?, transform.extent?))
+}
+
+/// Refits a group to the union of its members' own boxes, as python-pptx
+/// does after each addition.
+///
+/// `a:chOff` and `a:chExt` become the union in member space, and `a:off` and
+/// `a:ext` follow through the group's current mapping from member space to
+/// its parent, the one the renderer applies. The group's flips and rotation
+/// apply about the centre of `a:off` and `a:ext`, so when the group is
+/// `occupied`, meaning it had a counted member before the addition, `a:off`
+/// also moves by [`pivot_shift`]. No member drawn before the addition moves
+/// on the slide. A group without all four values draws its members unscaled
+/// in place, so its four values end equal, as python-pptx writes them. As
+/// in python-pptx, member rotation does not widen the union. A member
+/// without an offset and an extent does not count, nor does a group without
+/// members, and a group without a counted member keeps its transform.
+fn fit_group_to_members(group: &mut CT_GroupShape, occupied: bool) {
+    let mut union: Option<(i64, i64, i64, i64)> = None;
+    for (offset, extent) in group.children.iter().filter_map(member_box) {
+        let (left, top) = (offset.x.0, offset.y.0);
+        let right = left.saturating_add(extent.cx.0);
+        let bottom = top.saturating_add(extent.cy.0);
+        union = Some(union.map_or((left, top, right, bottom), |(l, t, r, b)| {
+            (l.min(left), t.min(top), r.max(right), b.max(bottom))
+        }));
+    }
+    let Some((left, top, right, bottom)) = union else {
+        return;
+    };
+    let width = right.saturating_sub(left).max(0);
+    let height = bottom.saturating_sub(top).max(0);
+    let transform = group.group_transform_mut();
+    let mapping = transform
+        .offset
+        .zip(transform.extent)
+        .zip(transform.child_offset.zip(transform.child_extent));
+    let (mut x, cx) = member_span_to_parent(
+        left,
+        width,
+        mapping.map(|((offset, extent), (child_offset, child_extent))| {
+            (offset.x.0, extent.cx.0, child_offset.x.0, child_extent.cx.0)
+        }),
+    );
+    let (mut y, cy) = member_span_to_parent(
+        top,
+        height,
+        mapping.map(|((offset, extent), (child_offset, child_extent))| {
+            (offset.y.0, extent.cy.0, child_offset.y.0, child_extent.cy.0)
+        }),
+    );
+    if occupied && let Some(((offset, extent), _)) = mapping {
+        let centre = |start: i64, length: i64| start as f64 + length as f64 / 2.0;
+        let (shift_x, shift_y) = pivot_shift(
+            transform,
+            centre(x, cx) - centre(offset.x.0, extent.cx.0),
+            centre(y, cy) - centre(offset.y.0, extent.cy.0),
+        );
+        x = x.saturating_add(shift_x);
+        y = y.saturating_add(shift_y);
+    }
+    transform.offset = Some(CT_Point2D {
+        x: Emu(x),
+        y: Emu(y),
+    });
+    transform.extent = Some(CT_PositiveSize2D {
+        cx: Emu(cx),
+        cy: Emu(cy),
+    });
+    transform.child_offset = Some(CT_Point2D {
+        x: Emu(left),
+        y: Emu(top),
+    });
+    transform.child_extent = Some(CT_PositiveSize2D {
+        cx: Emu(width),
+        cy: Emu(height),
+    });
+}
+
+/// Returns how far a group's `a:off` must move so that its flips and
+/// rotation, which apply about the centre of `a:off` and `a:ext`, place its
+/// members as before after that centre moved by `(dx, dy)`.
+///
+/// PowerPoint flips, then rotates, so for that linear part `L` the shift is
+/// `(L - I)(dx, dy)`, which is zero without rotation and flips. The rpptx
+/// renderer rotates a group before it flips it, which agrees with
+/// PowerPoint unless a group is both rotated and flipped.
+fn pivot_shift(transform: &CT_Transform2D, dx: f64, dy: f64) -> (i64, i64) {
+    let (sin, cos) = (f64::from(transform.rotation.0) / 60_000.0)
+        .to_radians()
+        .sin_cos();
+    let flip_x = if transform.flip_horizontal { -1.0 } else { 1.0 };
+    let flip_y = if transform.flip_vertical { -1.0 } else { 1.0 };
+    (
+        ((cos * flip_x - 1.0) * dx - sin * flip_y * dy).round() as i64,
+        (sin * flip_x * dx + (cos * flip_y - 1.0) * dy).round() as i64,
+    )
+}
+
+/// Maps one axis of a member-space span onto a group's parent, given the
+/// group's offset, extent, child offset, and child extent on that axis, as
+/// `offset + (start - child_offset) * extent / child_extent`. A zero child
+/// extent scales by one, as in the renderer, and `None` maps unchanged.
+fn member_span_to_parent(
+    start: i64,
+    length: i64,
+    mapping: Option<(i64, i64, i64, i64)>,
+) -> (i64, i64) {
+    let Some((offset, extent, child_offset, child_extent)) = mapping else {
+        return (start, length);
+    };
+    let scale = |value: i64| {
+        if child_extent == 0 || extent == child_extent {
+            value
+        } else {
+            (value as f64 * extent as f64 / child_extent as f64).round() as i64
+        }
+    };
+    (
+        offset.saturating_add(scale(start.saturating_sub(child_offset))),
+        scale(length),
+    )
 }
 
 /// The geometry family of a free-standing connector.
@@ -6061,6 +7376,51 @@ impl<'a> ShapeMut<'a> {
         Ok(())
     }
 
+    /// Crops a picture by left, top, right, and bottom insets of its image.
+    ///
+    /// Each inset is a share of the image, where `Percent1000(25_000)` is a
+    /// quarter, and a negative inset extends the image. An edge keeps its
+    /// stored attribute when its value is unchanged, a changed edge of zero
+    /// drops its attribute, and four zero insets add no `a:srcRect` to a
+    /// picture without one. Other shape kinds are rejected.
+    pub fn set_crop(
+        &mut self,
+        left: Percent1000,
+        top: Percent1000,
+        right: Percent1000,
+        bottom: Percent1000,
+    ) -> Result<()> {
+        const OPERATION: &str = "set crop";
+        let shape_kind = shape_kind(self.child);
+        let ShapeTreeChild::Picture(picture) = self.child else {
+            return Err(Error::UnsupportedShapeMutation {
+                operation: OPERATION,
+                shape_kind,
+            });
+        };
+        let fill = picture
+            .blip_fill
+            .as_mut()
+            .ok_or_else(|| invalid_shape_mutation(OPERATION, "picture has no p:blipFill"))?;
+        let zero = Percent1000::default();
+        if fill.source_rect.is_none() && [left, top, right, bottom] == [zero; 4] {
+            return Ok(());
+        }
+        let edge = |stored: Option<Percent1000>, value: Percent1000| {
+            if stored.unwrap_or_default() == value {
+                stored
+            } else {
+                (value != zero).then_some(value)
+            }
+        };
+        let rect = fill.source_rect.get_or_insert_with(RelativeRect::default);
+        rect.left = edge(rect.left, left);
+        rect.top = edge(rect.top, top);
+        rect.right = edge(rect.right, right);
+        rect.bottom = edge(rect.bottom, bottom);
+        Ok(())
+    }
+
     /// Inserts or replaces one finite preset-geometry adjustment.
     pub fn set_adjust_value(&mut self, name: &str, value: f64) -> Result<()> {
         if !value.is_finite() {
@@ -6229,6 +7589,11 @@ impl<'a> TableRef<'a> {
         self.table.grid.columns.get(column).copied()
     }
 
+    /// Returns one stored row height in EMU.
+    pub fn row_height(&self, row: usize) -> Option<Emu> {
+        self.table.rows.get(row).map(|row| row.height)
+    }
+
     /// Returns whether first-row table styling is enabled.
     pub fn first_row(&self) -> bool {
         self.table
@@ -6327,65 +7692,149 @@ impl<'a> TableMut<'a> {
 
     /// Changes one grid width and synchronizes the containing frame width.
     pub fn set_column_width(&mut self, column: usize, width: Emu) -> Result<()> {
+        const OPERATION: &str = "set column width";
         if width.0 <= 0 {
             return Err(invalid_table_mutation(
-                "set column width",
+                OPERATION,
                 "column width must be positive".to_owned(),
             ));
         }
         if column >= self.table.grid.columns.len() {
             return Err(invalid_table_mutation(
-                "set column width",
+                OPERATION,
                 format!("column index {column} is out of range"),
             ));
         }
-        let total_width = self
-            .table
-            .grid
-            .columns
-            .iter()
-            .enumerate()
-            .try_fold(0i64, |total, (index, current)| {
-                total.checked_add(if index == column { width.0 } else { current.0 })
-            })
-            .ok_or_else(|| {
-                invalid_table_mutation(
-                    "set column width",
-                    "table width exceeds the EMU range".to_owned(),
-                )
-            })?;
-        let total_height = self
-            .table
-            .rows
-            .iter()
-            .try_fold(0i64, |total, row| total.checked_add(row.height.0))
-            .ok_or_else(|| {
-                invalid_table_mutation(
-                    "set column width",
-                    "table height exceeds the EMU range".to_owned(),
-                )
-            })?;
-        if total_width <= 0 || total_height <= 0 {
-            return Err(invalid_table_mutation(
-                "set column width",
-                "table width and height must remain positive".to_owned(),
-            ));
-        }
-
         let mut staged = self.table.clone();
-        staged.grid.columns[column] = width;
+        staged
+            .set_column_width(column, width)
+            .map_err(|error| invalid_table_mutation(OPERATION, error.to_string()))?;
+        let (total_width, total_height) = table_extent(&staged, OPERATION)?;
         staged
             .to_xml()
-            .map_err(|error| invalid_table_mutation("set column width", error.to_string()))?;
-        self.table.grid.columns[column] = width;
+            .map_err(|error| invalid_table_mutation(OPERATION, error.to_string()))?;
+        *self.table = staged;
         let height = self
             .transform
             .extent
-            .map_or(Emu(total_height), |extent| extent.cy);
+            .map_or(total_height, |extent| extent.cy);
         self.transform.extent = Some(CT_PositiveSize2D {
-            cx: Emu(total_width),
+            cx: total_width,
             cy: height,
         });
+        Ok(())
+    }
+
+    /// Returns one stored row height in EMU.
+    pub fn row_height(&self, row: usize) -> Option<Emu> {
+        self.table.rows.get(row).map(|row| row.height)
+    }
+
+    /// Changes one row height and synchronizes the containing frame height.
+    ///
+    /// The stored height is a minimum, as in PowerPoint, which grows a row to
+    /// fit its text when it lays the table out.
+    pub fn set_row_height(&mut self, row: usize, height: Emu) -> Result<()> {
+        const OPERATION: &str = "set row height";
+        if height.0 <= 0 {
+            return Err(invalid_table_mutation(
+                OPERATION,
+                "row height must be positive".to_owned(),
+            ));
+        }
+        if row >= self.table.rows.len() {
+            return Err(invalid_table_mutation(
+                OPERATION,
+                format!("row index {row} is out of range"),
+            ));
+        }
+        let mut staged = self.table.clone();
+        staged.rows[row].height = height;
+        let (total_width, total_height) = table_extent(&staged, OPERATION)?;
+        staged
+            .to_xml()
+            .map_err(|error| invalid_table_mutation(OPERATION, error.to_string()))?;
+        self.table.rows[row].height = height;
+        let width = self
+            .transform
+            .extent
+            .map_or(total_width, |extent| extent.cx);
+        self.transform.extent = Some(CT_PositiveSize2D {
+            cx: width,
+            cy: total_height,
+        });
+        Ok(())
+    }
+
+    /// Inserts a row before `index`, or appends one when `index` equals the
+    /// row count, and grows the frame height by the new row's height.
+    ///
+    /// The new row copies the height of the row above it, or of the first row
+    /// when it becomes the first, and each new cell copies that row's cell
+    /// properties and first-paragraph formatting without its text. A row
+    /// inserted inside a merged cell extends the merge.
+    pub fn insert_row(&mut self, index: usize) -> Result<()> {
+        self.restructure("insert row", |table| table.insert_row(index))
+    }
+
+    /// Removes one row, which must not be the only one, and shrinks the frame
+    /// height by its height.
+    ///
+    /// A merged cell across the row loses one row, and when the row holds the
+    /// merge origin the row below takes it over with the origin's text.
+    pub fn remove_row(&mut self, index: usize) -> Result<()> {
+        self.restructure("remove row", |table| table.remove_row(index))
+    }
+
+    /// Inserts a grid column before `index`, or appends one when `index`
+    /// equals the column count, and grows the frame width by its width.
+    ///
+    /// The new column copies the width of the column left of it, or of the
+    /// first column when it becomes the first, and its cells copy that
+    /// column's cells as `insert_row` does. A column inserted inside a merged
+    /// cell extends the merge.
+    pub fn insert_column(&mut self, index: usize) -> Result<()> {
+        self.restructure("insert column", |table| table.insert_column(index))
+    }
+
+    /// Removes one grid column, which must not be the only one, and shrinks
+    /// the frame width by its width.
+    ///
+    /// A merged cell across the column loses one column, and when the column
+    /// holds the merge origin the column to its right takes it over with the
+    /// origin's text.
+    pub fn remove_column(&mut self, index: usize) -> Result<()> {
+        self.restructure("remove column", |table| table.remove_column(index))
+    }
+
+    /// Applies one row or column edit to a staged table and commits it.
+    ///
+    /// Each frame edge moves by the change of its grid sum, so the frame grows
+    /// or shrinks by the inserted or removed row or column. A frame that
+    /// PowerPoint measured taller than its stored rows, because it grew rows
+    /// to fit their text, keeps that excess.
+    fn restructure(
+        &mut self,
+        operation: &'static str,
+        edit: impl FnOnce(&mut CT_Table) -> std::result::Result<(), OxmlError>,
+    ) -> Result<()> {
+        let (old_width, old_height) = table_extent(self.table, operation)?;
+        let mut staged = self.table.clone();
+        edit(&mut staged).map_err(|error| invalid_table_mutation(operation, error.to_string()))?;
+        let (new_width, new_height) = table_extent(&staged, operation)?;
+        staged
+            .to_xml()
+            .map_err(|error| invalid_table_mutation(operation, error.to_string()))?;
+        let frame = self.transform.extent.unwrap_or(CT_PositiveSize2D {
+            cx: old_width,
+            cy: old_height,
+        });
+        let extent = CT_PositiveSize2D {
+            cx: moved_frame_edge(frame.cx, old_width, new_width, operation)?,
+            cy: moved_frame_edge(frame.cy, old_height, new_height, operation)?,
+        };
+        *self.table = staged;
+        self.transform.extent = Some(extent);
         Ok(())
     }
 
@@ -6468,6 +7917,16 @@ impl<'a> TableMut<'a> {
     }
 }
 
+/// One edge of a table cell, drawn by the `a:lnL`, `a:lnR`, `a:lnT`, or `a:lnB`
+/// line of its `a:tcPr`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CellBorder {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// A borrowed explicit table-grid cell.
 #[derive(Clone, Copy)]
 pub struct TableCellRef<'a> {
@@ -6532,6 +7991,17 @@ impl TableCellRef<'_> {
                     properties.margin_bottom,
                 )
             })
+    }
+
+    /// Returns the direct line of one cell edge, when present.
+    pub fn border(&self, edge: CellBorder) -> Option<&CT_LineProperties> {
+        let properties = self.cell.properties.as_ref()?;
+        match edge {
+            CellBorder::Left => properties.left.as_ref(),
+            CellBorder::Right => properties.right.as_ref(),
+            CellBorder::Top => properties.top.as_ref(),
+            CellBorder::Bottom => properties.bottom.as_ref(),
+        }
     }
 }
 
@@ -6601,6 +8071,29 @@ impl TableCellMut<'_> {
             properties.margin_top,
             properties.margin_bottom,
         )
+    }
+
+    /// Returns the direct line of one cell edge, when present.
+    pub fn border(&self, edge: CellBorder) -> Option<&CT_LineProperties> {
+        let properties = self.cell_ref().cell.properties.as_ref()?;
+        match edge {
+            CellBorder::Left => properties.left.as_ref(),
+            CellBorder::Right => properties.right.as_ref(),
+            CellBorder::Top => properties.top.as_ref(),
+            CellBorder::Bottom => properties.bottom.as_ref(),
+        }
+    }
+
+    /// Replaces or clears the direct line of one cell edge.
+    pub fn set_border(&mut self, edge: CellBorder, line: Option<CT_LineProperties>) {
+        let properties = self.properties_mut();
+        let slot = match edge {
+            CellBorder::Left => &mut properties.left,
+            CellBorder::Right => &mut properties.right,
+            CellBorder::Top => &mut properties.top,
+            CellBorder::Bottom => &mut properties.bottom,
+        };
+        *slot = line;
     }
 
     /// Returns whether this cell is the top-left origin of a merge.
@@ -6673,6 +8166,54 @@ fn table_properties_mut(table: &mut CT_Table) -> &mut CT_TableProperties {
     table
         .properties
         .get_or_insert_with(CT_TableProperties::default)
+}
+
+/// Returns the checked sums of a table's column widths and row heights.
+fn table_extent(table: &CT_Table, operation: &'static str) -> Result<(Emu, Emu)> {
+    let total_width = table
+        .grid
+        .columns
+        .iter()
+        .try_fold(0i64, |total, width| total.checked_add(width.0))
+        .ok_or_else(|| {
+            invalid_table_mutation(operation, "table width exceeds the EMU range".to_owned())
+        })?;
+    let total_height = table
+        .rows
+        .iter()
+        .try_fold(0i64, |total, row| total.checked_add(row.height.0))
+        .ok_or_else(|| {
+            invalid_table_mutation(operation, "table height exceeds the EMU range".to_owned())
+        })?;
+    if total_width <= 0 || total_height <= 0 {
+        return Err(invalid_table_mutation(
+            operation,
+            "table width and height must remain positive".to_owned(),
+        ));
+    }
+    Ok((Emu(total_width), Emu(total_height)))
+}
+
+/// Moves one frame edge by the change of its grid sum and requires the edge
+/// to stay positive.
+fn moved_frame_edge(
+    frame: Emu,
+    old_total: Emu,
+    new_total: Emu,
+    operation: &'static str,
+) -> Result<Emu> {
+    new_total
+        .0
+        .checked_sub(old_total.0)
+        .and_then(|change| frame.0.checked_add(change))
+        .filter(|size| *size > 0)
+        .map(Emu)
+        .ok_or_else(|| {
+            invalid_table_mutation(
+                operation,
+                "table frame size must remain positive and within the EMU range".to_owned(),
+            )
+        })
 }
 
 fn rectangular_dimensions(table: &CT_Table) -> std::result::Result<(usize, usize), String> {
@@ -7351,6 +8892,28 @@ impl<'a> ShapeRef<'a> {
     /// Returns the direct line of a shape, picture, or connector.
     pub fn line(&self) -> Option<&'a CT_LineProperties> {
         shape_properties(self.child)?.line.as_ref()
+    }
+
+    /// Returns a picture's `a:srcRect` crop as left, top, right, and bottom
+    /// insets of its image, reading an absent edge as zero.
+    ///
+    /// Other shape kinds return `None`.
+    pub fn crop(&self) -> Option<(Percent1000, Percent1000, Percent1000, Percent1000)> {
+        let ShapeTreeChild::Picture(picture) = self.child else {
+            return None;
+        };
+        let rect = picture
+            .blip_fill
+            .as_ref()
+            .and_then(|fill| fill.source_rect.as_ref());
+        Some(rect.map_or_else(Default::default, |rect| {
+            (
+                rect.left.unwrap_or_default(),
+                rect.top.unwrap_or_default(),
+                rect.right.unwrap_or_default(),
+                rect.bottom.unwrap_or_default(),
+            )
+        }))
     }
 
     /// Serialises the child as a self-contained element.

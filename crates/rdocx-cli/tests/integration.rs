@@ -1,12 +1,13 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use oxml_opc::OpcPackage;
 use oxml_opc::relationship::rel_types;
-use rdocx::Document;
-use serde_json::json;
+use rdocx::{Document, WordPackageClass};
+use serde_json::{Value, json};
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -37,6 +38,23 @@ fn cli(args: &[&str]) -> Output {
         .expect("run rdocx CLI")
 }
 
+/// Runs the CLI while its reader takes a short prefix of standard output and
+/// then closes it, as `| head -1` does.
+fn cli_with_closed_stdout(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rdocx"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rdocx CLI");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    stdout
+        .read_exact(&mut [0; 64])
+        .expect("read an output prefix");
+    drop(stdout);
+    child.wait_with_output().expect("wait for rdocx CLI")
+}
+
 fn assert_success(output: &Output, command: &str) {
     assert!(
         output.status.success(),
@@ -49,6 +67,52 @@ fn assert_success(output: &Output, command: &str) {
         "{command} wrote stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Asserts that `args` refuses to replace an existing `output` and leaves it
+/// byte-identical, and that the same command with `--force` replaces it.
+fn assert_existing_output_needs_force(args: &[&str], output: &Path) {
+    fs::write(output, b"keep me").unwrap();
+    let refused = cli(args);
+    assert_eq!(refused.status.code(), Some(1), "{args:?} was not refused");
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        format!(
+            "Error: output already exists: {} (pass --force to replace it)\n",
+            output.display()
+        )
+    );
+    assert_eq!(fs::read(output).unwrap(), b"keep me");
+
+    let forced = [args, &["--force"]].concat();
+    assert_success(&cli(&forced), &forced.join(" "));
+    assert_ne!(fs::read(output).unwrap(), b"keep me");
+    assert!(
+        fs::read_dir(output.parent().unwrap())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+    );
+}
+
+/// Asserts that `args`, whose output is `input` under some spelling, leaves
+/// the input byte-identical with and without `--force`.
+fn assert_input_is_never_replaced(args: &[&str], input: &Path, output: &str) {
+    let before = fs::read(input).unwrap();
+    for force in [&[][..], &["--force"]] {
+        let refused = cli(&[args, force].concat());
+        assert_eq!(refused.status.code(), Some(1), "{args:?} {force:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            format!("Error: output is the input file: {output}\n")
+        );
+        assert_eq!(fs::read(input).unwrap(), before, "{args:?} {force:?}");
+    }
 }
 
 fn fixture_document(paragraphs: &[&str]) -> Document {
@@ -77,35 +141,133 @@ fn write_revision_fixture(path: &Path) {
     paragraph.add_run("Charlie");
     document.save(path).unwrap();
 
-    let mut package = OpcPackage::open(path).unwrap();
-    let part = package.main_document_part().unwrap();
-    let xml = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
     let revisions = [
         ("Alpha", 10, "Alice", "2026-01-01T00:00:00Z"),
         ("Bravo", 20, "Bob", "2026-01-02T00:00:00Z"),
         ("Charlie", 30, "Alice", "2026-01-03T00:00:00Z"),
     ];
-    let mut xml = xml;
     for (text, id, author, timestamp) in revisions {
-        let marker = format!(">{text}</w:t>");
-        let text_position = xml.find(&marker).expect("fixture text is present");
-        let run_start = xml[..text_position]
-            .rfind("<w:r")
-            .expect("fixture run starts before text");
-        let run_end = text_position
-            + xml[text_position..]
-                .find("</w:r>")
-                .expect("fixture run ends after text")
-            + "</w:r>".len();
-        let run = xml[run_start..run_end].to_owned();
-        let revision = format!(
-            "<w:ins w:id=\"{id}\" w:author=\"{author}\" w:date=\"{timestamp}\">{run}</w:ins>"
-        );
-        xml.replace_range(run_start..run_end, &revision);
+        rewrite_run(path, text, |run| {
+            format!(
+                "<w:ins w:id=\"{id}\" w:author=\"{author}\" w:date=\"{timestamp}\">{run}</w:ins>"
+            )
+        });
     }
+    assert_eq!(Document::open(path).unwrap().revisions().len(), 3);
+}
+
+/// Replace the main-story run whose text is exactly `text` with `rewrite(run)`.
+fn rewrite_run(path: &Path, text: &str, rewrite: impl FnOnce(&str) -> String) {
+    let mut package = OpcPackage::open(path).unwrap();
+    let part = package.main_document_part().unwrap();
+    let mut xml = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
+    let marker = format!(">{text}</w:t>");
+    let text_position = xml.find(&marker).expect("fixture text is present");
+    let run_start = xml[..text_position]
+        .rfind("<w:r")
+        .expect("fixture run starts before text");
+    let run_end = text_position
+        + xml[text_position..]
+            .find("</w:r>")
+            .expect("fixture run ends after text")
+        + "</w:r>".len();
+    let replacement = rewrite(&xml[run_start..run_end]);
+    xml.replace_range(run_start..run_end, &replacement);
     package.set_part(&part, xml.into_bytes());
     package.save(path).unwrap();
-    assert_eq!(Document::open(path).unwrap().revisions().len(), 3);
+}
+
+/// Write the skills acceptance suite's every-story document: NEEDLE once in
+/// the body, a body table cell, a VML text box, the default header, the
+/// default footer and a table cell in it, the first-page footer, a footnote,
+/// and an endnote.
+fn write_every_story_fixture(path: &Path) {
+    let mut document = fixture_document(&["Body NEEDLE one."]);
+    {
+        let mut table = document.add_table(1, 2);
+        table.cell(0, 1).unwrap().set_text("Cell NEEDLE");
+    }
+    let footnote = document.add_footnote("Footnote NEEDLE.");
+    document
+        .add_paragraph("Footnote here")
+        .add_footnote_ref(footnote);
+    document.set_header("Header NEEDLE");
+    document.set_footer("Footer NEEDLE");
+    document.set_first_page_footer("First footer NEEDLE");
+    document.save(path).unwrap();
+
+    rewrite_run(path, "Footnote here", |run| {
+        format!(
+            r#"{run}<w:r><w:endnoteReference w:id="1"/></w:r><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:100pt;height:50pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>Text box NEEDLE</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#
+        )
+    });
+    let mut package = OpcPackage::open(path).unwrap();
+    let footer = package
+        .parts
+        .iter()
+        .find(|(name, xml)| {
+            name.starts_with("/word/footer")
+                && String::from_utf8_lossy(xml).contains(">Footer NEEDLE<")
+        })
+        .map(|(name, _)| name.clone())
+        .expect("fixture has a default footer");
+    let footer_xml = String::from_utf8(package.get_part(&footer).unwrap().to_vec())
+        .unwrap()
+        .replacen(
+            "</w:ftr>",
+            r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="4320"/></w:tblGrid><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>Footer cell NEEDLE</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:ftr>"#,
+            1,
+        );
+    package.set_part(&footer, footer_xml.into_bytes());
+    package.set_part(
+        "/word/endnotes.xml",
+        br#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> Endnote NEEDLE.</w:t></w:r></w:p></w:endnote></w:endnotes>"#
+            .to_vec(),
+    );
+    package.content_types.add_override(
+        "/word/endnotes.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+    );
+    package
+        .get_or_create_part_rels("/word/document.xml")
+        .add(rel_types::ENDNOTES, "endnotes.xml");
+    package.save(path).unwrap();
+}
+
+fn package_part_text(path: &Path, part: &str) -> String {
+    let package = OpcPackage::open(path).unwrap();
+    String::from_utf8(package.get_part(part).expect("part is present").to_vec()).unwrap()
+}
+
+fn header_part_name(path: &Path) -> String {
+    let package = OpcPackage::open(path).unwrap();
+    let mut headers = package
+        .parts
+        .keys()
+        .filter(|name| name.starts_with("/word/header"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 1, "fixture has one header part");
+    headers.remove(0)
+}
+
+/// Concatenate the text of every `w:delText` element, like the acceptance
+/// suite's `<w:delText[^>]*>([^<]*)</w:delText>` search.
+fn deleted_text(xml: &str) -> String {
+    let mut deleted = String::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<w:delText") {
+        rest = &rest[start..];
+        let tag_end = rest.find('>').expect("delText start tag ends");
+        if rest[..tag_end].ends_with('/') {
+            rest = &rest[tag_end..];
+            continue;
+        }
+        let content_end = rest.find("</w:delText>").expect("delText element ends");
+        deleted.push_str(&rest[tag_end + 1..content_end]);
+        rest = &rest[content_end..];
+    }
+    deleted
 }
 
 fn path_text(path: &Path) -> &str {
@@ -175,6 +337,468 @@ fn text_prints_body_and_table_content_in_document_order() {
         String::from_utf8(output.stdout).unwrap(),
         "Body first\nLeft cell\tRight cell\t\nBody second\n"
     );
+}
+
+#[test]
+fn printing_commands_end_cleanly_when_the_reader_closes_stdout() {
+    let temp = TempWorkspace::new("closed-stdout");
+    let input = temp.path.join("long.docx");
+    // Several hundred kilobytes outgrow a default pipe buffer, so the CLI
+    // is still writing when its reader goes away.
+    let lines = (0..20_000)
+        .map(|index| format!("Line {index}, lorem ipsum dolor sit amet."))
+        .collect::<Vec<_>>();
+    write_document(
+        &input,
+        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    for args in [
+        vec!["text", path_text(&input)],
+        vec!["text", path_text(&input), "--json"],
+    ] {
+        let output = cli_with_closed_stdout(&args);
+        assert_success(&output, &args.join(" "));
+    }
+}
+
+#[test]
+fn validate_keeps_its_verdict_when_the_reader_closes_stdout() {
+    let temp = TempWorkspace::new("validate-closed-stdout");
+    let valid = temp.path.join("valid.docx");
+    let corrupt = temp.path.join("corrupt.docx");
+    write_document(&valid, &["Valid content"]);
+    // Thousands of undeclared parts make a report that outgrows a default pipe
+    // buffer, so the CLI is still writing when its reader goes away.
+    let mut package = OpcPackage::open(&valid).unwrap();
+    for index in 0..3_000 {
+        package.set_part(&format!("/word/undeclared{index}.dat"), Vec::new());
+    }
+    package.save(&corrupt).unwrap();
+
+    let output = cli_with_closed_stdout(&["validate", path_text(&corrupt)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failing_stdout_other_than_a_closed_pipe_is_an_error() {
+    let temp = TempWorkspace::new("full-stdout");
+    let input = temp.path.join("short.docx");
+    write_document(&input, &["No space left"]);
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rdocx"))
+        .args(["text", path_text(&input)])
+        .stdout(full)
+        .output()
+        .expect("run rdocx CLI");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("Error: "), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn text_prints_paragraphs_wrapped_by_a_body_content_control() {
+    let temp = TempWorkspace::new("text-content-control");
+    let input = temp.path.join("control.docx");
+    write_document(&input, &["Body text"]);
+
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(fs::read(&input).unwrap())).unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap())
+        .unwrap()
+        .replacen(
+            "<w:body>",
+            r#"<w:body><w:sdt><w:sdtPr><w:tag w:val="goog_rdk_1"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Wrapped paragraph</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
+            1,
+        );
+    package.set_part("/word/document.xml", xml.into_bytes());
+    let mut file = fs::File::create(&input).unwrap();
+    package.write_to(&mut file).unwrap();
+
+    let output = cli(&["text", path_text(&input)]);
+    assert_success(&output, "text");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Wrapped paragraph\nBody text\n"
+    );
+}
+
+#[test]
+fn plain_text_prints_the_accepted_view_of_tracked_changes() {
+    let temp = TempWorkspace::new("text-tracked");
+    let input = temp.path.join("tracked.docx");
+    let mut document = fixture_document(&[]);
+    {
+        let mut paragraph = document.add_paragraph("");
+        paragraph.add_run("Tracked: ");
+        paragraph.add_run("ins NEEDLE");
+        paragraph.add_run("gone");
+    }
+    {
+        let mut table = document.add_table(1, 1);
+        table.cell(0, 0).unwrap().set_text("cell NEEDLE");
+    }
+    document.save(&input).unwrap();
+    rewrite_run(&input, "ins NEEDLE", |run| {
+        format!(r#"<w:ins w:id="1" w:author="Ada" w:date="2026-09-29T08:00:00Z">{run}</w:ins>"#)
+    });
+    rewrite_run(&input, "gone", |run| {
+        let run = run
+            .replace("<w:t", "<w:delText")
+            .replace("</w:t>", "</w:delText>");
+        format!(r#"<w:del w:id="2" w:author="Ada" w:date="2026-09-29T08:00:00Z">{run}</w:del>"#)
+    });
+    rewrite_run(&input, "cell NEEDLE", |run| {
+        format!(r#"<w:ins w:id="3" w:author="Ada" w:date="2026-09-29T08:00:00Z">{run}</w:ins>"#)
+    });
+    assert_eq!(Document::open(&input).unwrap().revisions().len(), 3);
+
+    let plain = cli(&["text", path_text(&input)]);
+    assert_success(&plain, "plain text");
+    assert_eq!(
+        String::from_utf8(plain.stdout).unwrap(),
+        "Tracked: ins NEEDLE\ncell NEEDLE\t\n"
+    );
+
+    let structured = cli(&["text", path_text(&input), "--json"]);
+    assert_success(&structured, "structured text");
+    let value: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    let texts = value["paragraphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|paragraph| paragraph["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["Tracked: ins NEEDLE", "cell NEEDLE"]);
+}
+
+#[test]
+fn text_views_read_every_story_after_the_body() {
+    let temp = TempWorkspace::new("text-every-story");
+    let input = temp.path.join("every-story.docx");
+    write_every_story_fixture(&input);
+
+    // The body keeps its exact form, and each other story follows under one
+    // line naming its kind and part. A footer lists its own paragraphs, the
+    // last one empty, before the cell of its table.
+    let plain = cli(&["text", path_text(&input)]);
+    assert_success(&plain, "plain text");
+    assert_eq!(
+        String::from_utf8(plain.stdout).unwrap(),
+        "Body NEEDLE one.\n\tCell NEEDLE\t\nFootnote here\n\
+         --- text_box (/word/document.xml) ---\nText box NEEDLE\n\
+         --- header (/word/header1.xml) ---\nHeader NEEDLE\n\
+         --- footer (/word/footer1.xml) ---\nFooter NEEDLE\n\nFooter cell NEEDLE\n\
+         --- footer (/word/footerFirst1.xml) ---\nFirst footer NEEDLE\n\
+         --- footnote (/word/footnotes.xml) ---\nFootnote NEEDLE.\n\
+         --- endnote (/word/endnotes.xml) ---\n Endnote NEEDLE.\n"
+    );
+
+    let structured = cli(&["text", path_text(&input), "--json"]);
+    assert_success(&structured, "structured text");
+    let value: Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(value["scope"], "all-supported-stories");
+    assert_eq!(
+        value["paragraphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|paragraph| paragraph["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Body NEEDLE one.", "", "Cell NEEDLE", "Footnote here"]
+    );
+    let story = |kind: &str, part_name: &str, items: Value| json!({ "kind": kind, "part_name": part_name, "owner_index": 0, "items": items });
+    let paragraph = |index: usize, text: &str| json!({ "index_path": [index], "kind": "paragraph", "text": text });
+    assert_eq!(
+        value["stories"],
+        json!([
+            story(
+                "text_box",
+                "/word/document.xml",
+                json!([paragraph(0, "Text box NEEDLE")])
+            ),
+            story(
+                "header",
+                "/word/header1.xml",
+                json!([paragraph(0, "Header NEEDLE")])
+            ),
+            story(
+                "footer",
+                "/word/footer1.xml",
+                json!([paragraph(0, "Footer NEEDLE"), paragraph(2, "")])
+            ),
+            story(
+                "table_cell",
+                "/word/footer1.xml",
+                json!([paragraph(1, "Footer cell NEEDLE")])
+            ),
+            story(
+                "footer",
+                "/word/footerFirst1.xml",
+                json!([paragraph(0, "First footer NEEDLE")])
+            ),
+            story(
+                "footnote",
+                "/word/footnotes.xml",
+                json!([paragraph(0, "Footnote NEEDLE.")])
+            ),
+            story(
+                "endnote",
+                "/word/endnotes.xml",
+                json!([paragraph(0, " Endnote NEEDLE.")])
+            ),
+        ])
+    );
+
+    let markdown = temp.path.join("every-story.md");
+    let output = cli(&[
+        "convert",
+        path_text(&input),
+        "--to",
+        "md",
+        "-o",
+        path_text(&markdown),
+    ]);
+    assert_success(&output, "convert markdown");
+    assert_eq!(
+        fs::read_to_string(&markdown).unwrap(),
+        "Body NEEDLE one.\n\n|  | Cell NEEDLE |\n| --- | --- |\n\nFootnote here\n\n---\n\n\
+         **text_box** (/word/document.xml)\n\nText box NEEDLE\n\n\
+         **header** (/word/header1.xml)\n\nHeader NEEDLE\n\n\
+         **footer** (/word/footer1.xml)\n\nFooter NEEDLE\n\nFooter cell NEEDLE\n\n\
+         **footer** (/word/footerFirst1.xml)\n\nFirst footer NEEDLE\n\n\
+         **footnote** (/word/footnotes.xml)\n\nFootnote NEEDLE.\n\n\
+         **endnote** (/word/endnotes.xml)\n\nEndnote NEEDLE.\n\n"
+    );
+
+    let html = temp.path.join("every-story.html");
+    let output = cli(&[
+        "convert",
+        path_text(&input),
+        "--to",
+        "html",
+        "-o",
+        path_text(&html),
+    ]);
+    assert_success(&output, "convert HTML");
+    let html = fs::read_to_string(&html).unwrap();
+    assert!(
+        html.ends_with(
+            "<p>Footnote here</p>\n\n<hr>\n\
+             <section>\n<p><strong>text_box</strong> (/word/document.xml)</p>\n<p>Text box NEEDLE</p>\n</section>\n\
+             <section>\n<p><strong>header</strong> (/word/header1.xml)</p>\n<p>Header NEEDLE</p>\n</section>\n\
+             <section>\n<p><strong>footer</strong> (/word/footer1.xml)</p>\n<p>Footer NEEDLE</p>\n<p>Footer cell NEEDLE</p>\n</section>\n\
+             <section>\n<p><strong>footer</strong> (/word/footerFirst1.xml)</p>\n<p>First footer NEEDLE</p>\n</section>\n\
+             <section>\n<p><strong>footnote</strong> (/word/footnotes.xml)</p>\n<p>Footnote NEEDLE.</p>\n</section>\n\
+             <section>\n<p><strong>endnote</strong> (/word/endnotes.xml)</p>\n<p>Endnote NEEDLE.</p>\n</section>\n\
+             </body>\n</html>"
+        ),
+        "{html}"
+    );
+}
+
+#[test]
+fn text_views_read_comments_but_conversions_leave_them_out() {
+    let temp = TempWorkspace::new("text-comment-story");
+    let input = temp.path.join("source.docx");
+    let commented = temp.path.join("commented.docx");
+    let mut document = fixture_document(&["Reviewed text"]);
+    document.set_header("Head <b> & co");
+    // An empty first-page header has no text to print.
+    document.set_first_page_header("");
+    document.save(&input).unwrap();
+    let output = cli(&[
+        "comment",
+        "add",
+        path_text(&input),
+        "--start-paragraph",
+        "0",
+        "--start-run",
+        "0",
+        "--end-paragraph",
+        "0",
+        "--end-run",
+        "1",
+        "--author",
+        "Reviewer",
+        "--text",
+        "Check this",
+        "-o",
+        path_text(&commented),
+    ]);
+    assert_success(&output, "comment add");
+
+    let structured = cli(&["text", path_text(&commented), "--json"]);
+    assert_success(&structured, "structured text");
+    let value: Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(
+        value["stories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|story| (story["kind"].as_str().unwrap(), story["items"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "header",
+                json!([{"index_path": [0], "kind": "paragraph", "text": "Head <b> & co"}])
+            ),
+            (
+                "header",
+                json!([{"index_path": [0], "kind": "paragraph", "text": ""}])
+            ),
+            (
+                "comment",
+                json!([{"index_path": [0], "kind": "paragraph", "text": "Check this"}])
+            ),
+        ]
+    );
+
+    let plain = cli(&["text", path_text(&commented)]);
+    assert_success(&plain, "plain text");
+    assert_eq!(
+        String::from_utf8(plain.stdout).unwrap(),
+        "Reviewed text\n--- header (/word/header1.xml) ---\nHead <b> & co\n\
+         --- comment (/word/comments.xml) ---\nCheck this\n"
+    );
+
+    // A comment is a review annotation, not document content, so a converted
+    // document keeps the header and leaves the comment out.
+    let markdown = temp.path.join("commented.md");
+    let html = temp.path.join("commented.html");
+    for (format, path) in [("md", &markdown), ("html", &html)] {
+        let output = cli(&[
+            "convert",
+            path_text(&commented),
+            "--to",
+            format,
+            "-o",
+            path_text(path),
+        ]);
+        assert_success(&output, "convert");
+    }
+    assert_eq!(
+        fs::read_to_string(&markdown).unwrap(),
+        "Reviewed text\n\n---\n\n**header** (/word/header1.xml)\n\nHead <b> & co\n\n"
+    );
+    let html = fs::read_to_string(&html).unwrap();
+    assert!(
+        html.contains(
+            "<section>\n<p><strong>header</strong> (/word/header1.xml)</p>\n\
+             <p>Head &lt;b&gt; &amp; co</p>\n</section>\n</body>"
+        ),
+        "{html}"
+    );
+    assert!(!html.contains("Check this"), "{html}");
+}
+
+#[test]
+fn text_views_never_read_the_fallback_copy_of_a_word_text_box() {
+    let temp = TempWorkspace::new("text-word-text-box");
+    let input = temp.path.join("text-box.docx");
+    write_document(&input, &["Anchor paragraph"]);
+    // Word writes a text box twice, DrawingML in mc:Choice and a VML copy in
+    // mc:Fallback. The copy holds other text here so that reading it shows.
+    rewrite_run(&input, "Anchor paragraph", |run| {
+        format!(
+            r#"{run}<w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" Requires="wps"><w:drawing><wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="1270000" cy="635000"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/><wp:docPr id="10" name="Text Box 10"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>Box NEEDLE</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:100pt;height:50pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>Fallback NEEDLE</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>"#
+        )
+    });
+
+    let markdown = temp.path.join("text-box.md");
+    let output = cli(&[
+        "convert",
+        path_text(&input),
+        "--to",
+        "md",
+        "-o",
+        path_text(&markdown),
+    ]);
+    assert_success(&output, "convert markdown");
+    let mut views = vec![fs::read_to_string(&markdown).unwrap()];
+    for args in [&["text"][..], &["text", "--json"][..]] {
+        let output = cli(&[args, &[path_text(&input)]].concat());
+        assert_success(&output, "text");
+        views.push(String::from_utf8(output.stdout).unwrap());
+    }
+    for view in views {
+        assert!(!view.contains("Fallback NEEDLE"), "{view}");
+        assert!(view.matches("Box NEEDLE").count() <= 1, "{view}");
+    }
+}
+
+#[test]
+fn text_views_keep_the_body_when_a_story_part_cannot_be_read() {
+    let temp = TempWorkspace::new("text-unreadable-story");
+    let valid = temp.path.join("valid.docx");
+    let mut document = fixture_document(&["Body text"]);
+    document.set_header("Head");
+    document.save(&valid).unwrap();
+    let header = header_part_name(&valid);
+
+    // Half of the header part, and a header relationship to a missing part.
+    let truncated = temp.path.join("truncated.docx");
+    let mut package = OpcPackage::open(&valid).unwrap();
+    let xml = package.get_part(&header).unwrap().to_vec();
+    package.set_part(&header, xml[..xml.len() / 2].to_vec());
+    package.save(&truncated).unwrap();
+    let missing = temp.path.join("missing.docx");
+    let mut package = OpcPackage::open(&valid).unwrap();
+    package.remove_part(&header).unwrap();
+    package.save(&missing).unwrap();
+
+    for (input, reason) in [
+        (
+            &truncated,
+            format!("part {header} is not well-formed XML: "),
+        ),
+        (&missing, format!("missing part {header}")),
+    ] {
+        let warned = |output: &Output| {
+            assert_eq!(output.status.code(), Some(0), "{reason}");
+            let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(
+                stderr.starts_with("Warning: other stories left out: ") && stderr.contains(&reason),
+                "{stderr}"
+            );
+            String::from_utf8(output.stdout.clone()).unwrap()
+        };
+
+        assert_eq!(warned(&cli(&["text", path_text(input)])), "Body text\n");
+
+        let value: Value =
+            serde_json::from_str(&warned(&cli(&["text", path_text(input), "--json"]))).unwrap();
+        assert_eq!(value["scope"], "main");
+        assert_eq!(value["stories"], json!([]));
+        assert_eq!(value["paragraphs"][0]["text"], "Body text");
+
+        for format in ["md", "html"] {
+            let output_path = input.with_extension(format);
+            warned(&cli(&[
+                "convert",
+                path_text(input),
+                "--to",
+                format,
+                "-o",
+                path_text(&output_path),
+            ]));
+            let converted = fs::read_to_string(&output_path).unwrap();
+            assert!(converted.contains("Body text"), "{converted}");
+            assert!(!converted.contains("Head"), "{converted}");
+        }
+    }
 }
 
 #[test]
@@ -252,6 +876,100 @@ fn convert_writes_valid_formats_and_uses_the_shared_default_output() {
 }
 
 #[test]
+fn convert_replaces_an_existing_output_only_with_force_and_never_its_input() {
+    let temp = TempWorkspace::new("convert-output-policy");
+    let input = temp.path.join("source.docx");
+    write_document(&input, &["Output policy"]);
+    let source = path_text(&input);
+    let spelled = temp.path.join("pages/../source.docx");
+    fs::create_dir(temp.path.join("pages")).unwrap();
+
+    let default_pdf = temp.path.join("source.pdf");
+    assert_existing_output_needs_force(&["convert", source, "--to", "pdf"], &default_pdf);
+    for to in ["pdf", "md", "html", "png", "tiff"] {
+        let output = temp.path.join(format!("converted.{to}"));
+        assert_existing_output_needs_force(
+            &[
+                "convert",
+                source,
+                "--to",
+                to,
+                "--dpi",
+                "24",
+                "-o",
+                path_text(&output),
+            ],
+            &output,
+        );
+        for spelling in [source, path_text(&spelled)] {
+            assert_input_is_never_replaced(
+                &["convert", source, "--to", to, "--dpi", "24", "-o", spelling],
+                &input,
+                spelling,
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        let refused = cli(&[
+            "convert",
+            source,
+            "--to",
+            "md",
+            "-o",
+            "/dev/null",
+            "--force",
+        ]);
+        assert_eq!(refused.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            "Error: output is not a regular file: /dev/null\n"
+        );
+    }
+}
+
+#[test]
+fn render_replaces_existing_pages_only_with_force_and_never_its_input() {
+    let temp = TempWorkspace::new("render-output-policy");
+    let input = temp.path.join("source.docx");
+    let pages = temp.path.join("pages");
+    write_document(&input, &["Output policy"]);
+    fs::create_dir(&pages).unwrap();
+    let render = [
+        "render",
+        path_text(&input),
+        "-o",
+        path_text(&pages),
+        "--dpi",
+        "24",
+    ];
+
+    assert_existing_output_needs_force(&render, &pages.join("source_page1.png"));
+    assert_existing_output_needs_force(
+        &[render.as_slice(), &["--format", "tiff"]].concat(),
+        &pages.join("source.tiff"),
+    );
+
+    // A document named like its own TIFF output, rendered into its folder.
+    let named = temp.path.join("named.tiff");
+    fs::copy(&input, &named).unwrap();
+    assert_input_is_never_replaced(
+        &[
+            "render",
+            path_text(&named),
+            "-o",
+            path_text(&temp.path),
+            "--format",
+            "tiff",
+            "--dpi",
+            "24",
+        ],
+        &named,
+        path_text(&named),
+    );
+}
+
+#[test]
 fn diff_reports_changed_paragraphs_without_using_exit_status_as_a_verdict() {
     let temp = TempWorkspace::new("diff");
     let before = temp.path.join("before.docx");
@@ -309,6 +1027,76 @@ fn replace_writes_a_reopenable_document_and_reports_the_exact_count() {
 }
 
 #[test]
+fn replace_output_extension_selects_the_package_class() {
+    let temp = TempWorkspace::new("replace-class");
+    let input = temp.path.join("template.dotx");
+    let replaced = temp.path.join("report.docx");
+    write_document(&input, &["Hello {{name}}"]);
+    assert_eq!(
+        Document::open(&input).unwrap().package_class().unwrap(),
+        WordPackageClass::Template
+    );
+
+    let output = cli(&[
+        "replace",
+        path_text(&input),
+        "--placeholder",
+        "{{name}}",
+        "--value",
+        "Reader",
+        "--output",
+        path_text(&replaced),
+    ]);
+    assert_success(&output, "replace");
+    assert_eq!(
+        Document::open(&replaced).unwrap().package_class().unwrap(),
+        WordPackageClass::Document
+    );
+}
+
+#[test]
+fn replace_refuses_a_macro_free_output_for_a_vba_input() {
+    let temp = TempWorkspace::new("replace-vba");
+    let input = temp.path.join("macros.docm");
+    let replaced = temp.path.join("report.docx");
+    let mut package = OpcPackage::from_reader(std::io::Cursor::new(
+        fixture_document(&["Hello {{name}}"]).to_bytes().unwrap(),
+    ))
+    .unwrap();
+    package
+        .get_or_create_part_rels("/word/document.xml")
+        .add(rel_types::VBA_PROJECT, "vbaProject.bin");
+    package.set_part("/word/vbaProject.bin", b"vba-project".to_vec());
+    package.content_types.add_override(
+        "/word/vbaProject.bin",
+        "application/vnd.ms-office.vbaProject",
+    );
+    package.content_types.add_override(
+        "/word/document.xml",
+        "application/vnd.ms-word.document.macroEnabled.main+xml",
+    );
+    package.save(&input).unwrap();
+
+    let output = cli(&[
+        "replace",
+        path_text(&input),
+        "--placeholder",
+        "{{name}}",
+        "--value",
+        "Reader",
+        "--output",
+        path_text(&replaced),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("VBA project"));
+    let entries: Vec<_> = fs::read_dir(&temp.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [input.file_name().unwrap()]);
+}
+
+#[test]
 fn cli_replace_reports_namespace_preflight_errors_without_panicking() {
     let temp = TempWorkspace::new("replace-namespace-error");
     let input = temp.path.join("used-default.docx");
@@ -343,6 +1131,314 @@ fn cli_replace_reports_namespace_preflight_errors_without_panicking() {
     assert!(!output_path.exists());
 }
 
+/// Word writes a text box twice, as DrawingML in `mc:Choice` and as VML in
+/// `mc:Fallback`. `rdocx replace --expect 1` failed on it with `found 2`.
+#[test]
+fn replace_with_expect_counts_a_word_text_box_once() {
+    let temp = TempWorkspace::new("replace-word-text-box");
+    let input = temp.path.join("text-box.docx");
+    let replaced = temp.path.join("replaced.docx");
+    write_document(&input, &["seed"]);
+
+    let copy = r#"<w:txbxContent><w:p><w:r><w:t>Box NEEDLE</w:t></w:r></w:p></w:txbxContent>"#;
+    let text_box = format!(
+        r#"<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx>{copy}</wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox>{copy}</v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>"#
+    );
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(fs::read(&input).unwrap())).unwrap();
+    package.set_part(
+        "/word/document.xml",
+        format!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:p><w:r><w:t>Anchor paragraph</w:t></w:r>{text_box}</w:p></w:body></w:document>"#
+        )
+        .into_bytes(),
+    );
+    package
+        .write_to(&mut fs::File::create(&input).unwrap())
+        .unwrap();
+
+    let output = cli(&[
+        "replace",
+        path_text(&input),
+        "--placeholder",
+        "NEEDLE",
+        "--value",
+        "X",
+        "--expect",
+        "1",
+        "--output",
+        path_text(&replaced),
+    ]);
+    assert_success(&output, "replace");
+
+    let package = OpcPackage::open(&replaced).unwrap();
+    let saved =
+        String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec()).unwrap();
+    assert!(!saved.contains("NEEDLE"), "{saved}");
+    assert_eq!(saved.matches(">Box X<").count(), 2, "{saved}");
+}
+
+/// `rdocx replace --expect 1` found none of the text that Google Docs and
+/// Word keep in content controls: a run wrapped inside its paragraph, a
+/// paragraph wrapped at body level, a control in a table cell, nested
+/// controls, a control in a text box, and the table and controls of a
+/// header or footer.
+#[test]
+fn replace_with_expect_counts_the_text_of_content_controls_everywhere() {
+    let temp = TempWorkspace::new("replace-content-controls");
+    let input = temp.path.join("controls.docx");
+    write_document(&input, &["seed"]);
+
+    let control = |tag: &str, content: &str| {
+        format!(
+            r#"<w:sdt><w:sdtPr><w:tag w:val="{tag}"/></w:sdtPr><w:sdtContent>{content}</w:sdtContent></w:sdt>"#
+        )
+    };
+    let run = |text: &str| format!("<w:r><w:t>{text}</w:t></w:r>");
+    let paragraph = |content: &str| format!("<w:p>{content}</w:p>");
+    let table = |cell: &str| {
+        format!(
+            r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl>"#
+        )
+    };
+    let text_box = format!(
+        r#"<w:r><w:pict><v:shape style="width:216pt;height:72pt"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#,
+        control("box", &paragraph(&run("{{box}}")))
+    );
+    let body = [
+        paragraph(&[run("Body "), control("goog_rdk_0", &run("{{inline}}"))].concat()),
+        control("goog_rdk_1", &paragraph(&run("{{block}}"))),
+        table(&control("cell", &paragraph(&run("{{cell}}")))),
+        control("outer", &paragraph(&control("inner", &run("{{nested}}")))),
+        paragraph(&[run("Host"), text_box].concat()),
+    ]
+    .concat();
+    let word = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let header = format!(
+        r#"<w:hdr xmlns:w="{word}">{}{}</w:hdr>"#,
+        table(&paragraph(&run("{{header_table}}"))),
+        control("header", &paragraph(&run("{{header_control}}")))
+    );
+    let footer = format!(
+        r#"<w:ftr xmlns:w="{word}">{}{}</w:ftr>"#,
+        control("page", &paragraph(&run("{{footer_control}}"))),
+        paragraph(&run("Confidential"))
+    );
+
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(fs::read(&input).unwrap())).unwrap();
+    let mut references = String::new();
+    for (kind, xml, rel_type) in [
+        ("header", header, rel_types::HEADER),
+        ("footer", footer, rel_types::FOOTER),
+    ] {
+        let part = format!("/word/{kind}1.xml");
+        package.set_part(&part, xml.into_bytes());
+        package.content_types.add_override(
+            &part,
+            &format!("application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"),
+        );
+        let id = package
+            .get_or_create_part_rels("/word/document.xml")
+            .add(rel_type, &format!("{kind}1.xml"));
+        references.push_str(&format!(
+            r#"<w:{kind}Reference w:type="default" r:id="{id}"/>"#
+        ));
+    }
+    package.set_part(
+        "/word/document.xml",
+        format!(
+            r#"<w:document xmlns:w="{word}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:v="urn:schemas-microsoft-com:vml"><w:body>{body}<w:sectPr>{references}</w:sectPr></w:body></w:document>"#
+        )
+        .into_bytes(),
+    );
+    package
+        .write_to(&mut fs::File::create(&input).unwrap())
+        .unwrap();
+
+    for name in [
+        "inline",
+        "block",
+        "cell",
+        "nested",
+        "box",
+        "header_table",
+        "header_control",
+        "footer_control",
+    ] {
+        let tag = format!("{{{{{name}}}}}");
+        let replaced = temp.path.join(format!("{name}.docx"));
+        let output = cli(&[
+            "replace",
+            path_text(&input),
+            "--placeholder",
+            &tag,
+            "--value",
+            "done",
+            "--expect",
+            "1",
+            "--output",
+            path_text(&replaced),
+        ]);
+        assert_success(&output, name);
+
+        let package = OpcPackage::open(&replaced).unwrap();
+        let saved = ["document", "header1", "footer1"]
+            .map(|part| {
+                let xml = package.get_part(&format!("/word/{part}.xml")).unwrap();
+                String::from_utf8(xml.to_vec()).unwrap()
+            })
+            .concat();
+        assert!(!saved.contains(&tag), "{name}: {saved}");
+        assert_eq!(saved.matches(">done<").count(), 1, "{name}: {saved}");
+    }
+}
+
+/// `rdocx replace --expect` counts what a reader sees in a footnote, an
+/// endnote and a tracked insertion, and neither the separators of the notes
+/// parts nor deleted text.
+#[test]
+fn replace_with_expect_counts_notes_and_tracked_insertions() {
+    let temp = TempWorkspace::new("replace-notes");
+    let input = temp.path.join("notes.docx");
+    let replaced = temp.path.join("replaced.docx");
+    write_document(&input, &["seed"]);
+
+    let word = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let notes = |kind: &str| {
+        format!(
+            r#"<w:{kind}s xmlns:w="{word}"><w:{kind} w:type="separator" w:id="-1"><w:p><w:r><w:t>NEEDLE</w:t></w:r></w:p></w:{kind}><w:{kind} w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:{kind}><w:{kind} w:id="1"><w:p><w:r><w:{kind}Ref/></w:r><w:r><w:t xml:space="preserve"> Note NEEDLE.</w:t></w:r></w:p></w:{kind}></w:{kind}s>"#
+        )
+    };
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(fs::read(&input).unwrap())).unwrap();
+    for (kind, rel_type) in [
+        ("footnote", rel_types::FOOTNOTES),
+        ("endnote", rel_types::ENDNOTES),
+    ] {
+        let part = format!("/word/{kind}s.xml");
+        package.set_part(&part, notes(kind).into_bytes());
+        package.content_types.add_override(
+            &part,
+            &format!("application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}s+xml"),
+        );
+        package
+            .get_or_create_part_rels("/word/document.xml")
+            .add(rel_type, &format!("{kind}s.xml"));
+    }
+    package.set_part(
+        "/word/document.xml",
+        format!(
+            r#"<w:document xmlns:w="{word}"><w:body><w:p><w:r><w:t xml:space="preserve">Tracked: </w:t></w:r><w:ins w:id="901" w:author="Editor" w:date="2026-01-01T00:00:00Z"><w:r><w:t>ins NEEDLE</w:t></w:r></w:ins><w:del w:id="902" w:author="Editor" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">del NEEDLE</w:delText></w:r></w:del><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:endnoteReference w:id="1"/></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        )
+        .into_bytes(),
+    );
+    package
+        .write_to(&mut fs::File::create(&input).unwrap())
+        .unwrap();
+
+    let replace = |expect: &str| {
+        cli(&[
+            "replace",
+            path_text(&input),
+            "--placeholder",
+            "NEEDLE",
+            "--value",
+            "X",
+            "--expect",
+            expect,
+            "--output",
+            path_text(&replaced),
+        ])
+    };
+    let output = replace("4");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("found 3"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = replace("3");
+    assert_success(&output, "replace --expect 3");
+    let package = OpcPackage::open(&replaced).unwrap();
+    let part = |name: &str| String::from_utf8(package.get_part(name).unwrap().to_vec()).unwrap();
+    let body = part("/word/document.xml");
+    assert!(body.contains(">ins X</w:t></w:r></w:ins>"), "{body}");
+    assert!(body.contains(">del NEEDLE</w:delText>"), "{body}");
+    for kind in ["footnote", "endnote"] {
+        let xml = part(&format!("/word/{kind}s.xml"));
+        assert_eq!(xml, notes(kind).replace("Note NEEDLE", "Note X"), "{kind}");
+    }
+}
+
+/// `rdocx text --json` shows the text inside a simple field, a smart tag and
+/// an inline custom XML element, and `rdocx replace --expect` counts it.
+#[test]
+fn text_and_replace_read_simple_fields_smart_tags_and_custom_xml() {
+    let temp = TempWorkspace::new("wrapped-text");
+    let word = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    for (name, start, end) in [
+        (
+            "field",
+            r#"<w:fldSimple w:instr=" DOCPROPERTY Title ">"#,
+            "</w:fldSimple>",
+        ),
+        (
+            "smart-tag",
+            r#"<w:smartTag w:element="place">"#,
+            "</w:smartTag>",
+        ),
+        (
+            "custom-xml",
+            r#"<w:customXml w:element="item">"#,
+            "</w:customXml>",
+        ),
+    ] {
+        let input = temp.path.join(format!("{name}.docx"));
+        let replaced = temp.path.join(format!("{name}-replaced.docx"));
+        write_document(&input, &["seed"]);
+        let mut package =
+            OpcPackage::from_reader(std::io::Cursor::new(fs::read(&input).unwrap())).unwrap();
+        package.set_part(
+            "/word/document.xml",
+            format!(
+                r#"<w:document xmlns:w="{word}"><w:body><w:p><w:r><w:t xml:space="preserve">before </w:t></w:r>{start}<w:r><w:t>MID</w:t></w:r>{end}<w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+            )
+            .into_bytes(),
+        );
+        package
+            .write_to(&mut fs::File::create(&input).unwrap())
+            .unwrap();
+
+        let output = cli(&["text", path_text(&input), "--json"]);
+        assert_success(&output, "text --json");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["paragraphs"][0]["text"], "before MID after", "{name}");
+
+        let output = cli(&[
+            "replace",
+            path_text(&input),
+            "--placeholder",
+            "MID",
+            "--value",
+            "X",
+            "--expect",
+            "1",
+            "--output",
+            path_text(&replaced),
+        ]);
+        assert_success(&output, "replace --expect 1");
+        let package = OpcPackage::open(&replaced).unwrap();
+        let body =
+            String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains(&format!("{start}<w:r><w:t>X</w:t></w:r>{end}")),
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn validate_exit_status_is_a_verdict() {
     let temp = TempWorkspace::new("validate");
@@ -373,6 +1469,165 @@ fn validate_exit_status_is_a_verdict() {
             "1 error(s) in {}:\n  1. relationship {relationship_id} points at missing part /word/media/missing.png\n",
             corrupt.display()
         )
+    );
+}
+
+/// #160: rdocx 0.14 rewrote an empty comments root without its `w14`
+/// declaration while `mc:Ignorable` still listed `w14`, and validate passed
+/// the part.
+#[test]
+fn validate_reports_an_undeclared_ignorable_prefix() {
+    let temp = TempWorkspace::new("validate-compatibility");
+    let valid = temp.path.join("valid.docx");
+    let broken = temp.path.join("broken.docx");
+    write_document(&valid, &["Valid content"]);
+
+    let mut package = OpcPackage::open(&valid).unwrap();
+    package.set_part(
+        "/word/comments.xml",
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15"></w:comments>"#.to_vec(),
+    );
+    package.content_types.add_override(
+        "/word/comments.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+    );
+    let document_part = package.main_document_part().unwrap();
+    package
+        .get_or_create_part_rels(&document_part)
+        .add(rel_types::COMMENTS, "comments.xml");
+    package.save(&broken).unwrap();
+
+    let output = cli(&["validate", path_text(&broken)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "1 error(s) in {}:\n  1. part /word/comments.xml lists undeclared prefix `w14` in mc:Ignorable\n",
+            broken.display()
+        )
+    );
+}
+
+#[test]
+fn validate_rejects_malformed_related_parts_and_undefined_style_ids() {
+    let temp = TempWorkspace::new("validate-parts");
+    let every_story = temp.path.join("every-story.docx");
+    write_every_story_fixture(&every_story);
+    let output = cli(&["validate", path_text(&every_story)]);
+    assert_success(&output, "validate every story");
+
+    let valid = temp.path.join("valid.docx");
+    let mut document = fixture_document(&[]);
+    document.add_paragraph("Styled").set_style("Heading1");
+    document.set_header("Head");
+    document.save(&valid).unwrap();
+    let output = cli(&["validate", path_text(&valid)]);
+    assert_success(&output, "validate defined styles");
+
+    // Half of a header part, as the skills suite cuts it, and the whole
+    // settings part but its closing root tag. Where the half cut lands
+    // decides which syntax error the reader reports.
+    let header = header_part_name(&valid);
+    for (part, cut, detail) in [
+        (header.as_str(), "half", ""),
+        (
+            "/word/settings.xml",
+            "end tag",
+            "the part ends inside 1 unclosed element(s)",
+        ),
+    ] {
+        let broken = temp.path.join("broken.docx");
+        let mut package = OpcPackage::open(&valid).unwrap();
+        let xml = package.get_part(part).unwrap().to_vec();
+        let kept = if cut == "half" {
+            xml.len() / 2
+        } else {
+            String::from_utf8_lossy(&xml)
+                .rfind("</w:settings>")
+                .unwrap()
+        };
+        package.set_part(part, xml[..kept].to_vec());
+        package.save(&broken).unwrap();
+
+        let output = cli(&["validate", path_text(&broken)]);
+        assert_eq!(output.status.code(), Some(1), "{part}");
+        assert!(output.stderr.is_empty(), "{part}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!(
+                "  1. part {part} is not well-formed XML: {detail}"
+            )),
+            "{stdout}"
+        );
+        fs::remove_file(broken).unwrap();
+    }
+
+    let broken = temp.path.join("cdata-before-root.docx");
+    let mut package = OpcPackage::open(&valid).unwrap();
+    let mut xml = b"<![CDATA[outside]]>".to_vec();
+    xml.extend_from_slice(package.get_part(&header).unwrap());
+    package.set_part(&header, xml);
+    package.save(&broken).unwrap();
+    let output = cli(&["validate", path_text(&broken)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
+        "part {header} is not well-formed XML: the part has CDATA outside its root element"
+    )));
+
+    // Undefined paragraph, table, and character style ids in the body and a
+    // header. The one inside a tracked property change records the formatting
+    // before the change, Word does not read the one inside mc:Fallback, and an
+    // empty id names no style, so these three are not reported.
+    let dangling = temp.path.join("dangling.docx");
+    let mut document = fixture_document(&[]);
+    document.add_paragraph("Styled").set_style("NoSuchStyle");
+    document.add_paragraph("Unstyled").set_style("");
+    document.add_table(1, 1).set_style("NoSuchTableStyle");
+    document.set_header("Head");
+    document.save(&dangling).unwrap();
+    let mut package = OpcPackage::open(&dangling).unwrap();
+    let body = String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec())
+        .unwrap()
+        .replacen(
+            r#"<w:pStyle w:val="NoSuchStyle"/>"#,
+            r#"<w:pStyle w:val="NoSuchStyle"/><w:pPrChange w:id="9" w:author="Ada"><w:pPr><w:pStyle w:val="RemovedStyle"/></w:pPr></w:pPrChange>"#,
+            1,
+        );
+    // The new run ends with the closing tag of the run holding "Unstyled".
+    let body = body.replacen(
+        ">Unstyled</w:t>",
+        r#">Unstyled</w:t></w:r><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" Requires="wps"/><mc:Fallback><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent><w:p><w:pPr><w:pStyle w:val="FallbackOnlyStyle"/></w:pPr></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent>"#,
+        1,
+    );
+    assert!(body.contains("RemovedStyle"));
+    assert!(body.contains("FallbackOnlyStyle"));
+    assert!(body.contains(r#"<w:pStyle w:val=""/>"#), "{body}");
+    package.set_part("/word/document.xml", body.into_bytes());
+    let header_xml = String::from_utf8(package.get_part(&header).unwrap().to_vec())
+        .unwrap()
+        .replacen(
+            "<w:r>",
+            r#"<w:r><w:rPr><w:rStyle w:val="NoSuchRunStyle"/></w:rPr>"#,
+            1,
+        );
+    assert!(header_xml.contains("NoSuchRunStyle"));
+    package.set_part(&header, header_xml.into_bytes());
+    package.save(&dangling).unwrap();
+
+    let output = cli(&["validate", path_text(&dangling)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!(
+            "3 error(s) in {}:\n\
+             \x20 1. paragraph style \"NoSuchStyle\" used in /word/document.xml is not defined\n\
+             \x20 2. table style \"NoSuchTableStyle\" used in /word/document.xml is not defined\n\
+             \x20 3. character style \"NoSuchRunStyle\" used in {header} is not defined\n",
+            dangling.display()
+        )),
+        "{stdout}"
     );
 }
 
@@ -752,6 +2007,23 @@ fn cli_collaboration_commands_are_schema_stable_and_atomic() {
         json!({
             "schema": 1,
             "scope": "all-supported-stories",
+            "options": {
+                "granularity": "run",
+                "ignore_formatting": false,
+                "ignore_whitespace": false,
+                "ignore_fields": false,
+                "ignore_comments": false,
+                "ignored_stories": [],
+            },
+            "revisions": 2,
+            "stories": [
+                {
+                    "kind": "body",
+                    "part_name": "/word/document.xml",
+                    "owner_index": 0,
+                    "revisions": 2,
+                },
+            ],
             "main_story_revisions": 2,
             "diagnostics": [],
             "output": path_text(&redline),
@@ -765,19 +2037,29 @@ fn cli_collaboration_commands_are_schema_stable_and_atomic() {
         value,
         json!({
             "schema": 1,
-            "scope": "main",
+            "scope": "all-supported-stories",
             "revisions": [
                 {
                     "id": 0,
                     "author": "Alice",
                     "timestamp": "2026-09-13T12:00:00Z",
                     "kind": "deletion",
+                    "story": {
+                        "kind": "body",
+                        "part_name": "/word/document.xml",
+                        "owner_index": 0,
+                    },
                 },
                 {
                     "id": 1,
                     "author": "Alice",
                     "timestamp": "2026-09-13T12:00:00Z",
                     "kind": "insertion",
+                    "story": {
+                        "kind": "body",
+                        "part_name": "/word/document.xml",
+                        "owner_index": 0,
+                    },
                 },
             ],
         })
@@ -963,6 +2245,188 @@ fn comment_commands_round_trip_one_resolved_thread() {
     assert_eq!(Document::open(&input).unwrap().comments().len(), 0);
 }
 
+/// GitHub issue #172: `comment add` counts runs the way `text --json` lists
+/// them, including the runs of an inline content control.
+#[test]
+fn comment_add_counts_the_runs_that_text_json_lists() {
+    let temp = TempWorkspace::new("comment-inline-control");
+    let input = temp.path.join("input.docx");
+    let mut document = fixture_document(&[]);
+    let mut paragraph = document.add_paragraph("");
+    for text in ["before ", "TAR", "GET", " after"] {
+        paragraph.add_run(text);
+    }
+    document.save(&input).unwrap();
+    let mut package = OpcPackage::open(&input).unwrap();
+    let part = package.main_document_part().unwrap();
+    let xml = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
+    let start = xml[..xml.find(">TAR<").unwrap()].rfind("<w:r>").unwrap();
+    let end =
+        xml.find(">GET<").unwrap() + xml[xml.find(">GET<").unwrap()..].find("</w:r>").unwrap();
+    let xml = format!(
+        "{}<w:sdt><w:sdtPr/><w:sdtContent>{}</w:r></w:sdtContent></w:sdt>{}",
+        &xml[..start],
+        &xml[start..end],
+        &xml[end + "</w:r>".len()..]
+    );
+    package.set_part(&part, xml.into_bytes());
+    package.save(&input).unwrap();
+
+    let text = cli(&["text", path_text(&input), "--json"]);
+    assert_success(&text, "text --json");
+    let value: serde_json::Value = serde_json::from_slice(&text.stdout).unwrap();
+    let runs = value["paragraphs"][0]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(runs, ["before ", "TAR", "GET", " after"]);
+
+    let add = |start_run: &str, end_run: &str, output: &Path| {
+        cli(&[
+            "comment",
+            "add",
+            path_text(&input),
+            "--start-paragraph",
+            "0",
+            "--start-run",
+            start_run,
+            "--end-paragraph",
+            "0",
+            "--end-run",
+            end_run,
+            "--author",
+            "Alice",
+            "--text",
+            "Here",
+            "--output",
+            path_text(output),
+        ])
+    };
+    let added = temp.path.join("added.docx");
+    assert_success(&add("1", "3", &added), "comment add");
+    let package = OpcPackage::open(&added).unwrap();
+    let xml = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
+    let anchored =
+        &xml[xml.find("<w:commentRangeStart").unwrap()..xml.find("<w:commentRangeEnd").unwrap()];
+    let anchored_text = anchored
+        .split("<w:t>")
+        .skip(1)
+        .map(|text| &text[..text.find("</w:t>").unwrap()])
+        .collect::<String>();
+    assert_eq!(anchored_text, "TARGET");
+
+    // From inside the control to after it cannot be anchored exactly.
+    let refused = temp.path.join("refused.docx");
+    let output = add("2", "4", &refused);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("crosses the edge of an inline content control"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!refused.exists());
+}
+
+#[test]
+fn comment_add_and_reply_write_the_given_rfc3339_date() {
+    const ADDED: &str = "2026-09-29T08:30:00Z";
+    const REPLIED: &str = "2026-09-29T10:45:00+02:00";
+    let temp = TempWorkspace::new("comment-dates");
+    let input = temp.path.join("input.docx");
+    let added_path = temp.path.join("added.docx");
+    let replied_path = temp.path.join("replied.docx");
+    write_document(&input, &["Comment target"]);
+    let add = |date: &str, output: &Path| {
+        cli(&[
+            "comment",
+            "add",
+            path_text(&input),
+            "--start-paragraph",
+            "0",
+            "--start-run",
+            "0",
+            "--end-paragraph",
+            "0",
+            "--end-run",
+            "1",
+            "--author",
+            "Alice",
+            "--text",
+            "Review this",
+            "--date",
+            date,
+            "--output",
+            path_text(output),
+        ])
+    };
+
+    assert_success(&add(ADDED, &added_path), "dated comment add");
+    let replied = cli(&[
+        "comment",
+        "reply",
+        path_text(&added_path),
+        "--id",
+        "0",
+        "--author",
+        "Bob",
+        "--text",
+        "Agreed",
+        "--date",
+        REPLIED,
+        "--output",
+        path_text(&replied_path),
+    ]);
+    assert_success(&replied, "dated comment reply");
+
+    let document = Document::open(&replied_path).unwrap();
+    let dates = document
+        .comments()
+        .iter()
+        .map(|comment| comment.date().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(dates, [Some(ADDED.to_owned()), Some(REPLIED.to_owned())]);
+    let comments_xml = package_part_text(&replied_path, "/word/comments.xml");
+    assert!(comments_xml.contains(&format!(r#"w:date="{ADDED}""#)));
+    assert!(comments_xml.contains(&format!(r#"w:date="{REPLIED}""#)));
+
+    for invalid in ["2026-02-30T00:00:00Z", "2026-09-29", "yesterday"] {
+        let rejected_path = temp.path.join("rejected.docx");
+        let rejected = add(invalid, &rejected_path);
+        assert_eq!(rejected.status.code(), Some(1), "{invalid}");
+        assert!(rejected.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(rejected.stderr).unwrap(),
+            format!("Error: invalid RFC 3339 comment timestamp: {invalid}\n")
+        );
+        assert!(!rejected_path.exists());
+    }
+    let rejected_reply_path = temp.path.join("rejected-reply.docx");
+    let rejected_reply = cli(&[
+        "comment",
+        "reply",
+        path_text(&added_path),
+        "--id",
+        "0",
+        "--author",
+        "Bob",
+        "--text",
+        "Agreed",
+        "--date",
+        "2026-09-29T25:00:00Z",
+        "--output",
+        path_text(&rejected_reply_path),
+    ]);
+    assert_eq!(rejected_reply.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rejected_reply.stderr)
+            .contains("invalid RFC 3339 comment timestamp: 2026-09-29T25:00:00Z")
+    );
+    assert!(!rejected_reply_path.exists());
+}
+
 #[test]
 fn revision_filters_change_only_matching_revisions() {
     let temp = TempWorkspace::new("revision-filters");
@@ -1116,6 +2580,337 @@ fn compare_accept_and_reject_reproduce_each_input() {
     );
 }
 
+const COMPARE_TIMESTAMP: &str = "2026-09-29T12:00:00Z";
+
+/// Run `rdocx compare --json` and return its record.
+fn compare_record(original: &Path, edited: &Path, redline: &Path, options: &[&str]) -> Value {
+    let mut args = vec![
+        "compare",
+        path_text(original),
+        path_text(edited),
+        "--author",
+        "Reviewer",
+        "--timestamp",
+        COMPARE_TIMESTAMP,
+        "--output",
+        path_text(redline),
+        "--json",
+    ];
+    args.extend_from_slice(options);
+    let output = cli(&args);
+    assert_success(&output, &format!("compare {options:?}"));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn compare_defaults_to_whole_runs_and_word_marks_only_the_changed_word() {
+    const LOREM: &str =
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.";
+    let edited_text = LOREM.replace("dolor", "DOLOR");
+    let temp = TempWorkspace::new("compare-granularity");
+    let original = temp.path.join("original.docx");
+    let edited = temp.path.join("edited.docx");
+    write_document(&original, &[LOREM, "Second paragraph"]);
+    write_document(&edited, &[&edited_text, "Second paragraph"]);
+
+    for (granularity, recorded, deleted) in [
+        (None, "run", LOREM),
+        (Some("run"), "run", LOREM),
+        (Some("word"), "word", "dolor"),
+        (Some("character"), "character", "dolor"),
+    ] {
+        let redline = temp
+            .path
+            .join(format!("redline-{recorded}-{}.docx", granularity.is_some()));
+        let options = granularity
+            .map(|granularity| vec!["--granularity", granularity])
+            .unwrap_or_default();
+        let record = compare_record(&original, &edited, &redline, &options);
+        assert_eq!(record["options"]["granularity"], recorded);
+        assert_eq!(record["main_story_revisions"], 2, "{granularity:?}");
+        assert_eq!(
+            deleted_text(&package_part_text(&redline, "/word/document.xml")).trim(),
+            deleted,
+            "{granularity:?}"
+        );
+        let mut accepted = Document::open(&redline).unwrap();
+        accepted.accept_all().unwrap();
+        assert_eq!(
+            accepted.text(),
+            format!("{edited_text}\nSecond paragraph\n")
+        );
+        let mut rejected = Document::open(&redline).unwrap();
+        rejected.reject_all().unwrap();
+        assert_eq!(rejected.text(), format!("{LOREM}\nSecond paragraph\n"));
+    }
+}
+
+#[test]
+fn compare_ignore_flags_keep_the_original_side() {
+    let temp = TempWorkspace::new("compare-ignore");
+    let path = |name: &str| temp.path.join(name);
+
+    write_document(&path("plain.docx"), &["plain"]);
+    let mut bold = fixture_document(&[]);
+    bold.add_paragraph("").add_run("plain").set_bold(true);
+    bold.save(path("bold.docx")).unwrap();
+
+    write_document(&path("spaced.docx"), &["old  tail"]);
+    write_document(&path("single.docx"), &["old tail"]);
+
+    for (name, result) in [("page-one.docx", "1"), ("page-two.docx", "2")] {
+        write_document(&path(name), &["FIELD"]);
+        rewrite_run(&path(name), "FIELD", |_| {
+            format!(
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>{result}</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#
+            )
+        });
+    }
+
+    for (original, edited, flag, key) in [
+        (
+            "plain.docx",
+            "bold.docx",
+            "--ignore-formatting",
+            "ignore_formatting",
+        ),
+        (
+            "spaced.docx",
+            "single.docx",
+            "--ignore-whitespace",
+            "ignore_whitespace",
+        ),
+        (
+            "page-one.docx",
+            "page-two.docx",
+            "--ignore-fields",
+            "ignore_fields",
+        ),
+    ] {
+        let tracked = compare_record(
+            &path(original),
+            &path(edited),
+            &path(&format!("tracked-{key}.docx")),
+            &[],
+        );
+        assert_ne!(tracked["main_story_revisions"], 0, "{flag}");
+        let ignored_path = path(&format!("ignored-{key}.docx"));
+        let ignored = compare_record(&path(original), &path(edited), &ignored_path, &[flag]);
+        assert_eq!(ignored["options"][key], true, "{flag}");
+        assert_eq!(ignored["main_story_revisions"], 0, "{flag}");
+        assert_eq!(
+            Document::open(&ignored_path).unwrap().text(),
+            Document::open(path(original)).unwrap().text(),
+            "{flag}"
+        );
+    }
+
+    // The edited side carries a comment added by the CLI and one changed word.
+    write_document(&path("reviewed.docx"), &["Review this", "old ending"]);
+    let commented = cli(&[
+        "comment",
+        "add",
+        path_text(&path("reviewed.docx")),
+        "--start-paragraph",
+        "0",
+        "--start-run",
+        "0",
+        "--end-paragraph",
+        "0",
+        "--end-run",
+        "1",
+        "--author",
+        "Bob",
+        "--text",
+        "edited side note",
+        "--output",
+        path_text(&path("commented.docx")),
+    ]);
+    assert_success(&commented, "comment add on the edited copy");
+    let replaced = cli(&[
+        "replace",
+        path_text(&path("commented.docx")),
+        "--placeholder",
+        "old",
+        "--value",
+        "new",
+        "--expect",
+        "1",
+        "--output",
+        path_text(&path("rewritten.docx")),
+    ]);
+    assert_success(&replaced, "replace on the edited copy");
+    let redline = path("comments-ignored.docx");
+    let record = compare_record(
+        &path("reviewed.docx"),
+        &path("rewritten.docx"),
+        &redline,
+        &["--ignore-comments"],
+    );
+    assert_eq!(record["options"]["ignore_comments"], true);
+    assert_eq!(record["main_story_revisions"], 2);
+    let document = Document::open(&redline).unwrap();
+    assert!(document.comments().is_empty());
+    assert_eq!(
+        deleted_text(&package_part_text(&redline, "/word/document.xml")),
+        "old ending"
+    );
+}
+
+#[test]
+fn compare_ignore_story_names_follow_the_python_story_kinds() {
+    let temp = TempWorkspace::new("compare-stories");
+    let original = temp.path.join("original.docx");
+    let edited = temp.path.join("edited.docx");
+    for (path, word) in [(&original, "old"), (&edited, "new")] {
+        let mut document = fixture_document(&[&format!("{word} body")]);
+        document.set_header(&format!("{word} header"));
+        document.save(path).unwrap();
+    }
+    let header = header_part_name(&original);
+    let both_tracked = ("old body".to_owned(), "old header".to_owned());
+    let tracked_stories = |redline: &Path| {
+        (
+            deleted_text(&package_part_text(redline, "/word/document.xml")),
+            deleted_text(&package_part_text(redline, &header)),
+        )
+    };
+
+    let redline = temp.path.join("default.docx");
+    let record = compare_record(&original, &edited, &redline, &[]);
+    assert_eq!(record["options"]["ignored_stories"], json!([]));
+    assert_eq!(tracked_stories(&redline), both_tracked);
+
+    let redline = temp.path.join("header-ignored.docx");
+    let record = compare_record(&original, &edited, &redline, &["--ignore-story", "header"]);
+    assert_eq!(record["options"]["ignored_stories"], json!(["header"]));
+    assert_eq!(
+        tracked_stories(&redline),
+        ("old body".to_owned(), String::new())
+    );
+    assert!(package_part_text(&redline, &header).contains("old header"));
+
+    let redline = temp.path.join("body-ignored.docx");
+    let record = compare_record(&original, &edited, &redline, &["--ignore-story", "body"]);
+    assert_eq!(record["options"]["ignored_stories"], json!(["body"]));
+    assert_eq!(record["main_story_revisions"], 0);
+    assert_eq!(
+        tracked_stories(&redline),
+        (String::new(), "old header".to_owned())
+    );
+
+    let others = ["footer", "comment", "text_box", "footnote", "endnote"];
+    let options = others
+        .iter()
+        .flat_map(|story| ["--ignore-story", story])
+        .collect::<Vec<_>>();
+    let redline = temp.path.join("others-ignored.docx");
+    let record = compare_record(&original, &edited, &redline, &options);
+    assert_eq!(record["options"]["ignored_stories"], json!(others));
+    assert_eq!(tracked_stories(&redline), both_tracked);
+}
+
+#[test]
+fn compare_rejects_unknown_and_duplicate_options_before_writing() {
+    let temp = TempWorkspace::new("compare-invalid-options");
+    let original = temp.path.join("original.docx");
+    let edited = temp.path.join("edited.docx");
+    let redline = temp.path.join("redline.docx");
+    write_document(&original, &["before"]);
+    write_document(&edited, &["after"]);
+
+    for (options, status, message) in [
+        (
+            &["--granularity", "words"][..],
+            2,
+            r#"unknown comparison granularity "words", expected run, word, or character"#,
+        ),
+        (
+            &["--ignore-story", "main"][..],
+            2,
+            r#"unknown comparison story "main", expected body, header, footer, comment, text_box, footnote, or endnote"#,
+        ),
+        (
+            &["--ignore-story", "table_cell"][..],
+            2,
+            r#"unknown comparison story "table_cell""#,
+        ),
+        (
+            &["--ignore-story", "header", "--ignore-story", "header"][..],
+            1,
+            "comparison options contain a duplicate ignored story",
+        ),
+    ] {
+        let mut args = vec![
+            "compare",
+            path_text(&original),
+            path_text(&edited),
+            "--author",
+            "Reviewer",
+            "--timestamp",
+            COMPARE_TIMESTAMP,
+            "--output",
+            path_text(&redline),
+        ];
+        args.extend_from_slice(options);
+        let rejected = cli(&args);
+        assert_eq!(rejected.status.code(), Some(status), "{options:?}");
+        assert!(rejected.stdout.is_empty(), "{options:?}");
+        let stderr = String::from_utf8(rejected.stderr).unwrap();
+        assert!(stderr.contains(message), "{options:?}: {stderr}");
+        assert!(!redline.exists(), "{options:?}");
+    }
+}
+
+#[test]
+fn compare_counts_the_revisions_it_creates_in_each_story() {
+    let temp = TempWorkspace::new("footer-compare");
+    let (original, edited) = write_footer_revision_inputs(&temp);
+    let redline = temp.path.join("redline.docx");
+    let text_redline = temp.path.join("text-redline.docx");
+
+    let compared = compare_footer_inputs(&original, &edited, &redline, true);
+    assert_success(&compared, "compare footer JSON");
+    let value: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "schema": 1,
+            "scope": "all-supported-stories",
+            "options": {
+                "granularity": "run",
+                "ignore_formatting": false,
+                "ignore_whitespace": false,
+                "ignore_fields": false,
+                "ignore_comments": false,
+                "ignored_stories": [],
+            },
+            "revisions": 2,
+            "stories": [
+                {
+                    "kind": "footer",
+                    "part_name": "/word/footer1.xml",
+                    "owner_index": 0,
+                    "revisions": 2,
+                },
+            ],
+            "main_story_revisions": 0,
+            "diagnostics": [],
+            "output": path_text(&redline),
+        })
+    );
+
+    let compared = compare_footer_inputs(&original, &edited, &text_redline, false);
+    assert_success(&compared, "compare footer text");
+    assert_eq!(
+        String::from_utf8_lossy(&compared.stdout),
+        format!(
+            "Created 2 revision element(s) in 1 story(ies)\n  footer\t/word/footer1.xml\t0\t2\nDiagnostics: 0\nWritten to {}\n",
+            path_text(&text_redline)
+        )
+    );
+}
+
 #[test]
 fn cli_structured_text_layout_and_guarded_replace_preserve_exact_contracts() {
     let temp = TempWorkspace::new("structured-automation");
@@ -1133,7 +2928,7 @@ fn cli_structured_text_layout_and_guarded_replace_preserve_exact_contracts() {
     assert_success(&text, "structured text");
     let text: serde_json::Value = serde_json::from_slice(&text.stdout).unwrap();
     assert_eq!(text["schema"], 1);
-    assert_eq!(text["scope"], "main");
+    assert_eq!(text["scope"], "all-supported-stories");
     assert_eq!(text["revision_view"], "accepted");
     assert_eq!(text["paragraphs"].as_array().unwrap().len(), 2);
     assert_eq!(text["paragraphs"][0]["body_index"], 0);
@@ -1231,7 +3026,7 @@ fn text_json_preserves_nested_paths_styles_numbering_and_run_formatting() {
         value,
         json!({
             "schema": 1,
-            "scope": "main",
+            "scope": "all-supported-stories",
             "revision_view": "accepted",
             "paragraphs": [
                 {
@@ -1274,7 +3069,99 @@ fn text_json_preserves_nested_paths_styles_numbering_and_run_formatting() {
                         {"index": 0, "text": "nested", "formatting": null}
                     ]
                 }
-            ]
+            ],
+            "stories": []
         })
     );
+}
+
+fn write_footer_revision_inputs(temp: &TempWorkspace) -> (PathBuf, PathBuf) {
+    let original = temp.path.join("original.docx");
+    let edited = temp.path.join("edited.docx");
+    for (path, footer) in [
+        (&original, "Footer lorem ipsum"),
+        (&edited, "Footer lorem IPSUM"),
+    ] {
+        let mut document = fixture_document(&["Body."]);
+        document.set_footer(footer);
+        document.save(path).expect("write footer fixture");
+    }
+    (original, edited)
+}
+
+fn compare_footer_inputs(original: &Path, edited: &Path, output: &Path, json: bool) -> Output {
+    let mut args = vec![
+        "compare",
+        path_text(original),
+        path_text(edited),
+        "--author",
+        "R",
+        "--timestamp",
+        "2026-09-27T12:00:00Z",
+        "--output",
+        path_text(output),
+    ];
+    if json {
+        args.push("--json");
+    }
+    cli(&args)
+}
+
+#[test]
+fn revision_list_names_the_story_of_compared_footer_revisions() {
+    let temp = TempWorkspace::new("footer-revision-list");
+    let (original, edited) = write_footer_revision_inputs(&temp);
+    let redline = temp.path.join("redline.docx");
+    let accepted = temp.path.join("accepted.docx");
+
+    let unchanged = cli(&["revision", "list", path_text(&original)]);
+    assert_success(&unchanged, "revision list without revisions");
+    assert_eq!(
+        String::from_utf8_lossy(&unchanged.stdout),
+        "(no revisions)\n"
+    );
+
+    let compared = compare_footer_inputs(&original, &edited, &redline, false);
+    assert_success(&compared, "compare footer");
+
+    let listed = cli(&["revision", "list", path_text(&redline), "--json"]);
+    assert_success(&listed, "revision list footer JSON");
+    let value: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(value["scope"], "all-supported-stories");
+    let records = value["revisions"].as_array().expect("revision records");
+    assert_eq!(records.len(), 2, "{value}");
+    for record in records {
+        assert_eq!(
+            record["story"],
+            json!({
+                "kind": "footer",
+                "part_name": "/word/footer1.xml",
+                "owner_index": 0,
+            })
+        );
+        assert_eq!(record["author"], "R");
+    }
+
+    let listed = cli(&["revision", "list", path_text(&redline)]);
+    assert_success(&listed, "revision list footer text");
+    let lines = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    for line in lines.lines() {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 7, "{line}");
+        assert_eq!(columns[1..3], ["R", "2026-09-27T12:00:00Z"], "{line}");
+        assert_eq!(columns[4..], ["footer", "/word/footer1.xml", "0"], "{line}");
+    }
+
+    let resolved = cli(&[
+        "revision",
+        "accept",
+        path_text(&redline),
+        "--output",
+        path_text(&accepted),
+        "--json",
+    ]);
+    assert_success(&resolved, "revision accept footer");
+    let value: serde_json::Value = serde_json::from_slice(&resolved.stdout).unwrap();
+    assert_eq!(value["resolved"], records.len());
 }

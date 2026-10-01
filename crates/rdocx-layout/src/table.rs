@@ -258,6 +258,10 @@ pub struct TableRow {
     pub keep_next: bool,
     /// Whether Word forbids a page break inside this row.
     pub cant_split: bool,
+    /// The minimum height in points a `w:trHeight` that is not exact asks
+    /// for, zero without one. Word splits the row across pages only when the
+    /// part that stays on the first page reaches it.
+    pub min_height: f64,
     /// Distance in points from the table origin to this row's first painted
     /// cell, resolved from the row's omitted grid columns and their width.
     ///
@@ -822,6 +826,7 @@ fn layout_table_inner(
             is_header,
             keep_next,
             cant_split: row_properties.cant_split.unwrap_or(false),
+            min_height: if exact { 0.0 } else { specified_height },
             offset_left,
         });
         row_semantics.push(RowSemantics {
@@ -954,7 +959,8 @@ pub(crate) fn resolved_cell_edge<'a>(
         Some(edge) => edge,
         None => table_edge?,
     };
-    (!edge.val.is_none()).then_some(edge)
+    // A picture border has no line to draw, so that side draws none.
+    (!edge.val.is_none() && !matches!(edge.val, ST_Border::Art(_))).then_some(edge)
 }
 
 /// The height in points a horizontal border takes between two rows. A double
@@ -2206,6 +2212,7 @@ mod tests {
                 extra_namespaces: Vec::new(),
                 background_xml: None,
                 background_extra_xml: Vec::new(),
+                root_attributes: Vec::new(),
             },
             styles: styles.clone(),
             numbering: None,
@@ -2397,6 +2404,7 @@ mod tests {
                 extra_namespaces: Vec::new(),
                 background_xml: None,
                 background_extra_xml: Vec::new(),
+                root_attributes: Vec::new(),
             },
             styles: styles.clone(),
             numbering: None,

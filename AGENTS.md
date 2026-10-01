@@ -144,9 +144,11 @@ a file list that `/complete-feature` executes against.
 - The hash-harness baseline is exclusive. One story per sprint wave may move it.
 - Verification that decides anything runs once over the integrated result, not
   per worker.
-- Worker branches and worktrees remain available through sprint verification
-  and review. `/close-sprint` removes clean completed workers after pushing
-  `main` and the sprint tag.
+- Keep worker branches through sprint verification and review. After a worker's
+  handoff is consumed and its local integration commit is recorded, remove its
+  clean worktree without `--force` to save disk space. Keep any dirty, carried
+  or unrelated worktree. `/close-sprint` removes completed worker branches
+  after pushing `main` and the sprint tag.
 
 ## Review tasks
 

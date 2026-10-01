@@ -1,15 +1,21 @@
 ---
-description: Run every unfinished F-ID in the current sprint. Designs first, implements in safe parallel waves, verifies dependency-prefix checkpoints and the final integrated result, then loops on review until clean.
+description: Run every unfinished F-ID in the current sprint. Designs first, implements in safe parallel waves, completes scoped dependency-prefix checkpoints and verifies the final integrated result, then loops on review until clean.
 ---
 
 # /run-sprint [--max-review-passes N] [--max-workers N]
 
 Drive the whole active sprint. Design every story before implementing any of
-them, run independent stories in parallel worktrees, verify dependency-prefix
-checkpoints and the final integrated result, and loop on `/sprint-review` until
+them, run independent stories in parallel worktrees, complete scoped dependency-prefix
+checkpoints and verify the final integrated result, then loop on `/sprint-review` until
 it comes back clean.
 
 Defaults are three review passes and as many workers as the wave allows.
+
+Each worker keeps its implementation scoped to its approved F-ID, with focused
+tests, the applicable oracle cases, `/verify --scoped` and a zero-finding
+`/microscope`. Reserve `/verify --full`, the union of sprint risk riders and
+`/sprint-review` for the integrated final result. A dependency-prefix
+checkpoint uses its scoped evidence and focused reconciliation checks.
 
 **`scripts/sprint_workflow.py` is the state authority.** Everything below is
 resumable through `.claude/scratch/SNN-run.json`. Reuse it rather than starting
@@ -39,8 +45,9 @@ exception described below, and it delegates the release tag to `/release`.
 
 5. Audit for leftovers from an interrupted run. `git worktree list` and
    `git branch --list 'work/*'` against the run state. Report anything the state
-   does not know about. **Do not delete a worktree or branch.** Worker cleanup
-   belongs to `/close-sprint` after the integrated sprint is pushed.
+   does not know about. Remove only clean completed worker worktrees whose
+   handoff and integration commit are recorded. Keep their branches until
+   `/close-sprint` has pushed the integrated sprint.
 6. Report every F-ID that is not `completed`, with its state, its dependencies,
    and the skills its diff will trigger.
 
@@ -158,41 +165,29 @@ else. Mark it `blocked`, say why, and carry on with the independent waves.
 
 ### Dependency-prefix checkpoint
 
-Use this route whenever the step 3 trigger matches. Keep the same sprint state
-file and repeat the route before every later wave whose formal dependency is not
-completed. Do not claim the dependent wave while its prerequisite is only
-prepared, integrated, or reviewed.
+Use this route when a later F-ID formally depends on an integrated story that
+is still `reviewed`. The prerequisite must become `completed` before the
+consumer starts, but full sprint verification and `/sprint-review` stay at
+sprint closure. Keep the same sprint run state.
 
-Pass numbering remains global in the sprint state. Treat each prefix-record,
-prepared-release, post-publication, and final-closure review as a distinct
-boundary with at most the configured review-pass bound. When the global pass
-number exceeds that bound only because earlier boundaries finished clean, use
-`record-review --extend` and record `scheduled dependency-prefix boundary` as
-the reason in the review file. This does not extend the current boundary's own
-remediation limit. If that limit is reached with actionable findings, mark the
-sprint blocked.
+1. Integrate the prepared prerequisite through `/integrate-feature ...
+   --batch`. Review its incremental integration diff against its approved
+   plan. A semantic conflict receives another `/microscope` pass after
+   reconciliation.
+2. Confirm the worker's `/verify --scoped`, focused oracle cases, hash result,
+   test gate and zero-finding microscope remain valid for the integrated
+   prefix. Run focused checks for any integration-only reconciliation. Do not
+   run `/verify --full` or `/sprint-review` at this checkpoint.
+3. Apply the non-release documentation and delivery-record steps in section 7
+   for that prerequisite. Mark it `completed`, clear its owner, and commit
+   those records. Keep the worker branch for final sprint review. Remove its
+   clean worktree after recording the integration commit to save disk space.
+4. Return the phase to `implementation` and start the dependent wave. Record
+   that full verification and sprint review are still due at final closure.
 
-1. Set the phase to `integration`. Integrate the prepared dependency prefix in
-   dependency order through `/integrate-feature ... --batch`. Do not integrate
-   or claim its unfinished consumer.
-2. Run `/verify --full`, add the prefix's risk riders, and record the passing
-   result at the current HEAD.
-3. Finalise the reviewed non-release prefix through `## 7. Finalise the record`.
-   Update its HLD and delivery records, mark each prefix F-ID completed, clear
-   its owner, and commit the records.
-4. Run `/verify --full` at the record HEAD, then complete the bounded
-   `/sprint-review` loop. When a pass is clean, preserve this exact order:
-   - Commit the clean review file without any other change.
-   - Run `record-review` to record the clean review at the resulting HEAD.
-   - Rerun `/verify --full` because the review commit changed HEAD, and record
-     that passing result at the same HEAD.
-
-   Do not run a confirmation review solely because its clean review file was
-   committed. The committed review remains the review evidence for that HEAD,
-   and the repeated full verification proves the commit introduced no failure.
-5. Return the phase to `implementation`. Start only waves whose formal
-   dependencies are now completed. For A to B to C, complete this route for A
-   before B starts and again for B before C starts.
+The final `/verify --full` and `/sprint-review` cover the complete integrated
+sprint at its current HEAD. A dependency checkpoint never supplies closure
+evidence for that final result.
 
 #### Release dependency extension
 
@@ -336,8 +331,8 @@ When the latest pass is clean:
    - Integrated F-IDs, and anything blocked or carried.
    - The verification evidence, especially the harness result.
    - Review passes and their verdicts.
-   - **Retained worker branches and worktrees**, which `/close-sprint` will
-     remove after the sprint merge and tag are pushed.
+   - **Retained worker branches and any remaining worktrees**, which
+     `/close-sprint` will clean after the sprint merge and tag are pushed.
    - The exact next command:
 
      ```text
@@ -351,8 +346,9 @@ When the latest pass is clean:
   integrated result.** That is precisely the failure `/sprint-review` exists to
   catch.
 - **Re-recording the hash baseline to make step 6 pass.**
-- **Deleting a worker branch or worktree.** `/close-sprint` owns cleanup after
-  the sprint is safely pushed.
+- **Deleting a worker branch before `/close-sprint`, or removing a dirty,
+  carried or unrelated worktree.** Only clean integrated worker worktrees may
+  be removed early.
 - **Running a confirmation pass after a clean review pass.**
 - **Asking the user to rerun `/run-sprint` solely to cross from a completed
   review pass into its remediation phase.**

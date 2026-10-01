@@ -85,8 +85,12 @@ programs into transient ordinary PresentationML groups before the shared
 resolver runs. Authoritative data-node text, layout-owned decorative shapes,
 quick styles, colours, connector paths, and the graphic-frame transform flow
 through the same text, paint, effect, geometry, group, and clipping machinery
-as ordinary shapes. Static, timeline, media, and animation entry points reuse
-that resolved group. Unsupported or invalid programs retain a visible bounds
+as ordinary shapes. The centred layouts set node alignment and line spacing as
+typed defaults that fill only what a data paragraph's own `a:pPr` leaves
+unset, so a node whose data says `algn="r"` renders right-aligned rather than
+as a labelled placeholder. An empty data paragraph takes no defaults. Static,
+timeline, media, and animation entry points reuse that resolved group.
+Unsupported or invalid programs retain a visible bounds
 fallback and a stable diagnostic. The renderer never reads diagram XML or
 treats a cached diagram drawing as authoritative.
 
@@ -296,6 +300,31 @@ with no visible difference and no failing test.
 
 Two writes of one document cannot detect that, since they reuse the same map
 instances. The regression builds two documents and compares their bytes.
+
+**The text layer follows what each glyph draws.** A `GlyphRun` carries its
+glyphs and its text but not the shaper's clusters, and a ligature draws several
+characters with one glyph, so pairing them by index shifts every later glyph.
+The writer reads the pairing from the font instead. A glyph draws the next
+character when the cmap gives it that character, and the next few when a GSUB
+ligature joins their glyphs into it, so the Carlito `ti` or `ffi` of a Calibri
+document extracts as its characters. Glyphs the font explains neither way share
+the characters up to the next glyph it does explain, looked for within 16
+glyphs and characters. When there is none, an unexplained glyph takes one
+character by position, which keeps the pairing linear in a run the font
+explains nowhere. A plain run has no `ActualText`, so there a glyph that draws
+none of its group's characters by itself adds no ToUnicode text rather than
+repeat a character another glyph carries, and neither does a glyph left after
+the run's last character. A rich run's clusters give their characters to their
+glyphs the same way, so no character of a cluster is lost. In a rich run, a
+glyph that draws none of them by itself, such as the dots an Arabic font draws
+apart from their letter, repeats the text of its cluster, which the run's
+`ActualText` covers, so every glyph of a rich run maps to Unicode. The
+ToUnicode CMap holds one entry per glyph for the whole font, so a glyph that
+draws different text in different places keeps its strongest pairing, a GSUB
+ligature first, then the cmap, then an inferred pairing. The ligature comes
+first because one glyph can be both, as the Carlito `fi` ligature and U+FB01
+are, and one literal U+FB01 must not turn every `fi` of the document into
+U+FB01.
 
 When `LayoutResult::structure` is present, the writer emits deterministic
 `BDC` and `EMC` pairs with page-local MCIDs, `/StructParents`, one parent number
@@ -1078,8 +1107,12 @@ deterministic renderers use their own bundle. Tracked layouts remain uncached
 and use the normal engine with a distinct revision-view paragraph identity.
 Caller-supplied font layouts construct an isolated engine, remain uncached, and
 cannot observe bundled or system fonts. Caller-font access returns an owned
-bundle. The separate bundled-fallback caller-font mode retains one reusable
-deterministic-base engine. Caller faces have highest priority, missing families
+bundle. `to_pdf_with_fonts` instead lays out uncached in a fresh normal-font
+engine with the caller fonts loaded over it, so a family the caller does not
+supply resolves as `to_pdf` resolves it, from system fonts when the
+`system-fonts` feature is enabled and then from the bundled fonts. The separate
+bundled-fallback caller-font mode retains one reusable deterministic-base
+engine. Caller faces have highest priority, missing families
 resolve from bundled faces, and system fonts remain unavailable. Its owned
 result shares immutable pages and font bytes without caching the completed
 bundle. Every PDF and raster path borrows its `LayoutResult` field from the same
@@ -1462,6 +1495,14 @@ so the rectangle is inset here and the edges carry no further offset.
 section's own first page, and `w:zOrder="back"` draws the frame before every
 other element on the page while the default draws it after.
 
+That renderer draws `dashed`, `dotted`, `dotDash` and `dotDotDash` with a dash
+pattern and `double` as two lines. A style without a pattern of its own draws
+as the nearest one, `dashSmallGap` as `dashed` and `dashDotStroked` as
+`dotDash`, and every other line style, `triple` and the `thinThickThin` family
+included, draws as one solid line. A picture border such as `apples` has no
+line to draw, so it draws nothing, while every `ST_Border` token, picture
+borders included, survives an edit and a save.
+
 `w:lnNumType` numbers body lines in the margin. The number is right-aligned
 `w:distance` clear of the track it labels, defaulting to Word's automatic
 quarter inch, shaped at nine points through the deterministic font manager and
@@ -1575,6 +1616,10 @@ font files already present in `RenderInput` before lowering every slide.
 The `rpptx` facade assembles a presentation package into this input through its
 deterministic render boundary. It rejects a source-to-resolved shape-count
 difference and verifies that page count matches slide count before returning.
+Tables with a known built-in PowerPoint style ID receive the resolved family
+and theme accent even when `ppt/tableStyles.xml` omits the definition. The
+renderer consumes those resolved fills, text colours, and borders through the
+same deterministic page path as package-defined styles.
 The CLI thumbnail path uses this same boundary for slide one. It derives DPI
 from the rendered page width so the PNG is exactly 320 pixels wide while its
 height remains proportional, then applies the normal per-slide pixel bound.
@@ -1753,6 +1798,11 @@ projection is required, then a second pass resolves both forward and backward
 targets. Facade numbering layout is created lazily only when a REF or TOC
 consumer requires it.
 
+Native TOC insertion writes a dynamic field around its generated entry cache.
+The inserted field therefore uses the same rebuild and pagination path as a
+producer-authored dynamic TOC after headings change. The generated right tab
+uses the section text width, falling back to the Letter default when the width
+is absent, non-positive, or outside the supported twip range.
 Table-of-contents rebuild creates its provisional PAGEREF fields before
 calling the deterministic bundled-font layout. The existing post-pagination
 pass remains the only page-target authority. Rebuild reads those displayed

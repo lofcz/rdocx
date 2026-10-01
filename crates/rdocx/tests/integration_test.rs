@@ -11,9 +11,9 @@ use rdocx::table::{
     TableConditionalFormatting, TableLayout, TableLook, TableWidth, VerticalAlignment,
 };
 use rdocx::{
-    BodyItemRef, BorderStyle, Length, ListLevel, MhtmlDiagnostic, ParagraphRef, RunPosition,
-    RunRange, SectionBreak, StoryItemKind, StoryKind, StyleBuilder, TabAlignment, TabLeader,
-    TableStyleRegion, UnderlineStyle,
+    BodyItemRef, BorderStyle, Length, ListLevel, ListNumberFormat, MhtmlDiagnostic, ParagraphRef,
+    RunPosition, RunRange, SectionBreak, StoryItemKind, StoryKind, StyleBuilder, TabAlignment,
+    TabLeader, TableStyleRegion, UnderlineStyle,
 };
 use rdocx::{Document, PackageReadLimits, RevisionKind, WordCreationProfile, WordPackageClass};
 use rdocx_oxml::CT_BorderEdge;
@@ -693,6 +693,125 @@ fn legacy_section_geometry_setters_preserve_infallible_compatibility() {
     assert_eq!(section.gutter.unwrap().0, -3);
     assert_eq!(section.header_distance.unwrap().0, -4);
     assert_eq!(section.footer_distance.unwrap().0, -5);
+}
+
+#[test]
+fn section_page_margin_setters_write_every_required_attribute() {
+    let build = |fill: bool| {
+        let mut document = Document::new();
+        document.add_paragraph("first");
+        for index in 1..4 {
+            document.insert_section(index).unwrap();
+            document.add_paragraph("next");
+        }
+        if fill {
+            let inch = Length::twips(1440);
+            let half_inch = Length::twips(720);
+            let mut section = document.section_mut(1).unwrap();
+            section.set_gutter(Length::twips(0)).unwrap();
+            let mut section = document.section_mut(2).unwrap();
+            section.set_margins(inch, inch, inch, inch).unwrap();
+            let mut section = document.section_mut(3).unwrap();
+            section
+                .set_header_footer_distance(half_inch, half_inch)
+                .unwrap();
+        }
+        document
+    };
+
+    // Each setter writes the value layout assumes for an absent one, and so
+    // does every attribute it fills in, so the pages are unchanged.
+    let mut filled = build(true);
+    assert_eq!(
+        filled.to_pdf_deterministic().unwrap(),
+        build(false).to_pdf_deterministic().unwrap()
+    );
+    let xml = String::from_utf8(document_xml(&mut filled)).unwrap();
+    let complete = concat!(
+        r#"<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440""#,
+        r#" w:gutter="0" w:header="720" w:footer="720"/>"#,
+    );
+    assert_eq!(xml.matches("<w:pgMar ").count(), 4, "{xml}");
+    assert_eq!(xml.matches(complete).count(), 4, "{xml}");
+
+    let mut section = filled.section_mut(3).unwrap();
+    section
+        .set_header_footer_distance(Length::twips(360), Length::twips(540))
+        .unwrap();
+    section
+        .set_margins(
+            Length::twips(720),
+            Length::twips(1080),
+            Length::twips(1440),
+            Length::twips(1800),
+        )
+        .unwrap();
+    assert_eq!(
+        section
+            .header_footer_distance()
+            .map(|(header, footer)| (header.to_twips(), footer.to_twips())),
+        Some((360, 540))
+    );
+    assert_eq!(section.gutter().map(Length::to_twips), Some(0));
+}
+
+/// `test_section_edits_write_the_native_body` in
+/// `crates/rdocx-py/tests/test_core.py` makes the same edits from Python and
+/// pins the same body, so CI checks that the binding writes what these native
+/// calls write.
+#[test]
+fn section_edits_write_the_body_the_python_binding_pins() {
+    let mut document = Document::new();
+    document.add_paragraph("first");
+    document.insert_section(1).unwrap();
+    let mut section = document.section_mut(0).unwrap();
+    section.set_orientation(ST_PageOrientation::Landscape);
+    // The values Python leaves out keep the section's own ones.
+    section
+        .set_margins(
+            Length::emu(457200),
+            Length::twips(1440),
+            Length::twips(1440),
+            Length::emu(1828800),
+        )
+        .unwrap();
+    section.set_page_number_start(3).unwrap();
+    section
+        .set_header_footer_distance(Length::twips(720), Length::emu(228600))
+        .unwrap();
+    section.set_different_first_page(true);
+    let mut section = document.section_mut(1).unwrap();
+    section
+        .set_page_size(Length::emu(7772400), Length::emu(10058400))
+        .unwrap();
+    section
+        .set_margins(
+            Length::emu(914400),
+            Length::emu(1143000),
+            Length::emu(685800),
+            Length::emu(1371600),
+        )
+        .unwrap();
+    section.set_gutter(Length::emu(127000)).unwrap();
+    section.set_columns(2, Length::emu(457200)).unwrap();
+    section.set_break_type(ST_SectionType::Continuous);
+    document.add_paragraph("second");
+
+    assert_eq!(
+        compact_body_xml(&mut document),
+        concat!(
+            r#"<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:pPr>"#,
+            r#"<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>"#,
+            r#"<w:pgMar w:top="720" w:right="1440" w:bottom="1440" w:left="2880""#,
+            r#" w:gutter="0" w:header="720" w:footer="360"/>"#,
+            r#"<w:pgNumType w:start="3"/><w:titlePg/></w:sectPr></w:pPr></w:p>"#,
+            r#"<w:p><w:r><w:t>second</w:t></w:r></w:p><w:sectPr>"#,
+            r#"<w:type w:val="continuous"/><w:pgSz w:w="12240" w:h="15840"/>"#,
+            r#"<w:pgMar w:top="1440" w:right="1800" w:bottom="1080" w:left="2160""#,
+            r#" w:gutter="200" w:header="720" w:footer="720"/>"#,
+            r#"<w:cols w:num="2" w:space="720"/></w:sectPr></w:body>"#,
+        )
+    );
 }
 
 struct F251OracleArtifacts {
@@ -2324,6 +2443,7 @@ mod settings_and_properties_tests {
                 last_modified_by: Some("Example reviewer".to_owned()),
                 created: Some("2026-09-07T00:00:00Z".to_owned()),
                 modified: Some("2026-09-07T01:00:00Z".to_owned()),
+                ..Default::default()
             })
             .unwrap();
         let mut application = AppProperties::default();
@@ -2421,6 +2541,38 @@ mod settings_and_properties_tests {
         assert_eq!(removed.default_tab_stop(), None);
         assert_eq!(removed.character_spacing_control(), None);
         assert_eq!(removed.theme_font_language(), None);
+    }
+
+    #[test]
+    fn every_core_property_survives_reopen_and_a_later_title_change() {
+        let text = |value: &str| Some(value.to_owned());
+        let properties = CoreProperties {
+            title: text("Draft title"),
+            category: text("Reports"),
+            content_status: text("Draft"),
+            identifier: text("DOC-7"),
+            language: text("en-GB"),
+            last_printed: text("2026-09-01T08:00:00Z"),
+            revision: text("4"),
+            version: text("1.2"),
+            ..Default::default()
+        };
+        let mut document =
+            Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document));
+        assert_eq!(document.core_properties(), None);
+        document.set_core_properties(properties.clone()).unwrap();
+
+        let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.core_properties(), Some(&properties));
+        reopened.set_title("Final title");
+        let reopened = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.core_properties(),
+            Some(&CoreProperties {
+                title: text("Final title"),
+                ..properties
+            })
+        );
     }
 
     #[test]
@@ -3576,6 +3728,118 @@ mod flat_opc_package_class_tests {
                 .unwrap(),
             WordPackageClass::MacroEnabledTemplate
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_writes_the_package_class_that_the_path_extension_names() {
+        let directory = std::env::temp_dir().join(format!(
+            "rdocx-extension-class-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let main_content_type = |path: &std::path::Path| {
+            OpcPackage::open(path)
+                .unwrap()
+                .content_types
+                .override_for("/word/document.xml")
+                .unwrap()
+                .to_owned()
+        };
+
+        let template_path = directory.join("t.dotx");
+        Document::new().save(&template_path).unwrap();
+        assert_eq!(
+            main_content_type(&template_path),
+            content_types::WORD_TEMPLATE
+        );
+        let document_path = directory.join("b.docx");
+        Document::open(&template_path)
+            .unwrap()
+            .save(&document_path)
+            .unwrap();
+        assert_eq!(
+            main_content_type(&document_path),
+            content_types::WORD_DOCUMENT
+        );
+        let compact_path = directory.join("compact.dotm");
+        Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document))
+            .save(&compact_path)
+            .unwrap();
+        assert_eq!(
+            main_content_type(&compact_path),
+            content_types::WORD_TEMPLATE_MACRO_ENABLED
+        );
+
+        let mut vba_free = Document::new_with_profile(WordCreationProfile::WordCompatible(
+            WordPackageClass::MacroEnabledDocument,
+        ));
+        for (extension, class) in [
+            ("DOCX", WordPackageClass::Document),
+            ("docm", WordPackageClass::MacroEnabledDocument),
+            ("dotx", WordPackageClass::Template),
+            ("dotm", WordPackageClass::MacroEnabledTemplate),
+        ] {
+            let path = directory.join(format!("converted.{extension}"));
+            vba_free.save(&path).unwrap();
+            assert_eq!(main_content_type(&path), content_type(class), "{extension}");
+            let bytes = vba_free.to_bytes_for_path(&path).unwrap();
+            assert_eq!(
+                Document::from_bytes(&bytes)
+                    .unwrap()
+                    .package_class()
+                    .unwrap(),
+                class
+            );
+        }
+        let other_path = directory.join("converted.bin");
+        vba_free.save(&other_path).unwrap();
+        assert_eq!(
+            main_content_type(&other_path),
+            content_types::WORD_DOCUMENT_MACRO_ENABLED
+        );
+        assert_eq!(
+            vba_free.package_class().unwrap(),
+            WordPackageClass::MacroEnabledDocument
+        );
+
+        for (class, same_class, refused) in [
+            (WordPackageClass::Template, "dotx", &["docx"][..]),
+            (
+                WordPackageClass::MacroEnabledDocument,
+                "docm",
+                &["docx", "dotx"][..],
+            ),
+        ] {
+            let mut document =
+                Document::from_bytes(&package_bytes(&source_package(class))).unwrap();
+            let same_class_path = directory.join(format!("vba-same.{same_class}"));
+            document.save(&same_class_path).unwrap();
+            assert_eq!(main_content_type(&same_class_path), content_type(class));
+            let converted_path = directory.join("vba-converted.dotm");
+            document.save(&converted_path).unwrap();
+            assert_eq!(
+                main_content_type(&converted_path),
+                content_types::WORD_TEMPLATE_MACRO_ENABLED
+            );
+            assert_eq!(
+                OpcPackage::open(&converted_path)
+                    .unwrap()
+                    .get_part("/word/vbaProject.bin"),
+                Some(VBA_BYTES)
+            );
+            for extension in refused {
+                let path = directory.join(format!("vba-refused.{extension}"));
+                let error = document.save(&path).unwrap_err();
+                assert!(
+                    error.to_string().contains("VBA project"),
+                    "{class:?} {extension}: {error}"
+                );
+                assert!(!path.exists(), "{class:?} {extension}");
+                assert!(document.to_bytes_for_path(&path).is_err());
+            }
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4970,14 +5234,24 @@ fn rich_html_fragments_match_word_in_every_supported_container() {
         ("/word/footer-story.xml", 2, 1),
     ] {
         let relationships = package.get_part_rels(owner).unwrap();
+        let image_relationships = relationships
+            .items
+            .iter()
+            .filter(|relationship| relationship.rel_type == rel_types::IMAGE)
+            .collect::<Vec<_>>();
+        // Repeated copies of the same image share one relationship per story.
+        // Every drawing must still retain its reference to that relationship.
         assert_eq!(
-            relationships
-                .items
-                .iter()
-                .filter(|relationship| relationship.rel_type == rel_types::IMAGE)
-                .count(),
-            expected_images,
+            image_relationships.len(),
+            1,
             "image relationship owner {owner}"
+        );
+        let xml = String::from_utf8_lossy(package.get_part(owner).unwrap());
+        let reference = format!("r:embed=\"{}\"", image_relationships[0].id);
+        assert_eq!(
+            xml.matches(&reference).count(),
+            expected_images,
+            "image owner {owner}"
         );
         assert_eq!(
             relationships
@@ -6752,7 +7026,7 @@ fn rtf_writer_reports_each_lossy_item_without_dropping_supported_siblings() {
         [
             (
                 "body[1]",
-                "body content control was dropped during RTF export",
+                "body content control was flattened during RTF export",
             ),
             (
                 "body[2]",
@@ -6769,7 +7043,7 @@ fn rtf_writer_reports_each_lossy_item_without_dropping_supported_siblings() {
         ]
     );
     let reparsed = Document::from_rtf_bytes(&written.bytes).unwrap().document;
-    assert_eq!(reparsed.text(), "first\nlast\n");
+    assert_eq!(reparsed.text(), "first\ncontrol\nlast\n");
 }
 
 #[test]
@@ -7474,6 +7748,15 @@ fn document_xml(document: &mut Document) -> Vec<u8> {
     let bytes = document.to_bytes().unwrap();
     let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
     package.get_part("/word/document.xml").unwrap().to_vec()
+}
+
+/// The saved `w:body` on one line without indentation, the form the Python
+/// binding tests compare against the same pinned value.
+fn compact_body_xml(document: &mut Document) -> String {
+    let xml = String::from_utf8(document_xml(document)).unwrap();
+    let start = xml.find("<w:body>").unwrap();
+    let end = xml.find("</w:body>").unwrap() + "</w:body>".len();
+    xml[start..end].lines().map(str::trim).collect()
 }
 
 #[test]
@@ -8351,6 +8634,115 @@ fn checked_row_cell_topology_is_atomic() {
     for (cell, width) in original_widths.into_iter().enumerate() {
         assert_eq!(table.cell(0, cell).unwrap().width(), Some(width));
     }
+}
+
+/// `test_table_acceptance_workflow_writes_the_native_body` in
+/// `crates/rdocx-py/tests/test_formatting_tables.py` makes the same calls from
+/// Python and pins the same body, so CI checks that the binding writes what
+/// these native calls write.
+#[test]
+fn table_acceptance_workflow_writes_the_body_the_python_binding_pins() {
+    let mut document = Document::new();
+    document.add_paragraph("before");
+    document.add_paragraph("after");
+    let mut table = document.insert_table(1, 3, 3);
+    table.set_cell_grid_span_checked(0, 0, Some(2)).unwrap();
+    table
+        .set_cell_vertical_merge(1, 2, Some(rdocx::table::VMerge::Restart))
+        .unwrap();
+    table
+        .set_cell_vertical_merge(2, 2, Some(rdocx::table::VMerge::Continue))
+        .unwrap();
+    table
+        .set_all_borders_checked(BorderStyle::Single, 4, "000000")
+        .unwrap();
+    table
+        .set_border_checked(
+            TableBorderEdge::InsideVertical,
+            BorderStyle::Dashed,
+            8,
+            "FF0000",
+        )
+        .unwrap();
+    table
+        .set_cell_margins_checked(
+            Length::emu(0),
+            Length::emu(63500),
+            Length::emu(12700),
+            Length::emu(127000),
+        )
+        .unwrap();
+    table
+        .set_grid_widths(&[
+            Length::emu(1371600),
+            Length::emu(1828800),
+            Length::emu(1828800),
+        ])
+        .unwrap();
+    assert!(table.set_column_width(2, Length::emu(914400)));
+    let mut cell = table.cell(1, 0).unwrap();
+    cell.set_shading_checked("D9D9D9").unwrap();
+    cell.set_margins_checked(
+        Length::emu(12700),
+        Length::emu(0),
+        Length::emu(25400),
+        Length::emu(6350),
+    )
+    .unwrap();
+    cell.set_border_checked(CellBorderEdge::Bottom, BorderStyle::Double, 6, "auto")
+        .unwrap();
+    let mut row = table.row(0).unwrap();
+    row.set_height_checked(RowHeight::AtLeast(Length::emu(254000)))
+        .unwrap();
+    row.set_cant_split_value(Some(true));
+    row.set_header_value(Some(true));
+    table
+        .row(1)
+        .unwrap()
+        .set_height_checked(RowHeight::Exact(Length::emu(381000)))
+        .unwrap();
+
+    assert_eq!(
+        compact_body_xml(&mut document),
+        concat!(
+            r#"<w:body><w:p><w:r><w:t>before</w:t></w:r></w:p><w:tbl><w:tblPr>"#,
+            r#"<w:tblW w:w="6480" w:type="dxa"/><w:tblBorders>"#,
+            r#"<w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#,
+            r#"<w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#,
+            r#"<w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#,
+            r#"<w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#,
+            r#"<w:insideH w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#,
+            r#"<w:insideV w:val="dashed" w:sz="8" w:space="0" w:color="FF0000"/>"#,
+            r#"</w:tblBorders><w:tblCellMar><w:top w:w="0" w:type="dxa"/>"#,
+            r#"<w:left w:w="200" w:type="dxa"/><w:bottom w:w="20" w:type="dxa"/>"#,
+            r#"<w:right w:w="100" w:type="dxa"/></w:tblCellMar></w:tblPr>"#,
+            r#"<w:tblGrid><w:gridCol w:w="2160"/><w:gridCol w:w="2880"/>"#,
+            r#"<w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:trPr><w:cantSplit/>"#,
+            r#"<w:trHeight w:val="400" w:hRule="atLeast"/><w:tblHeader/></w:trPr>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="5040" w:type="dxa"/>"#,
+            r#"<w:gridSpan w:val="2"/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr>"#,
+            r#"<w:tcW w:w="1440" w:type="dxa"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+            r#"<w:tr><w:trPr><w:trHeight w:val="600" w:hRule="exact"/></w:trPr>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="2160" w:type="dxa"/><w:tcBorders>"#,
+            r#"<w:bottom w:val="double" w:sz="6" w:space="0" w:color="auto"/>"#,
+            r#"</w:tcBorders>"#,
+            r#"<w:shd w:val="clear" w:color="auto" w:fill="D9D9D9"/><w:tcMar>"#,
+            r#"<w:top w:w="20" w:type="dxa"/><w:left w:w="10" w:type="dxa"/>"#,
+            r#"<w:bottom w:w="40" w:type="dxa"/><w:right w:w="0" w:type="dxa"/>"#,
+            r#"</w:tcMar></w:tcPr><w:p/></w:tc><w:tc><w:tcPr>"#,
+            r#"<w:tcW w:w="2880" w:type="dxa"/></w:tcPr><w:p/></w:tc><w:tc>"#,
+            r#"<w:tcPr><w:tcW w:w="1440" w:type="dxa"/>"#,
+            r#"<w:vMerge w:val="restart"/></w:tcPr><w:p/></w:tc></w:tr><w:tr>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="2160" w:type="dxa"/></w:tcPr><w:p/>"#,
+            r#"</w:tc><w:tc><w:tcPr><w:tcW w:w="2880" w:type="dxa"/></w:tcPr>"#,
+            r#"<w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="1440" w:type="dxa"/>"#,
+            r#"<w:vMerge/></w:tcPr><w:p/></w:tc></w:tr></w:tbl><w:p><w:r>"#,
+            r#"<w:t>after</w:t></w:r></w:p><w:sectPr>"#,
+            r#"<w:pgSz w:w="12240" w:h="15840"/>"#,
+            r#"<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440""#,
+            r#" w:gutter="0" w:header="720" w:footer="720"/></w:sectPr></w:body>"#,
+        )
+    );
 }
 
 #[test]
@@ -9556,6 +9948,170 @@ fn custom_style_round_trip() {
 
     let paras = doc2.paragraphs();
     assert_eq!(paras[0].style_id(), Some("CustomHeading"));
+}
+
+#[test]
+fn common_styles_are_added_once_and_leave_unstyled_layout_unchanged() {
+    let ids = |document: &Document| {
+        document
+            .styles()
+            .iter()
+            .map(|style| style.style_id().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut document =
+        Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document));
+    assert_eq!(ids(&document), ["Normal", "Heading1"]);
+    document.add_paragraph("Heading").style("Heading1");
+    document.add_paragraph("Body text");
+    document
+        .add_table(2, 2)
+        .cell(0, 0)
+        .unwrap()
+        .set_text("cell");
+    let before = document.to_pdf_deterministic().unwrap();
+
+    assert_eq!(document.add_common_styles().unwrap(), 15);
+    assert_eq!(
+        ids(&document),
+        [
+            "Normal",
+            "Heading1",
+            "Heading2",
+            "Heading3",
+            "Heading4",
+            "Heading5",
+            "Heading6",
+            "Heading7",
+            "Heading8",
+            "Heading9",
+            "Title",
+            "Subtitle",
+            "NoSpacing",
+            "Quote",
+            "ListParagraph",
+            "Caption",
+            "TableGrid",
+        ]
+    );
+    document.validate_style_graph().unwrap();
+    assert_eq!(document.to_pdf_deterministic().unwrap(), before);
+    let heading = document.style("Heading2").unwrap();
+    assert_eq!(heading.name(), Some("heading 2"));
+    assert_eq!(heading.based_on(), Some("Normal"));
+    assert_eq!(heading.next_style(), Some("Normal"));
+    assert_eq!(heading.paragraph_properties().unwrap().outline_lvl, Some(1));
+    assert_eq!(heading.semi_hidden(), None);
+    assert_eq!(
+        document.style("Heading4").unwrap().semi_hidden(),
+        Some(true)
+    );
+    let caption = document.style("Caption").unwrap();
+    assert_eq!(caption.name(), Some("caption"));
+    assert_eq!(caption.semi_hidden(), Some(true));
+    let grid = document.style("TableGrid").unwrap();
+    assert_eq!(grid.style_type(), rdocx::StyleType::Table);
+    let grid_properties = grid.table_properties().unwrap();
+    let borders = grid_properties.borders.as_ref().unwrap();
+    assert_eq!(borders.inside_v.as_ref().unwrap().val, ST_Border::Single);
+    // Without a `Normal Table` base, Word would give the cells no side padding.
+    assert_eq!(
+        grid_properties.cell_margin,
+        Some(CT_TblCellMar {
+            top: Some(rdocx::Twips(0)),
+            left: Some(rdocx::Twips(108)),
+            bottom: Some(rdocx::Twips(0)),
+            right: Some(rdocx::Twips(108)),
+        })
+    );
+
+    let saved = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(saved.clone())).unwrap();
+    let styles = std::str::from_utf8(package.get_part("/word/styles.xml").unwrap()).unwrap();
+    let grid_xml = &styles[styles.find(r#"w:styleId="TableGrid""#).unwrap()..];
+    for margin in [
+        r#"<w:top w:w="0" w:type="dxa"/>"#,
+        r#"<w:left w:w="108" w:type="dxa"/>"#,
+        r#"<w:bottom w:w="0" w:type="dxa"/>"#,
+        r#"<w:right w:w="108" w:type="dxa"/>"#,
+    ] {
+        assert!(grid_xml.contains(margin), "{margin}");
+    }
+    assert_eq!(document.add_common_styles().unwrap(), 0);
+    assert_eq!(document.to_bytes().unwrap(), saved);
+    let reopened = Document::from_bytes(&saved).unwrap();
+    assert_eq!(ids(&reopened), ids(&document));
+    reopened.validate_style_graph().unwrap();
+
+    let mut localized =
+        Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document));
+    localized
+        .add_style(StyleBuilder::paragraph("berschrift2", "Heading 2").based_on("Normal"))
+        .unwrap();
+    assert_eq!(localized.add_common_styles().unwrap(), 14);
+    assert!(localized.style("Heading2").is_none());
+
+    let mut baseless =
+        Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document));
+    assert!(baseless.remove_style("Heading1").unwrap());
+    assert!(baseless.remove_style("Normal").unwrap());
+    let saved = baseless.to_bytes().unwrap();
+    let error = baseless.add_common_styles().unwrap_err().to_string();
+    assert!(error.contains("missing style 'Normal'"), "{error}");
+    assert_eq!(baseless.to_bytes().unwrap(), saved);
+}
+
+#[test]
+fn a_style_linked_to_numbering_numbers_its_paragraphs_in_layout() {
+    assert_eq!(
+        ListNumberFormat::from_name("lowerLetter"),
+        ListNumberFormat::LowerLetter
+    );
+    assert_eq!(
+        ListNumberFormat::from_name("Decimal"),
+        ListNumberFormat::Other("Decimal".to_owned())
+    );
+    let mut document = Document::new();
+    let definition = document
+        .add_numbering_definition(&[
+            ListLevel::new(ListNumberFormat::from_name("decimal")).level_text("%1.")
+        ])
+        .unwrap();
+    let instance = document.add_numbering_instance(definition, &[]).unwrap();
+    document
+        .add_style(
+            StyleBuilder::paragraph("Step", "Step")
+                .based_on("Normal")
+                .paragraph_properties(rdocx::CT_PPr {
+                    space_before: Some(rdocx::Twips(240)),
+                    space_after: Some(rdocx::Twips(120)),
+                    ..Default::default()
+                })
+                .run_properties(rdocx::CT_RPr {
+                    font_ascii: Some("Arial".to_owned()),
+                    font_hansi: Some("Arial".to_owned()),
+                    sz: Some(rdocx::HalfPoint(28)),
+                    bold: Some(true),
+                    ..Default::default()
+                }),
+        )
+        .unwrap();
+    document
+        .link_style_to_numbering("Step", instance, 0)
+        .unwrap();
+    document.add_paragraph("Mix").style("Step");
+    document.add_paragraph("Bake").style("Step");
+    document.add_paragraph("Serve");
+
+    let layout = document.layout_deterministic().unwrap();
+    let marker = |index| {
+        layout
+            .document_body_paragraph_numbering(index)
+            .map(|numbering| numbering.marker_text.clone())
+    };
+    assert_eq!(marker(0).as_deref(), Some("1."));
+    assert_eq!(marker(1).as_deref(), Some("2."));
+    assert_eq!(marker(2), None);
 }
 
 #[test]
@@ -11316,6 +11872,46 @@ fn comments_part_uses_its_existing_relationship_target() {
     let mut input = std::io::Cursor::new(Vec::new());
     package.write_to(&mut input).unwrap();
     let mut document = Document::from_bytes(input.get_ref()).unwrap();
+
+    // Without a comment edit, every output keeps the producer part byte for
+    // byte at its target, so the package signature over it stays valid.
+    // F-255 wrote the typed model here on every save, which made compare
+    // refuse a document against its own save (#160).
+    let saved = document.to_bytes().unwrap();
+    let saved_package = OpcPackage::from_reader(std::io::Cursor::new(&saved)).unwrap();
+    assert!(saved_package.get_part("/word/comments.xml").is_none());
+    assert_eq!(
+        saved_package.get_part("/custom/comments-data.xml"),
+        Some(comments_xml.as_slice())
+    );
+    assert!(
+        !flat_opc_package_class_tests::has_package_signature_invalidation_marker(&saved_package)
+    );
+    let flat = document.to_flat_opc_bytes().unwrap();
+    let flat_xml = std::str::from_utf8(&flat).unwrap();
+    assert!(flat_xml.contains("<x:comments"), "{flat_xml}");
+    assert!(!flat_xml.contains("urn:rdocx:relationships/invalidated-package-signature"));
+
+    // A comment edit writes the typed model back to that same target, with
+    // the fixed `w:` root and every raw child, identically through ZIP and
+    // Flat OPC.
+    document
+        .add_comment(
+            RunRange {
+                start: RunPosition {
+                    body_index: 0,
+                    run_index: 0,
+                },
+                end: RunPosition {
+                    body_index: 0,
+                    run_index: 1,
+                },
+            },
+            "Ada",
+            None,
+            "edited",
+        )
+        .unwrap();
     let assert_canonical_package = |saved_package: &OpcPackage| {
         assert!(saved_package.get_part("/word/comments.xml").is_none());
         assert_eq!(
@@ -13058,6 +13654,72 @@ mod header_footer_pdf {
             marker < number && number < arabic,
             "SVG DOM keeps the logical marker prefix"
         );
+    }
+
+    /// GitHub issue #171. Carlito, the bundled Calibri, joins ti, fi, ft, ffi
+    /// and more into one glyph. The PDF text layer paired glyphs with
+    /// characters by index, which garbled every Calibri paragraph.
+    #[test]
+    fn ligatures_keep_their_characters_in_pdf_text_of_every_bundled_family() {
+        const TEXT: &str = "Location Rating Action fifteen office Observation";
+        let mut document = Document::new();
+        let mut expected = Vec::new();
+        for font in [
+            "Calibri",
+            "Arial",
+            "Cambria",
+            "Times New Roman",
+            "Courier New",
+        ] {
+            for bold in [false, true] {
+                let weight = if bold { "bold" } else { "regular" };
+                let line = format!("{font} {weight}: {TEXT}");
+                document
+                    .add_paragraph("")
+                    .add_run(&line)
+                    .font(font)
+                    .size(11.0)
+                    .bold(bold);
+                expected.push(line);
+            }
+        }
+        let pdf = document.to_pdf_deterministic().unwrap();
+
+        let page_text = pdf_page_text(&pdf).concat();
+        for line in &expected {
+            assert!(
+                page_text.contains(line.as_str()),
+                "{line:?} in {page_text:?}"
+            );
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "rdocx-171-ligatures-{}-{:?}.pdf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &pdf).unwrap();
+        let extracted = std::process::Command::new("pdftotext")
+            .arg(&path)
+            .arg("-")
+            .output();
+        std::fs::remove_file(&path).unwrap();
+        match extracted {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("#171 pdftotext check skipped because pdftotext is absent");
+            }
+            extracted => {
+                let extracted = extracted.unwrap();
+                assert!(extracted.status.success());
+                let lines = String::from_utf8(extracted.stdout).unwrap();
+                let lines = lines
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>();
+                assert_eq!(lines, expected);
+            }
+        }
     }
 
     #[test]
@@ -16217,9 +16879,9 @@ mod settings_and_web_settings_authoring_tests {
             "{word_default}"
         );
 
-        // A two-inch interval moves the implicit stop onto the wider grid.
+        // A two-inch interval is 144 points from the 72-point left margin.
         let two_inch = run_start(Some(Twips(2880)), "B");
-        assert!((two_inch - 180.0).abs() < 0.01, "{two_inch}");
+        assert!((two_inch - 216.0).abs() < 0.01, "{two_inch}");
     }
 }
 
@@ -18789,6 +19451,7 @@ mod advanced_table_authoring_and_geometry {
             extra_namespaces: Vec::new(),
             background_xml: None,
             background_extra_xml: Vec::new(),
+            root_attributes: Vec::new(),
         });
         let media = rdocx_layout::MediaRegistry::new(&input.images);
         let mut fonts =

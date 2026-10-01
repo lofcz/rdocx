@@ -1,7 +1,9 @@
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, assert_type
+from typing import TYPE_CHECKING, Literal, assert_type
 
 from rdocx import (
+    Bookmark,
     BoundingBox,
     Cell,
     CellCollection,
@@ -9,15 +11,19 @@ from rdocx import (
     Comment,
     ComparisonDiagnostic,
     ContentFragment,
+    CoreProperties,
     Document,
     Font,
     HeaderFooterVariant,
     Hyperlink,
     Inches,
+    Length,
     LayoutFragment,
     LayoutBackedFieldUpdateReport,
     LayoutPage,
+    ListLevel,
     RGBColor,
+    ReplacementCountError,
     Paragraph,
     ParagraphCollection,
     ParagraphFormat,
@@ -34,9 +40,12 @@ from rdocx import (
     StoryRunPosition,
     StoryRunRange,
     Style,
+    SvgDiagnostic,
+    SvgRenderResult,
     Table,
     TableCollection,
     TocRebuildReport,
+    WD_ROW_HEIGHT_RULE,
 )
 
 
@@ -46,6 +55,9 @@ def exercise_rdocx_types(path: Path) -> None:
     loaded: Document = Document.from_bytes(b"")
     paragraph: Paragraph = document.add_paragraph("typed")
     run: Run = paragraph.add_run(" run")
+    paragraph.text = None
+    paragraph.text = "retyped\tline"
+    assert_type(paragraph.text, str)
     paragraph.style = "Heading1"
     paragraph.numbering = (1, 2)
     assert_type(paragraph.style, str)
@@ -63,6 +75,7 @@ def exercise_rdocx_types(path: Path) -> None:
     paragraph_format: ParagraphFormat = paragraph.paragraph_format
     paragraph_format.keep_together = None
     split_boundary: int = document.split_run(0, 0, 1)
+    handle_boundary: int = document.split_run(paragraph, 0, 1)
     paragraphs: ParagraphCollection = document.paragraphs
     first: Paragraph = paragraphs[0]
     sliced: list[Paragraph] = paragraphs[:]
@@ -74,10 +87,51 @@ def exercise_rdocx_types(path: Path) -> None:
     table.remove_row(0)
     cell: Cell = row.cells[0]
     cell.text = first.text
+    assert_type(table.border("top"), tuple[str, int | None, str | None] | None)
+    table.set_borders("single", size=4, color="000000")
+    table.set_border("insideV", "dashed", size=8, color="FF0000")
+    assert_type(
+        table.cell_margins,
+        tuple[Length | None, Length | None, Length | None, Length | None] | None,
+    )
+    table.set_cell_margins(top=0, right=Inches(0.1), bottom=0, left=Inches(0.1))
+    assert_type(table.grid_widths, tuple[Length, ...])
+    table.grid_widths = [Inches(1)]
+    table.set_column_width(0, Inches(2))
+    assert_type(row.height, Length | None)
+    assert_type(row.height_rule, WD_ROW_HEIGHT_RULE | None)
+    assert_type(row.cant_split, bool | None)
+    assert_type(row.is_header, bool | None)
+    row.height = Inches(0.5)
+    row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+    row.cant_split = True
+    row.is_header = None
+    assert_type(cell.shading, str | None)
+    assert_type(cell.border("bottom"), tuple[str, int | None, str | None] | None)
+    assert_type(
+        cell.margins,
+        tuple[Length | None, Length | None, Length | None, Length | None] | None,
+    )
+    cell.shading = "D9D9D9"
+    cell.set_border("bottom", "double", size=6, color="auto")
+    cell.set_margins(top=0, right=0, bottom=0, left=0)
+    inserted_table: Table = document.insert_table(0, 2, 2)
+    inserted_table.set_cell_grid_span(0, 0, 2)
+    inserted_table.set_cell_grid_span(0, -1, None)
+    inserted_table.set_cell_vertical_merge(0, 0, "restart")
+    inserted_table.set_cell_vertical_merge(1, 0, None)
+    assert_type(cell.grid_span, int)
+    assert_type(cell.vertical_merge, Literal["restart", "continue"] | None)
     package_bytes: bytes = loaded.to_bytes()
     pdf_bytes: bytes = opened.to_pdf()
     pages: list[bytes] = opened.render_all_pages()
     maybe_page: bytes | None = opened.render_page_to_png(0)
+    font_pdf: bytes = opened.to_pdf(fonts=[("Carlito", b"font")], font_dir=path)
+    archival_pdf: bytes = opened.to_pdfa_deterministic("pdfa-3b")
+    svg_page: SvgRenderResult | None = opened.render_page_to_svg(0)
+    if svg_page is not None:
+        assert_type(svg_page.svg, str)
+        svg_diagnostics: tuple[SvgDiagnostic, ...] = svg_page.diagnostics
     document.save(path)
     document.remove_content(0)
     position = RunPosition(body_index=0, run_index=0)
@@ -89,39 +143,109 @@ def exercise_rdocx_types(path: Path) -> None:
         initials=None,
         date="2026-09-16T10:15:30Z",
     )
+    text_comment_id: int = document.add_comment_on_text(
+        "review", author="Ada", text="here", occurrence=0, initials=None, date=None
+    )
     reply_id: int = document.reply_to(
         comment_id,
         author="Grace",
         text="done",
         date="2026-09-16T11:00:00+01:00",
     )
+    bookmark_id: int = document.add_bookmark("target", range_)
+    bookmarks: tuple[Bookmark, ...] = document.bookmarks
+    assert_type(bookmarks[0].direct_range, RunRange | None)
+    run.add_tab()
+    run.add_field("PAGEREF target \\h", "1")
+    document.insert_toc(0, max_level=2)
     comments: tuple[Comment, ...] = document.comments
     sections: tuple[Section, ...] = document.sections
+    updated_section: Section = document.update_section(
+        0,
+        orientation="landscape",
+        margin_top=Inches(0.5),
+        column_count=2,
+        column_spacing=Inches(0.25),
+        different_first_page=True,
+        break_type="continuous",
+    )
+    document.insert_section(1)
+    document.remove_section(1)
     styles: tuple[Style, ...] = document.styles
+    note: Style = document.add_style("Note", "paragraph", based_on="Normal")
+    document.add_style(
+        "Boxed Note",
+        style_id="BoxedNote",
+        next_style="Normal",
+        font_name="Arial",
+        font_size=Inches(0.25),
+        bold=True,
+        italic=None,
+        color=RGBColor(0x11, 0x22, 0x33),
+        space_before=Inches(0.1),
+        space_after=None,
+        left_indent=Inches(0.5),
+        right_indent=None,
+        first_line_indent=-Inches(0.25),
+    )
+    list_level = ListLevel(format="decimal", text="%1.", start=1, left_indent=Inches(0.5))
+    assert_type(list_level.format, str)
+    assert_type(list_level.text, str | None)
+    assert_type(list_level.hanging_indent, int | None)
+    definition_id: int = document.add_numbering_definition([list_level, ListLevel()])
+    num_id: int = document.add_numbering_instance(definition_id)
+    document.link_style_to_numbering(note.style_id, num_id, 0)
+    document.set_default_style("Normal")
+    style_removed: bool = document.remove_style("BoxedNote")
     stories: tuple[Story, ...] = document.stories
     image_data: bytes | None = document.image_data("rId1")
     document.replace_image("rId1", b"image")
     document.replace_image_for_story(stories[0], "rId1", b"image")
+    resized: int = document.set_picture_size("rId1", width=Inches(1), height=Inches(1))
     story_items: tuple[StoryItem, ...] = document.story_items
     inserted_picture: StoryItem = document.add_picture(
         b"png", "image.png", Inches(1), Inches(1), after=story_items[0]
     )
     story_position = StoryRunPosition(item=story_items[0], run_index=0)
-    story_range = StoryRunRange(start=story_position, end=story_position)
+    handle_position = StoryRunPosition(paragraph=document.paragraphs[0], run_index=0)
+    story_range = StoryRunRange(start=story_position, end=handle_position)
     story_comment_id: int = document.add_comment(
         story_range, author="Ada", text="story review"
     )
     direct_body_index: int | None = story_items[0].direct_body_index if story_items else None
     variants: tuple[HeaderFooterVariant, ...] = document.header_footer_variants
     hyperlinks: tuple[Hyperlink, ...] = document.hyperlinks
+    document.set_hyperlink_url(hyperlinks[0], "https://example.org/new")
+    document.remove_hyperlink(hyperlinks[0])
     resolved: bool = document.resolve_comment(comment_id)
     removed: bool = document.remove_comment(reply_id)
     diagnostics: tuple[ComparisonDiagnostic, ...] = document.compare(
         opened, author="Ada", timestamp="2026-09-14T09:00:00Z"
     )
+    optioned: tuple[ComparisonDiagnostic, ...] = document.compare(
+        opened,
+        "Ada",
+        "2026-09-14T09:00:00Z",
+        granularity="word",
+        ignore_formatting=True,
+        ignore_whitespace=True,
+        ignore_fields=True,
+        ignore_comments=True,
+        ignored_stories=("header", "text_box"),
+    )
     fragments: tuple[LayoutFragment, ...] = document.layout()
     maybe_layout_page: LayoutPage | None = document.layout_page(0)
     report: TocRebuildReport = document.rebuild_toc()
+    core: CoreProperties = document.core_properties
+    core.title = "Typed title"
+    core.author = None
+    core.created = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    core.last_printed = None
+    core.revision = 2
+    assert_type(core.title, str)
+    assert_type(core.comments, str)
+    assert_type(core.modified, datetime | None)
+    assert_type(core.revision, int)
     update_fields_on_open: bool | None = document.update_fields_on_open
     document.update_fields_on_open = True
     document.update_fields_on_open = None
@@ -134,6 +258,11 @@ def exercise_rdocx_types(path: Path) -> None:
     document.move_content(table, content_index)
     replacement_count: int = document.try_replace_text("old", "new")
     regex_count: int = document.replace_all_regex([("old", "new")])
+    expected_count: int = document.try_replace_text("old", "new", expect=1)
+    batch_counts: tuple[int, ...] = document.replace_all([("a", "b", 1), ("c", "d")])
+    count_error = ReplacementCountError("message", 1, 2, index=0)
+    assert_type(count_error.index, int | None)
+    assert_type(count_error.found, int)
     revisions: tuple[Revision, ...] = document.revisions
     accepted: int = document.accept_all()
     dated: int = document.reject_revisions_in_date_range(
@@ -145,10 +274,16 @@ def exercise_rdocx_types(path: Path) -> None:
         file_name="report.docx", merge_fields={"Name": "Ada"}
     )
     assert_type(revisions[0].timestamp, str | None)
+    assert_type(revisions[0].story, Story | None)
     document.set_header("Header")
     document.set_footer("Footer")
     document.set_story_text(story_items[0], "edited")
     document.add_hyperlink_to_story(stories[0], "home", "https://example.com/")
+    section_footer: Story = document.create_section_story(0, "footer", "default")
+    linked_footer: Story = document.link_section_story(0, "footer", "first", section_footer)
+    unlinked_footer: Story = document.unlink_section_story(0, "footer", "first")
+    document.insert_content(section_footer, document.pop_content(story_items[0]))
+    document.insert_content(story_items[0], fragment)
     link_run: Run = first.add_hyperlink("docs", "https://example.com/docs")
     assert_type(story_items[0].xml, bytes)
     compatible_story_item = StoryItem(
@@ -194,6 +329,8 @@ def exercise_rdocx_types(path: Path) -> None:
         fragment_kind,
         inserted_picture,
         story_comment_id,
+        updated_section,
+        style_removed,
     )
     accepted, dated, replaced, matched, updated
 
@@ -202,6 +339,7 @@ if TYPE_CHECKING:
     Cell()  # type: ignore[call-arg]
     CellCollection()  # type: ignore[call-arg]
     CellParagraphCollection()  # type: ignore[call-arg]
+    CoreProperties()  # type: ignore[call-arg]
     Font()  # type: ignore[call-arg]
     Paragraph()  # type: ignore[call-arg]
     ParagraphCollection()  # type: ignore[call-arg]
@@ -212,3 +350,5 @@ if TYPE_CHECKING:
     RunCollection()  # type: ignore[call-arg]
     Table()  # type: ignore[call-arg]
     TableCollection()  # type: ignore[call-arg]
+    Document().compare(Document(), "Ada", "2026-09-14T09:00:00Z", granularity="words")  # type: ignore[arg-type]
+    Document().compare(Document(), "Ada", "2026-09-14T09:00:00Z", ignored_stories="header")  # type: ignore[arg-type]

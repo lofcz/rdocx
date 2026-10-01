@@ -16,9 +16,11 @@ from rpptx import (
     PP_ALIGN,
     Presentation,
     Pt,
+    ReplacementCountError,
     RGBColor,
     TextFrameLayout,
     TextLineLayout,
+    ValidationIssue,
 )
 from rpptx._rpptx import (
     AdjustmentCollection,
@@ -29,11 +31,14 @@ from rpptx._rpptx import (
     ColumnCollection,
     FillFormat,
     Font,
+    Hyperlink,
     Image,
     LineFormat,
     Paragraph,
     ParagraphCollection,
     PlaceholderCollection,
+    Row,
+    RowCollection,
     Run,
     RunCollection,
     Shape,
@@ -152,6 +157,15 @@ def exercise_rpptx_types(path: Path) -> None:
         for current_shape in current_slide.shapes:
             current_shape.has_text_frame
     package_bytes: bytes = presentation.to_bytes()
+    reopened: Presentation = Presentation.from_bytes(package_bytes)
+    replaced: int = presentation.try_replace_text("typed", "checked")
+    replacement_counts: tuple[int, int] = (0, 0)
+    try:
+        replaced = presentation.try_replace_text("checked", "typed", expect=2)
+    except ReplacementCountError as error:
+        replacement_counts = (error.expected, error.found)
+    issues: tuple[ValidationIssue, ...] = presentation.validate()
+    issue_lines: list[tuple[str, str]] = [(issue.kind, issue.message) for issue in issues]
     pdf_bytes: bytes = presentation.to_pdf()
     slide_png: bytes | None = presentation.render_slide_to_png(0)
     slide_pngs: list[bytes] = presentation.render_all_slides()
@@ -175,12 +189,16 @@ def exercise_rpptx_types(path: Path) -> None:
     )
     comments: tuple[Comment, ...] = presentation.slides[0].comments
     reply: CommentReply = comments[0].replies[0]
+    presentation.slides[0].resolve_comment(comments[0].id)
+    presentation.slides[0].remove_comment(reply.id)
     slide_width: Length | None = presentation.slide_width
     presentation.slide_height = Inches(6)
     current_slide = presentation.slides[0]
     slide_layout: SlideLayout = current_slide.slide_layout
     layout_index: int = presentation.slide_layouts.index(slide_layout)
     same_layout: bool = slide_layout == presentation.slide_layouts[0]
+    current_slide.slide_layout = presentation.slide_layouts[1]
+    current_slide = presentation.slides[0]
     hidden: bool = current_slide.hidden
     current_slide.hidden = True
     background: Background = current_slide.background
@@ -194,6 +212,7 @@ def exercise_rpptx_types(path: Path) -> None:
     shape.top = Inches(2)
     shape.width = Inches(3)
     shape.height = Inches(1)
+    geometry: tuple[Length, Length, Length, Length] | None = shape.effective_geometry()
     shape.name = "Typed"
     shape.rotation = 15.0
     rotation: float = shape.rotation
@@ -227,6 +246,7 @@ def exercise_rpptx_types(path: Path) -> None:
     picture.replace_image(b"")
     picture.replace_image(path)
     presentation.slides[0].shapes.remove(group)
+    duplicated: Slide = presentation.slides.duplicate(presentation.slides[0])
     presentation.slides.move(0, -1)
     presentation.slides.remove(presentation.slides[0])
     presentation.save(path)
@@ -286,7 +306,91 @@ def exercise_rpptx_types(path: Path) -> None:
         blob,
         image.content_type,
         image.ext,
+        duplicated,
+        reopened,
+        replaced,
+        replacement_counts,
+        issue_lines,
     )
+
+
+def exercise_rpptx_table_types(table: Table) -> None:
+    origin: Cell = table.cell(0, 0)
+    origin.merge(table.cell(1, 1))
+    spans: tuple[bool, bool, int, int] = (
+        origin.is_merge_origin,
+        origin.is_spanned,
+        origin.span_height,
+        origin.span_width,
+    )
+    origin.split()
+    cell_fill: FillFormat = origin.fill
+    cell_fill.solid()
+    origin.margin_left = Inches(0.1)
+    origin.margin_right = None
+    cell_margins: tuple[Length | None, ...] = (
+        origin.margin_left,
+        origin.margin_right,
+        origin.margin_top,
+        origin.margin_bottom,
+    )
+    rows: RowCollection = table.rows
+    row: Row = rows[0]
+    row.height = Inches(1)
+    row_heights: list[Length] = [current.height for current in rows]
+    borders: tuple[LineFormat, ...] = (
+        origin.border_left,
+        origin.border_right,
+        origin.border_top,
+        origin.border_bottom,
+    )
+    borders[0].width = Pt(1)
+    (spans, cell_margins, row_heights, rows[:])
+
+
+def exercise_rpptx_table_structure_types(table: Table) -> None:
+    appended: Row = table.rows.add_row()
+    inserted: Row = table.rows.add_row(0)
+    table.rows.remove(table.rows[-1])
+    column: Column = table.columns.add_column()
+    table.columns.add_column(index=-1)
+    table.columns.remove(table.columns[0])
+    (appended, inserted, column)
+
+
+def exercise_rpptx_picture_crop_types(picture: Shape) -> None:
+    picture.crop_left = 0.25
+    picture.crop_top = 0
+    crop: tuple[float, float, float, float] = (
+        picture.crop_left,
+        picture.crop_top,
+        picture.crop_right,
+        picture.crop_bottom,
+    )
+    picture.crop_right = crop[0]
+    picture.crop_bottom = -0.1
+
+
+def exercise_rpptx_z_order_types(slide: Slide) -> None:
+    slide.shapes.move(0, -1)
+
+
+def exercise_rpptx_group_population_types(group: Shape) -> None:
+    members: ShapeCollection = group.shapes
+    textbox: Shape = members.add_textbox(0, 0, Inches(1), Inches(1))
+    nested: Shape = group.shapes.add_group_shape()
+    nested.shapes.add_shape("rect", 0, 0, Inches(1), Inches(1))
+    group.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, 0, 0, Inches(1), Inches(1))
+    group.shapes.add_table(1, 2, 0, 0, Inches(2), Inches(1))
+    group.shapes.add_picture(io.BytesIO(b""), 0, 0)
+
+
+def exercise_rpptx_hyperlink_types(run: Run) -> None:
+    hyperlink: Hyperlink = run.hyperlink
+    hyperlink.address = "https://example.com"
+    address: str | None = hyperlink.address
+    hyperlink.address = None
+    (address,)
 
 
 def exercise_rpptx_text_layout_types(presentation: Presentation) -> None:
@@ -344,9 +448,12 @@ if TYPE_CHECKING:
     Column()  # type: ignore[call-arg]
     ColumnCollection()  # type: ignore[call-arg]
     Font()  # type: ignore[call-arg]
+    Hyperlink()  # type: ignore[call-arg]
     Paragraph()  # type: ignore[call-arg]
     ParagraphCollection()  # type: ignore[call-arg]
     PlaceholderCollection()  # type: ignore[call-arg]
+    Row()  # type: ignore[call-arg]
+    RowCollection()  # type: ignore[call-arg]
     Run()  # type: ignore[call-arg]
     RunCollection()  # type: ignore[call-arg]
     Shape()  # type: ignore[call-arg]
@@ -359,3 +466,4 @@ if TYPE_CHECKING:
     TextFrame()  # type: ignore[call-arg]
     TextFrameLayout()  # type: ignore[call-arg]
     TextLineLayout()  # type: ignore[call-arg]
+    ValidationIssue()  # type: ignore[call-arg]

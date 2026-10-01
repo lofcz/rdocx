@@ -38,17 +38,24 @@ spreadsheet programme. Four S70 cross-cutting stories add roughly 12 days for
 the confirmed Issue 67 closure and the three independently measured Issue 69
 performance corrections.
 
+F-X137 through F-X168 form a contribution and issue repair programme across
+S76 through S88. The 1 October intake has 77 open PRs and 30 open issues.
+The new tolerance, baseline, revision and accepted-view work continues after
+the original S82 acceptance wave. These are cross-cutting stories, separate
+from the 47 planned M24 feature stories. Their shared files and full issue
+contracts require integrated gates at each sprint boundary.
+
 M23 closes the five-document from-scratch business-document boundary. M24 then
 classifies and closes the broader modern DOCX authoring surface before M19 may
 begin. The spreadsheet programme remains a business decision and proceeds only
-if F-184 confirms a material gap in the Rust ecosystem at S81.
+if F-184 confirms a material gap in the Rust ecosystem at S95.
 
 The stopping and compression choices are:
 
 - **Stop after M23.** S73 can generate the five private reference documents
   from `Document::new()` through public modeled APIs, with no base template,
   raw OOXML, or LibreOffice field-update pass.
-- **Stop after M24.** S80 provides the complete modern DOCX authoring boundary.
+- **Stop after M24.** S94 provides the complete modern DOCX authoring boundary.
   Every in-scope feature is authorable, readable, mutable, round-trip safe,
   rendered where applicable, and classified across the public bindings.
 - **Archive M19 at its decision gate.** F-184 may still find that the advanced
@@ -1595,7 +1602,7 @@ decision lands.
 OPC, DrawingML, the chart engine, the layout engine and the PDF backend all
 exist and are format-neutral, which lowers the cost of a third family. That is
 not sufficient reason to build one. F-184 must reassess the Rust ecosystem when
-S81 begins. M19 proceeds only if no credible maintained crate provides the
+S95 begins. M19 proceeds only if no credible maintained crate provides the
 combined lifecycle required here: open an existing advanced workbook, preserve
 what is not executed, edit typed features, recalculate formulas and local
 pivots, refresh a declared Power Query subset, automate it through an Office
@@ -1617,7 +1624,7 @@ render to PDF.
 
 ### F-184, Advanced spreadsheet go or no-go (S)
 The go or no-go decision record. Reassess the maintained Rust spreadsheet
-ecosystem at S81, state whether the combined lifecycle gap still exists, and
+ecosystem at S95, state whether the combined lifecycle gap still exists, and
 archive M19 if it does not. If it does, amend `02-scope-and-non-goals.md`, define
 the boundary between `oxml-sml` as chart support and `rxlsx` as a library, and
 publish the preserve, model, and execute classification for every advanced
@@ -2223,8 +2230,9 @@ save-reopen, story placement, layout, rendering, determinism, bindings, and
 diagnostics. The closed matrix contains 85 stable rows and maps the five private
 documents only as anonymous, non-identifying capability families. The audit
 found no duplicate scope, missing owner, dangling dependency, dependency cycle,
-or scheduling conflict in F-243 through F-310, so their boundaries, sizes,
-dependencies, and S71 through S80 placement remain authoritative.
+or scheduling conflict in F-243 through F-310. Their boundaries, sizes, and
+dependencies remain authoritative. The current plan places them across S71
+through S94.
 **Capability matrix owner**: `docs/hld/02-scope-and-non-goals.md`, "Modern DOCX
 capability matrix".
 **Test gate**: regression. Every in-scope matrix row has evidence, an owner
@@ -6050,6 +6058,310 @@ render has been reproduced.
 `table_row_breaks_before_footer_only_page_and_repeats_header` asserts the
 footer-only page is absent, every body line appears once in reading order,
 and the table header repeats on the continuation page.
+
+### F-X137, Package and CLI safety contribution wave (L)
+
+Review and integrate PRs 174, 178, 182, 185 and 197 against the current
+sprint branch. Cover output refusal, atomic saves, root namespaces, empty
+comments parts and package class selection. Reconcile shared package and
+CLI changes without losing unrelated producer XML.
+**Depends on**: F-X136.
+**Test gate**: regression. The Issue 156, 157 and 164 reproductions, failed
+save cases and unchanged-part checks pass on the combined prefix.
+
+### F-X138, Word story and content contribution wave (L)
+
+Review and integrate PRs 177, 179, 180, 191, 195, 202, 210 and 211.
+Keep the stated stacks 195 before 202 and 210, and 202 before 211. Align
+story visibility, replacement counts, direct body coordinates, comment run
+positions and compatibility text box copies.
+**Depends on**: F-X137.
+**Test gate**: regression. Issue 163 and 172 entry points and the Issue
+160 content-control location matrix pass on the combined prefix.
+
+### F-X139, Word identity and comparison contribution wave (L)
+
+Review and integrate PRs 183, 184, 190, 193, 198 and 205. Reconcile
+identity preservation and comparison semantics with F-X138's changes in
+`rdocx-oxml` and `rdocx/src/comparison.rs`.
+**Depends on**: F-X138.
+**Test gate**: regression. Identity-only changes create no redline, the
+TOC rebuild accepts producer run attributes, and comparison option cases
+pass on the integrated Word model.
+
+### F-X140, Rendering and layout contribution wave (L)
+
+Review and integrate PRs 175, 188, 196, 199, 200, 206 and 207. Own the
+single reviewed hash baseline update from PR 188. Resolve PR 196's failed
+Presentation fidelity corpus gate and PR 206's MSRV and Test failures before
+either can land.
+**Depends on**: F-X137.
+**Test gate**: golden. The deterministic Word and presentation fidelity
+gates and the output-stability harness pass with every expected delta
+labelled and reviewed.
+
+### F-X141, Word Python contribution wave (L)
+
+The Word Python binding, stub and native facade expose the contributed table,
+section, style, field, replacement, story, rendering and core-property APIs
+from PRs 176, 187, 194, 201, 203 and 212 on the S76 prefix. Section updates
+use layout defaults for missing partners, native new documents initialize
+common Word styles, and inserted TOCs rebuild after heading edits. A separate
+reviewed hash baseline records the output changes after F-X140. The remaining
+Issue 168 checklist stays with F-X147.
+**Depends on**: F-X139, F-X140.
+**Test gate**: integration. The contributed Python workflow, typing smoke
+and Rust parity cases pass after save and reopen.
+
+### F-X142, Presentation Python contribution wave (L)
+
+Review and integrate PRs 173, 181, 189, 192, 208 and 209. PRs 208 and
+209 follow 189. Reconcile the shared shape, table, layout and binding
+files before running the Issue 169 deck workflow. Complete its remaining
+shape hyperlinks, shape and text range comments, and built-in table style
+rendering alongside the contributed APIs.
+**Depends on**: F-X140.
+**Test gate**: integration. Python and Rust deck operations round-trip,
+validate and render with correct shape geometry and table structure.
+
+### F-X143, Revision listing and CLI story contribution wave (M)
+
+Review and integrate PRs 186 and 204. PR 204 follows PR 198 from F-X139.
+Verify the revised CLI text and validation behavior against the S76 story
+and comparison prefixes.
+**Depends on**: F-X139, F-X141.
+**Test gate**: integration. Revision listing spans all stories and the CLI
+detects malformed related parts and undefined styles in its stated scope.
+
+### F-X144, Identity and producer matrices across operations (L)
+
+Complete Issues 157, 159 and 160 after the contribution wave. Preserve
+the attached identity and producer matrix rows as executable acceptance
+cases, add the missing content-control walker locations and verify
+`mc:Ignorable` on every edited part.
+**Depends on**: F-X143, F-X151.
+**Test gate**: regression. Both full matrices and the `add_picture` column
+pass with no comparison refusal, dropped identity or lost producer part.
+
+### F-X145, Comparison options and redline completion (L)
+
+Complete Issue 161 after the option-binding and comparison PRs. Carry
+edited-side comments through the redline, compare rebuilt TOCs and place
+markers correctly after changed text, including PR 205's refused case.
+**Depends on**: F-X143, F-X144.
+**Test gate**: regression. Python and CLI options agree and redline accept
+reproduces edited text and comment state in every specified case.
+
+### F-X146, Word line height and inline picture spacing (L)
+
+Complete both parts of Issue 162 and the rich-line part of Issue 226,
+reviewing PRs 222, 225 and 237 against the integrated rendering prefix.
+F-X163 completes Issue 226's plain-line fit after PR 242. Measure text
+pitch with bundled fonts and prevent proportional spacing from scaling a
+tall inline picture's height.
+**Depends on**: F-X140.
+**Test gate**: golden. The four-family, two-size, two-spacing pitch matrix
+and the Word-exported picture fixture meet pinned expected geometry.
+
+### F-X147, Complete rdocx Python production checklist (L)
+
+Complete Issue 168 after F-X141 and F-X153. Address rich section story authoring,
+transactional counted replacement and rendering parity in the integrated
+build, then finish style mutation and removal, run removal, an XML or
+package write path and text-anchored comments. Record a reviewed scope
+decision for any intentionally unsupported long-tail operation.
+**Depends on**: F-X141, F-X145, F-X153.
+**Test gate**: integration. Every Issue 168 checklist example runs from
+Python, or has an explicit accepted scope decision and documented fallback.
+
+### F-X148, Complete rpptx Python production checklist (L)
+
+Independently exercise F-X142's and F-X156's complete Issue 169 checklist against the
+production deck fixture and cross-viewer output. Record any integration gap
+found after S77 and repair it through a scoped follow-up rather than claiming
+the checklist was completed twice.
+**Depends on**: F-X142, F-X156.
+**Test gate**: integration. The complete deck chain round-trips, validates
+and renders, with every checklist item either passing or explicitly scoped.
+
+### F-X149, Word fixture and workflow acceptance gate (L)
+
+Convert Issue 158's attached fixtures, two matrices and two workflows
+into repeatable Word acceptance evidence. Keep deterministic font mode and
+review every expected hash delta. Exercise DOCX, its CLI and Python binding
+after the narrower Word issues are repaired.
+**Depends on**: F-X144, F-X145, F-X146, F-X147, F-X152.
+**Test gate**: differential. The report workflow and both matrices pass
+against their pinned reference outputs.
+
+### F-X150, Reconcile issue closure evidence (M)
+
+Audit every acceptance criterion in the 22 open Issues 156 through 172,
+215 through 217, 226 and 227 against the integrated S76 to S82 result.
+Issue 158 closes last. Do not infer acceptance from a PR merge.
+**Depends on**: F-X149, F-X158.
+**Test gate**: integration. Each criterion has a passing artifact or an
+explicitly unresolved issue, and the final sprint verify and review gates
+pass before any closure action.
+
+### F-X151, Word preservation and comparison PR intake (L)
+
+Review PRs 214, 228, 229, 232, 233 and 239 after S77. Reconcile story
+export, lexical validation, field text and TOC comparison without dropping
+unmodelled XML.
+**Depends on**: F-X143.
+**Test gate**: regression. Producer, compare and package round trips pass on
+the combined prefix with the hash harness unchanged or a reviewed delta.
+
+### F-X152, Full-story CLI diff and count repair (M)
+
+Review PR 236 and complete Issue 227 across cells and related stories.
+**Depends on**: F-X143, F-X151.
+**Test gate**: regression. The issue reproducer locates every changed story
+paragraph and counts each changed paragraph once.
+
+### F-X153, Word Python supplemental contribution (M)
+
+Review PR 220 for anchored CLI comments, numbering and run removal. Reconcile
+its overlap with F-X141 before finishing the Issue 168 checklist.
+**Depends on**: F-X141, F-X144.
+**Test gate**: integration. Python and CLI comment coordinates, numbering and
+run removal pass after save and reopen.
+
+### F-X154, Presentation text and preservation repair (M)
+
+Review PRs 218 and 223 and complete Issues 215 and 216. Preserve unmodelled
+`a:bodyPr` attributes and give text-frame line feeds authoring semantics.
+**Depends on**: F-X142.
+**Test gate**: regression. Unedited text bodies remain byte-equivalent where
+required, and assigned line feeds survive layout, validation and rendering.
+
+### F-X155, Presentation drawing API contribution (L)
+
+Review PRs 219, 221, 224, 230 and 234. Replay PR 219 after 189 and PR 234
+after 207. Reconcile hyperlinks, line ends, shadows, preset geometry and
+connector style in schema order.
+**Depends on**: F-X142, F-X154.
+**Test gate**: integration. The authored effects and links reopen in
+python-pptx, validate and match the pinned cross-viewer renders.
+
+### F-X156, Presentation slide and table contribution (L)
+
+Review PRs 231, 235 and 238. Replay PR 231 after 181 and reconcile scoped
+replacement and slide import against F-X142's built-in table style resolution.
+**Depends on**: F-X142, F-X155.
+**Test gate**: integration. Imported and edited decks reopen, validate and
+render without losing media, notes or relationships.
+
+### F-X157, Complete deck-chain authoring checklist (L)
+
+Finish all six Issue 217 items after their PRs, including scope decisions
+where explicitly allowed. Check the complete chain in both Python APIs and
+independent viewers.
+**Depends on**: F-X148, F-X155, F-X156.
+**Test gate**: differential. Each item passes python-pptx reopen, `rpptx
+validate` and LibreOffice versus rpptx rendering, or has a reviewed scope
+boundary and fallback.
+
+### F-X158, Presentation fixture and workflow acceptance gate (L)
+
+Convert the attached deck workflow into repeatable acceptance evidence after
+Issues 169, 170, 215, 216 and 217 are addressed.
+**Depends on**: F-X140, F-X148, F-X154, F-X157.
+**Test gate**: differential. The full deck workflow round-trips, validates
+and matches pinned viewer outputs.
+
+### F-X159, Word document validity baseline (M)
+
+Review PR 240 after S82. Correct the package metadata and nested table output
+that prevent a new document from opening in Word. Keep its intentional hash
+change isolated and reviewed.
+**Depends on**: F-X149.
+**Test gate**: differential. Word opens the source-built document and nested
+table, and the deterministic baseline changes only in the declared entries.
+
+### F-X160, Tolerant style, drawing and measurement reads (L)
+
+Review PRs 248, 249 and 250 after F-X159. Accept repeated style IDs and
+multiple default table styles already present, duplicate drawing IDs within
+one part, and decimal integer measurements without introducing new defects.
+**Depends on**: F-X159, F-X147.
+**Test gate**: regression. Both Issue 243 fixtures pass every style mutator,
+and Issues 246 and 247 pass read, edit, save and reopen with the specified
+rounding and drawing identity behavior.
+
+### F-X161, Compact Word XML and namespace preservation (L)
+
+Review PR 251 after F-X160. Serialize only changed parts compactly, declare
+`w` once on the root and preserve unknown subtrees and producer attributes.
+Own one labelled and reviewed baseline change for this sprint.
+**Depends on**: F-X144, F-X160.
+**Test gate**: round-trip. Issue 245's edited package retains untouched
+regions and valid namespaces, and its 20 declared hash entries reconcile.
+
+### F-X162, Per-paragraph section width and pagination (M)
+
+Review PR 241 after F-X161. Resolve section width at each paragraph rather
+than using the final section's width for the whole document. Own one reviewed
+baseline change for this sprint.
+**Depends on**: F-X161.
+**Test gate**: golden. Mixed-section paragraphs, tables and page boundaries
+match the pinned Word render with deterministic fonts and declared hashes.
+
+### F-X163, Plain-line trailing-space fit (M)
+
+Review PR 242 after F-X146 and F-X162. Complete Issue 226's plain-line
+symptom while preserving the rich UAX 14 correction from PR 222. Own this
+sprint's labelled hash and golden pixel baseline change.
+**Depends on**: F-X146, F-X162.
+**Test gate**: golden. Both paths break at Word's reported widths without a
+leading space or punctuation error, and all expected deltas are reviewed.
+
+### F-X164, Added shape theme style (M)
+
+Review PR 252 after PRs 207, 230 and 234. Emit an ordered `p:style` for new
+shapes and verify its visible theme fill or line.
+**Depends on**: F-X155.
+**Test gate**: differential. Source-built shapes reopen in python-pptx and
+PowerPoint and render visibly in PowerPoint, LibreOffice and rpptx.
+
+### F-X165, Python and CLI tracked revision view (M)
+
+Review PR 256 after the S77 revision inventory. Expose accepted and tracked
+views consistently in Python and the CLI, rejecting invalid selectors.
+**Depends on**: F-X143, F-X150.
+**Test gate**: integration. Issue 253's old and new text appears in the
+selected PDF and CLI output under pinned Poppler, with Python parity.
+
+### F-X166, Picture and final-block comparison revisions (L)
+
+Review PR 257, PR 258, PR 260 and stacked PR 261 in that order. Preserve
+both image media and final paragraph properties through accept and reject.
+Reconcile shared comparison and revision code against F-X145 and F-X165.
+**Depends on**: F-X145, F-X165.
+**Test gate**: differential. Issue 254's three picture cases agree with Word
+for Mac, and Issue 255's five final-block pairs open in Word with correct
+revision marks, content and properties in both directions.
+
+### F-X167, Accepted-view exporters and readers (L)
+
+Review PR 259 after PR 256 and the content-control exporter work, then PRs
+262 and 263. Make HTML, Markdown, plain text and layout agree on deleted
+paragraph and row visibility without losing retained content.
+**Depends on**: F-X151, F-X165, F-X166.
+**Test gate**: regression. Every accepted-view output agrees after save and
+reopen, and the Python bindings gate that fails on PR 259 is green.
+
+### F-X168, Current issue and contribution closure evidence (M)
+
+Reconcile all 30 issues and 77 open PRs from the 1 October GitHub snapshot
+against their full criteria and the integrated S76 to S88 result. Record
+contributor comments, manual viewer checks, unresolved criteria and specific
+follow-up F-IDs. Issue 158 closes last if every child criterion passes.
+**Depends on**: F-X149, F-X158, F-X160 through F-X167.
+**Test gate**: integration. Every criterion has linked evidence on main or
+remains open with a named follow-up. Full verification and sprint review pass
+before any closure action.
 
 ### F-X021, The hash harness should cover PDF output (M)
 The output-stability harness records `page1.png` and three `word/*.xml` parts

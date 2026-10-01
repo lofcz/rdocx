@@ -366,7 +366,10 @@ impl MathExpression {
             }
             Self::BorderBox(value) => {
                 preservation_has_unsupported_content(&value.preservation)
-                    || property_container_has_unsupported_content(&value.preservation, "borderBoxPr")
+                    || property_container_has_unsupported_content(
+                        &value.preservation,
+                        "borderBoxPr",
+                    )
                     || value.base.has_unsupported_content()
             }
         }
@@ -3834,7 +3837,9 @@ mod tests {
         };
         assert!(radical.hide_degree);
         assert!(radical.degree.expressions.is_empty());
-        assert!(matches!(radical.base.expressions.as_slice(), [MathExpression::Run(run)] if run.text == "x"));
+        assert!(
+            matches!(radical.base.expressions.as_slice(), [MathExpression::Run(run)] if run.text == "x")
+        );
     }
 
     #[test]
@@ -4696,5 +4701,4 @@ mod tests {
             assert!(String::from_utf8(saved).unwrap().contains("m:borderBox"));
         }
     }
-
 }

@@ -692,7 +692,10 @@ fn next_tab_stop(current_x: f64, tab_stops: &[TabStop]) -> Option<&TabStop> {
 /// because the width of that trailing text is only known once the line is
 /// complete; the gap is clamped so the line never exceeds its available width.
 fn align_trailing_tabs(lines: &mut [LayoutLine], tab_stops: &[TabStop]) {
-    if tab_stops.iter().all(|stop| matches!(stop.align, TabAlign::Left | TabAlign::Bar)) {
+    if tab_stops
+        .iter()
+        .all(|stop| matches!(stop.align, TabAlign::Left | TabAlign::Bar))
+    {
         return;
     }
     for line in lines.iter_mut() {

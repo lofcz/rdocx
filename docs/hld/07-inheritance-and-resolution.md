@@ -140,7 +140,11 @@ the resolver boundary so the renderer can substitute the current page before
 shaping.
 
 Table resolution selects the explicit table style or the table style list's
-default. It applies whole-table, row and column bands, first and last columns,
+default. A known Office built-in ID without a package definition resolves from
+its built-in visual family and theme accent. A package definition of that ID
+takes precedence, and an unknown ID follows the list default. Style lookup
+does not add a definition to the saved package. Resolution applies whole-table,
+row and column bands, first and last columns,
 first and last rows, then corner regions. Direct cell properties apply last.
 The result carries concrete fills, text styles, margins, four borders, spans,
 merge ownership, and right-to-left order. Border values retain region priority
@@ -226,9 +230,10 @@ as an ordinary shape and retains its transform, direct line, fill, and
 arrowheads. Connector custom geometry reuses the same checked DrawingML path
 evaluator as ordinary shape custom geometry. A horizontal or vertical
 connector may have a zero extent on its
-collapsed axis and remains a finite stroked path. A connector without a direct
-line keeps a visible default line and a diagnostic until its preserved
-`p:style` reference has a typed resolution path. Explicit
+collapsed axis and remains a finite stroked path. A connector's line resolves
+from the `a:lnRef` of its typed `p:style` and its direct `a:ln`, as an ordinary
+shape's line does. A connector with neither keeps a visible default line and a
+diagnostic. Explicit
 `p:bgPr` fills and `p:bgRef` theme styles resolve to concrete background paint
 before crossing the renderer boundary. If slide, layout, and master all omit
 `p:bg`, the resolved background remains absent and the raster backend keeps its
@@ -344,7 +349,11 @@ Six independent chains. Getting them separately right is the difference between
 Shape's own `a:xfrm`, then the matching layout placeholder, then the matching
 master placeholder, then none. `ResolveCtx::effective_xfrm` returns an owned
 clone from the first source that supplies a transform. A shape that resolves to
-no extent is skipped rather than treated as an error.
+no extent is skipped rather than treated as an error. The public
+`inherited_xfrm(placeholder, layout, master)` resolves the layout and master
+part of that chain without a `ResolveCtx`. `effective_xfrm` and
+`effective_picture_xfrm` fall back to it, and the facade's effective geometry
+and layout change call it, so all of them share one matching rule.
 
 ### 2. Body properties
 
@@ -399,7 +408,9 @@ shape's explicit `a:spPr` fill, line and effects on top. Reference colour
 transforms precede the placeholder colour's transforms. Fill and modelled
 effects are atomic replacements. Line width, cap, fill, dash, join, head, and
 tail values overlay independently, so omitted direct properties retain their
-theme values. An explicit `a:noFill` replaces a referenced fill.
+theme values. An explicit `a:noFill` replaces a referenced fill. A connector
+resolves its line reference the same way. Its fill and effect references are
+not rendered yet.
 
 Opaque effect children remain preserved rather than being claimed as resolved.
 An opaque effect that still contains `phClr` returns

@@ -51,13 +51,28 @@ with open("review.pdf", "wb") as output:
 - Slide layouts, slides, placeholders, shapes, text frames, paragraphs, runs,
   pictures, preset shapes, and tables.
 - Deterministic PDF and PNG output for slides and speaker notes.
-- Speaker-note text plus modern comment authors, threads, replies, and ordered
-  comment movement.
+- Formatting-preserving text replacement across slides and speaker notes,
+  with an optional expected count that leaves the deck unchanged on a
+  mismatch.
+- Package and PresentationML validation that returns the issues
+  `rpptx validate` reports as typed values.
+- Speaker-note text plus modern comment authors, threads, replies, thread
+  resolution and removal, and ordered comment movement.
 - Master, layout, placeholder, theme, shape, chart, media, and relationship
   state remains inside the native presentation engine during package edits.
 - Read speaker-note text and inspect or mutate modern comment threads.
 - Python collections with negative indexes, slices, iteration, and explicit
   stale-handle errors after structural changes.
+- Table cell merge and split, cell fills, margins, and borders, and row
+  heights.
+- Table rows and columns added with `table.rows.add_row()` and
+  `table.columns.add_column()` and removed with `remove`, keeping merged cells
+  and the frame size in step.
+- Picture crop, read and written as in python-pptx.
+- Shape z-order through `slide.shapes.move(from_, to)`.
+- Group members added through `group.shapes`, with the group refit to its
+  members as in python-pptx.
+- Run hyperlinks, read, added, retargeted, and removed as in python-pptx.
 
 ## Use it when
 

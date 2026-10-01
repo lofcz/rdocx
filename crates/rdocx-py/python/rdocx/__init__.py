@@ -1,6 +1,6 @@
 """Python bindings for rdocx."""
 
-from .enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
+from .enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
 from .enum.text import WD_ALIGN_PARAGRAPH, WD_UNDERLINE
 from .shared import Cm, Emu, Inches, Length, Mm, Pt, RGBColor
 
@@ -25,7 +25,27 @@ class LayoutError(RdocxError):
     """Document layout or rendering failed."""
 
 
+class ReplacementCountError(RdocxError):
+    """A counted replacement matched a different number of times than expected.
+
+    ``index`` is the position of the failing pair in a ``Document.replace_all``
+    batch, and ``None`` for ``Document.try_replace_text``.
+    """
+
+    def __init__(
+        self, message: str, expected: int, found: int, index: "int | None" = None
+    ) -> None:
+        super().__init__(message, expected, found, index)
+        self.expected = expected
+        self.found = found
+        self.index = index
+
+    def __str__(self) -> str:
+        return str(self.args[0])
+
+
 from ._rdocx import (
+    Bookmark,
     BoundingBox,
     Cell,
     CellCollection,
@@ -33,6 +53,7 @@ from ._rdocx import (
     Comment,
     ComparisonDiagnostic,
     ContentFragment,
+    CoreProperties,
     Document,
     Font,
     HeaderFooterVariant,
@@ -40,6 +61,7 @@ from ._rdocx import (
     LayoutFragment,
     LayoutBackedFieldUpdateReport,
     LayoutPage,
+    ListLevel,
     Paragraph,
     ParagraphCollection,
     ParagraphFormat,
@@ -56,12 +78,15 @@ from ._rdocx import (
     StoryRunPosition,
     StoryRunRange,
     Style,
+    SvgDiagnostic,
+    SvgRenderResult,
     Table,
     TableCollection,
     TocRebuildReport,
 )
 
 __all__ = [
+    "Bookmark",
     "BoundingBox",
     "Cm",
     "Cell",
@@ -70,6 +95,7 @@ __all__ = [
     "Comment",
     "ComparisonDiagnostic",
     "ContentFragment",
+    "CoreProperties",
     "Document",
     "Emu",
     "Font",
@@ -81,6 +107,7 @@ __all__ = [
     "LayoutFragment",
     "LayoutBackedFieldUpdateReport",
     "LayoutPage",
+    "ListLevel",
     "Mm",
     "PackageError",
     "Paragraph",
@@ -89,6 +116,7 @@ __all__ = [
     "Pt",
     "RGBColor",
     "RdocxError",
+    "ReplacementCountError",
     "Revision",
     "Row",
     "RowCollection",
@@ -103,11 +131,14 @@ __all__ = [
     "StoryRunPosition",
     "StoryRunRange",
     "Style",
+    "SvgDiagnostic",
+    "SvgRenderResult",
     "Table",
     "TableCollection",
     "TocRebuildReport",
     "WD_ALIGN_PARAGRAPH",
     "WD_CELL_VERTICAL_ALIGNMENT",
+    "WD_ROW_HEIGHT_RULE",
     "WD_TABLE_ALIGNMENT",
     "WD_UNDERLINE",
     "XmlError",

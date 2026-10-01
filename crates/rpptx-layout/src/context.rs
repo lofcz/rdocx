@@ -15,7 +15,8 @@ use oxml_drawing::line::{
 };
 use oxml_drawing::style_ref::{FontCollectionIndex, StyleReference};
 use oxml_drawing::table::{
-    CT_TableBorders, CT_TableCellStyle, CT_TablePartStyle, CT_TableStyleList, CT_TableTextStyle,
+    CT_TableBorders, CT_TableCellStyle, CT_TablePartStyle, CT_TableStyle, CT_TableStyleList,
+    CT_TableTextStyle,
 };
 use oxml_drawing::text::{
     CT_TextBody, CT_TextBodyProperties, CT_TextCharacterProperties, CT_TextListStyle,
@@ -190,27 +191,9 @@ impl<'a> ResolveCtx<'a> {
         &'ctx self,
         placeholder: Option<&CT_Placeholder>,
     ) -> (Option<&'ctx CT_Shape>, Option<&'ctx CT_Shape>) {
-        let Some(slide_key) = placeholder.map(CT_Placeholder::key) else {
-            return (None, None);
-        };
-        let Some(layout_shape) = find_placeholder(
-            &self.layout.common_slide_data.shape_tree.children,
-            &slide_key,
-        ) else {
-            return (None, None);
-        };
-        let Some(layout_key) = layout_shape
-            .placeholder
-            .as_ref()
-            .map(|placeholder| placeholder.key())
-        else {
-            return (None, None);
-        };
-        let master_shape = find_placeholder(
-            &self.master.common_slide_data.shape_tree.children,
-            &layout_key,
-        );
-        (Some(layout_shape), master_shape)
+        placeholder.map_or((None, None), |placeholder| {
+            placeholder_chain(placeholder, self.layout, self.master)
+        })
     }
 
     fn is_slide_number_placeholder(&self, shape: &CT_Shape) -> bool {
@@ -232,13 +215,9 @@ impl<'a> ResolveCtx<'a> {
 
     /// Resolves an owned transform from the slide, layout, then master shape.
     pub fn effective_xfrm(&self, shape: &CT_Shape) -> Option<CT_Transform2D> {
-        let (layout, master) = self.placeholder_chain(shape);
-        shape
-            .shape_properties
-            .transform
-            .clone()
-            .or_else(|| layout.and_then(|shape| shape.shape_properties.transform.as_ref().cloned()))
-            .or_else(|| master.and_then(|shape| shape.shape_properties.transform.as_ref().cloned()))
+        shape.shape_properties.transform.clone().or_else(|| {
+            inherited_xfrm(shape.placeholder.as_ref()?, self.layout, self.master).cloned()
+        })
     }
 
     /// Resolves picture bounds from the slide picture, layout placeholder, then master placeholder.
@@ -246,13 +225,9 @@ impl<'a> ResolveCtx<'a> {
         &self,
         picture: &rpptx_oxml::picture::CT_Picture,
     ) -> Option<CT_Transform2D> {
-        let (layout, master) = self.placeholder_chain_for(picture.placeholder.as_ref());
-        picture
-            .shape_properties
-            .transform
-            .clone()
-            .or_else(|| layout.and_then(|shape| shape.shape_properties.transform.as_ref().cloned()))
-            .or_else(|| master.and_then(|shape| shape.shape_properties.transform.as_ref().cloned()))
+        picture.shape_properties.transform.clone().or_else(|| {
+            inherited_xfrm(picture.placeholder.as_ref()?, self.layout, self.master).cloned()
+        })
     }
 
     /// Resolves body properties per field over defaults, master, layout, and slide.
@@ -820,17 +795,15 @@ impl<'a> ResolveCtx<'a> {
                     .map(|fill| self.concrete_fill(fill, (bounds.width, bounds.height)))
                     .transpose()?
                     .unwrap_or((None, None));
-                let has_direct_line = connector.shape_properties.line.is_some();
-                let mut line = connector
-                    .shape_properties
-                    .line
+                let has_line_source =
+                    connector.shape_properties.line.is_some() || connector.style().is_some();
+                let effective_line = self.effective_connector_line(connector)?;
+                let mut line = effective_line
                     .as_ref()
                     .map(|line| self.concrete_line(line, (bounds.width, bounds.height)))
                     .transpose()?
                     .flatten();
-                let (head_end, tail_end) = connector
-                    .shape_properties
-                    .line
+                let (head_end, tail_end) = effective_line
                     .as_ref()
                     .map(resolved_line_ends)
                     .unwrap_or((None, None));
@@ -886,7 +859,7 @@ impl<'a> ResolveCtx<'a> {
                 if let Some(message) = geometry_diagnostic {
                     diagnostics.push(Diagnostic { message });
                 }
-                let line_unsupported = (!has_direct_line).then_some("connector line style");
+                let line_unsupported = (!has_line_source).then_some("connector line style");
                 if line_unsupported.is_some() {
                     line = Some(Stroke::new(Paint::Solid(Color::BLACK), 1.0));
                     diagnostics.push(Diagnostic {
@@ -2157,14 +2130,33 @@ impl ResolveCtx<'_> {
             .iter()
             .map(|width| emu_to_points(width.0))
             .collect();
-        let style = self.table_styles.and_then(|styles| {
-            styles.style(
-                table
-                    .properties
-                    .as_ref()
-                    .and_then(|properties| properties.style_id.as_deref()),
-            )
+        let selected_id = table
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.style_id.as_deref());
+        let explicit_style = self.table_styles.and_then(|styles| {
+            selected_id.and_then(|id| styles.styles.iter().find(|style| style.style_id == id))
         });
+        let default_id = self
+            .table_styles
+            .and_then(|styles| styles.default_style_id.as_deref());
+        let default_style = self.table_styles.and_then(|styles| {
+            default_id.and_then(|id| styles.styles.iter().find(|style| style.style_id == id))
+        });
+        let builtin_style = if explicit_style.is_none() {
+            selected_id.and_then(builtin_table_style)
+        } else {
+            None
+        };
+        let builtin_default = if selected_id.is_none() && default_style.is_none() {
+            default_id.and_then(builtin_table_style)
+        } else {
+            None
+        };
+        let style = explicit_style
+            .or(builtin_style.as_ref())
+            .or(default_style)
+            .or(builtin_default.as_ref());
         let row_count = table.rows.len();
         let column_count = table.grid.columns.len();
         let table_properties = table.properties.as_ref();
@@ -2423,6 +2415,636 @@ impl ResolveCtx<'_> {
         substitute_fill(&mut fill, reference.color.as_ref(), "table cell")?;
         Ok(Some(fill))
     }
+}
+
+// Office's built-in table style IDs, grouped by visual family and theme accent.
+// Source: LibreOffice oox predefined-table-styles.cxx.
+const BUILTIN_TABLE_STYLES: &[(&str, &str, &str)] = &[
+    (
+        "{2D5ABB26-0587-4C30-8999-92F81FD0307C}",
+        "Themed-Style-1",
+        "",
+    ),
+    (
+        "{3C2FFA5D-87B4-456A-9821-1D502468CF0F}",
+        "Themed-Style-1",
+        "Accent1",
+    ),
+    (
+        "{284E427A-3D55-4303-BF80-6455036E1DE7}",
+        "Themed-Style-1",
+        "Accent2",
+    ),
+    (
+        "{69C7853C-536D-4A76-A0AE-DD22124D55A5}",
+        "Themed-Style-1",
+        "Accent3",
+    ),
+    (
+        "{775DCB02-9BB8-47FD-8907-85C794F793BA}",
+        "Themed-Style-1",
+        "Accent4",
+    ),
+    (
+        "{35758FB7-9AC5-4552-8A53-C91805E547FA}",
+        "Themed-Style-1",
+        "Accent5",
+    ),
+    (
+        "{08FB837D-C827-4EFA-A057-4D05807E0F7C}",
+        "Themed-Style-1",
+        "Accent6",
+    ),
+    (
+        "{5940675A-B579-460E-94D1-54222C63F5DA}",
+        "Themed-Style-2",
+        "",
+    ),
+    (
+        "{D113A9D2-9D6B-4929-AA2D-F23B5EE8CBE7}",
+        "Themed-Style-2",
+        "Accent1",
+    ),
+    (
+        "{18603FDC-E32A-4AB5-989C-0864C3EAD2B8}",
+        "Themed-Style-2",
+        "Accent2",
+    ),
+    (
+        "{306799F8-075E-4A3A-A7F6-7FBC6576F1A4}",
+        "Themed-Style-2",
+        "Accent3",
+    ),
+    (
+        "{E269D01E-BC32-4049-B463-5C60D7B0CCD2}",
+        "Themed-Style-2",
+        "Accent4",
+    ),
+    (
+        "{327F97BB-C833-4FB7-BDE5-3F7075034690}",
+        "Themed-Style-2",
+        "Accent5",
+    ),
+    (
+        "{638B1855-1B75-4FBE-930C-398BA8C253C6}",
+        "Themed-Style-2",
+        "Accent6",
+    ),
+    (
+        "{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF}",
+        "Light-Style-1",
+        "",
+    ),
+    (
+        "{3B4B98B0-60AC-42C2-AFA5-B58CD77FA1E5}",
+        "Light-Style-1",
+        "Accent1",
+    ),
+    (
+        "{0E3FDE45-AF77-4B5C-9715-49D594BDF05E}",
+        "Light-Style-1",
+        "Accent2",
+    ),
+    (
+        "{C083E6E3-FA7D-4D7B-A595-EF9225AFEA82}",
+        "Light-Style-1",
+        "Accent3",
+    ),
+    (
+        "{D27102A9-8310-4765-A935-A1911B00CA55}",
+        "Light-Style-1",
+        "Accent4",
+    ),
+    (
+        "{5FD0F851-EC5A-4D38-B0AD-8093EC10F338}",
+        "Light-Style-1",
+        "Accent5",
+    ),
+    (
+        "{68D230F3-CF80-4859-8CE7-A43EE81993B5}",
+        "Light-Style-1",
+        "Accent6",
+    ),
+    (
+        "{7E9639D4-E3E2-4D34-9284-5A2195B3D0D7}",
+        "Light-Style-2",
+        "",
+    ),
+    (
+        "{69012ECD-51FC-41F1-AA8D-1B2483CD663E}",
+        "Light-Style-2",
+        "Accent1",
+    ),
+    (
+        "{72833802-FEF1-4C79-8D5D-14CF1EAF98D9}",
+        "Light-Style-2",
+        "Accent2",
+    ),
+    (
+        "{F2DE63D5-997A-4646-A377-4702673A728D}",
+        "Light-Style-2",
+        "Accent3",
+    ),
+    (
+        "{17292A2E-F333-43FB-9621-5CBBE7FDCDCB}",
+        "Light-Style-2",
+        "Accent4",
+    ),
+    (
+        "{5A111915-BE36-4E01-A7E5-04B1672EAD32}",
+        "Light-Style-2",
+        "Accent5",
+    ),
+    (
+        "{912C8C85-51F0-491E-9774-3900AFEF0FD7}",
+        "Light-Style-2",
+        "Accent6",
+    ),
+    (
+        "{616DA210-FB5B-4158-B5E0-FEB733F419BA}",
+        "Light-Style-3",
+        "",
+    ),
+    (
+        "{BC89EF96-8CEA-46FF-86C4-4CE0E7609802}",
+        "Light-Style-3",
+        "Accent1",
+    ),
+    (
+        "{5DA37D80-6434-44D0-A028-1B22A696006F}",
+        "Light-Style-3",
+        "Accent2",
+    ),
+    (
+        "{8799B23B-EC83-4686-B30A-512413B5E67A}",
+        "Light-Style-3",
+        "Accent3",
+    ),
+    (
+        "{ED083AE6-46FA-4A59-8FB0-9F97EB10719F}",
+        "Light-Style-3",
+        "Accent4",
+    ),
+    (
+        "{BDBED569-4797-4DF1-A0F4-6AAB3CD982D8}",
+        "Light-Style-3",
+        "Accent5",
+    ),
+    (
+        "{E8B1032C-EA38-4F05-BA0D-38AFFFC7BED3}",
+        "Light-Style-3",
+        "Accent6",
+    ),
+    (
+        "{793D81CF-94F2-401A-BA57-92F5A7B2D0C5}",
+        "Medium-Style-1",
+        "",
+    ),
+    (
+        "{B301B821-A1FF-4177-AEE7-76D212191A09}",
+        "Medium-Style-1",
+        "Accent1",
+    ),
+    (
+        "{9DCAF9ED-07DC-4A11-8D7F-57B35C25682E}",
+        "Medium-Style-1",
+        "Accent2",
+    ),
+    (
+        "{1FECB4D8-DB02-4DC6-A0A2-4F2EBAE1DC90}",
+        "Medium-Style-1",
+        "Accent3",
+    ),
+    (
+        "{1E171933-4619-4E11-9A3F-F7608DF75F80}",
+        "Medium-Style-1",
+        "Accent4",
+    ),
+    (
+        "{FABFCF23-3B69-468F-B69F-88F6DE6A72F2}",
+        "Medium-Style-1",
+        "Accent5",
+    ),
+    (
+        "{10A1B5D5-9B99-4C35-A422-299274C87663}",
+        "Medium-Style-1",
+        "Accent6",
+    ),
+    (
+        "{073A0DAA-6AF3-43AB-8588-CEC1D06C72B9}",
+        "Medium-Style-2",
+        "",
+    ),
+    (
+        "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}",
+        "Medium-Style-2",
+        "Accent1",
+    ),
+    (
+        "{21E4AEA4-8DFA-4A89-87EB-49C32662AFE0}",
+        "Medium-Style-2",
+        "Accent2",
+    ),
+    (
+        "{F5AB1C69-6EDB-4FF4-983F-18BD219EF322}",
+        "Medium-Style-2",
+        "Accent3",
+    ),
+    (
+        "{00A15C55-8517-42AA-B614-E9B94910E393}",
+        "Medium-Style-2",
+        "Accent4",
+    ),
+    (
+        "{7DF18680-E054-41AD-8BC1-D1AEF772440D}",
+        "Medium-Style-2",
+        "Accent5",
+    ),
+    (
+        "{93296810-A885-4BE3-A3E7-6D5BEEA58F35}",
+        "Medium-Style-2",
+        "Accent6",
+    ),
+    (
+        "{8EC20E35-A176-4012-BC5E-935CFFF8708E}",
+        "Medium-Style-3",
+        "",
+    ),
+    (
+        "{6E25E649-3F16-4E02-A733-19D2CDBF48F0}",
+        "Medium-Style-3",
+        "Accent1",
+    ),
+    (
+        "{85BE263C-DBD7-4A20-BB59-AAB30ACAA65A}",
+        "Medium-Style-3",
+        "Accent2",
+    ),
+    (
+        "{EB344D84-9AFB-497E-A393-DC336BA19D2E}",
+        "Medium-Style-3",
+        "Accent3",
+    ),
+    (
+        "{EB9631B5-78F2-41C9-869B-9F39066F8104}",
+        "Medium-Style-3",
+        "Accent4",
+    ),
+    (
+        "{74C1A8A3-306A-4EB7-A6B1-4F7E0EB9C5D6}",
+        "Medium-Style-3",
+        "Accent5",
+    ),
+    (
+        "{2A488322-F2BA-4B5B-9748-0D474271808F}",
+        "Medium-Style-3",
+        "Accent6",
+    ),
+    (
+        "{D7AC3CCA-C797-4891-BE02-D94E43425B78}",
+        "Medium-Style-4",
+        "",
+    ),
+    (
+        "{69CF1AB2-1976-4502-BF36-3FF5EA218861}",
+        "Medium-Style-4",
+        "Accent1",
+    ),
+    (
+        "{8A107856-5554-42FB-B03E-39F5DBC370BA}",
+        "Medium-Style-4",
+        "Accent2",
+    ),
+    (
+        "{0505E3EF-67EA-436B-97B2-0124C06EBD24}",
+        "Medium-Style-4",
+        "Accent3",
+    ),
+    (
+        "{C4B1156A-380E-4F78-BDF5-A606A8083BF9}",
+        "Medium-Style-4",
+        "Accent4",
+    ),
+    (
+        "{22838BEF-8BB2-4498-84A7-C5851F593DF1}",
+        "Medium-Style-4",
+        "Accent5",
+    ),
+    (
+        "{16D9F66E-5EB9-4882-86FB-DCBF35E3C3E4}",
+        "Medium-Style-4",
+        "Accent6",
+    ),
+    ("{E8034E78-7F5D-4C2E-B375-FC64B27BC917}", "Dark-Style-1", ""),
+    (
+        "{125E5076-3810-47DD-B79F-674D7AD40C01}",
+        "Dark-Style-1",
+        "Accent1",
+    ),
+    (
+        "{37CE84F3-28C3-443E-9E96-99CF82512B78}",
+        "Dark-Style-1",
+        "Accent2",
+    ),
+    (
+        "{D03447BB-5D67-496B-8E87-E561075AD55C}",
+        "Dark-Style-1",
+        "Accent3",
+    ),
+    (
+        "{E929F9F4-4A8F-4326-A1B4-22849713DDAB}",
+        "Dark-Style-1",
+        "Accent4",
+    ),
+    (
+        "{8FD4443E-F989-4FC4-A0C8-D5A2AF1F390B}",
+        "Dark-Style-1",
+        "Accent5",
+    ),
+    (
+        "{AF606853-7671-496A-8E4F-DF71F8EC918B}",
+        "Dark-Style-1",
+        "Accent6",
+    ),
+    ("{5202B0CA-FC54-4496-8BCA-5EF66A818D29}", "Dark-Style-2", ""),
+    (
+        "{0660B408-B3CF-4A94-85FC-2B1E0A45F4A2}",
+        "Dark-Style-2",
+        "Accent1",
+    ),
+    (
+        "{91EBBBCC-DAD2-459C-BE2E-F6DE35CF9A28}",
+        "Dark-Style-2",
+        "Accent3",
+    ),
+    (
+        "{46F890A9-2807-4EBB-B81D-B2AA78EC7F39}",
+        "Dark-Style-2",
+        "Accent5",
+    ),
+];
+
+/// Materializes a built-in Office table style that has an ID but no package definition.
+fn builtin_table_style(style_id: &str) -> Option<CT_TableStyle> {
+    let (_, family, accent) = BUILTIN_TABLE_STYLES
+        .iter()
+        .find(|(id, _, _)| id.eq_ignore_ascii_case(style_id))?;
+    let accent = if accent.is_empty() {
+        "dk1"
+    } else {
+        match *accent {
+            "Accent1" => "accent1",
+            "Accent2" => "accent2",
+            "Accent3" => "accent3",
+            "Accent4" => "accent4",
+            "Accent5" => "accent5",
+            _ => "accent6",
+        }
+    };
+    let mut xml = format!(
+        "<a:tblStyleLst xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:tblStyle styleId=\"{style_id}\" styleName=\"{family}\">"
+    );
+    let edge = [
+        ("left", accent),
+        ("right", accent),
+        ("top", accent),
+        ("bottom", accent),
+    ];
+    let white_edge = [
+        ("left", "lt1"),
+        ("right", "lt1"),
+        ("top", "lt1"),
+        ("bottom", "lt1"),
+    ];
+    match *family {
+        "Themed-Style-1" => {
+            builtin_style_region(&mut xml, "wholeTbl", None, Some("dk1"), &edge);
+            builtin_style_region(
+                &mut xml,
+                "band1H",
+                Some((accent, "alpha", 40000)),
+                None,
+                &[],
+            );
+            builtin_style_region(
+                &mut xml,
+                "band1V",
+                Some((accent, "alpha", 40000)),
+                None,
+                &[],
+            );
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                Some((accent, "", 0)),
+                Some("lt1"),
+                &[("bottom", "lt1")],
+            );
+        }
+        "Themed-Style-2" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some((accent, "", 0)),
+                Some("lt1"),
+                &edge,
+            );
+            builtin_style_region(&mut xml, "band1H", Some(("lt1", "alpha", 20000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some(("lt1", "alpha", 20000)), None, &[]);
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                None,
+                Some("lt1"),
+                &[("bottom", "lt1")],
+            );
+        }
+        "Light-Style-1" | "Light-Style-3" => {
+            builtin_style_region(&mut xml, "wholeTbl", None, Some("tx1"), &edge);
+            builtin_style_region(
+                &mut xml,
+                "band1H",
+                Some((accent, "alpha", 20000)),
+                None,
+                &[],
+            );
+            builtin_style_region(
+                &mut xml,
+                "band1V",
+                Some((accent, "alpha", 20000)),
+                None,
+                &[],
+            );
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                None,
+                Some(accent),
+                &[("bottom", accent)],
+            );
+        }
+        "Light-Style-2" => {
+            builtin_style_region(&mut xml, "wholeTbl", None, Some("tx1"), &edge);
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                Some((accent, "", 0)),
+                Some("bg1"),
+                &[],
+            );
+            builtin_style_region(&mut xml, "lastRow", None, None, &[("top", accent)]);
+        }
+        "Medium-Style-1" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some(("lt1", "", 0)),
+                Some("dk1"),
+                &edge,
+            );
+            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 20000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 20000)), None, &[]);
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                Some((accent, "", 0)),
+                Some("lt1"),
+                &[],
+            );
+        }
+        "Medium-Style-2" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some((accent, "tint", 20000)),
+                Some("dk1"),
+                &white_edge,
+            );
+            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
+            for name in ["firstRow", "lastRow", "firstCol", "lastCol"] {
+                builtin_style_region(
+                    &mut xml,
+                    name,
+                    Some((accent, "", 0)),
+                    Some("lt1"),
+                    &white_edge,
+                );
+            }
+        }
+        "Medium-Style-3" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some(("lt1", "", 0)),
+                Some("dk1"),
+                &[("top", "dk1"), ("bottom", "dk1")],
+            );
+            builtin_style_region(&mut xml, "band1H", Some(("dk1", "tint", 20000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some(("dk1", "tint", 20000)), None, &[]);
+            for name in ["firstRow", "firstCol", "lastCol"] {
+                builtin_style_region(&mut xml, name, Some((accent, "", 0)), Some("lt1"), &[]);
+            }
+        }
+        "Medium-Style-4" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some((accent, "tint", 20000)),
+                Some("dk1"),
+                &edge,
+            );
+            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                Some((accent, "tint", 20000)),
+                Some(accent),
+                &[],
+            );
+            builtin_style_region(
+                &mut xml,
+                "lastRow",
+                Some(("dk1", "tint", 20000)),
+                None,
+                &[("top", "dk1")],
+            );
+        }
+        "Dark-Style-1" | "Dark-Style-2" => {
+            builtin_style_region(
+                &mut xml,
+                "wholeTbl",
+                Some((accent, "tint", 20000)),
+                Some("dk1"),
+                &[],
+            );
+            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
+            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
+            builtin_style_region(
+                &mut xml,
+                "firstRow",
+                Some(("dk1", "", 0)),
+                Some("lt1"),
+                &white_edge,
+            );
+            builtin_style_region(&mut xml, "lastRow", Some((accent, "", 0)), None, &[]);
+        }
+        _ => unreachable!("built-in family mapping is exhaustive"),
+    }
+    let header_end = xml.find("<a:wholeTbl>")?;
+    let mut ordered = xml[..header_end].to_owned();
+    for region in [
+        "wholeTbl", "band1H", "band2H", "band1V", "band2V", "lastCol", "firstCol", "lastRow",
+        "seCell", "swCell", "firstRow", "neCell", "nwCell",
+    ] {
+        let open = format!("<a:{region}>");
+        if let Some(start) = xml.find(&open) {
+            let close = format!("</a:{region}>");
+            let end = xml[start..].find(&close)? + start + close.len();
+            ordered.push_str(&xml[start..end]);
+        }
+    }
+    ordered.push_str("</a:tblStyle></a:tblStyleLst>");
+    CT_TableStyleList::from_xml(ordered.as_bytes())
+        .ok()?
+        .styles
+        .into_iter()
+        .next()
+}
+
+fn builtin_style_region(
+    xml: &mut String,
+    region: &str,
+    fill: Option<(&str, &str, u32)>,
+    text: Option<&str>,
+    borders: &[(&str, &str)],
+) {
+    xml.push_str(&format!("<a:{region}>"));
+    if let Some(text) = text {
+        xml.push_str(&format!(
+            "<a:tcTxStyle><a:schemeClr val=\"{text}\"/></a:tcTxStyle>"
+        ));
+    }
+    if fill.is_some() || !borders.is_empty() {
+        xml.push_str("<a:tcStyle>");
+        if !borders.is_empty() {
+            xml.push_str("<a:tcBdr>");
+            for (edge, color) in borders {
+                xml.push_str(&format!("<a:{edge}><a:ln w=\"12700\"><a:solidFill><a:schemeClr val=\"{color}\"/></a:solidFill></a:ln></a:{edge}>"));
+            }
+            xml.push_str("</a:tcBdr>");
+        }
+        if let Some((color, transform, value)) = fill {
+            xml.push_str(&format!("<a:solidFill><a:schemeClr val=\"{color}\">"));
+            if !transform.is_empty() {
+                xml.push_str(&format!("<a:{transform} val=\"{value}\"/>"));
+            }
+            xml.push_str("</a:schemeClr></a:solidFill>");
+        }
+        xml.push_str("</a:tcStyle>");
+    }
+    xml.push_str(&format!("</a:{region}>"));
 }
 
 #[derive(Default)]
@@ -3826,6 +4448,46 @@ fn merge_body_properties(target: &mut CT_TextBodyProperties, source: &CT_TextBod
     }
 }
 
+/// Returns the transform a slide placeholder inherits, ignoring its own.
+///
+/// The placeholder matches a layout placeholder, whose own key then matches
+/// a master placeholder. The first of the two that carries a transform
+/// supplies it whole, which is the fallback [`ResolveCtx::effective_xfrm`]
+/// takes when the slide shape has no transform of its own.
+pub fn inherited_xfrm<'a>(
+    placeholder: &CT_Placeholder,
+    layout: &'a CT_SlideLayout,
+    master: &'a CT_SlideMaster,
+) -> Option<&'a CT_Transform2D> {
+    let (layout, master) = placeholder_chain(placeholder, layout, master);
+    [layout, master]
+        .into_iter()
+        .flatten()
+        .find_map(|shape| shape.shape_properties.transform.as_ref())
+}
+
+fn placeholder_chain<'a>(
+    placeholder: &CT_Placeholder,
+    layout: &'a CT_SlideLayout,
+    master: &'a CT_SlideMaster,
+) -> (Option<&'a CT_Shape>, Option<&'a CT_Shape>) {
+    let Some(layout_shape) = find_placeholder(
+        &layout.common_slide_data.shape_tree.children,
+        &placeholder.key(),
+    ) else {
+        return (None, None);
+    };
+    let Some(layout_key) = layout_shape
+        .placeholder
+        .as_ref()
+        .map(|placeholder| placeholder.key())
+    else {
+        return (None, None);
+    };
+    let master_shape = find_placeholder(&master.common_slide_data.shape_tree.children, &layout_key);
+    (Some(layout_shape), master_shape)
+}
+
 fn find_placeholder<'a>(
     children: &'a [ShapeTreeChild],
     key: &PlaceholderKey,
@@ -3870,8 +4532,8 @@ mod tests {
     use rpptx_oxml::slide_parts::{CT_Slide, CT_SlideLayout, CT_SlideMaster, ColorMapOverrideKind};
 
     use super::{
-        BackgroundSource, FlattenedItem, FlattenedSource, ResolveCtx, resolved_shape_page_bounds,
-        resolved_shape_page_transform, transform_values,
+        BackgroundSource, FlattenedItem, FlattenedSource, ResolveCtx, inherited_xfrm,
+        resolved_shape_page_bounds, resolved_shape_page_transform, transform_values,
     };
     use crate::{
         ChartResource, Diagnostic, ParagraphAlignment, ResolvedAutofit, ResolvedBackground,
@@ -4340,6 +5002,50 @@ mod tests {
 
         assert_eq!(offsets, [11, 22, 33]);
         assert!(context.effective_xfrm(fixture.slide_shape(3)).is_none());
+    }
+
+    #[test]
+    fn inherited_transform_skips_the_slide_shape_and_follows_the_layout_key() {
+        let slide_children = [
+            shape_with_details(Some("body"), Some(1), &transform(11), None),
+            shape(Some("body"), Some(3)),
+            shape(Some("ftr"), Some(9)),
+            shape(Some("body"), Some(5)),
+        ]
+        .join("");
+        let layout_children = [
+            shape_with_details(Some("body"), Some(1), &transform(21), None),
+            shape(Some("body"), Some(3)),
+            shape(Some("ftr"), Some(10)),
+        ]
+        .join("");
+        let master_children = [
+            shape_with_details(Some("body"), Some(1), &transform(31), None),
+            shape_with_details(Some("body"), Some(3), &transform(33), None),
+            shape_with_details(Some("ftr"), Some(11), &transform(34), None),
+            shape_with_details(Some("body"), Some(5), &transform(35), None),
+        ]
+        .join("");
+        let fixture = Fixture::new(&slide_children, &layout_children, &master_children);
+        let context = fixture.context();
+        let inherited = |index: usize| {
+            let placeholder = fixture.slide_shape(index).placeholder.as_ref().unwrap();
+            inherited_xfrm(placeholder, &fixture.layout, &fixture.master)
+                .map(|transform| transform.offset.unwrap().x.0)
+        };
+
+        assert_eq!(inherited(0), Some(21));
+        assert_eq!(inherited(1), Some(33));
+        assert_eq!(inherited(2), Some(34));
+        assert_eq!(inherited(3), None, "a master match alone is not inherited");
+        for index in 1..4 {
+            assert_eq!(
+                context
+                    .effective_xfrm(fixture.slide_shape(index))
+                    .map(|transform| transform.offset.unwrap().x.0),
+                inherited(index)
+            );
+        }
     }
 
     #[test]
@@ -5836,6 +6542,48 @@ mod tests {
     }
 
     #[test]
+    fn connector_style_resolves_the_theme_line_under_its_direct_line() {
+        let styled = |line_index: u32, line: &str| {
+            connector("line", 127_000, 254_000, "", line).replace(
+                "</p:cxnSp>",
+                &format!(
+                    r#"<p:style><a:lnRef idx="{line_index}"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="1"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="tx1"/></a:fontRef></p:style></p:cxnSp>"#
+                ),
+            )
+        };
+        let fixture = Fixture::new(
+            &[
+                styled(2, ""),
+                styled(2, r#"<a:ln w="38100"/>"#),
+                styled(0, ""),
+            ]
+            .join(""),
+            "",
+            "",
+        );
+
+        let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "{:?}",
+            resolved.diagnostics
+        );
+        let accent1 = Paint::Solid(Color::from_hex("156082"));
+        let themed = resolved.shapes[0].line.as_ref().expect("theme line");
+        assert_eq!((&themed.paint, themed.width), (&accent1, 1.5));
+        let widened = resolved.shapes[1].line.as_ref().expect("overlaid line");
+        assert_eq!((&widened.paint, widened.width), (&accent1, 3.0));
+        assert_eq!(resolved.shapes[2].line, None);
+        assert!(
+            resolved
+                .shapes
+                .iter()
+                .all(|shape| shape.unsupported.is_none())
+        );
+    }
+
+    #[test]
     fn unknown_preset_keeps_bounds_text_and_diagnostic() {
         let shape = format!(
             "<p:sp><p:nvSpPr><p:cNvPr/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}<a:prstGeom prst=\"futureBurst\"/></p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>keep this text</a:t></a:r></a:p></p:txBody></p:sp>",
@@ -6311,6 +7059,41 @@ mod tests {
         assert!(style.bold && style.italic);
         assert_eq!(style.fill, Some(Paint::Solid(Color::from_hex("AABBCC"))));
         assert_eq!(style.latin_typeface.as_deref(), Some("Aptos Display"));
+    }
+
+    #[test]
+    fn builtin_table_styles_resolve_without_package_definitions() {
+        assert_eq!(super::BUILTIN_TABLE_STYLES.len(), 74);
+        for (id, _, _) in super::BUILTIN_TABLE_STYLES {
+            let style = super::builtin_table_style(id).expect("known built-in style parses");
+            assert_eq!(&style.style_id, id);
+            assert!(style.whole_table.is_some());
+        }
+        assert!(super::builtin_table_style("{00000000-0000-0000-0000-000000000000}").is_none());
+
+        let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="254000" cy="254000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc/></a:tr><a:tr h="127000"><a:tc/></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
+        let fixture = Fixture::new(frame, "", "");
+        let resolved = fixture.context().resolve_slide((20.0, 20.0)).unwrap();
+        let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+            panic!("expected table");
+        };
+        assert!(matches!(table.rows[0].cells[0].fill, Some(Paint::Solid(_))));
+        assert!(matches!(table.rows[1].cells[0].fill, Some(Paint::Solid(_))));
+        assert_ne!(table.rows[0].cells[0].fill, table.rows[1].cells[0].fill);
+
+        let package_style = oxml_drawing::table::CT_TableStyleList::from_xml(br#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblStyle styleId="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" styleName="Package override"><a:wholeTbl><a:tcStyle><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:tcStyle></a:wholeTbl></a:tblStyle></a:tblStyleLst>"#).unwrap();
+        let overridden = fixture
+            .context()
+            .with_table_styles(&package_style)
+            .resolve_slide((20.0, 20.0))
+            .unwrap();
+        let ResolvedContent::Table(overridden) = &overridden.shapes[0].content else {
+            panic!("expected table");
+        };
+        assert_eq!(
+            overridden.rows[0].cells[0].fill,
+            Some(Paint::Solid(Color::from_hex("FF0000")))
+        );
     }
 
     #[test]

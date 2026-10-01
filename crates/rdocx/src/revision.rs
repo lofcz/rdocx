@@ -1,18 +1,56 @@
 //! Native tracked-revision inspection and atomic resolution.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 pub use rdocx_oxml::RevisionKind;
+use rdocx_oxml::text::CT_P;
 use rdocx_oxml::{CT_Document, CT_Revision};
 
-use crate::{Document, Error, ParagraphRef, Result};
+use crate::{Document, Error, ParagraphRef, Result, StoryId};
 
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
 type NamespaceScope = HashMap<String, String>;
 type NamespaceDeclarations = Vec<(String, String)>;
+
+/// Whether a tracked revision takes its text out of the accepted view, as a
+/// deletion or a move away does. The exporters leave that text out.
+pub(crate) fn revision_removes_text(revision: &CT_Revision) -> bool {
+    matches!(
+        revision.kind(),
+        RevisionKind::Deletion | RevisionKind::MoveFrom
+    )
+}
+
+/// The content of a tracked insertion or move in, which the exporters write in
+/// place. None for an empty one, and for a deletion, a move away or a property
+/// change.
+pub(crate) fn accepted_revision_content(revision: &CT_Revision) -> Option<&CT_P> {
+    matches!(
+        revision.kind(),
+        RevisionKind::Insertion | RevisionKind::MoveTo
+    )
+    .then(|| revision.content_paragraph())
+    .flatten()
+}
+
+/// Whether the preserved paragraph child `paragraph.extra_xml[index]` is the
+/// source of one of the typed `paragraph.revisions`, which the exporters read
+/// through the revision instead.
+pub(crate) fn raw_is_typed_revision(paragraph: &CT_P, index: usize) -> bool {
+    let run_index = paragraph.extra_xml[index].0;
+    let slot = paragraph.extra_xml[..index]
+        .iter()
+        .filter(|(at, _)| *at == run_index)
+        .count();
+    paragraph
+        .revisions
+        .iter()
+        .any(|(at, revision_slot, _)| *at == run_index && *revision_slot == slot)
+}
 
 /// An immutable view of one tracked revision in the main document.
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +83,103 @@ impl RevisionRef<'_> {
         self.inner
             .content_paragraph()
             .map(|inner| ParagraphRef { inner })
+    }
+}
+
+/// One owned tracked revision and the Word story that holds it.
+///
+/// [`Document::story_revisions`] returns one snapshot for each revision
+/// element that accepting or rejecting every revision resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryRevision {
+    story: StoryId,
+    id: i32,
+    author: String,
+    timestamp: Option<String>,
+    kind: RevisionKind,
+}
+
+fn comment_comparison_record(
+    document: &Document,
+) -> Result<Option<(serde_json::Value, RevisionMetadata)>> {
+    let Some(raw) = document
+        .package
+        .get_part(crate::comparison::COMMENT_COMPARISON_PART)
+    else {
+        return Ok(None);
+    };
+    use base64::Engine;
+    let encoded = std::str::from_utf8(raw)
+        .map_err(|error| Error::Other(error.to_string()))?
+        .strip_prefix(crate::comparison::COMMENT_COMPARISON_OPEN)
+        .and_then(|xml| xml.strip_suffix(crate::comparison::COMMENT_COMPARISON_CLOSE))
+        .ok_or_else(|| Error::Other("invalid comment comparison XML".to_owned()))?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| Error::Other(error.to_string()))?;
+    let record: serde_json::Value =
+        serde_json::from_slice(&data).map_err(|error| Error::Other(error.to_string()))?;
+    let metadata = RevisionMetadata {
+        kind: RevisionKind::Insertion,
+        id: record
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .ok_or_else(|| Error::Other("invalid comment revision id".to_owned()))?,
+        author: record
+            .get("author")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Other("invalid comment revision author".to_owned()))?
+            .to_owned(),
+        timestamp: Some(
+            record
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Other("invalid comment revision date".to_owned()))?
+                .to_owned(),
+        ),
+    };
+    Ok(Some((record, metadata)))
+}
+
+pub(crate) fn comment_comparison_revision(
+    document: &Document,
+    story: StoryId,
+) -> Result<Option<StoryRevision>> {
+    Ok(
+        comment_comparison_record(document)?.map(|(_, metadata)| StoryRevision {
+            story,
+            id: metadata.id,
+            author: metadata.author,
+            timestamp: metadata.timestamp,
+            kind: metadata.kind,
+        }),
+    )
+}
+
+impl StoryRevision {
+    /// Return the story that holds this revision.
+    ///
+    /// Table cells fold into the story that holds the table. The identity is
+    /// one of those returned by [`Document::stories`] for the same document.
+    pub fn story(&self) -> &StoryId {
+        &self.story
+    }
+
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub fn author(&self) -> &str {
+        &self.author
+    }
+
+    pub fn timestamp(&self) -> Option<&str> {
+        self.timestamp.as_deref()
+    }
+
+    pub fn kind(&self) -> RevisionKind {
+        self.kind
     }
 }
 
@@ -177,8 +312,8 @@ impl Document {
             candidate.package.set_part(&candidate.doc_part_name, output);
         }
 
-        let story_parts = crate::comparison::related_story_part_names(&candidate)?;
-        for part_name in story_parts {
+        let story_parts = crate::comparison::revision_story_parts(&candidate)?;
+        for (_, part_name) in story_parts {
             let part = candidate
                 .package
                 .get_part(&part_name)
@@ -191,6 +326,40 @@ impl Document {
                     .checked_add(count)
                     .ok_or_else(|| Error::Other("resolved revision count overflowed".to_owned()))?;
             }
+        }
+        if let Some((record, metadata)) = comment_comparison_record(&candidate)?
+            && scope.matches(&metadata)
+        {
+            if matches!(resolution, Resolution::Reject) {
+                crate::comparison::apply_comment_snapshot(
+                    &mut candidate,
+                    record.get("original").ok_or_else(|| {
+                        Error::Other("missing original comment snapshot".to_owned())
+                    })?,
+                )?;
+            }
+            candidate
+                .package
+                .remove_part(crate::comparison::COMMENT_COMPARISON_PART);
+            candidate
+                .package
+                .content_types
+                .remove_override(crate::comparison::COMMENT_COMPARISON_PART);
+            if let Some(relationships) = candidate
+                .package
+                .get_part_rels_mut(&candidate.doc_part_name)
+            {
+                relationships.items.retain(|relationship| {
+                    relationship.rel_type != crate::comparison::COMMENT_COMPARISON_REL
+                        || oxml_opc::OpcPackage::resolve_rel_target(
+                            &candidate.doc_part_name,
+                            &relationship.target,
+                        ) != crate::comparison::COMMENT_COMPARISON_PART
+                });
+            }
+            resolved = resolved
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("resolved revision count overflowed".to_owned()))?;
         }
         if resolved == 0 {
             return Ok(0);
@@ -226,6 +395,40 @@ pub(crate) fn modeled_revision_count(source: &[u8]) -> Result<usize> {
         .iter()
         .filter(|element| element.revision.is_some())
         .count())
+}
+
+/// List the modeled revisions of one story part in document order.
+///
+/// These are the elements that resolving the part counts. Each one belongs to
+/// the innermost span in `owners` that holds its start tag.
+pub(crate) fn story_part_revisions(
+    part_name: &str,
+    source: &[u8],
+    owners: &[(Range<usize>, StoryId)],
+) -> Result<Vec<StoryRevision>> {
+    let tree = XmlTree::parse(source)?;
+    tree.elements
+        .iter()
+        .filter_map(|element| Some((element.start, element.revision.as_ref()?)))
+        .map(|(start, metadata)| {
+            let (_, story) = owners
+                .iter()
+                .filter(|(span, _)| span.contains(&start))
+                .max_by_key(|(span, _)| span.start)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "tracked revision at byte {start} of {part_name} has no story owner"
+                    ))
+                })?;
+            Ok(StoryRevision {
+                story: story.clone(),
+                id: metadata.id,
+                author: metadata.author.clone(),
+                timestamp: metadata.timestamp.clone(),
+                kind: metadata.kind,
+            })
+        })
+        .collect()
 }
 
 fn date_scope(start: &str, end: &str) -> Result<RevisionScope<'static>> {
@@ -447,6 +650,13 @@ impl<'a> XmlTree<'a> {
         promoted_namespaces: &[(String, String)],
     ) -> Result<Vec<u8>> {
         let element = &self.elements[index];
+        // Rejected deleted text reads as text again, and a deleted field
+        // instruction as an instruction.
+        let restored_local = match element.local.as_str() {
+            "delText" if convert_deleted_text && element.word => Some("t"),
+            "delInstrText" if convert_deleted_text && element.word => Some("instrText"),
+            _ => None,
+        };
         if element.empty {
             let raw = &self.source[element.start..element.end];
             let raw = inject_namespace_declarations(
@@ -454,13 +664,10 @@ impl<'a> XmlTree<'a> {
                 &element.namespace_declarations,
                 promoted_namespaces,
             );
-            return Ok(
-                if convert_deleted_text && element.word && element.local == "delText" {
-                    rename_element(&raw, &element.name, "t")
-                } else {
-                    raw
-                },
-            );
+            return Ok(match restored_local {
+                Some(local) => rename_element(&raw, &element.name, local),
+                None => raw,
+            });
         }
 
         let resolves_paragraph_property_change = element.word
@@ -493,15 +700,15 @@ impl<'a> XmlTree<'a> {
             &element.namespace_declarations,
             promoted_namespaces,
         );
-        if convert_deleted_text && element.word && element.local == "delText" {
-            output.extend_from_slice(&rename_element(&open, &element.name, "t"));
+        if let Some(local) = restored_local {
+            output.extend_from_slice(&rename_element(&open, &element.name, local));
         } else {
             output.extend_from_slice(&open);
         }
         output.extend_from_slice(&inner);
         let close = &self.source[element.close_start..element.end];
-        if convert_deleted_text && element.word && element.local == "delText" {
-            output.extend_from_slice(&rename_element(close, &element.name, "t"));
+        if let Some(local) = restored_local {
+            output.extend_from_slice(&rename_element(close, &element.name, local));
         } else {
             output.extend_from_slice(close);
         }

@@ -9,8 +9,8 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use rdocx_oxml::math::{
     BarPosition, FractionType, MathAccent, MathArgument, MathBar, MathBorderBox, MathDelimiter,
-    MathExpression, MathFraction, MathLimit, MathMatrix, MathMatrixRow, MathNary, MathPreSubSuperscript,
-    MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
+    MathExpression, MathFraction, MathLimit, MathMatrix, MathMatrixRow, MathNary,
+    MathPreSubSuperscript, MathRadical, MathRun, MathScript, MathStyle, MathSubSuperscript,
 };
 
 use crate::{Error, Result};
@@ -1154,7 +1154,10 @@ fn parse_mathml_matrix(
     // Pad with empty cells so the matrix stays rectangular, like TeX does.
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
     if rows.iter().any(|row| row.len() != width) {
-        diagnostics.push(path, "ragged MathML matrix rows were padded with empty cells")?;
+        diagnostics.push(
+            path,
+            "ragged MathML matrix rows were padded with empty cells",
+        )?;
     }
     Ok(vec![MathExpression::Matrix(MathMatrix::new(
         rows.into_iter()
@@ -1922,7 +1925,10 @@ fn write_mathml_expression(
         }
         MathExpression::Bar(value) => {
             let (open, close) = match value.position {
-                BarPosition::Top => ("<mover accent=\"true\"><mrow>", "</mrow><mo>\u{203E}</mo></mover>"),
+                BarPosition::Top => (
+                    "<mover accent=\"true\"><mrow>",
+                    "</mrow><mo>\u{203E}</mo></mover>",
+                ),
                 BarPosition::Bottom => (
                     "<munder accentunder=\"true\"><mrow>",
                     "</mrow><mo>\u{203E}</mo></munder>",
@@ -3576,14 +3582,11 @@ mod tests {
                 && value.message == "unsupported MathML attribute was discarded"
         }));
         // Presentation hints without an OMML counterpart are accepted silently.
-        assert!(
-            !attribute_losses
-                .diagnostics
-                .iter()
-                .any(|value| value.path.ends_with("/@largeop")
-                    || value.path.ends_with("/@stretchy")
-                    || value.path.ends_with("/@form"))
-        );
+        assert!(!attribute_losses.diagnostics.iter().any(
+            |value| value.path.ends_with("/@largeop")
+                || value.path.ends_with("/@stretchy")
+                || value.path.ends_with("/@form")
+        ));
         assert!(attribute_losses.diagnostics.iter().any(|value| {
             value.path == "/math[1]/mover[1]/@accent"
                 && value.message == "unsupported MathML attribute value was discarded"
@@ -3596,10 +3599,7 @@ mod tests {
             value.path.ends_with("mrow[1]/mo[2]/@bar")
                 && value.message == "unsupported MathML attribute was discarded"
         }));
-        for path in [
-            "/math[1]/mrow[1]/mo[1]/@foo",
-            "/math[1]/mrow[1]/mo[2]/@bar",
-        ] {
+        for path in ["/math[1]/mrow[1]/mo[1]/@foo", "/math[1]/mrow[1]/mo[2]/@bar"] {
             assert_eq!(
                 attribute_losses
                     .diagnostics
@@ -3824,7 +3824,10 @@ mod tests {
         let MathExpression::Run(sin) = &expressions[1] else {
             panic!("function name run")
         };
-        assert_eq!((sin.text.as_str(), sin.properties.normal), ("sin", Some(true)));
+        assert_eq!(
+            (sin.text.as_str(), sin.properties.normal),
+            ("sin", Some(true))
+        );
         let MathExpression::Run(x) = &expressions[2] else {
             panic!("invisible operator is dropped and x follows")
         };
@@ -4693,5 +4696,4 @@ mod tests {
             assert_eq!(equation_from_latex(&tex.value).unwrap().value, parsed.value);
         }
     }
-
 }

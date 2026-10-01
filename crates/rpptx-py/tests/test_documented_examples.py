@@ -402,6 +402,49 @@ def test_whole_text_replacement_stales_descendant_handles_once():
     assert prs.slides[0].shapes[-1].text_frame.paragraphs[0].text == "after"
 
 
+def test_run_text_replaces_in_place_and_keeps_every_handle_live():
+    import rpptx
+
+    prs = _textbox_presentation(rpptx)
+    prs.slides[0].shapes[0].text_frame.paragraphs[0].add_run(" world")
+    slides = prs.slides
+    slide = slides[0]
+    shapes = slide.shapes
+    shape = shapes[0]
+    left = shape.left
+    frame = shape.text_frame
+    paragraph = frame.paragraphs[0]
+    runs = paragraph.runs
+    first, second = runs[0], runs[1]
+    font = first.font
+
+    for value in ("HELLO", "line\nfeed", "vertical\vtab", "tab\tstop", ""):
+        first.text = value
+        assert first.text == value
+        assert second.text == " world"
+        assert paragraph.text == frame.text == shape.text == value + " world"
+        assert len(runs) == 2
+        assert shape.left == left
+        assert len(slides) == len(shapes) == len(slide.shapes) == 1
+        assert font.bold is None
+
+    second.text = "world"
+    font.bold = True
+    assert (first.text, second.text, first.font.bold) == ("", "world", True)
+    fresh = prs.slides[0].shapes[0].text_frame.paragraphs[0].runs
+    assert [run.text for run in fresh] == ["", "world"]
+
+    paragraph.text = "whole"
+    for operation in (
+        lambda: shape.left,
+        lambda: len(slide.shapes),
+        lambda: second.text,
+        lambda: font.bold,
+    ):
+        _assert_stale_after_exactly_one_bump(rpptx, operation)
+    assert prs.slides[0].shapes[0].text == "whole"
+
+
 def test_nested_group_paths_report_exact_recovery(tmp_path):
     if importlib.util.find_spec("pptx") is None:
         pytest.skip("python-pptx oracle is installed only for the differential gate")
@@ -1684,6 +1727,83 @@ def test_text_properties_agree_with_python_pptx_in_both_directions(tmp_path):
     assert font.color.rgb == OracleRGBColor(0xAA, 0xBB, 0xCC)
 
 
+def _slide_hyperlink_targets(data):
+    import xml.etree.ElementTree as ElementTree
+
+    relationships = _package_parts(data)["ppt/slides/_rels/slide1.xml.rels"]
+    return sorted(
+        relationship.get("Target")
+        for relationship in ElementTree.fromstring(relationships)
+        if relationship.get("Type").endswith("/hyperlink")
+    )
+
+
+def test_run_hyperlink_address_reads_writes_and_prunes_like_python_pptx(tmp_path):
+    import rpptx
+
+    prs = _textbox_presentation(rpptx)
+    prs.slides[0].shapes[0].text_frame.paragraphs[0].add_run(" world")
+    first, second = prs.slides[0].shapes[0].text_frame.paragraphs[0].runs
+    link = first.hyperlink
+    assert link.address is None
+    before = prs.to_bytes()
+    link.address = None
+    link.address = ""
+    assert prs.to_bytes() == before
+    link.address = "https://example.com/a?x=1&y=2"
+    second.hyperlink.address = "https://example.com/a?x=1&y=2"
+    assert (first.hyperlink.address, second.text) == ("https://example.com/a?x=1&y=2", " world")
+    assert _slide_hyperlink_targets(prs.to_bytes()) == ["https://example.com/a?x=1&y=2"]
+    for _ in range(3):
+        link.address = "https://example.com/b"
+        link.address = "https://example.com/c"
+    assert _slide_hyperlink_targets(prs.to_bytes()) == [
+        "https://example.com/a?x=1&y=2",
+        "https://example.com/c",
+    ]
+    second.hyperlink.address = None
+    assert (second.hyperlink.address, second.font.name) == (None, None)
+    assert _slide_hyperlink_targets(prs.to_bytes()) == ["https://example.com/c"]
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="control characters"):
+        link.address = "https://example.com/\nnext"
+    assert prs.to_bytes() == before
+    assert b"https://example.com/c" in prs.to_pdf()
+    held = first.hyperlink
+    prs.slides.add_slide(prs.slide_layouts[6])
+    with pytest.raises(rpptx.StaleElementError, match=r"\.runs\[0\]\.hyperlink\."):
+        _ = held.address
+    output = tmp_path / "hyperlinks.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    runs = pptx.Presentation(output).slides[0].shapes[0].text_frame.paragraphs[0].runs
+    assert [run.hyperlink.address for run in runs] == ["https://example.com/c", None]
+
+    def build(deck):
+        frame = deck.slides.add_slide(deck.slide_layouts[6]).shapes.add_textbox(0, 0, 100, 100)
+        paragraph = frame.text_frame.paragraphs[0]
+        for text in ("one", "two"):
+            run = paragraph.add_run()
+            run.text = text
+            run.hyperlink.address = f"https://example.com/{text}"
+
+    source = _python_pptx_deck(tmp_path / "python-pptx-links.pptx", build)
+    prs = rpptx.Presentation(source)
+    runs = prs.slides[0].shapes[0].text_frame.paragraphs[0].runs
+    assert [run.hyperlink.address for run in runs] == [
+        "https://example.com/one",
+        "https://example.com/two",
+    ]
+    runs[0].hyperlink.address = "https://example.com/two"
+    runs[1].hyperlink.address = None
+    retargeted = tmp_path / "python-pptx-links-out.pptx"
+    prs.save(retargeted)
+    assert _slide_hyperlink_targets(retargeted.read_bytes()) == ["https://example.com/two"]
+    runs = pptx.Presentation(retargeted).slides[0].shapes[0].text_frame.paragraphs[0].runs
+    assert [run.hyperlink.address for run in runs] == ["https://example.com/two", None]
+
+
 def test_text_enums_match_python_pptx_member_values_and_xml_tokens():
     if importlib.util.find_spec("pptx") is None:
         pytest.skip("python-pptx oracle is installed only for the differential gate")
@@ -1847,6 +1967,43 @@ def test_slide_layout_hidden_and_background_round_trip_through_python_pptx(tmp_p
     assert oracle.slides[0]._element.get("show") in (None, "1")
 
 
+def test_slide_layout_assignment_retargets_the_slide_and_keeps_unplaced_placeholders(tmp_path):
+    import rpptx
+
+    source = _python_pptx_deck(
+        tmp_path / "layouts.pptx", lambda deck: deck.slides.add_slide(deck.slide_layouts[1])
+    )
+    prs = rpptx.Presentation(source)
+    for index, text in enumerate(("Title", "Body")):
+        prs.slides[0].shapes[index].text = text
+    slide = prs.slides[0]
+    body_geometry = slide.shapes[1].effective_geometry()
+    slide.slide_layout = prs.slide_layouts[5]
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: slide.slide_layout)
+    slide = prs.slides[0]
+    assert slide.slide_layout == prs.slide_layouts[5]
+    title, body = slide.shapes
+    assert title.left is None
+    assert (body.left, body.top, body.width, body.height) == body_geometry
+    assert [frame.shape_id for frame in prs.text_layout()] == [title.shape_id, body.shape_id]
+
+    prs.slides[0].slide_layout = prs.slide_layouts[0]
+    assert prs.slides[0].shapes[0].effective_geometry() == (685800, 2130425, 7772400, 1470025)
+    with pytest.raises(ValueError, match="slide layout is not in this presentation"):
+        prs.slides[0].slide_layout = rpptx.Presentation().slide_layouts[1]
+    with pytest.raises(TypeError):
+        prs.slides[0].slide_layout = 1
+    output = tmp_path / "relaid.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output).slides[0]
+    assert oracle.slide_layout.name == "Title Slide"
+    title, body = oracle.shapes
+    assert (title.left, title.top, title.width, title.height) == (685800, 2130425, 7772400, 1470025)
+    assert (body.left, body.top, body.width, body.height) == body_geometry
+
+
 def test_shape_geometry_name_and_rotation_setters_match_python_pptx(tmp_path):
     import rpptx
 
@@ -1890,6 +2047,61 @@ def test_shape_geometry_name_and_rotation_setters_match_python_pptx(tmp_path):
         rpptx.Inches(4),
     )
     assert (oracle.name, oracle.rotation) == ("Renamed box", 30.0)
+
+
+def test_placeholder_effective_geometry_matches_python_pptx_and_one_setter_keeps_the_rest(tmp_path):
+    import rpptx
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    source = _python_pptx_deck(
+        tmp_path / "placeholders.pptx",
+        lambda deck: [deck.slides.add_slide(deck.slide_layouts[index]) for index in (0, 1, 5, 8)],
+    )
+    oracle = pptx.Presentation(source)
+    prs = rpptx.Presentation(source)
+    for slide, oracle_slide in zip(prs.slides, oracle.slides, strict=True):
+        for shape, expected in zip(slide.shapes, oracle_slide.shapes, strict=True):
+            assert (shape.left, shape.top, shape.width, shape.height) == (None,) * 4
+            geometry = shape.effective_geometry()
+            assert geometry == (expected.left, expected.top, expected.width, expected.height)
+            assert all(isinstance(value, rpptx.Length) for value in geometry)
+    assert prs.slides[2].shapes[0].effective_geometry() == (457200, 274638, 8229600, 1143000)
+
+    prs.slides[0].shapes[0].text = "Rotated title"
+    prs.slides[2].shapes[0].text = "Moved title"
+    title = prs.slides[2].shapes[0]
+    title.left = title.effective_geometry()[0] + rpptx.Inches(0.1)
+    moved = (457200 + 91440, 274638, 8229600, 1143000)
+    assert (title.left, title.top, title.width, title.height) == moved
+    assert title.effective_geometry() == moved
+    body = prs.slides[1].shapes[1]
+    body.height = 1000000
+    assert (body.left, body.top, body.width, body.height) == (457200, 1600200, 8229600, 1000000)
+    rotated = prs.slides[0].shapes[0]
+    rotated_geometry = rotated.effective_geometry()
+    rotated.rotation = 30.0
+    assert rotated.rotation == 30.0
+    assert rotated.effective_geometry() == rotated_geometry
+    assert (rotated.left, rotated.top, rotated.width, rotated.height) == rotated_geometry
+    assert [(frame.slide_index, frame.shape_id) for frame in prs.text_layout()] == [
+        (0, rotated.shape_id),
+        (2, title.shape_id),
+    ]
+    output = tmp_path / "moved.pptx"
+    prs.save(output)
+    reread = pptx.Presentation(output)
+    oracle_title = reread.slides[2].shapes[0]
+    assert (oracle_title.left, oracle_title.top, oracle_title.width, oracle_title.height) == moved
+    oracle_body = reread.slides[1].shapes[1]
+    assert (oracle_body.left, oracle_body.width, oracle_body.height) == (457200, 8229600, 1000000)
+    oracle_rotated = reread.slides[0].shapes[0]
+    assert (
+        oracle_rotated.left,
+        oracle_rotated.top,
+        oracle_rotated.width,
+        oracle_rotated.height,
+    ) == rotated_geometry
+    assert oracle_rotated.rotation == 30.0
 
 
 def test_shape_type_reports_the_python_pptx_member_for_every_shape_kind(tmp_path):
@@ -1983,6 +2195,331 @@ def test_fill_and_line_formats_write_what_python_pptx_reads(tmp_path):
     assert oracle[1].fill.type == pptx.enum.dml.MSO_FILL.BACKGROUND
 
 
+def _cell_records(table, rows, columns):
+    return [
+        (cell.text, cell.is_merge_origin, cell.is_spanned, cell.span_height, cell.span_width)
+        for cell in (table.cell(row, column) for row in range(rows) for column in range(columns))
+    ]
+
+
+def _python_pptx_merged_table(pptx, split):
+    deck = pptx.Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    table = slide.shapes.add_table(3, 3, 0, 0, 5_486_400, 2_743_200).table
+    for row in range(3):
+        for column in range(3):
+            table.cell(row, column).text = f"{row}{column}"
+    table.cell(0, 0).merge(table.cell(1, 1))
+    if split:
+        table.cell(0, 0).split()
+    return table
+
+
+def test_table_cells_merge_split_fill_and_margins_like_python_pptx(tmp_path):
+    import rpptx
+    from rpptx.dml.color import RGBColor
+    from rpptx.enum.dml import MSO_FILL_TYPE
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_table(3, 3, 0, 0, 5_486_400, 2_743_200)
+    prs.slides[0].shapes.add_table(1, 2, 0, 3_000_000, 100, 100)
+    table = prs.slides[0].shapes[0].table
+    for row in range(3):
+        for column in range(3):
+            table.cell(row, column).text = f"{row}{column}"
+    origin, held = table.cell(0, 0), table.cell(2, 2)
+    origin.merge(table.cell(1, 1))
+    assert (origin.is_merge_origin, origin.is_spanned, origin.span_height, origin.span_width) == (
+        True,
+        False,
+        2,
+        2,
+    )
+    assert (table.cell(1, 0).is_merge_origin, table.cell(1, 0).is_spanned) == (False, True)
+    assert (held.text, held.is_merge_origin, held.span_width) == ("22", False, 1)
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="merged cells"):
+        table.cell(1, 1).merge(table.cell(2, 2))
+    with pytest.raises(ValueError, match="other_cell from different table"):
+        held.merge(prs.slides[0].shapes[1].table.cell(0, 0))
+    with pytest.raises(rpptx.RpptxError, match="merge-origin"):
+        held.split()
+    assert prs.to_bytes() == before
+    merged = tmp_path / "merged.pptx"
+    prs.save(merged)
+    origin.split()
+    assert not any(record[1] or record[2] for record in _cell_records(table, 3, 3))
+
+    cell, other = table.cell(2, 0), table.cell(2, 1)
+    assert cell.fill.type is None
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = RGBColor(0x12, 0x34, 0x56)
+    other.fill.background()
+    assert (cell.fill.type, other.fill.type) == (MSO_FILL_TYPE.SOLID, MSO_FILL_TYPE.BACKGROUND)
+    assert (cell.margin_left, cell.margin_right, cell.margin_top, cell.margin_bottom) == (None,) * 4
+    cell.margin_left = rpptx.Inches(0.25)
+    cell.margin_top = rpptx.Pt(3)
+    assert (cell.margin_left, cell.margin_top) == (rpptx.Inches(0.25), rpptx.Pt(3))
+    assert isinstance(cell.margin_left, rpptx.Length)
+    before = prs.to_bytes()
+    cell.margin_right = None
+    with pytest.raises(ValueError, match="32-bit"):
+        cell.margin_bottom = 2**31
+    assert prs.to_bytes() == before
+    cell.margin_top = None
+    assert cell.margin_top is None
+    held_fill = cell.fill
+    prs.slides.add_slide(prs.slide_layouts[6])
+    with pytest.raises(rpptx.StaleElementError, match=r"table\.cell\(2, 0\)\.fill"):
+        _ = held_fill.type
+    split = tmp_path / "split.pptx"
+    prs.save(split)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    for path, was_split in ((merged, False), (split, True)):
+        expected = _cell_records(_python_pptx_merged_table(pptx, was_split), 3, 3)
+        assert _cell_records(pptx.Presentation(path).slides[0].shapes[0].table, 3, 3) == expected
+        assert _cell_records(rpptx.Presentation(path).slides[0].shapes[0].table, 3, 3) == expected
+    oracle = pptx.Presentation(split).slides[0].shapes[0].table
+    assert oracle.cell(2, 0).fill.fore_color.rgb == pptx.dml.color.RGBColor(0x12, 0x34, 0x56)
+    assert oracle.cell(2, 1).fill.type == pptx.enum.dml.MSO_FILL.BACKGROUND
+    assert oracle.cell(2, 0).margin_left == rpptx.Inches(0.25)
+    assert (oracle.cell(2, 0).margin_right, oracle.cell(2, 0).margin_top) == (91_440, 45_720)
+
+    def build(deck):
+        written = deck.slides.add_slide(deck.slide_layouts[6]).shapes.add_table(1, 1, 0, 0, 100, 100)
+        written = written.table.cell(0, 0)
+        written.margin_bottom = rpptx.Pt(4)
+        written.fill.solid()
+        written.fill.fore_color.rgb = pptx.dml.color.RGBColor(0xAB, 0xCD, 0xEF)
+
+    source = _python_pptx_deck(tmp_path / "python-pptx-cells.pptx", build)
+    read = rpptx.Presentation(source).slides[0].shapes[0].table.cell(0, 0)
+    assert (read.margin_left, read.margin_bottom) == (None, rpptx.Pt(4))
+    assert read.fill.fore_color.rgb == RGBColor(0xAB, 0xCD, 0xEF)
+
+
+def test_table_row_heights_and_cell_borders_write_what_python_pptx_reads(tmp_path):
+    import rpptx
+    from rpptx.dml.color import RGBColor
+    from rpptx.enum.dml import MSO_FILL_TYPE
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_table(3, 2, 0, 0, rpptx.Inches(4), rpptx.Inches(3))
+    shape = prs.slides[0].shapes[0]
+    rows = shape.table.rows
+    assert len(rows) == 3
+    assert [row.height for row in rows] == [rpptx.Inches(1)] * 3
+    assert isinstance(rows[0].height, rpptx.Length)
+    held = rows[-1]
+    rows[1].height = rpptx.Inches(1.5)
+    assert (held.height, shape.height) == (rpptx.Inches(1), rpptx.Inches(3.5))
+    assert [row.height for row in rows[1:]] == [rpptx.Inches(1.5), rpptx.Inches(1)]
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="row height must be positive"):
+        rows[0].height = 0
+    with pytest.raises(IndexError):
+        _ = rows[3]
+
+    cell = shape.table.cell(0, 0)
+    left = cell.border_left
+    assert (left.width, left.color.rgb, left.fill.type) == (0, None, None)
+    assert prs.to_bytes() == before
+    left.width = rpptx.Pt(2)
+    left.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+    cell.border_bottom.fill.solid()
+    cell.border_bottom.fill.fore_color.rgb = RGBColor(0x00, 0x80, 0x00)
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = RGBColor(0x11, 0x22, 0x33)
+    assert (cell.border_left.width, cell.border_left.color.rgb) == (
+        rpptx.Pt(2),
+        RGBColor(0xFF, 0x00, 0x00),
+    )
+    assert (cell.border_top.fill.type, cell.border_bottom.fill.type) == (None, MSO_FILL_TYPE.SOLID)
+    held_border = cell.border_right
+    prs.slides.add_slide(prs.slide_layouts[6])
+    with pytest.raises(rpptx.StaleElementError, match=r"table\.cell\(0, 0\)\.border_right\."):
+        _ = held_border.width
+    with pytest.raises(rpptx.StaleElementError, match=r"table\.rows\[2\]\."):
+        _ = held.height
+    output = tmp_path / "rows-borders.pptx"
+    prs.save(output)
+    xml = _package_parts(output.read_bytes())["ppt/slides/slide1.xml"].decode()
+    properties = xml[xml.index("<a:tcPr") :]
+    assert (
+        properties.index("<a:lnL")
+        < properties.index("<a:lnB")
+        < properties.index('<a:srgbClr val="112233"/>')
+    )
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    from pptx.oxml.ns import qn
+
+    oracle = pptx.Presentation(output).slides[0].shapes[0]
+    assert [row.height for row in oracle.table.rows] == [
+        rpptx.Inches(1),
+        rpptx.Inches(1.5),
+        rpptx.Inches(1),
+    ]
+    assert oracle.height == rpptx.Inches(3.5)
+    border = oracle.table.cell(0, 0)._tc.tcPr.find(qn("a:lnL"))
+    assert border.get("w") == str(rpptx.Pt(2))
+    assert border.find(qn("a:solidFill"))[0].get("val") == "FF0000"
+
+    def build(deck):
+        table = deck.slides.add_slide(deck.slide_layouts[6]).shapes.add_table(2, 1, 0, 0, 100, 100)
+        table.table.rows[0].height = rpptx.Pt(30)
+
+    source = _python_pptx_deck(tmp_path / "python-pptx-rows.pptx", build)
+    assert rpptx.Presentation(source).slides[0].shapes[0].table.rows[0].height == rpptx.Pt(30)
+
+
+def _python_pptx_options_table(deck):
+    """Build the slide 4 table of the rdocx-skills deck fixture."""
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches, Pt
+
+    rows = (
+        ("", "A. Repair", "B. Refurbish", "C. Replace deck"),
+        ("Cost (EUR)", "46,000", "212,000", "690,000"),
+        ("Closure", "2 weeks", "7 weeks", "5 months"),
+        ("Next major work", "2031", "2040", "2055"),
+    )
+    slide = deck.slides.add_slide(deck.slide_layouts[5])
+    slide.shapes.title.text = "Three options"
+    frame = slide.shapes.add_table(4, 4, Inches(0.5), Inches(1.5), Inches(9), Inches(2.4))
+    for row_index, row in enumerate(rows):
+        for column_index, value in enumerate(row):
+            cell = frame.table.cell(row_index, column_index)
+            cell.text = value
+            for run in cell.text_frame.paragraphs[0].runs:
+                run.font.size = Pt(15)
+            if row_index == 0:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = RGBColor(0x3E, 0x4A, 0x59)
+
+
+def test_table_rows_and_columns_are_added_and_removed_like_python_pptx_add_tr(tmp_path):
+    import rpptx
+    from rpptx.dml.color import RGBColor
+
+    source = _python_pptx_deck(tmp_path / "options.pptx", _python_pptx_options_table)
+    prs = rpptx.Presentation(source)
+    held_cell = prs.slides[0].shapes[1].table.cell(3, 0)
+    rows = prs.slides[0].shapes[1].table.rows
+    row = rows.add_row()
+    assert type(row).__name__ == "Row"
+    assert row.height == rpptx.Inches(0.6)
+    for operation in (lambda: held_cell.text, lambda: len(rows)):
+        _assert_stale_after_exactly_one_bump(rpptx, operation)
+    shape = prs.slides[0].shapes[1]
+    assert (shape.width, shape.height) == (rpptx.Inches(9), rpptx.Inches(3))
+    table = shape.table
+    assert [len(table.rows), len(table.columns)] == [5, 4]
+    assert [table.cell(4, column).text for column in range(4)] == [""] * 4
+    table.cell(4, 0).text = "Risk"
+
+    top = table.rows.add_row(0)
+    table = prs.slides[0].shapes[1].table
+    assert (top.height, table.cell(1, 1).text) == (rpptx.Inches(0.6), "A. Repair")
+    assert table.cell(0, 1).fill.fore_color.rgb == RGBColor(0x3E, 0x4A, 0x59)
+    table.rows.remove(table.rows[0])
+
+    column = prs.slides[0].shapes[1].table.columns.add_column(-1)
+    assert column.width == rpptx.Inches(2.25)
+    column.width = rpptx.Inches(1)
+    shape = prs.slides[0].shapes[1]
+    assert (shape.width, shape.height) == (rpptx.Inches(10), rpptx.Inches(3))
+    table = shape.table
+    assert [table.cell(1, index).text for index in range(5)] == [
+        "Cost (EUR)",
+        "46,000",
+        "212,000",
+        "",
+        "690,000",
+    ]
+
+    before = prs.to_bytes()
+    other = rpptx.Presentation(source).slides[0].shapes[1].table
+    with pytest.raises(IndexError, match="row index out of range"):
+        table.rows.add_row(6)
+    with pytest.raises(IndexError, match="column index out of range"):
+        table.columns.add_column(-6)
+    with pytest.raises(ValueError, match="row is not in this collection"):
+        table.rows.remove(other.rows[0])
+    with pytest.raises(ValueError, match="column is not in this collection"):
+        table.columns.remove(other.columns[0])
+    with pytest.raises(TypeError):
+        table.rows.remove(table.columns[0])
+    assert prs.to_bytes() == before
+    held_row = table.rows[0]
+    prs.slides.add_slide(prs.slide_layouts[6])
+    with pytest.raises(rpptx.StaleElementError, match=r"table\.rows\[0\]\."):
+        prs.slides[0].shapes[1].table.rows.remove(held_row)
+    prs.slides.remove(prs.slides[1])
+    output = tmp_path / "rows-columns.pptx"
+    prs.save(output)
+    xml = _package_parts(output.read_bytes())["ppt/slides/slide1.xml"].decode()
+    appended = xml[xml.rindex("<a:tr ") : xml.index("</a:tbl>")]
+    assert appended.count('<a:endParaRPr sz="1500"/>') == 5
+    assert appended.startswith('<a:tr h="548640"><a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p>')
+    assert '<a:r><a:rPr sz="1500"/><a:t>Risk</a:t></a:r>' in appended
+    assert appended.index("Risk") < appended.index("<a:tcPr/>") < appended.index("</a:tc>")
+
+    def measured(deck):
+        _python_pptx_options_table(deck)
+        deck.slides[0].shapes[1].height = rpptx.Inches(3)
+
+    measured_source = _python_pptx_deck(tmp_path / "measured.pptx", measured)
+    measured_deck = rpptx.Presentation(measured_source)
+    measured_deck.slides[0].shapes[1].table.rows.add_row()
+    assert measured_deck.slides[0].shapes[1].height == rpptx.Inches(3.6)
+    measured_table = measured_deck.slides[0].shapes[1].table
+    measured_table.rows.remove(measured_table.rows[0])
+    assert measured_deck.slides[0].shapes[1].height == rpptx.Inches(3)
+
+    single = rpptx.Presentation()
+    single.slides.add_slide(single.slide_layouts[6]).shapes.add_table(1, 2, 0, 0, 200, 100)
+    table = single.slides[0].shapes[0].table
+    with pytest.raises(rpptx.RpptxError, match="at least one row"):
+        table.rows.remove(table.rows[0])
+    table.columns.remove(table.columns[1])
+    table = single.slides[0].shapes[0].table
+    with pytest.raises(rpptx.RpptxError, match="at least one column"):
+        table.columns.remove(table.columns[0])
+    assert single.slides[0].shapes[0].width == 100
+
+    merged = rpptx.Presentation()
+    merged.slides.add_slide(merged.slide_layouts[6]).shapes.add_table(3, 3, 0, 0, 300, 300)
+    table = merged.slides[0].shapes[0].table
+    table.cell(0, 0).merge(table.cell(1, 1))
+    table.rows.add_row(1)
+    table = merged.slides[0].shapes[0].table
+    table.columns.add_column(1)
+    table = merged.slides[0].shapes[0].table
+    origin = table.cell(0, 0)
+    assert (origin.span_height, origin.span_width) == (3, 3)
+    table.rows.remove(table.rows[0])
+    table = merged.slides[0].shapes[0].table
+    assert (table.cell(0, 0).span_height, table.cell(0, 0).is_merge_origin) == (2, True)
+    merged_output = tmp_path / "merged-rows.pptx"
+    merged.save(merged_output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output).slides[0].shapes[1]
+    assert (len(oracle.table.rows), len(oracle.table.columns)) == (5, 5)
+    assert oracle.height == sum(row.height for row in oracle.table.rows) == rpptx.Inches(3)
+    assert oracle.width == sum(column.width for column in oracle.table.columns)
+    assert [cell.text for cell in oracle.table.rows[4].cells] == ["Risk", "", "", "", ""]
+    assert oracle.table.cell(4, 0).text_frame.paragraphs[0].runs[0].font.size == pptx.util.Pt(15)
+    assert oracle.table.cell(4, 1)._tc.txBody.p_lst[0].endParaRPr.get("sz") == "1500"
+    oracle = pptx.Presentation(merged_output).slides[0].shapes[0].table
+    assert (oracle.cell(0, 0).span_height, oracle.cell(0, 0).span_width) == (2, 3)
+    assert oracle.cell(1, 2).is_spanned and not oracle.cell(2, 0).is_spanned
+
+
 def test_colour_edits_keep_python_pptx_brightness_transforms(tmp_path):
     import rpptx
     from rpptx.dml.color import RGBColor
@@ -2051,6 +2588,250 @@ def test_pictures_accept_bytes_and_file_objects_and_replace_their_image(tmp_path
     assert [oracle[index].image.blob for index in range(3)] == [blue, jpeg, jpeg]
 
 
+def test_picture_crop_matches_python_pptx_in_both_directions(tmp_path):
+    import rpptx
+
+    header = struct.pack(">IIBBBBB", 2, 1, 8, 2, 0, 0, 0)
+    red_then_blue = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(bytes((0, 0xFF, 0, 0, 0, 0, 0xFF))))
+        + _png_chunk(b"IEND", b"")
+    )
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(red_then_blue, 0, 0, rpptx.Inches(2), rpptx.Inches(1))
+    prs.slides[0].shapes.add_textbox(0, 0, 10, 10)
+    picture = prs.slides[0].shapes[0]
+    assert (picture.crop_left, picture.crop_top, picture.crop_right, picture.crop_bottom) == (0.0,) * 4
+    before = prs.to_bytes()
+    picture.crop_right = 0.0
+    assert prs.to_bytes() == before
+    uncropped = prs.render_slide_to_png(0, dpi=36.0)
+    held = prs.slides[0].shapes[0]
+    picture.crop_left = 0.5
+    picture.crop_bottom = -0.125
+    assert (held.crop_left, held.crop_bottom) == (0.5, -0.125)
+    assert prs.render_slide_to_png(0, dpi=36.0) != uncropped
+    cropped = prs.to_bytes()
+    for bad in (float("nan"), float("inf"), 21474.83648 + 1):
+        with pytest.raises(ValueError, match="crop must be a finite fraction"):
+            picture.crop_top = bad
+    textbox = prs.slides[0].shapes[1]
+    with pytest.raises(ValueError, match="shape is not a picture"):
+        _ = textbox.crop_left
+    with pytest.raises(ValueError, match="shape is not a picture"):
+        textbox.crop_left = 0.1
+    assert prs.to_bytes() == cropped
+    output = tmp_path / "cropped.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output).slides[0].shapes[0]
+    assert (oracle.crop_left, oracle.crop_top, oracle.crop_right, oracle.crop_bottom) == (
+        0.5,
+        0.0,
+        0.0,
+        -0.125,
+    )
+
+    def build(deck):
+        written = deck.slides.add_slide(deck.slide_layouts[6]).shapes.add_picture(
+            io.BytesIO(_tiny_png()), 0, 0
+        )
+        written.crop_top = 0.2
+        written.crop_right = 1 / 3
+
+    source = _python_pptx_deck(tmp_path / "python-pptx-crop.pptx", build)
+    read = rpptx.Presentation(source).slides[0].shapes[0]
+    assert (read.crop_left, read.crop_top, read.crop_right) == (0.0, 0.2, 0.33333)
+
+
+def test_shapes_move_changes_the_z_order_and_stales_handles_once(tmp_path):
+    import rpptx
+
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    for name in ("back", "middle", "front"):
+        prs.slides[0].shapes.add_shape("rect", 0, 0, 100, 100).name = name
+    shapes = prs.slides[0].shapes
+    held = shapes[0]
+    shapes.move(0, -1)
+    assert [shape.name for shape in prs.slides[0].shapes] == ["middle", "front", "back"]
+    for operation in (lambda: held.name, lambda: len(shapes)):
+        _assert_stale_after_exactly_one_bump(rpptx, operation)
+    with pytest.raises(rpptx.StaleElementError, match=r"prs\.slides\[0\]\.shapes\[0\]\."):
+        _ = held.name
+    prs.slides[0].shapes.move(-1, 1)
+    assert [shape.name for shape in prs.slides[0].shapes] == ["middle", "back", "front"]
+    before = prs.to_bytes()
+    with pytest.raises(IndexError, match="shape index out of range"):
+        prs.slides[0].shapes.move(0, 3)
+    group = prs.slides[0].shapes.add_group_shape()
+    with pytest.raises(ValueError, match="nested shape collections cannot remove or move shapes"):
+        group.shapes.move(0, 0)
+    prs.slides[0].shapes.remove(prs.slides[0].shapes[3])
+    assert prs.to_bytes() == before
+    output = tmp_path / "z-order.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output).slides[0].shapes
+    assert [shape.name for shape in oracle] == ["middle", "back", "front"]
+
+
+def test_group_shapes_add_members_and_the_group_fits_them(tmp_path):
+    import rpptx
+    from rpptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE, MSO_SHAPE_TYPE
+
+    emu = 914_400
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    group = prs.slides[0].shapes.add_group_shape()
+    shapes = group.shapes
+    textbox = shapes.add_textbox(emu, emu, emu, emu)
+    for operation in (lambda: group.name, lambda: len(shapes)):
+        _assert_stale_after_exactly_one_bump(rpptx, operation)
+    with pytest.raises(rpptx.StaleElementError, match=r"prs\.slides\[0\]\.shapes\[0\]\.shapes\."):
+        shapes.add_textbox(0, 0, 1, 1)
+    textbox.text = "inside"
+    group = prs.slides[0].shapes[0]
+    assert (group.left, group.top, group.width, group.height) == (emu, emu, emu, emu)
+
+    prs.slides[0].shapes[0].shapes.add_shape(MSO_SHAPE.OVAL, 2 * emu, emu // 2, emu, emu)
+    prs.slides[0].shapes[0].shapes.add_connector(MSO_CONNECTOR.STRAIGHT, 0, 0, emu, emu)
+    prs.slides[0].shapes[0].shapes.add_table(1, 2, emu, 2 * emu, emu, emu)
+    prs.slides[0].shapes[0].shapes.add_picture(io.BytesIO(_tiny_png()), emu, emu, emu, emu)
+    inner = prs.slides[0].shapes[0].shapes.add_group_shape()
+    assert (inner.left, inner.width, len(inner.shapes)) == (0, 0, 0)
+    nested = inner.shapes.add_textbox(3 * emu, 3 * emu, emu, emu)
+    assert nested.left == 3 * emu
+    group = prs.slides[0].shapes[0]
+    assert [shape.shape_type for shape in group.shapes] == [
+        MSO_SHAPE_TYPE.TEXT_BOX,
+        MSO_SHAPE_TYPE.AUTO_SHAPE,
+        MSO_SHAPE_TYPE.LINE,
+        MSO_SHAPE_TYPE.TABLE,
+        MSO_SHAPE_TYPE.PICTURE,
+        MSO_SHAPE_TYPE.GROUP,
+    ]
+    assert (group.left, group.top, group.width, group.height) == (0, 0, 4 * emu, 4 * emu)
+    inner = group.shapes[5]
+    assert (inner.left, inner.top, inner.width, inner.height) == (3 * emu, 3 * emu, emu, emu)
+    ids = [shape.shape_id for shape in group.shapes] + [group.shape_id, inner.shapes[0].shape_id]
+    assert len(set(ids)) == len(ids) == 8
+    output = tmp_path / "group.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output).slides[0].shapes[0]
+    assert (oracle.left, oracle.top, oracle.width, oracle.height) == (0, 0, 4 * emu, 4 * emu)
+    assert [int(shape.shape_type) for shape in oracle.shapes] == [17, 1, 9, 19, 13, 6]
+    assert oracle.shapes[0].text_frame.text == "inside"
+    assert oracle.shapes[5].shapes[0].left == 3 * emu
+
+
+def test_a_new_group_holds_one_text_box_that_its_extents_cover(tmp_path):
+    import rpptx
+
+    emu = 914_400
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    g = prs.slides[0].shapes.add_group_shape()
+    g.shapes.add_textbox(emu, emu, emu, emu)
+    output = tmp_path / "one-member.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    group = pptx.Presentation(output).slides[0].shapes[0]
+    assert [int(shape.shape_type) for shape in group.shapes] == [17]
+    member = group.shapes[0]
+    assert (group.left, group.top, group.width, group.height) == (
+        member.left,
+        member.top,
+        member.width,
+        member.height,
+    )
+    xfrm = group._element.grpSpPr.xfrm
+    assert (xfrm.chOff.x, xfrm.chOff.y, xfrm.chExt.cx, xfrm.chExt.cy) == (emu, emu, emu, emu)
+
+
+def test_only_groups_accept_members_and_nested_collections_do_not_remove():
+    import rpptx
+
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.slides[0].shapes.add_group_shape()
+    prs.slides[0].shapes[0].shapes.add_textbox(0, 0, 10, 10)
+    textbox = prs.slides[0].shapes.add_textbox(0, 0, 10, 10)
+    before = prs.to_bytes()
+    with pytest.raises(ValueError, match="shape is not a group"):
+        textbox.shapes.add_textbox(0, 0, 10, 10)
+    with pytest.raises(ValueError, match="shape is not a group"):
+        textbox.shapes.add_picture("missing.png", 0, 0)
+    with pytest.raises(rpptx.RpptxError):
+        prs.slides[0].shapes[0].shapes.add_shape("notAPreset", 0, 0, 10, 10)
+    group = prs.slides[0].shapes[0]
+    with pytest.raises(ValueError, match="nested shape collections cannot remove or move shapes"):
+        group.shapes.remove(group.shapes[0])
+    assert prs.to_bytes() == before
+    assert len(prs.slides[0].shapes[0].shapes) == 1
+
+
+def test_a_group_in_an_alternate_content_fallback_does_not_take_new_shapes(tmp_path):
+    import rpptx
+
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.slides[0].shapes.add_group_shape()
+    prs.slides[0].shapes[0].shapes.add_textbox(0, 0, 100, 100)
+    parts = _package_parts(prs.to_bytes())
+    slide = parts["ppt/slides/slide1.xml"].decode()
+    start = slide.index("<p:grpSp>")
+    end = slide.index("</p:grpSp>") + len("</p:grpSp>")
+    group = slide[start:end]
+    parts["ppt/slides/slide1.xml"] = (
+        slide[:start]
+        + '<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        + ' xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main">'
+        + f'<mc:Choice Requires="p14">{group}</mc:Choice><mc:Fallback>{group}</mc:Fallback>'
+        + "</mc:AlternateContent>"
+        + slide[end:]
+    ).encode()
+    source = tmp_path / "fallback-group.pptx"
+    source.write_bytes(_package_bytes(parts))
+    prs = rpptx.Presentation(source)
+    fallback_group = prs.slides[0].shapes[0].shapes[0]
+    assert int(fallback_group.shape_type) == 6
+    with pytest.raises(ValueError, match="mc:AlternateContent fallback cannot take new shapes"):
+        fallback_group.shapes.add_textbox(0, 0, 10, 10)
+
+
+def test_an_empty_nested_group_lets_python_pptx_refit_its_parent(tmp_path):
+    import rpptx
+
+    emu = 914_400
+    prs = rpptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.slides[0].shapes.add_group_shape()
+    prs.slides[0].shapes[0].shapes.add_textbox(emu, emu, emu, emu)
+    inner = prs.slides[0].shapes[0].shapes.add_group_shape()
+    assert (inner.left, inner.top, inner.width, inner.height) == (0, 0, 0, 0)
+    outer = prs.slides[0].shapes[0]
+    assert (outer.left, outer.top, outer.width, outer.height) == (emu, emu, emu, emu)
+    output = tmp_path / "empty-nested.pptx"
+    prs.save(output)
+
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output)
+    group = oracle.slides[0].shapes[0]
+    group.shapes.add_textbox(2 * emu, 2 * emu, emu, emu)
+    # python-pptx counts the empty group's zero box, which rpptx leaves out.
+    assert (group.left, group.top, group.width, group.height) == (0, 0, 3 * emu, 3 * emu)
+    oracle.save(output)
+    assert len(rpptx.Presentation(output).slides[0].shapes[0].shapes) == 3
+
+
 def test_shapes_and_slides_are_removed_and_reordered_with_stale_handles(tmp_path):
     import rpptx
 
@@ -2092,6 +2873,216 @@ def test_shapes_and_slides_are_removed_and_reordered_with_stale_handles(tmp_path
     pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
     oracle = pptx.Presentation(output)
     assert [len(slide.shapes) for slide in oracle.slides] == [2, 1]
+
+
+def test_slide_duplicate_inserts_after_the_source_with_its_notes(tmp_path):
+    import rpptx
+
+    prs = rpptx.Presentation()
+    for index in range(3):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.shapes.add_textbox(0, 0, 10, 10).text = f"slide {index}"
+    prs.slides[1].notes_text = "note 1"
+    source = prs.slides[1]
+    held = prs.slides[2].shapes[0]
+
+    duplicate = prs.slides.duplicate(source)
+    assert [slide.shapes[0].text for slide in prs.slides] == [
+        "slide 0",
+        "slide 1",
+        "slide 1",
+        "slide 2",
+    ]
+    assert [slide.notes_text for slide in prs.slides] == [None, "note 1", "note 1", None]
+    assert (duplicate.shapes[0].text, duplicate.notes_text) == ("slide 1", "note 1")
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: held.text)
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: source.notes_text)
+    duplicate.notes_text = "copy note"
+    assert [slide.notes_text for slide in prs.slides] == [None, "note 1", "copy note", None]
+
+    other = rpptx.Presentation()
+    other_slide = other.slides.add_slide(other.slide_layouts[6])
+    with pytest.raises(ValueError, match="slide is not in this collection"):
+        prs.slides.duplicate(other_slide)
+
+    prs.add_comment_author(
+        id="{11111111-1111-1111-1111-111111111111}",
+        name="Ada Lovelace",
+        user_id="ada@example.com",
+        provider_id="local",
+    )
+    prs.slides[0].add_comment(
+        id="{22222222-2222-2222-2222-222222222222}",
+        author_id="{11111111-1111-1111-1111-111111111111}",
+        created="2026-09-14T10:30:00Z",
+        text="Blocks duplication",
+    )
+    commented = prs.slides[0]
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="modern comments"):
+        prs.slides.duplicate(commented)
+    assert prs.to_bytes() == before
+    assert (len(prs.slides), commented.shapes[0].text) == (4, "slide 0")
+
+    output = tmp_path / "duplicated.pptx"
+    prs.save(output)
+    pptx = pytest.importorskip("pptx", reason="python-pptx is the differential oracle")
+    oracle = pptx.Presentation(output)
+    assert [slide.shapes[0].text for slide in oracle.slides] == [
+        "slide 0",
+        "slide 1",
+        "slide 1",
+        "slide 2",
+    ]
+    assert [
+        slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else None
+        for slide in oracle.slides
+    ] == [None, "note 1", "copy note", None]
+
+
+def test_presentation_from_bytes_opens_like_a_path_and_rejects_other_bytes(tmp_path):
+    import rpptx
+
+    prs = _textbox_presentation(rpptx)
+    prs.slides[0].notes_text = "note"
+    path = tmp_path / "source.pptx"
+    prs.save(path)
+
+    reopened = rpptx.Presentation.from_bytes(path.read_bytes())
+    assert len(reopened.slides) == 1
+    assert (reopened.slides[0].shapes[0].text, reopened.slides[0].notes_text) == (
+        "hello",
+        "note",
+    )
+    assert reopened.to_bytes() == rpptx.Presentation(path).to_bytes()
+    with pytest.raises(rpptx.PackageError):
+        rpptx.Presentation.from_bytes(b"not a package")
+
+
+def test_try_replace_text_checks_the_expected_count_before_publishing():
+    import pickle
+
+    import rpptx
+
+    prs = _textbox_presentation(rpptx)
+    prs.slides[0].shapes[0].text = "NAME and NAME"
+    prs.slides[0].shapes.add_table(1, 1, 0, 0, 100, 100).table.cell(0, 0).text = "NAME"
+    prs.slides[0].notes_text = "Notes for NAME"
+    held = prs.slides[0].shapes[0]
+    before = prs.to_bytes()
+
+    with pytest.raises(rpptx.ReplacementCountError) as raised:
+        prs.try_replace_text("NAME", "Ada", expect=3)
+    error = raised.value
+    assert isinstance(error, rpptx.RpptxError)
+    assert str(error) == 'expected 3 replacement(s) of "NAME", found 4'
+    assert (error.expected, error.found) == (3, 4)
+    # Worker pools pickle exceptions, so the counts must survive the trip.
+    copied = pickle.loads(pickle.dumps(error))
+    assert (str(copied), copied.expected, copied.found) == (str(error), 3, 4)
+    assert prs.to_bytes() == before
+    assert held.text == "NAME and NAME"
+
+    assert prs.try_replace_text("MISSING", "x") == 0
+    assert prs.try_replace_text("MISSING", "x", expect=0) == 0
+    with pytest.raises(rpptx.ReplacementCountError, match="found 0"):
+        prs.try_replace_text("MISSING", "x", expect=1)
+    with pytest.raises(rpptx.RpptxError, match="placeholder must not be empty"):
+        prs.try_replace_text("", "x")
+    assert prs.to_bytes() == before
+    assert held.text == "NAME and NAME"
+
+    assert prs.try_replace_text("NAME", "Ada", expect=4) == 4
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: held.text)
+    shapes = prs.slides[0].shapes
+    assert (shapes[0].text, shapes[1].table.cell(0, 0).text) == ("Ada and Ada", "Ada")
+    assert prs.slides[0].notes_text == "Notes for Ada"
+    held = prs.slides[0].shapes[0]
+    assert prs.try_replace_text("Ada", "Grace") == 4
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: held.text)
+    assert prs.slides[0].shapes[0].text == "Grace and Grace"
+
+
+def test_slide_resolve_and_remove_comment_match_the_cli_operations():
+    import rpptx
+
+    author_id = "{11111111-1111-1111-1111-111111111111}"
+    comment_id = "{22222222-2222-2222-2222-222222222222}"
+    reply_id = "{33333333-3333-3333-3333-333333333333}"
+    second_id = "{55555555-5555-5555-5555-555555555555}"
+    unknown_id = "{99999999-9999-9999-9999-999999999999}"
+    created = "2026-09-14T10:30:00Z"
+    prs = rpptx.Presentation()
+    for _ in range(2):
+        prs.slides.add_slide(prs.slide_layouts[6])
+    prs.add_comment_author(
+        id=author_id, name="Ada Lovelace", user_id="ada@example.com", provider_id="local"
+    )
+    prs.slides[0].add_comment(id=comment_id, author_id=author_id, created=created, text="Thread")
+    prs.slides[0].reply_to_comment(
+        comment_id, id=reply_id, author_id=author_id, created=created, text="Reply"
+    )
+    prs.slides[0].add_comment(id=second_id, author_id=author_id, created=created, text="Second")
+
+    slide = prs.slides[0]
+    before = prs.to_bytes()
+    for operation, comment in (
+        (slide.resolve_comment, unknown_id),
+        (slide.resolve_comment, reply_id),
+        (slide.remove_comment, unknown_id),
+        (prs.slides[1].remove_comment, comment_id),
+    ):
+        with pytest.raises(rpptx.RpptxError, match="unknown comment id"):
+            operation(comment)
+    assert prs.to_bytes() == before
+    assert [comment.status for comment in slide.comments] == [None, None]
+
+    slide.resolve_comment(comment_id)
+    _assert_stale_after_exactly_one_bump(rpptx, lambda: slide.comments)
+    thread, second = prs.slides[0].comments
+    assert (thread.id, thread.status, second.status) == (comment_id, "resolved", None)
+    assert [(reply.id, reply.status) for reply in thread.replies] == [(reply_id, None)]
+
+    prs.slides[0].remove_comment(reply_id)
+    assert prs.slides[0].comments[0].replies == ()
+    prs.slides[0].remove_comment(comment_id)
+    assert [comment.id for comment in prs.slides[0].comments] == [second_id]
+    reopened = rpptx.Presentation.from_bytes(prs.to_bytes())
+    assert reopened.slides[0].comments == prs.slides[0].comments
+
+    # The facade keeps the emptied comments part, so duplicate still refuses.
+    prs.slides[0].remove_comment(second_id)
+    assert prs.slides[0].comments == ()
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="modern comments"):
+        prs.slides.duplicate(prs.slides[0])
+    assert (prs.to_bytes(), len(prs.slides)) == (before, 2)
+
+
+def test_validate_returns_the_issues_the_cli_prints_as_frozen_snapshots(tmp_path):
+    import rpptx
+
+    prs = rpptx.Presentation()
+    assert prs.validate() == ()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    for text in ("first", "second"):
+        prs.slides[0].shapes.add_textbox(0, 0, 10, 10).text = text
+    assert prs.validate() == ()
+    first, second = (shape.shape_id for shape in prs.slides[0].shapes)
+    source = tmp_path / "source.pptx"
+    broken = tmp_path / "broken.pptx"
+    prs.save(source)
+    _replace_in_slide(source, broken, f'id="{second}"', f'id="{first}"')
+
+    broken_deck = rpptx.Presentation(broken)
+    (issue,) = broken_deck.validate()
+    assert (issue.kind, issue.message) == (
+        "duplicate_shape_id",
+        f"DuplicateShapeId {{ slide: 0, id: {first} }}",
+    )
+    assert broken_deck.validate() == (issue,)
+    with pytest.raises(AttributeError):
+        issue.kind = "other"
 
 
 def test_add_shape_accepts_preset_names_and_every_mso_shape_member(tmp_path):
@@ -2231,3 +3222,107 @@ def test_adjustments_match_python_pptx_defaults_reads_and_writes(tmp_path):
     prs.save(output)
     oracle = pptx.Presentation(output).slides[0].shapes
     assert oracle[list(MSO_SHAPE).index(MSO_SHAPE.ROUNDED_RECTANGLE)].adjustments[0] == 0.3
+
+
+def test_issue_169_replace_text_alias_is_counted_and_atomic():
+    import rpptx
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(0, 0, 100_000, 100_000).text = "Original"
+    before = prs.to_bytes()
+
+    with pytest.raises(rpptx.ReplacementCountError):
+        prs.replace_text("Original", "Updated", expect=2)
+    assert prs.to_bytes() == before
+
+    assert prs.replace_text("Original", "Updated", expect=1) == 1
+    reopened = rpptx.Presentation.from_bytes(prs.to_bytes())
+    assert reopened.slides[0].shapes[0].text == "Updated"
+
+
+def test_issue_169_effective_geometry_materializes_missing_partners():
+    import rpptx
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title = slide.shapes.title
+    assert title.left is None
+    resolved = title.effective_geometry()
+    assert resolved is not None
+    left, top, width, height = (int(value) for value in resolved)
+    assert width > 0 and height > 0
+
+    title.left = left + 100
+    materialized = prs.slides[0].shapes.title
+    assert tuple(int(value) for value in (materialized.left, materialized.top,
+                                          materialized.width, materialized.height)) == (
+        left + 100, top, width, height
+    )
+
+
+def test_issue_169_shape_click_hyperlink_round_trips_and_python_pptx_reads_it(tmp_path):
+    import pptx
+    import rpptx
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_textbox(0, 0, 100_000, 100_000)
+    shape.text = "Open"
+    shape = prs.slides[0].shapes[0]
+    assert shape.click_action.hyperlink.address is None
+    shape.click_action.hyperlink.address = "https://example.com/first"
+    output = tmp_path / "shape-link.pptx"
+    prs.save(output)
+    assert pptx.Presentation(output).slides[0].shapes[0].click_action.hyperlink.address == (
+        "https://example.com/first"
+    )
+    reopened = rpptx.Presentation(output)
+    link = reopened.slides[0].shapes[0].click_action.hyperlink
+    assert link.address == "https://example.com/first"
+    link.address = "https://example.com/second"
+    output = tmp_path / "shape-link-retargeted.pptx"
+    reopened.save(output)
+    assert pptx.Presentation(output).slides[0].shapes[0].click_action.hyperlink.address == (
+        "https://example.com/second"
+    )
+    link.address = None
+    assert reopened.slides[0].shapes[0].click_action.hyperlink.address is None
+
+
+def test_issue_169_modern_comments_anchor_to_shape_and_text_range(tmp_path):
+    import rpptx
+
+    prs = rpptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_textbox(0, 0, 100_000, 100_000)
+    shape.text = "Hello world"
+    shape_id = prs.slides[0].shapes[0].shape_id
+    author_id = "{11111111-1111-1111-1111-111111111111}"
+    prs.add_comment_author(
+        id=author_id, name="Ada", user_id="ada@example.test", provider_id="local"
+    )
+    kwargs = dict(author_id=author_id, created="2026-09-30T10:00:00Z", text="Review")
+    slide = prs.slides[0]
+    before = prs.to_bytes()
+    with pytest.raises(rpptx.RpptxError, match="text range exceeds"):
+        slide.add_comment(id="{22222222-2222-2222-2222-222222222222}",
+                          shape_id=shape_id, text_start=10, text_length=4, **kwargs)
+    assert prs.to_bytes() == before
+    slide.add_comment(id="{22222222-2222-2222-2222-222222222222}",
+                      shape_id=shape_id, **kwargs)
+    prs.slides[0].add_comment(id="{33333333-3333-3333-3333-333333333333}",
+                              shape_id=shape_id, text_start=6, text_length=5, **kwargs)
+    output = tmp_path / "anchored-comments.pptx"
+    prs.save(output)
+    with zipfile.ZipFile(output) as archive:
+        comments = archive.read("ppt/comments/comment1.xml")
+    assert b"<ac:deMkLst" in comments
+    assert b"<ac:txMkLst" in comments
+    assert f'<ac:spMk id="{shape_id}"/>'.encode() in comments
+    assert b'<ac:txMk cp="6" len="5"><ac:context len="11" hash="' in comments
+    reopened = rpptx.Presentation(output)
+    assert [comment.id for comment in reopened.slides[0].comments] == [
+        "{22222222-2222-2222-2222-222222222222}",
+        "{33333333-3333-3333-3333-333333333333}",
+    ]

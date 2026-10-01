@@ -26,6 +26,14 @@ Required before completion:
 `/microscope` is not optional and not skippable. Its exit condition is zero
 defects and zero smells, iterating in numbered passes until it reaches that.
 
+Keep each F-ID implementation limited to its approved design. The worker runs
+focused tests, the plan's applicable oracle and risk checks, `/verify --scoped`,
+and a zero-finding `/microscope`. Run `/verify --full` and `/sprint-review` once over the final integrated
+sprint result. A formal dependency-prefix checkpoint completes its reviewed
+prerequisite using scoped evidence and focused integration checks so a
+dependent F-ID can start. It does not run the full workspace or sprint review.
+The release workflow retains its separate full gate before publication.
+
 Review commands never patch the diff they audit. When an orchestration command
 such as `/run-sprint` invokes a review, the completed review returns control to
 the orchestrator. It may enter a separate remediation phase and launch the next
@@ -65,11 +73,14 @@ that has to come first. The rules that make it safe:
 - **Never resolve a semantic conflict automatically.** Reconcile against both
   approved design plans, then re-review.
 
-Worker branches and worktrees are **retained** through integration, full
-verification and sprint review. After `/close-sprint` has merged and pushed
-both `main` and the sprint tag, it removes the clean worktrees and local
-branches for completed workers recorded in the sprint state. It never removes
-an uncommitted worktree, a carried worker or an unrelated worktree.
+Worker branches are retained through integration, full verification and sprint
+review. After a handoff is consumed and its local integration commit is
+recorded, a clean completed worker worktree may be removed without `--force`
+to save disk space. The branch remains available to recreate the worktree if
+review needs it. After `/close-sprint` has merged and pushed both `main` and
+the sprint tag, it removes completed worker branches and any remaining clean
+completed worker worktrees. It never removes an uncommitted worktree, a
+carried worker or an unrelated worktree.
 
 ## The command surface
 
@@ -235,9 +246,10 @@ Per-sprint branches off `main`, named `sprint/sNN`. Every F-ID commit lands on
 the active sprint branch, never directly on `main`.
 
 Parallel work adds `work/<fid-lower>-<agent>` branches, cut from the sprint
-branch head at claim time and squashed back by `/integrate-feature`. They are
-retained until `/close-sprint` has pushed the integrated sprint, then removed
-locally. They are never pushed unless asked.
+branch head at claim time and squashed back by `/integrate-feature`. Their
+branches are retained until `/close-sprint` has pushed the integrated sprint.
+Clean integrated worktrees may be removed earlier. Worker branches are never
+pushed unless asked.
 
 - `/sync-sprint SNN` creates the branch off the latest `main`.
 - `/claim-feature` cuts a worker branch from the sprint branch head.
@@ -246,8 +258,9 @@ locally. They are never pushed unless asked.
 - `/release vX.Y.Z` tags an already reviewed sprint SHA and starts publication.
 - `/close-sprint SNN --next SMM` validates readiness, merges to `main` with an
   explicit merge commit, creates the annotated `sNN` tag, pushes both, removes
-  completed worker worktrees and local branches, then runs `/sync-sprint` for
-  the next sprint.
+  completed worker worktrees and local branches, reconciles contributed PRs
+  and issues against integrated acceptance evidence with human-written
+  contributor thanks, then runs `/sync-sprint` for the next sprint.
 
 Only `/close-sprint` may touch `main` or create an `sNN` sprint tag. Only
 `/release` may create or push a `v*` release tag or start crates.io

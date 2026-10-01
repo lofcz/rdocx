@@ -87,6 +87,12 @@ push to the end of the sprint run.
      --integration-commit <new-sha>
    ```
 
+10. **Save disk space.** After the integration commit is recorded, confirm the
+    worker path is still registered to that branch and its status is empty.
+    Remove that clean worktree with `git worktree remove` without `--force`.
+    Keep the worker branch for final verification and review. Leave a dirty,
+    carried or unrelated worktree intact and report why it remains.
+
 ## What `--batch` changes
 
 1. Commit only feature-local work: code, tests, the design plan, the review
@@ -103,9 +109,9 @@ push to the end of the sprint run.
 - **Integrating without a validating handoff.** No exceptions.
 - **Auto-resolving a semantic conflict.** Two plausible merges of a parser and
   a renderer produce a file that compiles and renders the wrong thing.
-- **Deleting the worker branch or worktree.** Report both as retained cleanup
-  targets. `/close-sprint` removes them after the integrated sprint passes its
-  gates and is pushed.
+- **Deleting the worker branch or an unclean worktree.** Report the retained
+  branch and any worktree that cannot be safely removed. `/close-sprint`
+  removes completed worker branches after the sprint is pushed.
 - **Pushing in `--batch`.**
 - **Merging to `main` or tagging.** `/close-sprint` owns `main` and sprint
   tags. `/release` owns release tags.

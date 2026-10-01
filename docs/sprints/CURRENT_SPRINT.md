@@ -1,56 +1,58 @@
-# Current Sprint, S75
+# Current Sprint, S78
 
-**Milestone**: M24 Modern DOCX authoring completeness.
+**Milestone**: X, contribution intake and issue repair.
 
-**Goal**: restore the hosted Python binding gate, integrate the open
-contribution wave and its unassigned issue reports, then finish Issue 138's
-table pagination correction before one reviewed mid-milestone merge.
+**Goal**: land the reviewed Word preservation and comparison contributions on
+the completed S77 prefix. Then run the attached identity and producer matrices
+and finish the comparison and redline acceptance criteria for Issues 157, 159,
+160 and 161.
 
 ## Spec references
 
-- `docs/hld/03-architecture.md`, for native story snapshots and the integrated
-  PowerPoint facade and bindings.
-- `docs/hld/04-opc-and-packaging.md`, for comparison and unchanged-part
-  preservation.
-- `docs/hld/08-rendering-spec.md`, for Word paragraph spacing, table geometry,
-  row splitting, and page flow.
-- `docs/hld/12-testing-strategy.md`, for source-built regressions, the hash
-  harness, and pinned deterministic rendering checks.
-- `docs/hld/14-development-backlog.md`, for F-X134 through F-X136 acceptance
-  contracts, dependencies, sizes, and named test gates.
+- `docs/hld/03-architecture.md`, for the Word facade, comparison and CLI crate
+  boundaries.
+- `docs/hld/04-opc-and-packaging.md`, for source-preserving story and package
+  round trips.
+- `docs/hld/08-rendering-spec.md`, for layout-backed field and TOC behavior
+  exercised by the producer matrix.
+- `docs/hld/10-bindings-spec.md`, for Python and CLI comparison options and
+  redline parity.
+- `docs/hld/12-testing-strategy.md`, for deterministic fixtures, the hash
+  harness and the integrated regression gate.
+- `docs/hld/14-development-backlog.md`, for the F-X151, F-X144 and F-X145
+  contracts and their dependencies.
 
 ## The wave
 
 | F-ID | Title | Size | Status | Owner |
 |------|-------|------|--------|-------|
-| F-X134 | Keep Python story hyperlink snapshots linear | S | done | - |
-| F-X135 | Integrate PRs 146 through 151 and resolve unassigned reports | L | done | - |
-| F-X136 | Fix table row breaks and footer-only pages | L | done | - |
+| F-X151 | Word preservation and comparison PR intake | L | done | - |
+| F-X144 | Identity and producer matrices across operations | L | done | - |
+| F-X145 | Comparison options and redline completion | L | done | - |
 
 ## Sequencing note
 
-F-X134 runs first because it repairs the hosted Python binding gate inherited
-from the completed story inventory work. F-X135 then integrates the six
-remaining contributor branches and repairs Issues 134, 135, 136, 139, and 140,
-which initially had no implementation pull request. F-X136 follows F-X135 and
-closes the distinct remaining Issue 138 table-pagination report. At the
-user-approved cutoff, F-X133 and F-271 through F-277 carry pending to S76.
-The carry preserves their dependency order and avoids claiming unfinished
-related-story work in this mid-milestone merge.
+F-X151 follows completed F-X143 and reviews the incremental changes in PRs
+214, 228, 229, 232, 233 and 239 against the S77 prefix. Resolve PR 214's
+recorded overlap with PR 194, and rerun the failed PR 239 Python binding gate
+on the reconciled result. F-X144 follows F-X151 and completes the identity,
+producer and add_picture matrices. F-X145 follows F-X144 and completes the
+comparison option, edited-side comment, rebuilt TOC and marker-order cases.
+Use focused checks and a zero-finding microscope per story, then the full
+verification and sprint review once on the combined result.
 
 ## Definition of done for this sprint
 
-- Story hyperlink snapshots inventory namespace scopes once per physical
-  source and pass the hosted Python linear-scaling gate without weakening its
-  bound.
-- PRs 146 through 151 are integrated at their pinned reviewed heads with
-  overlaps reconciled, PR 148's missing deterministic golden baseline repaired,
-  and stale per-branch archive measurements replaced by one combined record.
-- Issues 134, 135, 136, 139, and 140 have source-built regressions and complete
-  fixes. Issue 138 closes only after line-height and row-splitting behavior is
-  implemented and verified by F-X136.
-- F-271 through F-277 and F-X133 retain their pending acceptance contracts in
-  S76, with the carry reason recorded at sprint close.
-- The full workspace, deterministic hash harness, pinned differential oracles,
-  package gates, bindings, and documentation checks pass without unexplained
-  output changes.
+- Each contributed PR has a reviewed incremental diff on the S77 prefix, with
+  overlaps reconciled and focused checks passing on the replayed result.
+- The Issue 157 add_picture column and all Issue 159 identity rows pass every
+  named operation without lost identity or comparison refusal.
+- The Issue 160 producer matrix, content-control walker locations, unchanged
+  comments bytes and mc:Ignorable checks pass on edited parts.
+- Python and CLI comparison options agree. Edited-side comments, rebuilt TOCs
+  and marker placement meet every Issue 161 redline case.
+- The combined result passes the hash harness, the applicable binding and
+  package regressions, `/verify --full` and `/sprint-review` before closure.
+- At `/close-sprint`, reconcile S78 PRs and issues against verified `main`,
+  thank contributors in specific human-written comments, and close issues
+  only after their complete criteria have evidence.

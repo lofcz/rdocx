@@ -170,7 +170,7 @@ fn generate_feature_showcase(_samples_dir: &Path) -> Document {
 
     // ── TABLE OF CONTENTS ──
     doc.add_paragraph("").page_break_before(true);
-    doc.insert_toc(doc.content_count(), 3);
+    doc.insert_toc(doc.content_count(), 3).unwrap();
 
     // ── SECTION 1: TEXT FORMATTING ──
     doc.add_paragraph("").page_break_before(true);
@@ -822,7 +822,7 @@ fn generate_proposal(_samples_dir: &Path) -> Document {
     doc.add_paragraph("").page_break_before(true);
     doc.add_paragraph("Table of Contents").style("Heading1");
     // We'll add a manual-style TOC since the insert_toc goes at a specific position
-    doc.insert_toc(doc.content_count(), 2);
+    doc.insert_toc(doc.content_count(), 2).unwrap();
 
     // ── Executive Summary ──
     doc.add_paragraph("").page_break_before(true);
@@ -1487,7 +1487,7 @@ fn generate_report(_samples_dir: &Path) -> Document {
 
     // ── TOC ──
     doc.add_paragraph("").page_break_before(true);
-    doc.insert_toc(doc.content_count(), 3);
+    doc.insert_toc(doc.content_count(), 3).unwrap();
 
     // ── Section 1: Executive Overview ──
     doc.add_paragraph("").page_break_before(true);

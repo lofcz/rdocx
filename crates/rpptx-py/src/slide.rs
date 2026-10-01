@@ -253,6 +253,29 @@ impl PySlide {
         )
     }
 
+    /// Moves the slide to another layout of this presentation.
+    ///
+    /// Placeholders the new layout does not place keep the geometry they
+    /// inherited, and the revision advances once.
+    #[setter]
+    fn set_slide_layout(&self, py: Python<'_>, layout: &Bound<'_, PyAny>) -> PyResult<()> {
+        let index = self.validate(py)?;
+        let layout = layout.extract::<PyRef<'_, PySlideLayout>>()?;
+        if !layout.presentation.is(&self.presentation) {
+            return Err(PyValueError::new_err(
+                "slide layout is not in this presentation",
+            ));
+        }
+        layout.validate(py)?;
+        let mut presentation = self.presentation.borrow_mut(py);
+        presentation
+            .inner
+            .set_slide_layout(index, layout.index)
+            .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
+        presentation.revisions.bump();
+        Ok(())
+    }
+
     #[getter]
     fn hidden(&self, py: Python<'_>) -> PyResult<bool> {
         let index = self.validate(py)?;
@@ -337,23 +360,42 @@ impl PySlide {
         )
     }
 
-    #[pyo3(signature = (*, id, author_id, created, text))]
+    // PyO3 exposes these as named Python arguments, so a Rust options wrapper
+    // would only hide the public signature from this boundary.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, id, author_id, created, text, shape_id=None, text_start=None, text_length=None))]
     fn add_comment(
         &self,
         id: String,
         author_id: String,
         created: String,
         text: &str,
+        shape_id: Option<u32>,
+        text_start: Option<usize>,
+        text_length: Option<usize>,
         py: Python<'_>,
     ) -> PyResult<()> {
         let index = self.validate(py)?;
         let comment = rpptx::Comment::new(id, author_id, created, text)
             .map_err(|error| crate::rpptx_value_to_pyerr(py, error.to_string()))?;
+        if text_start.is_some() != text_length.is_some()
+            || (text_start.is_some() && shape_id.is_none())
+        {
+            return Err(PyValueError::new_err(
+                "text_start and text_length require each other and shape_id",
+            ));
+        }
         let mut presentation = self.presentation.borrow_mut(py);
-        presentation
-            .inner
-            .add_comment(index, comment)
-            .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
+        match shape_id {
+            Some(shape_id) => presentation.inner.add_comment_at_shape(
+                index,
+                comment,
+                shape_id,
+                text_start.zip(text_length),
+            ),
+            None => presentation.inner.add_comment(index, comment),
+        }
+        .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
         presentation.revisions.bump();
         Ok(())
     }
@@ -375,6 +417,30 @@ impl PySlide {
         presentation
             .inner
             .reply_to_comment(index, comment_id, reply)
+            .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
+        presentation.revisions.bump();
+        Ok(())
+    }
+
+    /// Marks one comment thread resolved. A reply id is an unknown id.
+    fn resolve_comment(&self, comment_id: &str, py: Python<'_>) -> PyResult<()> {
+        let index = self.validate(py)?;
+        let mut presentation = self.presentation.borrow_mut(py);
+        presentation
+            .inner
+            .resolve_comment(index, comment_id)
+            .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
+        presentation.revisions.bump();
+        Ok(())
+    }
+
+    /// Removes one comment thread with its replies, or one reply.
+    fn remove_comment(&self, comment_id: &str, py: Python<'_>) -> PyResult<()> {
+        let index = self.validate(py)?;
+        let mut presentation = self.presentation.borrow_mut(py);
+        presentation
+            .inner
+            .remove_comment(index, comment_id)
             .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
         presentation.revisions.bump();
         Ok(())
@@ -501,6 +567,29 @@ impl PySlideCollection {
             .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
         presentation.revisions.bump();
         Ok(())
+    }
+
+    /// Duplicates one slide of this presentation with its notes right after
+    /// the source, and returns the new slide.
+    fn duplicate(&self, py: Python<'_>, slide: &Bound<'_, PyAny>) -> PyResult<Py<PySlide>> {
+        self.len(py)?;
+        let slide = slide.extract::<PyRef<'_, PySlide>>()?;
+        if !slide.presentation.is(&self.presentation) {
+            return Err(PyValueError::new_err("slide is not in this collection"));
+        }
+        let index = slide.validate(py)?;
+        let path = {
+            let mut presentation = self.presentation.borrow_mut(py);
+            presentation
+                .inner
+                .duplicate_slide(index)
+                .map_err(|error| crate::rpptx_to_pyerr(py, error))?;
+            presentation.revisions.bump();
+            presentation
+                .revisions
+                .capture(smallvec![PathSeg::Slide(index + 1)])
+        };
+        Py::new(py, PySlide::new(self.presentation.clone_ref(py), path))
     }
 
     /// Moves the slide at `from_` so that it ends up at index `to`.

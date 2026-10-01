@@ -7667,21 +7667,17 @@ rdocx-layout = "=0.10.1"
             normalized,
         )
         ordered_steps = (
-            "Integrate the prepared dependency prefix",
-            "Run `/verify --full`",
-            "Finalise the reviewed non-release prefix",
-            "Commit the clean review file",
-            "record the clean review at the resulting HEAD",
-            "Rerun `/verify --full` because the review commit changed HEAD",
+            "Integrate the prepared prerequisite",
+            "Confirm the worker's `/verify --scoped`",
+            "Apply the non-release documentation and delivery-record steps",
             "Return the phase to `implementation`",
         )
         positions = tuple(checkpoint.index(step) for step in ordered_steps)
         self.assertEqual(positions, tuple(sorted(positions)))
-        self.assertIn("Do not run a confirmation review", checkpoint)
-        self.assertIn("Do not claim the dependent wave", checkpoint)
-        self.assertIn("Pass numbering remains global", checkpoint)
-        self.assertIn("at most the configured review-pass bound", checkpoint)
-        self.assertIn("scheduled dependency-prefix boundary", checkpoint)
+        self.assertIn("Do not run `/verify --full` or `/sprint-review`", normalized)
+        self.assertIn("Run focused checks for any integration-only reconciliation", checkpoint)
+        self.assertIn("The final `/verify --full` and `/sprint-review`", checkpoint)
+        self.assertIn("A dependency checkpoint never supplies closure evidence", normalized)
 
     def test_run_sprint_requires_ordinary_dependency_prefix_checkpoints(self) -> None:
         run_sprint = (workflow.REPO / ".claude/commands/run-sprint.md").read_text(
@@ -7695,17 +7691,19 @@ rdocx-layout = "=0.10.1"
                 "a formal dependency exists",
                 1,
             ),
-            "missing-review-commit": run_sprint.replace(
-                "Commit the clean review file", "Leave the review file uncommitted", 1
-            ),
-            "confirmation-review": run_sprint.replace(
-                "Do not run a confirmation review",
-                "Run a confirmation review",
+            "missing-scoped-evidence": run_sprint.replace(
+                "Confirm the worker's `/verify --scoped`",
+                "Trust the worker's claim",
                 1,
             ),
-            "missing-checkpoint-review-bound": run_sprint.replace(
-                "at most the configured review-pass bound",
-                "an unlimited number of review passes",
+            "premature-full-gate": run_sprint.replace(
+                "run `/verify --full` or `/sprint-review` at this checkpoint",
+                "run `/verify --full` and `/sprint-review` at this checkpoint",
+                1,
+            ),
+            "missing-final-evidence-boundary": run_sprint.replace(
+                "A dependency checkpoint never supplies closure",
+                "A dependency checkpoint supplies closure",
                 1,
             ),
         }
@@ -9782,7 +9780,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertTrue(all(len(value) == 1 for value in placements.values()))
         self.assertEqual(
             {sprint for value in placements.values() for sprint, _, _ in value},
-            set(range(70, 81)) - {75},
+            set(range(70, 75)) | set(range(89, 95)),
         )
 
         backlog_rows: dict[str, list[tuple[int, str, str, str]]] = {

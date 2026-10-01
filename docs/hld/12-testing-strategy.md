@@ -106,6 +106,21 @@ a reintroduction is obvious from the test name alone rather than from a diff.
 The existing file is the model: `zero_column_tables_do_not_panic`,
 `saving_is_reproducible`.
 
+The Word comparison regression gate covers the Issue 161 option matrix through
+native, installed Python, and CLI entry points with `run` as each default.
+Source-built comment add, remove, reply, resolve, and date cases compare,
+save, accept, and reject against both inputs. A comment-owned external link
+and internal asset must survive redline save and acceptance, then disappear on
+rejection when the original has no comment. A colliding producer path must
+retain the body's asset while carrying the edited comment asset at a new path.
+An ignored comment story skips damaged comment-owned targets. A comment-only
+date edit must list one selectable revision and report one resolved revision.
+The rebuilt TOC
+smoke case and a TOC-entry hyperlink transition check paragraph replacement,
+while a word-level insertion before bookmark and comment markers checks exact
+marker order after both resolutions. Compatible comment text remains covered
+by the existing full-story Word records.
+
 The legacy form and glossary round-trip gate constructs every package in
 source. It covers typed text, checkbox, and drop-down values, deterministic
 part-scoped ordinal identity across supported internal Word stories, AutoText
@@ -793,12 +808,12 @@ order. Focused tests cover dotted and lexical lookup, loop shadowing and scope
 restoration, every JSON truthiness case, malformed and crossed controls, and
 atomic rejection. The round-trip test clones section-ending paragraphs and
 table rows, then proves their section properties and unmodelled XML remain in
-schema order after saving and reopening. Headers, footers, text boxes, and
-chart labels retain the scalar-only coverage shared with literal placeholder
-replacement. The repeating-table regression gate expands three adjacent
-template rows over ten records and compares all thirty rows in order. It also
-checks banding, grid spans, vertical merge restarts and continuations, and
-atomic rejection of an invalid repeated numbering reference. The continuous
+schema order after saving and reopening. Headers, footers, footnotes, endnotes,
+text boxes, and chart labels retain the scalar-only coverage shared with literal
+placeholder replacement. The repeating-table regression gate expands three
+adjacent template rows over ten records and compares all thirty rows in order.
+It also checks banding, grid spans, vertical merge restarts and continuations,
+and atomic rejection of an invalid repeated numbering reference. The continuous
 numbering regression proves that mixed list and ordinary paragraphs retain one
 `numId` and level without changing the numbering part. The paired round-trip
 test compares row, cell, table, numbering, and raw XML state after reopen and
@@ -852,6 +867,39 @@ relationships remain byte-exact and appear once in tracked, accepted,
 rejected, saved, and reopened views. The legacy/default compatibility test
 keeps `Document::compare` byte-identical to default options. No sample invokes
 comparison, so the 49-entry hash harness remains unchanged.
+
+The Word contribution regression gate checks caller-font PDF fallback, whole
+paragraph comparison with hyperlinks, bookmarks, and rebuilt TOCs, exporter
+visibility through block and inline controls, namespace and border retention,
+XML-character rejection before package publication, and complex fields whose
+text or sibling fields share one physical run. Changed package, facade,
+DrawingML, and Presentation sources also run their native suites, the rdocx
+Python binding suite, and the unchanged 49-entry hash harness. The binding
+suite includes empty caller-font directories and retains the ordinary PDF
+fallback. Every published archive row is remeasured against the exact source.
+
+The identity acceptance matrix builds one cached-TOC report with headings,
+a table, a block control, and footer page fields. Seventeen paragraph, run,
+field-run, footer-run, control, and row identity variants each exercise save,
+replacement, six-entry TOC rebuild, field refresh, PDF render, identity-only
+comparison, and one-word comparison. The producer matrix applies eleven XML
+traits to the same report and checks byte-identical no-op save, replacement,
+TOC rebuild, field refresh, render, refreshed-field comparison, one-word
+comparison, self-comparison after an rdocx edit, and picture insertion after
+save and reopen. The source-built binding cases use python-docx 1.2.0 only
+for input construction. Native regressions cover content-control read and
+write walkers across body, cell, nested, header, footer, and text-box owners,
+and check `mc:Ignorable` declarations in every rewritten Word story part and
+the styles root after a style edit.
+
+Story revision regressions list body, cell, header, footer, note, comment, and
+text-box owners, then compare their identities and counts with accept and
+reject after save and reopen. CLI regressions retain existing revision output
+fields while adding story identity and counts. Text and conversion cases keep
+the body and name a malformed related part in one warning. Validation cases
+reject malformed related XML and undefined style IDs. Python listing and its
+type stub agree with the native inventory. These changes leave the 49-entry
+hash harness unchanged.
 
 `comparison_tracks_changed_table_grids_as_table_replacement` source-builds
 tables that gain a column, lose a column, and resize both columns. Each tracked
@@ -1285,6 +1333,11 @@ moved and cannot be evaded, including by a change that is purely in
 compression. A fingerprint of extracted text and page geometry alone was
 rejected, because the dependency refresh in F-X020 moved all seven sample PDFs
 while `pdftotext` output stayed identical in 7 of 7.
+
+Focused PDF text regressions require a shaped ligature to map back to its
+full source text through ToUnicode. The seven sample resource and byte hashes
+cover the resulting font maps, while their page, PNG and Word XML hashes remain
+stable.
 
 Document metadata streams are excluded only from `pdf/resources`. They are not
 page resources, and their complete bytes remain covered by `pdf/bytes`. A
@@ -1841,7 +1894,18 @@ values, source attribute order, child schema order, and deterministic package
 bytes. Focused unit coverage rejects duplicate expanded names and proves that
 authored `paraId` replaces only its expanded-name match. The public run-shape
 regression prevents the internal retention record from changing the existing
-`CT_R` struct literal surface.
+`CT_R` struct literal surface. `table_row_identity_attribute_regressions`
+extends the gate to table rows, direct, inside a table-level content control,
+and self-closing. A one-word edit outside the table keeps every row identity
+in source order and a reopened save is byte identical. Identity-only row
+differences add no comparison revision, a changed word adds two, the rows
+raise no unsupported-content or export diagnostic, and rich merge region
+markers and whole-paragraph fragment fields still resolve in paragraphs and
+rows that carry Word identities. A row or paragraph that declares `w14` itself
+under a root that does not, and a comparison of main and header stories
+against a copy whose roots declare `w14`, both write a readable part. Rows
+and paragraphs copied by `clone_table_row`, `clone_content` and template loops
+drop their w14 identities and keep their revision-save identities.
 
 The run-level page-break differential gate authors both the break-only
 paragraph written by python-docx and a break between two pieces of text. Its

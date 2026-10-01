@@ -38,9 +38,11 @@ schema-ordered relative positioning plus none, square, tight, through, top and
 bottom wrapping. Tight and through output includes the required wrap polygon.
 Text boxes use a WPS DrawingML primary branch with exact rotation and vertical
 direction, plus a self-contained VML fallback whose shape type, text spacing,
-and vertical flow agree with the selected option. Unsupported producer
-`AlternateContent` remains opaque unless the facade authors that complete
-fragment itself.
+and vertical flow agree with the selected option. A Word text box in a
+run's producer `AlternateContent` is read as a story from its first text-box
+Choice. Replacement edits every copy of it. Other unsupported producer branches remain
+opaque unless the facade authors the complete fragment. See
+`03-architecture.md` and `10-bindings-spec.md`.
 
 Cross-document body-fragment import treats each selected picture or chart
 drawing as the root of a part-local relationship closure. It assigns fresh
@@ -76,6 +78,14 @@ their original slots rather than appending them at the end.
 
 **`a:t` whitespace.** Leading and trailing whitespace is significant and needs
 `xml:space="preserve"`. Cheap to guard, and infuriating to diagnose later.
+
+**`a:t` characters XML cannot carry.** The text setters store a character XML
+1.0 forbids, such as U+0001 or the vertical tab U+000B, as `_xHHHH_` with four
+uppercase hexadecimal digits, as python-pptx's run text setter does. Reading
+never decodes that form, as neither python-pptx nor PowerPoint does, so the
+getters, the renderer and PowerPoint all show the stored text. Replacing a
+paragraph's text turns each vertical tab into an `a:br`, the break that
+paragraph text reads back as a vertical tab.
 
 ## Colour, the part everyone gets wrong
 
@@ -242,6 +252,18 @@ are absent, inserting them moves preserved boundary-0 content to the slot after
 keeps a preserved `mc:AlternateContent` run substitution after the newly
 inserted properties without changing its bytes.
 
+`CT_TextParagraph` allows one `a:pPr`, but real decks carry a second one
+between runs, and python-pptx and LibreOffice open them. The reader types the
+first `a:pPr` as the paragraph properties, which alone govern resolution,
+layout and rendering. Every later `a:pPr` is preserved verbatim at its
+position. When the first `a:pPr` leads the paragraph, a no-op round trip keeps
+the paragraph bytes. A first `a:pPr` that follows a run is written at the
+front, as before. An edit of a run, of the typed properties, or of the run list
+keeps a later `a:pPr` in place, and whole-paragraph text replacement keeps it
+after the new run. Text reading still reads every run. Chart text shares the
+reader, so a `c:txPr` with a second `a:pPr` now reads where rdocx and rpptx
+used to report the chart invalid.
+
 `CT_TextParagraphProperties::set_bullet` keeps one member per bullet group. A
 typed colour, size, font, or choice removes a preserved `a:buClrTx`,
 `a:buSzTx`, `a:buFontTx`, or `a:buBlip` of the same group, and clearing the
@@ -301,6 +323,31 @@ origin in row-major order, and each source keeps one empty paragraph. Splitting
 is valid only at an origin, clears this pattern across its checked rectangle,
 and does not redistribute the migrated content.
 
+The writer matches preserved `a:gridCol` attributes and children, such as
+PowerPoint's `a16:colId` extension, to the public column widths by value, and
+fails with an ambiguity error when an edit leaves repeated widths it cannot
+pair. `CT_Table::set_column_width` first pairs every column with its metadata
+by position, so a width edit keeps the metadata with its column whatever the
+other widths are.
+
+`insert_row`, `remove_row`, `insert_column`, and `remove_column` change the
+explicit grid and require one explicit cell per grid column and merges that fit
+the grid. A new row copies the height of the row above it, or of the first row
+when it becomes the first, and a new column copies the width of the column to
+its left, or of the first column. Each new cell copies the `a:tcPr` of the
+neighbouring cell it was built from. `CT_TextBody::empty_like` gives it that
+cell's body properties, list style, and first paragraph properties, with one
+empty paragraph whose `a:endParaRPr` carries the first run's character
+properties without hyperlinks, as PowerPoint keeps formatting on an empty
+paragraph. New rows, columns, and cells carry no unmodelled content, so the
+`a16:rowId` and `a16:colId` extensions PowerPoint writes are never duplicated.
+An insertion strictly inside a merge extends it, and every other new cell is
+unmerged. A removal inside a merge shrinks it, and removing the first row or
+column of a merge moves the origin state, text, and cell properties to the next
+row or column. A changed span is rewritten on every cell of the merge that
+stored the old span, which keeps the origin and continuation pattern above.
+Removing the only row or column fails.
+
 Table properties expose right-to-left order, first and last row and column
 flags, row and column banding, and the optional table style id. Unsupported
 cell properties remain raw XML at their schema boundary. The rendering subset
@@ -317,6 +364,9 @@ theme font reference, text colour, outer borders, and inside horizontal and
 vertical borders. Producer wrapper elements such as `a:fill`, `a:tcBdr`, and
 its edge children remain part of the modelled schema path. Empty wrappers and
 unmodelled siblings retain their original form.
+The model does not insert definitions for Office's built-in table styles into
+`ppt/tableStyles.xml`. Resolution supplies those definitions when a table names
+a known built-in ID and the package has no matching style record.
 
 Readers accept any element prefix. Writers use fixed `a:` prefixes and schema
 child order for the modelled subset. Table writers emit `a:tblPr`,

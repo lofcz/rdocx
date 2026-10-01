@@ -1,15 +1,26 @@
 //! CLI command implementations.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use oxml_cli_support::{
-    StagedOutputSet, default_output_path, ensure_output_paths_available, json_envelope, parse_range,
+    StagedOutputSet, default_output_path, ensure_output_paths_allowed,
+    ensure_output_paths_available, json_envelope, parse_range,
 };
+use oxml_opc::relationship::rel_types;
+use quick_xml::XmlVersion;
+use quick_xml::escape::escape;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{Namespace, ResolveResult};
+use quick_xml::reader::NsReader;
 use rdocx::{
-    BodyItemRef, Document, RasterFormat, RasterOptions, RasterOutput, RevisionKind, RunRange,
+    BodyItemRef, ComparisonGranularity, ComparisonOptions, ComparisonStoryKind, Document,
+    RasterFormat, RasterOptions, RasterOutput, RevisionKind, RunRange, StoryId, StoryItemKind,
+    StoryKind,
 };
 use rdocx_oxml::content_control::{CT_Sdt, SdtContent};
 use rdocx_oxml::document::{BodyContent, CT_Document};
+use rdocx_oxml::namespace::{MC_NS, W_NS};
 use rdocx_oxml::table::{CT_Row, CT_Tbl, CT_Tc, CellContent};
 use rdocx_oxml::text::{CT_P, CT_R};
 use serde_json::{Value, json};
@@ -67,38 +78,39 @@ pub fn inspect(file: &Path, json: bool) -> Result<()> {
         }
     }
 
+    let mut stdout = io::stdout().lock();
     if json {
         let obj = inspect_json(file, &doc, style_ids)?;
-        println!("{}", serde_json::to_string_pretty(&obj)?);
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&obj)?)?;
     } else {
-        println!("File: {}", file.display());
-        println!("Paragraphs: {paragraph_count}");
-        println!("Tables: {table_count}");
-        println!("Content elements: {content_count}");
-        println!();
-        println!("Metadata:");
+        writeln!(stdout, "File: {}", file.display())?;
+        writeln!(stdout, "Paragraphs: {paragraph_count}")?;
+        writeln!(stdout, "Tables: {table_count}")?;
+        writeln!(stdout, "Content elements: {content_count}")?;
+        writeln!(stdout)?;
+        writeln!(stdout, "Metadata:")?;
         if let Some(t) = &title {
-            println!("  Title: {t}");
+            writeln!(stdout, "  Title: {t}")?;
         }
         if let Some(a) = &author {
-            println!("  Author: {a}");
+            writeln!(stdout, "  Author: {a}")?;
         }
         if let Some(s) = &subject {
-            println!("  Subject: {s}");
+            writeln!(stdout, "  Subject: {s}")?;
         }
         if let Some(k) = &keywords {
-            println!("  Keywords: {k}");
+            writeln!(stdout, "  Keywords: {k}")?;
         }
         if title.is_none() && author.is_none() && subject.is_none() && keywords.is_none() {
-            println!("  (none)");
+            writeln!(stdout, "  (none)")?;
         }
-        println!();
-        println!("Styles used:");
+        writeln!(stdout)?;
+        writeln!(stdout, "Styles used:")?;
         if style_ids.is_empty() {
-            println!("  (none)");
+            writeln!(stdout, "  (none)")?;
         } else {
             for sid in &style_ids {
-                println!("  - {sid}");
+                writeln!(stdout, "  - {sid}")?;
             }
         }
     }
@@ -126,6 +138,8 @@ fn inspect_json(file: &Path, doc: &Document, style_ids: Vec<String>) -> Result<V
 ///
 /// Body paragraphs and table cell text are both emitted, in document order —
 /// printing only `paragraphs()` would silently drop everything inside tables.
+/// Every other story follows the body: text boxes, headers, footers,
+/// footnotes, endnotes, and comments.
 pub fn text(file: &Path, json_output: bool) -> Result<()> {
     let doc = Document::open(file)?;
     if json_output {
@@ -145,15 +159,243 @@ pub fn text(file: &Path, json_output: bool) -> Result<()> {
                 BodyContent::RawXml(_) => {}
             }
         }
+        let stories = readable_stories(file, &doc);
+        // Without the other stories the record covers the main story only.
+        let scope = if stories.is_some() {
+            "all-supported-stories"
+        } else {
+            "main"
+        };
+        let stories = stories
+            .unwrap_or_default()
+            .iter()
+            .map(|story| {
+                let items = story
+                    .items
+                    .iter()
+                    .map(|(index_path, kind, text)| {
+                        json!({ "index_path": index_path, "kind": kind, "text": text })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "kind": story_kind_name(story.story.kind()),
+                    "part_name": story.story.part_name(),
+                    "owner_index": story.story.owner_index(),
+                    "items": items,
+                })
+            })
+            .collect::<Vec<_>>();
         print_json(json!({
-            "scope": "main",
+            "scope": scope,
             "revision_view": "accepted",
             "paragraphs": paragraphs,
+            "stories": stories,
         }))?;
     } else {
-        print!("{}", doc.text());
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "{}", doc.text())?;
+        let stories = readable_stories(file, &doc).unwrap_or_default();
+        for (kind, part_name, texts) in story_parts(&stories) {
+            writeln!(stdout, "--- {} ({part_name}) ---", story_kind_name(kind))?;
+            for text in texts {
+                writeln!(stdout, "{text}")?;
+            }
+        }
     }
     Ok(())
+}
+
+/// One story that the body view leaves out, with the index path, kind, and
+/// accepted-view text of each of its direct paragraphs and block content
+/// controls.
+struct StoryText {
+    story: StoryId,
+    items: Vec<(Vec<usize>, &'static str, String)>,
+}
+
+/// Read the other stories for a text view that already has its body.
+///
+/// A story part that cannot be read, such as a truncated header or a header
+/// relationship to a missing part, does not cost the body. The view prints
+/// one warning on stderr, naming the part when it can, and lists no other
+/// story. `validate` reports the same part as an error.
+fn readable_stories(file: &Path, doc: &Document) -> Option<Vec<StoryText>> {
+    let error = match other_stories(doc) {
+        Ok(stories) => return Some(stories),
+        Err(error) => error,
+    };
+    let malformed = oxml_opc::OpcPackage::open(file)
+        .ok()
+        .and_then(|package| malformed_story_part(&package));
+    eprintln!(
+        "Warning: other stories left out: {}",
+        malformed.unwrap_or_else(|| error.to_string())
+    );
+    None
+}
+
+/// Name the first story part of the main document that is not well-formed
+/// XML, with the reason.
+fn malformed_story_part(package: &oxml_opc::OpcPackage) -> Option<String> {
+    let doc_part = package.main_document_part()?;
+    let rels = package.get_part_rels(&doc_part)?;
+    rels.items
+        .iter()
+        .filter(|rel| {
+            rel.target_mode.as_deref() != Some("External")
+                && STORY_RELATIONSHIPS.contains(&rel.rel_type.as_str())
+        })
+        .find_map(|rel| {
+            let part_name = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
+            let detail = xml_style_references(package.get_part(&part_name)?).err()?;
+            Some(format!("part {part_name} is not well-formed XML: {detail}"))
+        })
+}
+
+/// The relationships from the main document to its other story parts.
+const STORY_RELATIONSHIPS: [&str; 5] = [
+    rel_types::HEADER,
+    rel_types::FOOTER,
+    rel_types::FOOTNOTES,
+    rel_types::ENDNOTES,
+    rel_types::COMMENTS,
+];
+
+/// Read every story but the main body and its table cells, which the body
+/// view already covers, in [`Document::stories`] order.
+///
+/// Only the direct items of a story are read, so the text of an inline
+/// control or a field is not repeated after its paragraph. A table is left
+/// out because each of its cells is a table-cell story of its own.
+fn other_stories(doc: &Document) -> Result<Vec<StoryText>> {
+    let mut main_part = None;
+    let mut stories: Vec<StoryText> = Vec::new();
+    for item in doc.story_item_snapshots()? {
+        let story = item.location().story();
+        if story.kind() == StoryKind::Body {
+            main_part = Some(story.part_name().to_owned());
+            continue;
+        }
+        if story.kind() == StoryKind::TableCell && main_part.as_deref() == Some(story.part_name()) {
+            continue;
+        }
+        if stories.last().is_none_or(|last| &last.story != story) {
+            stories.push(StoryText {
+                story: story.clone(),
+                items: Vec::new(),
+            });
+        }
+        let kind = match item.location().item_kind() {
+            StoryItemKind::Paragraph => "paragraph",
+            StoryItemKind::ContentControl => "content_control",
+            _ => continue,
+        };
+        if item.is_direct_child()
+            && let Some(last) = stories.last_mut()
+        {
+            last.items.push((
+                item.location().index_path().to_vec(),
+                kind,
+                item.text().unwrap_or_default().to_owned(),
+            ));
+        }
+    }
+    Ok(stories)
+}
+
+/// Group the texts of the stories by package part, each part labelled with
+/// the kind of its first story, such as a header part holding table cells.
+/// A part without any text, such as an empty header variant, is left out.
+fn story_parts(stories: &[StoryText]) -> Vec<(StoryKind, &str, Vec<&str>)> {
+    let mut parts: Vec<(StoryKind, &str, Vec<&str>)> = Vec::new();
+    for story in stories {
+        let part_name = story.story.part_name();
+        if parts.last().is_none_or(|(_, last, _)| *last != part_name) {
+            parts.push((story.story.kind(), part_name, Vec::new()));
+        }
+        if let Some((_, _, texts)) = parts.last_mut() {
+            texts.extend(story.items.iter().map(|(_, _, text)| text.as_str()));
+        }
+    }
+    parts.retain(|(_, _, texts)| texts.iter().any(|text| !text.trim().is_empty()));
+    parts
+}
+
+/// Name a story kind as Python `Story.kind` does.
+fn story_kind_name(kind: StoryKind) -> &'static str {
+    match kind {
+        StoryKind::Body => "body",
+        StoryKind::TableCell => "table_cell",
+        StoryKind::Header => "header",
+        StoryKind::Footer => "footer",
+        StoryKind::Footnote => "footnote",
+        StoryKind::Endnote => "endnote",
+        StoryKind::Comment => "comment",
+        StoryKind::TextBox => "text_box",
+        _ => "unknown",
+    }
+}
+
+/// The story parts a converted document carries after its body. Comments are
+/// review annotations rather than document content, so they are left out.
+fn converted_story_parts(stories: &[StoryText]) -> Vec<(StoryKind, &str, Vec<&str>)> {
+    story_parts(stories)
+        .into_iter()
+        .filter(|(kind, _, _)| *kind != StoryKind::Comment)
+        .collect()
+}
+
+/// Append the stories after the Markdown body, each part under a bold label.
+fn push_markdown_stories(markdown: &mut String, stories: &[StoryText]) {
+    let parts = converted_story_parts(stories);
+    if parts.is_empty() {
+        return;
+    }
+    if !markdown.is_empty() {
+        if !markdown.ends_with("\n\n") {
+            markdown.push_str(if markdown.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            });
+        }
+        markdown.push_str("---\n\n");
+    }
+    for (kind, part_name, texts) in parts {
+        markdown.push_str(&format!("**{}** ({part_name})\n\n", story_kind_name(kind)));
+        for text in texts.iter().map(|text| text.trim()) {
+            if !text.is_empty() {
+                markdown.push_str(text);
+                markdown.push_str("\n\n");
+            }
+        }
+    }
+}
+
+/// Insert the stories before the end of the HTML body, one section per part.
+fn push_html_stories(html: &mut String, stories: &[StoryText]) {
+    let parts = converted_story_parts(stories);
+    if parts.is_empty() {
+        return;
+    }
+    let mut sections = String::from("<hr>\n");
+    for (kind, part_name, texts) in parts {
+        sections.push_str(&format!(
+            "<section>\n<p><strong>{}</strong> ({})</p>\n",
+            story_kind_name(kind),
+            escape(part_name)
+        ));
+        for text in texts.iter().map(|text| text.trim()) {
+            if !text.is_empty() {
+                sections.push_str(&format!("<p>{}</p>\n", escape(text)));
+            }
+        }
+        sections.push_str("</section>\n");
+    }
+    match html.rfind("</body>") {
+        Some(end) => html.insert_str(end, &sections),
+        None => html.push_str(&sections),
+    }
 }
 
 /// Emit deterministic point-space extents for every direct body item.
@@ -202,14 +444,16 @@ pub fn layout(file: &Path, json_output: bool) -> Result<()> {
             "body_items": body_items,
         }))?;
     } else {
-        println!("Pages: {}", layout.layout.pages.len());
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "Pages: {}", layout.layout.pages.len())?;
         for item in body_items {
-            println!(
+            writeln!(
+                stdout,
                 "Body item {} ({}): {} fragment(s)",
                 item["body_index"],
                 item["kind"].as_str().unwrap_or("unknown"),
                 item["fragments"].as_array().map_or(0, Vec::len)
-            );
+            )?;
         }
     }
     Ok(())
@@ -260,7 +504,7 @@ fn paragraph_json(body_index: usize, path: &[Value], paragraph: &CT_P) -> Value 
         "path": path,
         "style": style,
         "numbering": numbering,
-        "text": runs.iter().filter_map(|run| run["text"].as_str()).collect::<String>(),
+        "text": paragraph.accepted_text(),
         "runs": runs,
     })
 }
@@ -373,6 +617,7 @@ pub fn convert(
     file: &Path,
     to: &str,
     output: Option<&Path>,
+    force: bool,
     dpi: u32,
     font_dir: Option<&Path>,
     image: ImageOptions<'_>,
@@ -398,7 +643,13 @@ pub fn convert(
         Some(p) => p.to_path_buf(),
         None => default_output_path(file, default_ext),
     };
+    // Several PNG or JPEG pages are written under numbered names, so those
+    // outputs are checked once the pages are selected.
+    if !matches!(to, "png" | "jpg" | "jpeg") {
+        ensure_output_paths_allowed(std::slice::from_ref(&output_path), file, force)?;
+    }
 
+    let mut stdout = io::stdout().lock();
     match to {
         "pdf" => {
             let bytes = if let Some(dir) = font_dir {
@@ -411,15 +662,21 @@ pub fn convert(
             } else {
                 doc.to_pdf()?
             };
-            std::fs::write(&output_path, bytes)?;
+            stage_and_publish(&[(output_path.clone(), bytes)], force)?;
         }
         "html" => {
-            let html = doc.to_html();
-            std::fs::write(&output_path, html)?;
+            let mut html = doc.to_html();
+            if let Some(stories) = readable_stories(file, &doc) {
+                push_html_stories(&mut html, &stories);
+            }
+            stage_and_publish(&[(output_path.clone(), html.into_bytes())], force)?;
         }
         "md" | "markdown" => {
-            let md = doc.to_markdown();
-            std::fs::write(&output_path, md)?;
+            let mut md = doc.to_markdown();
+            if let Some(stories) = readable_stories(file, &doc) {
+                push_markdown_stories(&mut md, &stories);
+            }
+            stage_and_publish(&[(output_path.clone(), md.into_bytes())], force)?;
         }
         "png" | "jpg" | "jpeg" | "tif" | "tiff" => {
             let (format, extension) = parse_image_format(to, image.quality, image.transparent)?;
@@ -438,14 +695,14 @@ pub fn convert(
                     let RasterOutput::MultiPageTiff(tiff) = output else {
                         return Err("TIFF render did not produce one stream".into());
                     };
-                    stage_and_publish(&[(output_path.clone(), tiff)])?;
-                    println!("Written to {}", output_path.display());
+                    stage_and_publish(&[(output_path.clone(), tiff)], force)?;
+                    writeln!(stdout, "Written to {}", output_path.display())?;
                 }
                 RasterFormat::Png { .. } | RasterFormat::Jpeg { .. } => {
                     let output_paths =
                         convert_separate_output_paths(&output_path, extension, selected.len());
-                    ensure_output_paths_available(&output_paths)?;
-                    let mut staged = StagedOutputSet::new();
+                    ensure_output_paths_allowed(&output_paths, file, force)?;
+                    let mut staged = StagedOutputSet::with_replace_existing(force);
                     for (page_index, path) in selected.iter().zip(output_paths.iter()) {
                         let image = render_one_raster_page(
                             &layout.layout,
@@ -459,18 +716,19 @@ pub fn convert(
                     }
                     staged.publish()?;
                     if output_paths.len() == 1 {
-                        println!("Written to {}", output_path.display());
+                        writeln!(stdout, "Written to {}", output_path.display())?;
                     } else {
                         let stem = output_path
                             .file_stem()
                             .unwrap_or_default()
                             .to_string_lossy();
                         let parent = output_path.parent().unwrap_or(Path::new("."));
-                        println!(
+                        writeln!(
+                            stdout,
                             "Written {} pages to {}/{stem}_NNN.{extension}",
                             output_paths.len(),
                             parent.display()
-                        );
+                        )?;
                     }
                 }
             }
@@ -479,7 +737,7 @@ pub fn convert(
         _ => unreachable!(),
     }
 
-    println!("Written to {}", output_path.display());
+    writeln!(stdout, "Written to {}", output_path.display())?;
     Ok(())
 }
 
@@ -491,19 +749,22 @@ pub fn diff(file_a: &Path, file_b: &Path) -> Result<()> {
     let paras_a: Vec<String> = doc_a.paragraphs().iter().map(|p| p.text()).collect();
     let paras_b: Vec<String> = doc_b.paragraphs().iter().map(|p| p.text()).collect();
 
-    println!(
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
         "--- {} ({} paragraphs, {} tables)",
         file_a.display(),
         doc_a.paragraph_count(),
         doc_a.table_count()
-    );
-    println!(
+    )?;
+    writeln!(
+        stdout,
         "+++ {} ({} paragraphs, {} tables)",
         file_b.display(),
         doc_b.paragraph_count(),
         doc_b.table_count()
-    );
-    println!();
+    )?;
+    writeln!(stdout)?;
 
     // Simple LCS-based diff on paragraph texts
     let lcs = compute_lcs(&paras_a, &paras_b);
@@ -514,12 +775,12 @@ pub fn diff(file_a: &Path, file_b: &Path) -> Result<()> {
     while k < lcs.len() {
         // Output removed lines before the match
         while i < paras_a.len() && paras_a[i] != lcs[k] {
-            println!("- [{}] {}", i + 1, paras_a[i]);
+            writeln!(stdout, "- [{}] {}", i + 1, paras_a[i])?;
             i += 1;
         }
         // Output added lines before the match
         while j < paras_b.len() && paras_b[j] != lcs[k] {
-            println!("+ [{}] {}", j + 1, paras_b[j]);
+            writeln!(stdout, "+ [{}] {}", j + 1, paras_b[j])?;
             j += 1;
         }
         // Skip the common line
@@ -530,19 +791,19 @@ pub fn diff(file_a: &Path, file_b: &Path) -> Result<()> {
 
     // Remaining lines
     while i < paras_a.len() {
-        println!("- [{}] {}", i + 1, paras_a[i]);
+        writeln!(stdout, "- [{}] {}", i + 1, paras_a[i])?;
         i += 1;
     }
     while j < paras_b.len() {
-        println!("+ [{}] {}", j + 1, paras_b[j]);
+        writeln!(stdout, "+ [{}] {}", j + 1, paras_b[j])?;
         j += 1;
     }
 
     let changes = paras_a.len() + paras_b.len() - 2 * lcs.len();
     if changes == 0 {
-        println!("(no differences in paragraph text)");
+        writeln!(stdout, "(no differences in paragraph text)")?;
     } else {
-        println!("\n{changes} paragraph(s) differ.");
+        writeln!(stdout, "\n{changes} paragraph(s) differ.")?;
     }
 
     Ok(())
@@ -566,16 +827,18 @@ pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+    let mut stdout = io::stdout().lock();
     if json_output {
         print_json(json!({
             "scope": "main",
             "comments": records,
         }))?;
     } else if comments.is_empty() {
-        println!("(no comments)");
+        writeln!(stdout, "(no comments)")?;
     } else {
         for comment in comments {
-            println!(
+            writeln!(
+                stdout,
                 "{}\t{}\t{}\t{}",
                 comment.id(),
                 comment.author().unwrap_or(""),
@@ -585,24 +848,26 @@ pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
                     "open"
                 },
                 comment.text().replace('\n', " ")
-            );
+            )?;
         }
     }
     Ok(())
 }
 
 /// Add one Word comment and publish the complete mutated document atomically.
+#[allow(clippy::too_many_arguments)]
 pub fn comment_add(
     file: &Path,
     range: RunRange,
     author: &str,
     initials: Option<&str>,
     text: &str,
+    date: Option<&str>,
     output: &Path,
     json_output: bool,
 ) -> Result<()> {
     let mut doc = Document::open(file)?;
-    let id = doc.add_comment(range, author, initials, text)?;
+    let id = doc.add_comment_with_date(range, author, initials, text, date)?;
     publish_document(&mut doc, output)?;
     mutation_record(
         json_output,
@@ -619,11 +884,12 @@ pub fn comment_reply(
     parent_id: i32,
     author: &str,
     text: &str,
+    date: Option<&str>,
     output: &Path,
     json_output: bool,
 ) -> Result<()> {
     let mut doc = Document::open(file)?;
-    let id = doc.reply_to(parent_id, author, text)?;
+    let id = doc.reply_to_with_date(parent_id, author, text, date)?;
     publish_document(&mut doc, output)?;
     mutation_record(
         json_output,
@@ -666,10 +932,10 @@ pub fn comment_remove(file: &Path, id: i32, output: &Path, json_output: bool) ->
     )
 }
 
-/// List modeled revisions from the main story.
+/// List modeled revisions from every supported story.
 pub fn revision_list(file: &Path, json_output: bool) -> Result<()> {
     let doc = Document::open(file)?;
-    let revisions = doc.revisions();
+    let revisions = doc.story_revisions()?;
     let records = revisions
         .iter()
         .map(|revision| {
@@ -678,25 +944,31 @@ pub fn revision_list(file: &Path, json_output: bool) -> Result<()> {
                 "author": revision.author(),
                 "timestamp": revision.timestamp(),
                 "kind": revision_kind_label(revision.kind()),
+                "story": story_json(revision.story()),
             })
         })
         .collect::<Vec<_>>();
+    let mut stdout = io::stdout().lock();
     if json_output {
         print_json(json!({
-            "scope": "main",
+            "scope": "all-supported-stories",
             "revisions": records,
         }))?;
     } else if revisions.is_empty() {
-        println!("(no revisions in main story)");
+        writeln!(stdout, "(no revisions)")?;
     } else {
         for revision in revisions {
-            println!(
-                "{}\t{}\t{}\t{}",
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 revision.id(),
                 revision.author(),
                 revision.timestamp().unwrap_or(""),
-                revision_kind_label(revision.kind())
-            );
+                revision_kind_label(revision.kind()),
+                story_kind_label(revision.story().kind()),
+                revision.story().part_name(),
+                revision.story().owner_index()
+            )?;
         }
     }
     Ok(())
@@ -748,10 +1020,82 @@ pub fn resolve_revisions(
             "output": output.display().to_string(),
         }))?;
     } else {
-        println!("{action_label}: {count} revision element(s)");
-        println!("Written to {}", output.display());
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{action_label}: {count} revision element(s)")?;
+        writeln!(stdout, "Written to {}", output.display())?;
     }
     Ok(())
+}
+
+/// Granularity names, shared by argument parsing and the JSON record.
+const COMPARISON_GRANULARITIES: [(&str, ComparisonGranularity); 3] = [
+    ("run", ComparisonGranularity::Run),
+    ("word", ComparisonGranularity::Word),
+    ("character", ComparisonGranularity::Character),
+];
+
+/// Ignorable story names. They follow the Python `Story.kind` names, so
+/// `body` selects the main story.
+const COMPARISON_STORIES: [(&str, ComparisonStoryKind); 7] = [
+    ("body", ComparisonStoryKind::Main),
+    ("header", ComparisonStoryKind::Header),
+    ("footer", ComparisonStoryKind::Footer),
+    ("comment", ComparisonStoryKind::Comment),
+    ("text_box", ComparisonStoryKind::TextBox),
+    ("footnote", ComparisonStoryKind::Footnote),
+    ("endnote", ComparisonStoryKind::Endnote),
+];
+
+/// Parse a `--granularity` value.
+pub fn parse_comparison_granularity(
+    name: &str,
+) -> std::result::Result<ComparisonGranularity, String> {
+    COMPARISON_GRANULARITIES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, granularity)| *granularity)
+        .ok_or_else(|| {
+            format!("unknown comparison granularity {name:?}, expected run, word, or character")
+        })
+}
+
+/// Parse one `--ignore-story` value.
+pub fn parse_comparison_story(name: &str) -> std::result::Result<ComparisonStoryKind, String> {
+    COMPARISON_STORIES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, kind)| *kind)
+        .ok_or_else(|| {
+            format!(
+                "unknown comparison story {name:?}, expected body, header, footer, comment, \
+                 text_box, footnote, or endnote"
+            )
+        })
+}
+
+fn comparison_options_json(options: &ComparisonOptions) -> Value {
+    let granularity = COMPARISON_GRANULARITIES
+        .iter()
+        .find(|(_, known)| *known == options.granularity)
+        .map(|(name, _)| *name);
+    let stories = options
+        .ignored_stories
+        .iter()
+        .map(|kind| {
+            COMPARISON_STORIES
+                .iter()
+                .find(|(_, known)| known == kind)
+                .map(|(name, _)| *name)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "granularity": granularity,
+        "ignore_formatting": options.ignore_formatting,
+        "ignore_whitespace": options.ignore_whitespace,
+        "ignore_fields": options.ignore_fields,
+        "ignore_comments": options.ignore_comments,
+        "ignored_stories": stories,
+    })
 }
 
 /// Create a tracked-changes document from an original and edited input.
@@ -760,13 +1104,25 @@ pub fn compare(
     edited: &Path,
     author: &str,
     timestamp: &str,
+    options: &ComparisonOptions,
     output: &Path,
     json_output: bool,
 ) -> Result<()> {
     let mut original_doc = Document::open(original)?;
     let edited_doc = Document::open(edited)?;
-    let diagnostics = original_doc.compare(&edited_doc, author, timestamp)?;
-    let revision_count = original_doc.revisions().len();
+    let diagnostics = original_doc.compare_with_options(&edited_doc, author, timestamp, options)?;
+    let main_story_revisions = original_doc.revisions().len();
+    let revisions = original_doc.story_revisions()?;
+    let mut stories = Vec::<(&StoryId, usize)>::new();
+    for revision in &revisions {
+        match stories
+            .iter_mut()
+            .find(|(story, _)| *story == revision.story())
+        {
+            Some((_, count)) => *count += 1,
+            None => stories.push((revision.story(), 1)),
+        }
+    }
     let records = diagnostics
         .iter()
         .map(|diagnostic| {
@@ -778,16 +1134,42 @@ pub fn compare(
         .collect::<Vec<_>>();
     publish_document(&mut original_doc, output)?;
     if json_output {
+        let story_records = stories
+            .iter()
+            .map(|(story, count)| {
+                let mut record = story_json(story);
+                record["revisions"] = json!(count);
+                record
+            })
+            .collect::<Vec<_>>();
         print_json(json!({
             "scope": "all-supported-stories",
-            "main_story_revisions": revision_count,
+            "options": comparison_options_json(options),
+            "revisions": revisions.len(),
+            "stories": story_records,
+            "main_story_revisions": main_story_revisions,
             "diagnostics": records,
             "output": output.display().to_string(),
         }))?;
     } else {
-        println!("Created {revision_count} main-story revision element(s)");
-        println!("Diagnostics: {}", diagnostics.len());
-        println!("Written to {}", output.display());
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "Created {} revision element(s) in {} story(ies)",
+            revisions.len(),
+            stories.len()
+        )?;
+        for (story, count) in &stories {
+            writeln!(
+                stdout,
+                "  {}\t{}\t{}\t{count}",
+                story_kind_label(story.kind()),
+                story.part_name(),
+                story.owner_index()
+            )?;
+        }
+        writeln!(stdout, "Diagnostics: {}", diagnostics.len())?;
+        writeln!(stdout, "Written to {}", output.display())?;
     }
     Ok(())
 }
@@ -806,10 +1188,11 @@ pub fn toc_rebuild(file: &Path, output: &Path, json_output: bool) -> Result<()> 
             "output": output.display().to_string(),
         }))?;
     } else {
-        println!("Entries: {}", report.entry_count);
-        println!("Bookmarks: {}", report.bookmark_count);
-        println!("Diagnostics: {}", report.diagnostic_count());
-        println!("Written to {}", output.display());
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "Entries: {}", report.entry_count)?;
+        writeln!(stdout, "Bookmarks: {}", report.bookmark_count)?;
+        writeln!(stdout, "Diagnostics: {}", report.diagnostic_count())?;
+        writeln!(stdout, "Written to {}", output.display())?;
     }
     Ok(())
 }
@@ -863,9 +1246,31 @@ fn revision_kind_label(kind: RevisionKind) -> &'static str {
     }
 }
 
+fn story_kind_label(kind: StoryKind) -> &'static str {
+    match kind {
+        StoryKind::Body => "body",
+        StoryKind::TableCell => "table-cell",
+        StoryKind::Header => "header",
+        StoryKind::Footer => "footer",
+        StoryKind::Footnote => "footnote",
+        StoryKind::Endnote => "endnote",
+        StoryKind::Comment => "comment",
+        StoryKind::TextBox => "text-box",
+        _ => "unknown",
+    }
+}
+
+fn story_json(story: &StoryId) -> Value {
+    json!({
+        "kind": story_kind_label(story.kind()),
+        "part_name": story.part_name(),
+        "owner_index": story.owner_index(),
+    })
+}
+
 fn publish_document(doc: &mut Document, output: &Path) -> Result<()> {
-    let bytes = doc.to_bytes()?;
-    stage_and_publish(&[(output.to_path_buf(), bytes)])
+    let bytes = doc.to_bytes_for_path(output)?;
+    stage_and_publish(&[(output.to_path_buf(), bytes)], false)
 }
 
 fn mutation_record(
@@ -888,17 +1293,19 @@ fn mutation_record(
         object.extend(detail);
         print_json(payload)?;
     } else {
-        println!("{action}");
-        println!("Written to {}", output.display());
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{action}")?;
+        writeln!(stdout, "Written to {}", output.display())?;
     }
     Ok(())
 }
 
 fn print_json(payload: Value) -> Result<()> {
-    println!(
+    writeln!(
+        io::stdout(),
         "{}",
         serde_json::to_string_pretty(&json_envelope(payload)?)?
-    );
+    )?;
     Ok(())
 }
 
@@ -957,8 +1364,12 @@ pub fn replace(
         .into());
     }
     publish_document(&mut doc, output)?;
-    println!("Replaced {count} occurrence(s) of \"{placeholder}\" -> \"{value}\"");
-    println!("Written to {}", output.display());
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "Replaced {count} occurrence(s) of \"{placeholder}\" -> \"{value}\""
+    )?;
+    writeln!(stdout, "Written to {}", output.display())?;
     Ok(())
 }
 
@@ -966,6 +1377,7 @@ pub fn replace(
 pub fn render(
     file: &Path,
     output_dir: Option<&Path>,
+    force: bool,
     dpi: f64,
     options: RenderOptions<'_>,
 ) -> Result<()> {
@@ -979,21 +1391,24 @@ pub fn render(
     let stem = file.file_stem().unwrap_or_default().to_string_lossy();
     let legacy_single_page = options.page.is_some();
 
+    let mut stdout = io::stdout().lock();
     // Writing into a directory the user named but has not created should not
     // fail with a bare "No such file or directory". Do it after validation and
     // encoding so invalid options leave no partial output.
     match format {
         RasterFormat::Tiff => {
+            let out_path = out_dir.join(format!("{stem}.tiff"));
+            ensure_output_paths_allowed(std::slice::from_ref(&out_path), file, force)?;
             let output =
                 oxml_pdf::render_pages(&layout.layout, &selected, RasterOptions { dpi, format })?;
             let RasterOutput::MultiPageTiff(tiff) = output else {
                 return Err("TIFF render did not produce one stream".into());
             };
-            let out_path = out_dir.join(format!("{stem}.tiff"));
             std::fs::create_dir_all(out_dir)?;
             let tiff_len = tiff.len();
-            stage_and_publish(&[(out_path.clone(), tiff)])?;
-            println!(
+            stage_and_publish(&[(out_path.clone(), tiff)], force)?;
+            writeln!(
+                stdout,
                 "Pages {} -> {} ({} bytes)",
                 selected
                     .iter()
@@ -1002,7 +1417,7 @@ pub fn render(
                     .join(","),
                 out_path.display(),
                 tiff_len
-            );
+            )?;
         }
         RasterFormat::Png { .. } | RasterFormat::Jpeg { .. } => {
             let output_paths = selected
@@ -1013,8 +1428,8 @@ pub fn render(
                 })
                 .collect::<Vec<_>>();
             std::fs::create_dir_all(out_dir)?;
-            ensure_output_paths_available(&output_paths)?;
-            let mut staged = StagedOutputSet::new();
+            ensure_output_paths_allowed(&output_paths, file, force)?;
+            let mut staged = StagedOutputSet::with_replace_existing(force);
             let mut rendered = Vec::with_capacity(selected.len());
             for (page_index, out_path) in selected.iter().zip(output_paths.iter()) {
                 let one_based = page_index + 1;
@@ -1028,10 +1443,14 @@ pub fn render(
             }
             staged.publish()?;
             for (one_based, out_path, len) in rendered {
-                println!("Page {one_based} -> {} ({len} bytes)", out_path.display());
+                writeln!(
+                    stdout,
+                    "Page {one_based} -> {} ({len} bytes)",
+                    out_path.display()
+                )?;
             }
             if !legacy_single_page {
-                println!("Rendered {} page(s) at {dpi} DPI", selected.len());
+                writeln!(stdout, "Rendered {} page(s) at {dpi} DPI", selected.len())?;
             }
         }
     }
@@ -1126,13 +1545,16 @@ fn render_one_raster_page(
     Ok(pages.remove(0))
 }
 
-fn stage_and_publish(outputs: &[(PathBuf, Vec<u8>)]) -> Result<()> {
-    let paths = outputs
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
-    ensure_output_paths_available(&paths)?;
-    let mut staged = StagedOutputSet::new();
+/// Publishes complete outputs, replacing existing files only with `force`.
+fn stage_and_publish(outputs: &[(PathBuf, Vec<u8>)], force: bool) -> Result<()> {
+    if !force {
+        let paths = outputs
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        ensure_output_paths_available(&paths)?;
+    }
+    let mut staged = StagedOutputSet::with_replace_existing(force);
     for (path, bytes) in outputs {
         staged.stage_bytes(path, bytes)?;
     }
@@ -1151,11 +1573,11 @@ fn validate_dpi(dpi: f64) -> Result<()> {
 ///
 /// Returns `Ok(false)` when a structural error was found, so the caller can
 /// exit non-zero — a validator that always succeeds cannot gate anything in CI.
+/// A related part that is not well-formed XML and a paragraph, character, or
+/// table style id that no style defines are structural errors too.
 /// Advisory findings (empty paragraphs, missing metadata) are reported but do
 /// not affect the exit status.
 pub fn validate(file: &Path) -> Result<bool> {
-    let doc = Document::open(file)?;
-
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -1193,6 +1615,95 @@ pub fn validate(file: &Path) -> Result<bool> {
         }
     }
 
+    // Markup Compatibility requires every prefix that `mc:Ignorable` or
+    // `mc:MustUnderstand` lists to be declared, and a consumer may reject a
+    // part that breaks the rule. A part that does not parse as XML is
+    // outside this check.
+    let mut xml_parts = package
+        .parts
+        .iter()
+        .filter(|(part_name, _)| {
+            package
+                .content_types
+                .content_type_for(part_name)
+                .is_some_and(|content_type| content_type.ends_with("xml"))
+        })
+        .collect::<Vec<_>>();
+    xml_parts.sort();
+    for (part_name, xml) in xml_parts {
+        let Ok(findings) = rdocx_oxml::namespace::undeclared_compatibility_prefixes(xml) else {
+            continue;
+        };
+        for (attribute, prefix) in findings {
+            errors.push(format!(
+                "part {part_name} lists undeclared prefix `{prefix}` in mc:{attribute}"
+            ));
+        }
+    }
+
+    // Every XML part the main document relates to must be well formed. The
+    // style ids that its story parts name are checked once the document opens.
+    let mut style_references = Vec::new();
+    if let Some(doc_part) = package.main_document_part() {
+        let mut parts = vec![(doc_part.clone(), true)];
+        for rel in package
+            .get_part_rels(&doc_part)
+            .iter()
+            .flat_map(|rels| &rels.items)
+        {
+            if rel.target_mode.as_deref() == Some("External") {
+                continue;
+            }
+            let target = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
+            let story = STORY_RELATIONSHIPS.contains(&rel.rel_type.as_str());
+            if !parts.iter().any(|(known, _)| *known == target) {
+                parts.push((target, story));
+            }
+        }
+        for (part_name, story) in parts {
+            let is_xml = package
+                .content_types
+                .content_type_for(&part_name)
+                .is_some_and(|content_type| {
+                    content_type.ends_with("+xml") || content_type.ends_with("/xml")
+                });
+            let Some(xml) = package.get_part(&part_name).filter(|_| is_xml) else {
+                continue;
+            };
+            match xml_style_references(xml) {
+                Err(detail) => {
+                    errors.push(format!("part {part_name} is not well-formed XML: {detail}"));
+                }
+                Ok(references) if story => style_references.extend(
+                    references
+                        .into_iter()
+                        .map(|(kind, style_id)| (kind, style_id, part_name.clone())),
+                ),
+                Ok(_) => {}
+            }
+        }
+    }
+
+    // A malformed part can keep the document from opening. The errors found
+    // so far explain why, so they are reported together with the failure.
+    let doc = match Document::open(file) {
+        Ok(doc) => doc,
+        Err(error) if !errors.is_empty() => {
+            errors.push(format!("the document does not open: {error}"));
+            return report_validation(file, &errors, &warnings);
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    // Word falls back to the default style for a style id that no style
+    // defines, so the style that the document names is silently lost.
+    for (kind, style_id, part_name) in style_references {
+        let issue = format!("{kind} style {style_id:?} used in {part_name} is not defined");
+        if doc.style(&style_id).is_none() && !errors.contains(&issue) {
+            errors.push(issue);
+        }
+    }
+
     // --- Advisory findings ---
 
     if doc.content_count() == 0 {
@@ -1227,27 +1738,132 @@ pub fn validate(file: &Path) -> Result<bool> {
         warnings.push("Missing document author".to_string());
     }
 
-    // --- Report ---
+    report_validation(file, &errors, &warnings)
+}
 
+fn report_validation(file: &Path, errors: &[String], warnings: &[String]) -> Result<bool> {
+    match print_validation_report(file, errors, warnings) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error.into()),
+        _ => Ok(errors.is_empty()),
+    }
+}
+
+fn print_validation_report(file: &Path, errors: &[String], warnings: &[String]) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
     if errors.is_empty() && warnings.is_empty() {
-        println!("OK — no issues found in {}", file.display());
-        return Ok(true);
+        return writeln!(stdout, "OK — no issues found in {}", file.display());
     }
 
     if !errors.is_empty() {
-        println!("{} error(s) in {}:", errors.len(), file.display());
+        writeln!(stdout, "{} error(s) in {}:", errors.len(), file.display())?;
         for (i, issue) in errors.iter().enumerate() {
-            println!("  {}. {issue}", i + 1);
+            writeln!(stdout, "  {}. {issue}", i + 1)?;
         }
     }
     if !warnings.is_empty() {
-        println!("{} warning(s) in {}:", warnings.len(), file.display());
+        writeln!(
+            stdout,
+            "{} warning(s) in {}:",
+            warnings.len(),
+            file.display()
+        )?;
         for (i, issue) in warnings.iter().enumerate() {
-            println!("  {}. {issue}", i + 1);
+            writeln!(stdout, "  {}. {issue}", i + 1)?;
         }
     }
+    Ok(())
+}
 
-    Ok(errors.is_empty())
+/// Read `xml` as one well-formed element tree and return the paragraph,
+/// character, and table style ids it names. The ids inside a tracked property
+/// change are left out, because they record the formatting before the change,
+/// and so are those inside `mc:Fallback`, which Word does not read. An empty
+/// id names no style.
+fn xml_style_references(xml: &[u8]) -> std::result::Result<Vec<(&'static str, String)>, String> {
+    let mut reader = NsReader::from_reader(xml);
+    // One entry per open element: whether its style ids are left out.
+    let mut open = Vec::new();
+    let mut roots = 0usize;
+    let mut references = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let (namespace, event) = match reader.read_resolved_event_into(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => return Err(format!("{error} at byte {}", reader.error_position())),
+        };
+        let is_word =
+            matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W_NS.as_bytes());
+        let is_compatibility =
+            matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == MC_NS.as_bytes());
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                if open.is_empty() {
+                    roots += 1;
+                    if roots > 1 {
+                        return Err("the part has more than one root element".to_owned());
+                    }
+                }
+                let local_name = element.local_name();
+                let kind = match local_name.as_ref() {
+                    b"pStyle" => Some("paragraph"),
+                    b"rStyle" => Some("character"),
+                    b"tblStyle" => Some("table"),
+                    _ => None,
+                };
+                if let Some(kind) = kind.filter(|_| is_word && !open.contains(&true))
+                    && let Some(style_id) = word_value(&reader, element)?
+                    && !style_id.is_empty()
+                {
+                    references.push((kind, style_id));
+                }
+                if matches!(event, Event::Start(_)) {
+                    open.push(
+                        (is_word && local_name.as_ref().ends_with(b"PrChange"))
+                            || (is_compatibility && local_name.as_ref() == b"Fallback"),
+                    );
+                }
+            }
+            Event::End(_) => {
+                open.pop();
+            }
+            Event::Text(text) if open.is_empty() && !text.iter().all(u8::is_ascii_whitespace) => {
+                return Err("the part has text outside its root element".to_owned());
+            }
+            Event::CData(_) if open.is_empty() => {
+                return Err("the part has CDATA outside its root element".to_owned());
+            }
+            Event::Eof if roots == 0 => return Err("the part has no root element".to_owned()),
+            Event::Eof if !open.is_empty() => {
+                return Err(format!(
+                    "the part ends inside {} unclosed element(s)",
+                    open.len()
+                ));
+            }
+            Event::Eof => return Ok(references),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+/// Return the `w:val` attribute of a WordprocessingML element.
+fn word_value(
+    reader: &NsReader<&[u8]>,
+    element: &BytesStart<'_>,
+) -> std::result::Result<Option<String>, String> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| error.to_string())?;
+        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
+        if matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W_NS.as_bytes())
+            && local_name.as_ref() == b"val"
+        {
+            let value = attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .map_err(|error| error.to_string())?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1298,6 +1914,7 @@ mod tests {
             &input,
             "md",
             None,
+            false,
             96,
             None,
             ImageOptions {

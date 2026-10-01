@@ -7,12 +7,18 @@ presentation, notes, handout, PDF, and animation outputs.
 
 ## Capabilities
 
-- Open, create, validate, and save PPTX or PPSX packages.
+- Open, create, validate, and save PPTX, PPTM, POTX, POTM, PPSX, and PPSM
+  packages. The save path extension selects the declared package class, so a
+  template saved as `.pptx` becomes a presentation.
 - Encrypt and sign packages through the opt-in `agile-encryption` and
   `digital-signatures` features.
 - Add, remove, move, duplicate, and transfer slides.
 - Author and edit text, pictures, shapes, groups, tables, charts, comments,
   SmartArt text, and media.
+- Populate groups, nested to any depth, with text boxes, preset shapes,
+  connectors, groups, tables, and pictures.
+- Insert and remove table rows and columns, extending or shrinking merged
+  cells and growing or shrinking the frame by the row or column size.
 - Produce PDF, PDF/A, resolved slide frames, notes, handouts, and animations.
 - Import HTML, ODP, and PDF through explicit facade APIs.
 - Resolve master, layout, placeholder, theme, chart, SmartArt, media, notes,
@@ -22,7 +28,7 @@ presentation, notes, handout, PDF, and animation outputs.
 
 | Measurement | Value | Version | Platform | Build mode | Input | Command | Statistic | Measured on |
 |---|---|---|---|---|---|---|---|---|
-| Crates.io archive: rpptx | 407,658 compressed bytes, 2,122,094 member bytes, 16 members | 0.12.1 | macOS 26.6.2, Apple M5 Max, arm64 | `cargo package --locked --no-verify` | Tracked `rpptx` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-09-26 |
+| Crates.io archive: rpptx | 441,567 compressed bytes, 2,292,106 member bytes, 16 members | 0.12.1 | macOS 26.6.2, Apple M5 Max, arm64 | `cargo package --locked --no-verify` | Tracked `rpptx` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-10-01 |
 
 ## Use it when
 

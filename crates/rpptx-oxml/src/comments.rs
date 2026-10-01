@@ -2,6 +2,7 @@ use std::io::Write;
 
 use oxml_core::OxmlError;
 use oxml_core::raw_xml::{capture_element, capture_empty_element};
+use oxml_core::xml::reject_non_xml_characters;
 use oxml_drawing::namespace::A_NS;
 use oxml_drawing::order::OrderedRawChildren;
 use oxml_drawing::text::CT_TextBody;
@@ -39,12 +40,17 @@ impl CommentAuthor {
     ) -> Result<Self> {
         let id = id.into();
         validate_guid("comment author", &id)?;
+        let (name, user_id, provider_id) = (name.into(), user_id.into(), provider_id.into());
+        reject_non_xml_characters("comment author name", &name)?;
+        reject_non_xml_characters("comment author initials", initials.unwrap_or_default())?;
+        reject_non_xml_characters("comment author user id", &user_id)?;
+        reject_non_xml_characters("comment author provider id", &provider_id)?;
         Ok(Self {
             id,
-            name: name.into(),
+            name,
             initials: initials.map(str::to_owned),
-            user_id: user_id.into(),
-            provider_id: provider_id.into(),
+            user_id,
+            provider_id,
             raw_attributes: Vec::new(),
             raw_children: OrderedRawChildren::default(),
         })
@@ -270,6 +276,70 @@ impl Comment {
             raw_attributes: Vec::new(),
             raw_children: OrderedRawChildren::default(),
         })
+    }
+
+    /// The preserved anchor element, including its namespace declarations.
+    pub fn anchor_xml(&self) -> &[u8] {
+        &self.anchor
+    }
+
+    /// Anchors this comment to a drawing element, or to a range of its text.
+    /// `monikers` contains the schema-ordered drawing path for a shape anchor.
+    pub fn set_drawing_anchor(
+        &mut self,
+        slide_id: u32,
+        monikers: &[(&str, u32)],
+        text_range: Option<(usize, usize)>,
+        text_context: Option<&str>,
+    ) -> Result<()> {
+        if slide_id < 256 || monikers.is_empty() {
+            return Err(invalid(
+                "comment anchor requires a slide and drawing element".into(),
+            ));
+        }
+        let mut anchor = format!(
+            "<ac:{} xmlns:ac=\"{}\" xmlns:pc=\"{}\"><pc:docMk/><pc:sldMk sldId=\"{}\"/>",
+            if text_range.is_some() {
+                "txMkLst"
+            } else {
+                "deMkLst"
+            },
+            DRAWING_COMMAND_NS,
+            POWERPOINT_COMMAND_NS,
+            slide_id,
+        );
+        if text_range.is_none() {
+            for (kind, id) in monikers {
+                if !matches!(
+                    *kind,
+                    "spMk" | "grpSpMk" | "graphicFrameMk" | "cxnSpMk" | "picMk"
+                ) || *id == 0
+                {
+                    return Err(invalid("invalid comment drawing moniker".into()));
+                }
+                anchor.push_str(&format!("<ac:{kind} id=\"{id}\"/>"));
+            }
+        }
+        if let Some((start, length)) = text_range {
+            let start = i32::try_from(start)
+                .map_err(|_| invalid("comment text start exceeds i32".into()))?;
+            let length = i32::try_from(length)
+                .map_err(|_| invalid("comment text length exceeds i32".into()))?;
+            let context =
+                text_context.ok_or_else(|| invalid("comment text context is missing".into()))?;
+            let context_length = context.encode_utf16().count();
+            let hash = context.encode_utf16().fold(0u32, |hash, code| {
+                hash.wrapping_mul(33).wrapping_add(u32::from(code))
+            });
+            anchor.push_str(&format!("<ac:txMk cp=\"{start}\" len=\"{length}\"><ac:context len=\"{context_length}\" hash=\"{hash}\"/></ac:txMk>"));
+        }
+        anchor.push_str(if text_range.is_some() {
+            "</ac:txMkLst>"
+        } else {
+            "</ac:deMkLst>"
+        });
+        self.anchor = anchor.into_bytes();
+        Ok(())
     }
 
     pub fn text(&self) -> String {

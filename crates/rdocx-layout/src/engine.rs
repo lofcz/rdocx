@@ -931,7 +931,9 @@ struct ReusableEngineContext {
     charts: HashMap<String, std::result::Result<Box<oxml_chart::CT_ChartSpace>, String>>,
     chart_theme: oxml_drawing::theme::CT_OfficeStyleSheet,
     chart_color_map: oxml_drawing::color::ColorMap,
-    core_properties: Option<rdocx_oxml::core_properties::CoreProperties>,
+    /// Boxed, because every `Document` holds two engines inline and debug
+    /// builds keep many copies of `Document` on deep stacks.
+    core_properties: Option<Box<rdocx_oxml::core_properties::CoreProperties>>,
     hyperlink_urls: HashMap<String, String>,
     footnotes: Option<rdocx_oxml::footnotes::CT_Footnotes>,
     endnotes: Option<rdocx_oxml::footnotes::CT_Footnotes>,
@@ -1027,7 +1029,7 @@ impl ReusableEngineContext {
             charts: input.charts.clone(),
             chart_theme: input.chart_theme.clone(),
             chart_color_map: input.chart_color_map.clone(),
-            core_properties: input.core_properties.clone(),
+            core_properties: input.core_properties.clone().map(Box::new),
             hyperlink_urls: input.hyperlink_urls.clone(),
             footnotes: input.footnotes.clone(),
             endnotes: input.endnotes.clone(),
@@ -1104,7 +1106,7 @@ impl ReusableEngineContext {
             && self.charts == input.charts
             && self.chart_theme == input.chart_theme
             && self.chart_color_map == input.chart_color_map
-            && self.core_properties == input.core_properties
+            && self.core_properties.as_deref() == input.core_properties.as_ref()
             && self.hyperlink_urls == input.hyperlink_urls
             && self.theme == input.theme
             && self.caller_font_aliases == caller_font_aliases
@@ -2273,6 +2275,10 @@ impl Engine {
                 })
                 .count()
         });
+        // The restart begins strictly before the first changed block. A page
+        // boundary right before it may have been chosen by that block, which
+        // moved there whole or broke the page before itself, and an edit can
+        // undo that choice. The document start is always a safe restart.
         let restart_checkpoint = first_changed.and_then(|first_changed| {
             self.restart_cache
                 .as_ref()
@@ -2280,7 +2286,9 @@ impl Engine {
                 .checkpoints
                 .iter()
                 .rev()
-                .find(|checkpoint| checkpoint.next_block_index <= first_changed)
+                .find(|checkpoint| {
+                    checkpoint.next_block_index < first_changed || checkpoint.page_count == 0
+                })
                 .copied()
         });
         let tail_reusable = sources.is_none()
@@ -3619,7 +3627,9 @@ fn table_is_cache_safe(table: &CT_Tbl, styles: &CT_Styles) -> bool {
             properties.change.is_none() && properties.revision_xml.is_empty()
         })
         && table.rows.iter().all(|row| {
-            row.extra_xml.is_empty()
+            row.extra_xml
+                .iter()
+                .all(|(position, raw)| CT_Row::raw_is_root_attributes(*position, raw))
                 && row.content_controls.is_empty()
                 && row.properties.as_ref().is_none_or(|properties| {
                     properties.revision_markers.is_empty() && properties.revision_xml.is_empty()
@@ -5378,7 +5388,10 @@ fn substitute_fields(
 /// transparent; groups and images are opaque line breakers).
 enum LineFlatItem<'a> {
     Run(&'a mut GlyphRun),
-    Line { start: &'a mut Point, end: &'a mut Point },
+    Line {
+        start: &'a mut Point,
+        end: &'a mut Point,
+    },
     Other,
 }
 
@@ -5389,9 +5402,7 @@ fn flatten_line_items<'a>(elements: &'a mut [PositionedElement], out: &mut Vec<L
             PositionedElement::Line { start, end, .. } => {
                 out.push(LineFlatItem::Line { start, end })
             }
-            PositionedElement::MarkedContent { children, .. } => {
-                flatten_line_items(children, out)
-            }
+            PositionedElement::MarkedContent { children, .. } => flatten_line_items(children, out),
             _ => out.push(LineFlatItem::Other),
         }
     }
@@ -5409,7 +5420,12 @@ enum LineAnchor {
 /// a line ending at the right margin (or the part of a line after a tab-sized
 /// gap) is right-anchored, a line equidistant from both edges is centred,
 /// anything else is left-anchored.
-fn realign_line_after_field(flat: &mut [LineFlatItem<'_>], index: usize, delta: f64, page_width: f64) {
+fn realign_line_after_field(
+    flat: &mut [LineFlatItem<'_>],
+    index: usize,
+    delta: f64,
+    page_width: f64,
+) {
     let (baseline, font_size) = match &flat[index] {
         LineFlatItem::Run(run) => (run.origin.y, run.font_size),
         _ => return,
@@ -5417,7 +5433,8 @@ fn realign_line_after_field(flat: &mut [LineFlatItem<'_>], index: usize, delta: 
     let on_line = |item: &LineFlatItem<'_>| match item {
         LineFlatItem::Run(run) => (run.origin.y - baseline).abs() < 0.5,
         LineFlatItem::Line { start, end } => {
-            (start.y - baseline).abs() < font_size * 1.5 && (end.y - baseline).abs() < font_size * 1.5
+            (start.y - baseline).abs() < font_size * 1.5
+                && (end.y - baseline).abs() < font_size * 1.5
         }
         LineFlatItem::Other => false,
     };
@@ -5461,23 +5478,28 @@ fn realign_line_after_field(flat: &mut [LineFlatItem<'_>], index: usize, delta: 
         Some(x) => {
             let field_x = runs[position].1;
             if field_x >= x {
-                (runs.iter().copied().filter(|r| r.1 >= x).collect(), LineAnchor::End)
+                (
+                    runs.iter().copied().filter(|r| r.1 >= x).collect(),
+                    LineAnchor::End,
+                )
             } else {
-                (runs.iter().copied().filter(|r| r.1 < x).collect(), LineAnchor::Start)
+                (
+                    runs.iter().copied().filter(|r| r.1 < x).collect(),
+                    LineAnchor::Start,
+                )
             }
         }
         None => {
             let left_margin = left;
             let right_margin = page_width - right;
-            let anchor = if (left_margin - right_margin).abs() < 1.5
-                && right - left < page_width * 0.8
-            {
-                LineAnchor::Center
-            } else if right_margin < left_margin - 1.5 {
-                LineAnchor::End
-            } else {
-                LineAnchor::Start
-            };
+            let anchor =
+                if (left_margin - right_margin).abs() < 1.5 && right - left < page_width * 0.8 {
+                    LineAnchor::Center
+                } else if right_margin < left_margin - 1.5 {
+                    LineAnchor::End
+                } else {
+                    LineAnchor::Start
+                };
             (runs.clone(), anchor)
         }
     };
@@ -5520,8 +5542,8 @@ fn realign_line_after_field(flat: &mut [LineFlatItem<'_>], index: usize, delta: 
     if shifts.is_empty() {
         return;
     }
-    for i in lo..hi {
-        if let LineFlatItem::Line { start, end } = &mut flat[i] {
+    for item in &mut flat[lo..hi] {
+        if let LineFlatItem::Line { start, end } = item {
             let mid = (start.x + end.x) / 2.0;
             if let Some((_, _, shift)) = shifts
                 .iter()
@@ -14596,6 +14618,24 @@ mod tests {
             .extra_xml
             .push((0, br#"<w:unknown/>"#.to_vec()));
         assert!(!table_is_cache_safe(&preserved_cell, &input.styles));
+
+        // Word writes revision-save and paragraph identities on every row.
+        // They carry no content, so the row stays cache safe, unlike a raw
+        // child of the row.
+        let document = rdocx_oxml::CT_Document::from_xml(
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body><w:tbl><w:tr w:rsidR="00A1B2C3" w:rsidTr="00A1B2C4" w14:paraId="1A2B3C4D"><w:tc><w:p><w:r><w:t>identified row</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#,
+        )
+        .expect("identified row document parses");
+        let Some(BodyContent::Table(mut identified_row)) = document.body.content.into_iter().next()
+        else {
+            panic!("identified row table parses");
+        };
+        assert!(!identified_row.rows[0].extra_xml.is_empty());
+        assert!(table_is_cache_safe(&identified_row, &input.styles));
+        identified_row.rows[0]
+            .extra_xml
+            .push((0, br#"<w:unknown/>"#.to_vec()));
+        assert!(!table_is_cache_safe(&identified_row, &input.styles));
     }
 
     fn restart_input() -> LayoutInput {
@@ -14874,6 +14914,8 @@ mod tests {
             assert_eq!(displayed, page.page_number.to_string());
         }
 
+        // Paragraph 80 opens page 8 here, so the edit restarts at the clean
+        // boundary before it, paragraph 57 on page 6, and rebuilds four pages.
         change_page_spanning_paragraph(&mut input, 80, 1);
         let warm = engine.layout(&input).expect("warm note and footer edit");
         let fresh = Engine::new_deterministic()
@@ -14881,7 +14923,7 @@ mod tests {
             .layout(&input)
             .expect("fresh note and footer edit");
         assert_layout_results_equal(&warm, &fresh);
-        assert!(engine.page_layout_invocation_count() <= 2);
+        assert!(engine.page_layout_invocation_count() <= 4);
     }
 
     #[test]
@@ -14907,6 +14949,102 @@ mod tests {
                 .is_some_and(|cache| !cache.checkpoints.is_empty()),
             "complete ordinary-prose block boundaries must publish restart checkpoints"
         );
+    }
+
+    /// A paragraph that keeps with next takes its page from the chain after
+    /// it, so a warm edit that grows or shrinks any paragraph of a chain lays
+    /// out as a fresh engine does, wherever the chain falls against the first
+    /// page end, which comes near paragraph 30 here.
+    #[test]
+    fn keep_next_chain_warm_edits_equal_fresh_layout() {
+        let lines = |count: usize| "paragraph of a keep-with-next chain ".repeat(4 * count);
+        let (two, four) = (lines(1), lines(2));
+        // Paragraphs `chain_start` and the one after it keep with next, and
+        // `texts[2]` ends the chain.
+        let chain_input = |chain_start: usize, texts: [&str; 3]| {
+            let mut input = make_input_with_text("");
+            input.document.body.content.clear();
+            for index in 0..70_usize {
+                let mut paragraph = CT_P::new();
+                if let Some(member @ 0..=2) = index.checked_sub(chain_start) {
+                    if member < 2 {
+                        paragraph.properties.get_or_insert_default().keep_next = Some(true);
+                    }
+                    paragraph.add_run(texts[member]);
+                } else {
+                    paragraph.add_run(&format!("ordinary prose paragraph {index:03} line"));
+                }
+                input.document.body.add_paragraph(paragraph);
+            }
+            input
+        };
+        let assert_warm_edit = |before: LayoutInput, after: LayoutInput| {
+            let mut engine = Engine::new_deterministic().expect("bundled fonts load");
+            engine.layout(&before).expect("prime keep-with-next chain");
+            let warm = engine.layout(&after).expect("warm chain edit");
+            let fresh = Engine::new_deterministic()
+                .expect("bundled fonts load")
+                .layout(&after)
+                .expect("fresh chain edit");
+            assert_layout_results_equal(&warm, &fresh);
+        };
+        let original = [two.as_str(), two.as_str(), four.as_str()];
+        for chain_start in 26..33 {
+            for member in 0..3 {
+                for text in ["one line", four.as_str()] {
+                    let mut edited = original;
+                    edited[member] = text;
+                    assert_warm_edit(
+                        chain_input(chain_start, original),
+                        chain_input(chain_start, edited),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A block that did not fit moved whole to the top of the next page, and
+    /// that page boundary is a checkpoint. Once the block is edited shorter it
+    /// may fit where it was, so a warm relayout restarts before it and lays
+    /// out as a fresh engine does.
+    #[test]
+    fn a_block_moved_to_a_new_page_and_edited_shorter_lays_out_as_fresh() {
+        let text = |lines: usize| "block moved whole to the next page ".repeat(3 * lines);
+        let input = |fillers: usize, lines: usize, keep_lines: bool| {
+            let mut input = make_input_with_text("");
+            input.document.body.content.clear();
+            for index in 0..fillers {
+                let mut paragraph = CT_P::new();
+                paragraph.add_run(&format!("ordinary prose paragraph {index:03} line"));
+                input.document.body.add_paragraph(paragraph);
+            }
+            let mut moved = CT_P::new();
+            moved.properties.get_or_insert_default().keep_lines = Some(keep_lines);
+            moved.add_run(&text(lines));
+            input.document.body.add_paragraph(moved);
+            for index in 0..30 {
+                let mut paragraph = CT_P::new();
+                paragraph.add_run(&format!("ordinary prose tail {index:03} line"));
+                input.document.body.add_paragraph(paragraph);
+            }
+            input
+        };
+        // Kept together, or widow-controlled with room for one line only.
+        for (lines, keep_lines) in [(12, true), (4, false)] {
+            for fillers in 20..40 {
+                let mut engine = Engine::new_deterministic().expect("bundled fonts load");
+                engine
+                    .layout(&input(fillers, lines, keep_lines))
+                    .expect("prime moved block");
+                let shorter = input(fillers, 1, keep_lines);
+                let warm = engine.layout(&shorter).expect("warm shorter block");
+                let fresh = Engine::new_deterministic()
+                    .expect("bundled fonts load")
+                    .layout(&shorter)
+                    .expect("fresh shorter block");
+                assert_layout_results_equal(&warm, &fresh);
+            }
+        }
     }
 
     #[test]
@@ -15833,7 +15971,8 @@ mod tests {
     #[test]
     fn substituted_page_field_closes_the_gap_in_left_aligned_text() {
         let mut input = make_input_with_text("");
-        input.document.body.content[0] = BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
+        input.document.body.content[0] =
+            BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
         let spans = first_page_text_spans(&input);
         assert!(spans.iter().any(|(text, _, _)| text == "1"), "{spans:?}");
         assert!((spans[0].1 - 72.0).abs() < 0.5, "{spans:?}");
@@ -15855,13 +15994,17 @@ mod tests {
             ..Default::default()
         });
         input.document.body.content[0] = BodyContent::Paragraph(paragraph);
-        left.document.body.content[0] = BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
+        left.document.body.content[0] =
+            BodyContent::Paragraph(page_field_paragraph("Strana ", " z 9"));
 
         let spans = first_page_text_spans(&input);
         let left_spans = first_page_text_spans(&left);
         let line_width = spans.last().unwrap().2 - spans[0].1;
         let left_width = left_spans.last().unwrap().2 - left_spans[0].1;
-        assert!((line_width - left_width).abs() < 0.05, "{spans:?} vs {left_spans:?}");
+        assert!(
+            (line_width - left_width).abs() < 0.05,
+            "{spans:?} vs {left_spans:?}"
+        );
         for pair in spans.windows(2) {
             assert!((pair[1].1 - pair[0].2).abs() < 0.05, "{spans:?}");
         }
@@ -15875,8 +16018,8 @@ mod tests {
 
     #[test]
     fn substituted_page_field_after_a_right_tab_stays_on_the_tab_stop() {
-        use rdocx_oxml::borders::{CT_TabStop, CT_Tabs};
         use rdocx_oxml::Twips;
+        use rdocx_oxml::borders::{CT_TabStop, CT_Tabs};
         use rdocx_oxml::shared::ST_TabJc;
 
         let mut input = make_input_with_text("");
@@ -15900,9 +16043,15 @@ mod tests {
 
         let spans = first_page_text_spans(&input);
         assert_eq!(spans[0].0, "Title");
-        assert!((spans[0].1 - 72.0).abs() < 0.5, "title stays at the left margin: {spans:?}");
+        assert!(
+            (spans[0].1 - 72.0).abs() < 0.5,
+            "title stays at the left margin: {spans:?}"
+        );
         for pair in spans[1..].windows(2) {
-            assert!((pair[1].1 - pair[0].2).abs() < 0.05, "no gap inside the tabbed group: {spans:?}");
+            assert!(
+                (pair[1].1 - pair[0].2).abs() < 0.05,
+                "no gap inside the tabbed group: {spans:?}"
+            );
         }
         assert!(
             (spans.last().unwrap().2 - (72.0 + 468.0)).abs() < 0.5,
@@ -17493,6 +17642,7 @@ mod tests {
                     is_header: true,
                     keep_next: false,
                     cant_split: false,
+                    min_height: 0.0,
                     offset_left: 0.0,
                 },
                 table::TableRow {
@@ -17502,6 +17652,7 @@ mod tests {
                     is_header: false,
                     keep_next: false,
                     cant_split: false,
+                    min_height: 0.0,
                     offset_left: 0.0,
                 },
             ],

@@ -17,6 +17,10 @@ There are three deliberately different verification scopes:
 Do not silently widen `--scoped` to `--full`. Feature completion proves the
 feature contract. Sprint closure proves that the integrated result works as a
 whole.
+Run only the focused external oracle cases named by the approved story plan
+under `--scoped`. Run the union of applicable oracle riders at the integrated
+`--full` gate. A dependency-prefix checkpoint confirms scoped evidence and focused integration
+checks. The full gate runs on the final integrated sprint result.
 
 ## Steps
 

@@ -1500,6 +1500,7 @@ dependencies = [
  "oxml-layout",
  "oxml-opc",
  "oxml-pdf",
+ "quick-xml",
  "rdocx",
  "rdocx-oxml",
  "serde_json",
@@ -1556,6 +1557,7 @@ dependencies = [
  "oxml-py-support",
  "pyo3",
  "rdocx",
+ "rdocx-oxml",
  "smallvec",
 ]
 
