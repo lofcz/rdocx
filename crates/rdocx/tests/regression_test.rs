@@ -516,8 +516,20 @@ fn f252_oracle_document() -> Document {
 fn f252_page_text(page: &oxml_layout::PageFrame) -> String {
     let mut text = String::new();
     oxml_layout::walk(&page.elements, &mut |element, _| match element {
-        oxml_layout::PositionedElement::Text(run) => text.push_str(&run.text),
-        oxml_layout::PositionedElement::MultilingualText(run) => text.push_str(&run.logical_text),
+        oxml_layout::PositionedElement::Text(run)
+            if !(run.source.is_none()
+                && run.advances.iter().all(|advance| *advance == 0.0)
+                && run.text == "\u{2060}") =>
+        {
+            text.push_str(&run.text)
+        }
+        oxml_layout::PositionedElement::MultilingualText(run)
+            if !(run.source.is_none()
+                && run.x_advances.iter().all(|advance| *advance == 0.0)
+                && run.logical_text == "\u{2060}") =>
+        {
+            text.push_str(&run.logical_text)
+        }
         _ => {}
     });
     text
@@ -3251,7 +3263,17 @@ fn equal_related_content_resolves_only_through_its_story_owner() {
         } else {
             1
         };
-        assert_eq!(image_ids.len(), expected, "{kind:?}");
+        assert_eq!(
+            image_ids.len(),
+            1,
+            "{kind:?} image relationship deduplication"
+        );
+        let xml = std::str::from_utf8(package.get_part(story.part_name()).unwrap()).unwrap();
+        assert_eq!(
+            xml.matches("r:embed=").count(),
+            expected,
+            "{kind:?} drawings"
+        );
         assert_eq!(hyperlink_ids.len(), expected, "{kind:?}");
         for relationship_id in image_ids {
             assert_eq!(
@@ -41055,21 +41077,21 @@ fn text_xml_cannot_carry_is_refused_at_entry_and_never_saved() {
     document.add_paragraph("tab\tand\u{1}");
     let error = document.to_bytes().unwrap_err().to_string();
     assert!(
-        error.contains("/word/document.xml holds U+0001 at line"),
+        error.contains("/word/document.xml contains a character forbidden by XML 1.0: U+0001"),
         "{error}"
     );
 
     let mut document = Document::new();
     document.set_header("Header \u{ffff}");
     let error = document.to_bytes().unwrap_err().to_string();
-    assert!(error.contains("holds U+FFFF at line"), "{error}");
+    assert!(error.contains("forbidden by XML 1.0: U+FFFF"), "{error}");
     assert!(error.contains("/word/header"), "{error}");
 
     let mut document = Document::new();
     document.add_footnote("note \u{2}");
     let error = document.to_bytes().unwrap_err().to_string();
     assert!(
-        error.contains("/word/footnotes.xml holds U+0002 at line"),
+        error.contains("/word/footnotes.xml contains a character forbidden by XML 1.0: U+0002"),
         "{error}"
     );
 }
