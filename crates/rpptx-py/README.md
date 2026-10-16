@@ -52,8 +52,8 @@ with open("review.pdf", "wb") as output:
   pictures, preset shapes, and tables.
 - Deterministic PDF and PNG output for slides and speaker notes.
 - Formatting-preserving text replacement across slides and speaker notes,
-  with an optional expected count that leaves the deck unchanged on a
-  mismatch.
+  on one slide or in one text frame, with an optional expected count that
+  leaves the deck unchanged on a mismatch.
 - Package and PresentationML validation that returns the issues
   `rpptx validate` reports as typed values.
 - Speaker-note text plus modern comment authors, threads, replies, thread
@@ -73,6 +73,8 @@ with open("review.pdf", "wb") as output:
 - Group members added through `group.shapes`, with the group refit to its
   members as in python-pptx.
 - Run hyperlinks, read, added, retargeted, and removed as in python-pptx.
+- Shape click actions, a hyperlink or a slide jump, through `shape.click_action`
+  as in python-pptx.
 
 ## Use it when
 
@@ -127,3 +129,40 @@ Licensed under either the
 [MIT License](https://github.com/tensorbee/rdocx/blob/main/LICENSE) or the
 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), at your
 option.
+
+## Licensed font embedding
+
+Use caller-owned font bytes with explicit authorization under their exact
+license identity. Binary readers are bounded and consumed through actual EOF.
+
+```python
+from pathlib import Path
+from rpptx import Presentation, FontEmbeddingLicense
+
+value = Presentation()
+license = FontEmbeddingLicense(authorized=True, identity="SIL Open Font License 1.1")
+value.embed_font("My Face", Path("MyFace-Regular.ttf"), license=license)
+value.save("embedded.pptx")
+for font in value.embedded_fonts:
+    print(font)
+value.embed_true_type_fonts = False
+value.remove_embedded_font("My Face", "regular")
+```
+
+Kinds are regular, bold, italic and bold_italic. Snapshots are immutable and
+remain readable after later native edits. Flags distinguish None, False and
+True, where None removes only the owned setting. Explicit caller render fonts
+override matching embedded faces. Unsupported imported PowerPoint formats
+retain original bytes with absent decoded data.
+
+## Package signatures
+
+`Presentation.sign(private_key, certificate)` accepts bytes containing a PKCS#8
+RSA private key and X.509 certificate as DER or single unencrypted PEM blocks.
+Each input is limited to1MiB. The returned ordinary dictionary reports signer
+identity, cryptographic validity, complete package coverage, covered parts,
+relationships and precise issue payloads. `verify_signatures()` returns a tuple
+of these dictionaries for current content, or an empty tuple when unsigned.
+Later edits can invalidate a signature. Verification preserves live handles.
+The certificate identity does not establish certificate-chain trust. Existing
+native refusals of signed input and external relationships remain in force.

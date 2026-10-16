@@ -1,6 +1,8 @@
 //! CLI command implementations.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use oxml_cli_support::{
@@ -14,9 +16,10 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use rdocx::{
-    BodyItemRef, ComparisonGranularity, ComparisonOptions, ComparisonStoryKind, Document,
-    RasterFormat, RasterOptions, RasterOutput, RevisionKind, RunRange, StoryId, StoryItemKind,
-    StoryKind,
+    BodyItemRef, ComparisonGranularity, ComparisonOptions, ComparisonStoryKind, CoreProperties,
+    CustomProperty, CustomPropertyValue, Document, FieldDateTime, FieldEvaluationContext,
+    HdrFtrType, HeaderFooterKind, PictureOccurrence, RasterFormat, RasterOptions, RasterOutput,
+    RevisionKind, RevisionStyle, RevisionView, RunRange, StoryId, StoryItemKind, StoryKind,
 };
 use rdocx_oxml::content_control::{CT_Sdt, SdtContent};
 use rdocx_oxml::document::{BodyContent, CT_Document};
@@ -34,11 +37,14 @@ pub struct ImageOptions<'a> {
 }
 
 pub struct RenderOptions<'a> {
+    pub font_dir: Option<&'a Path>,
     pub page: Option<usize>,
     pub pages: Option<&'a str>,
     pub format: &'a str,
     pub quality: u8,
     pub transparent: bool,
+    pub revision_view: RevisionView,
+    pub revision_style: RevisionStyle,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +93,18 @@ pub fn inspect(file: &Path, json: bool) -> Result<()> {
         writeln!(stdout, "Paragraphs: {paragraph_count}")?;
         writeln!(stdout, "Tables: {table_count}")?;
         writeln!(stdout, "Content elements: {content_count}")?;
+        writeln!(stdout, "Words (accepted main body): {}", doc.word_count())?;
+        writeln!(
+            stdout,
+            "Characters (including spaces): {}",
+            doc.character_count(true)
+        )?;
+        writeln!(
+            stdout,
+            "Pages (deterministic layout): {}",
+            doc.layout_deterministic()?.layout.pages.len()
+        )?;
+        writeln!(stdout, "Pictures: {}", doc.pictures()?.len())?;
         writeln!(stdout)?;
         writeln!(stdout, "Metadata:")?;
         if let Some(t) = &title {
@@ -119,6 +137,8 @@ pub fn inspect(file: &Path, json: bool) -> Result<()> {
 }
 
 fn inspect_json(file: &Path, doc: &Document, style_ids: Vec<String>) -> Result<Value> {
+    let layout = doc.layout_deterministic()?;
+    let pictures = doc.pictures()?;
     Ok(json_envelope(json!({
         "file": file.display().to_string(),
         "paragraphs": doc.paragraph_count(),
@@ -131,6 +151,10 @@ fn inspect_json(file: &Path, doc: &Document, style_ids: Vec<String>) -> Result<V
             "keywords": doc.keywords(),
         },
         "styles_used": style_ids,
+        "word_count":doc.word_count(),"character_count":doc.character_count(true),"page_count":layout.layout.pages.len(),
+        "count_scope":"accepted-main-body","character_include_spaces":true,"page_count_source":"deterministic-layout",
+        "diagnostics":layout.layout.diagnostics.iter().map(|d|d.message.clone()).collect::<Vec<_>>(),
+        "pictures":pictures.iter().map(|p|picture_json(p,None)).collect::<Vec<_>>(),
     }))?)
 }
 
@@ -145,10 +169,15 @@ pub fn text(file: &Path, json_output: bool) -> Result<()> {
     if json_output {
         let document = parsed_main_document(file)?;
         let mut paragraphs = Vec::new();
+        let mut joining = Vec::new();
         for (body_index, content) in document.body.content.iter().enumerate() {
             match content {
                 BodyContent::Paragraph(paragraph) => {
-                    paragraphs.push(paragraph_json(body_index, &[], paragraph));
+                    joining.push(paragraph);
+                    if !document.body.accepted_paragraph_joins_next(body_index) {
+                        paragraphs.push(joined_paragraph_json(body_index, &joining));
+                        joining.clear();
+                    }
                 }
                 BodyContent::Table(table) => {
                     collect_table_paragraphs(body_index, &[], table, &mut paragraphs);
@@ -192,15 +221,11 @@ pub fn text(file: &Path, json_output: bool) -> Result<()> {
             "stories": stories,
         }))?;
     } else {
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "{}", doc.text())?;
-        let stories = readable_stories(file, &doc).unwrap_or_default();
-        for (kind, part_name, texts) in story_parts(&stories) {
-            writeln!(stdout, "--- {} ({part_name}) ---", story_kind_name(kind))?;
-            for text in texts {
-                writeln!(stdout, "{text}")?;
-            }
+        let report = doc.text_report();
+        for diagnostic in &report.diagnostics {
+            eprintln!("Warning: {}", diagnostic.message);
         }
+        write!(io::stdout().lock(), "{}", report.text)?;
     }
     Ok(())
 }
@@ -399,9 +424,17 @@ fn push_html_stories(html: &mut String, stories: &[StoryText]) {
 }
 
 /// Emit deterministic point-space extents for every direct body item.
-pub fn layout(file: &Path, json_output: bool) -> Result<()> {
+pub fn layout(file: &Path, json_output: bool, font_dir: Option<&Path>) -> Result<()> {
     let doc = Document::open(file)?;
-    let layout = doc.layout_deterministic()?;
+    let fonts = font_dir
+        .map(oxml_layout::FontFile::from_dir)
+        .transpose()?
+        .unwrap_or_default();
+    let refs = fonts
+        .iter()
+        .map(|font| (font.family.as_str(), font.data.as_slice()))
+        .collect::<Vec<_>>();
+    let layout = doc.layout_with_fonts_and_bundled_fallback(&refs)?;
     let body_items = doc
         .body_items()
         .enumerate()
@@ -509,6 +542,28 @@ fn paragraph_json(body_index: usize, path: &[Value], paragraph: &CT_P) -> Value 
     })
 }
 
+fn joined_paragraph_json(body_index: usize, paragraphs: &[&CT_P]) -> Value {
+    let mut result = paragraph_json(body_index, &[], paragraphs[paragraphs.len() - 1]);
+    if paragraphs.len() == 1 {
+        return result;
+    }
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    for paragraph in paragraphs {
+        let projected = paragraph_json(body_index, &[], paragraph);
+        text.push_str(projected["text"].as_str().unwrap_or_default());
+        if let Some(projected_runs) = projected["runs"].as_array() {
+            runs.extend(projected_runs.iter().cloned());
+        }
+    }
+    for (index, run) in runs.iter_mut().enumerate() {
+        run["index"] = json!(index);
+    }
+    result["text"] = json!(text);
+    result["runs"] = json!(runs);
+    result
+}
+
 fn run_formatting_json(run: &CT_R) -> Value {
     let Some(properties) = run.properties.as_ref() else {
         return Value::Null;
@@ -533,10 +588,22 @@ fn collect_table_paragraphs(
     table: &CT_Tbl,
     output: &mut Vec<Value>,
 ) {
-    for (row_index, row) in table.rows.iter().enumerate() {
-        let mut row_path = path.to_vec();
-        row_path.push(path_segment("row", row_index));
-        collect_row_paragraphs(body_index, &row_path, row, output);
+    // Row controls and direct rows retain their model paths and source order.
+    for boundary in 0..=table.rows.len() {
+        for (control_index, (at, _, control)) in table.content_controls.iter().enumerate() {
+            if *at == boundary {
+                let mut control_path = path.to_vec();
+                control_path.push(path_segment("content-control", control_index));
+                collect_control_paragraphs(body_index, &control_path, control, output);
+            }
+        }
+        if let Some(row) = table.rows.get(boundary)
+            && !row.accepted_view_removes()
+        {
+            let mut row_path = path.to_vec();
+            row_path.push(path_segment("row", boundary));
+            collect_row_paragraphs(body_index, &row_path, row, output);
+        }
     }
 }
 
@@ -546,10 +613,19 @@ fn collect_row_paragraphs(
     row: &CT_Row,
     output: &mut Vec<Value>,
 ) {
-    for (cell_index, cell) in row.cells.iter().enumerate() {
-        let mut cell_path = path.to_vec();
-        cell_path.push(path_segment("cell", cell_index));
-        collect_cell_paragraphs(body_index, &cell_path, cell, output);
+    for boundary in 0..=row.cells.len() {
+        for (control_index, (at, _, control)) in row.content_controls.iter().enumerate() {
+            if *at == boundary {
+                let mut control_path = path.to_vec();
+                control_path.push(path_segment("content-control", control_index));
+                collect_control_paragraphs(body_index, &control_path, control, output);
+            }
+        }
+        if let Some(cell) = row.cells.get(boundary) {
+            let mut cell_path = path.to_vec();
+            cell_path.push(path_segment("cell", boundary));
+            collect_cell_paragraphs(body_index, &cell_path, cell, output);
+        }
     }
 }
 
@@ -595,6 +671,7 @@ fn collect_control_paragraphs(
                 content_path.push(path_segment("table", content_index));
                 collect_table_paragraphs(body_index, &content_path, table, output);
             }
+            SdtContent::Row(row) if row.accepted_view_removes() => {}
             SdtContent::Row(row) => {
                 content_path.push(path_segment("row", content_index));
                 collect_row_paragraphs(body_index, &content_path, row, output);
@@ -612,7 +689,84 @@ fn collect_control_paragraphs(
     }
 }
 
+/// Import text into DOCX or retain the existing DOCX conversion routes.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_input(
+    file: &Path,
+    to: Option<&str>,
+    template: Option<&Path>,
+    rendering_options: bool,
+    output: Option<&Path>,
+    force: bool,
+    dpi: u32,
+    font_dir: Option<&Path>,
+    revision_view: RevisionView,
+    revision_style: RevisionStyle,
+    image: ImageOptions<'_>,
+) -> Result<()> {
+    let extension = file
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "html" | "htm" | "md" | "markdown") {
+        if template.is_some() {
+            return Err("--template requires HTML or Markdown input".into());
+        }
+        return convert(
+            file,
+            to.ok_or("--to is required for DOCX input")?,
+            output,
+            force,
+            dpi,
+            font_dir,
+            revision_view,
+            revision_style,
+            image,
+        );
+    }
+    if to.unwrap_or("docx") != "docx" {
+        return Err("HTML and Markdown input supports only --to docx".into());
+    }
+    if rendering_options
+        || font_dir.is_some()
+        || revision_view != RevisionView::Accepted
+        || image.pages.is_some()
+        || image.transparent
+        || dpi != 150
+        || image.quality != 90
+    {
+        return Err("rendering options do not apply to HTML or Markdown input".into());
+    }
+    let destination = output.map_or_else(|| default_output_path(file, "docx"), Path::to_path_buf);
+    ensure_output_paths_allowed(std::slice::from_ref(&destination), file, force)?;
+    let loaded = template.map(Document::open).transpose()?;
+    if let Some(path) = template {
+        ensure_output_paths_allowed(std::slice::from_ref(&destination), path, force)?;
+    }
+    let mut imported = if matches!(extension.as_str(), "md" | "markdown") {
+        Document::open_markdown_with_local_images(file, loaded.as_ref())?
+    } else {
+        Document::open_html_with_local_images(file, loaded.as_ref())?
+    };
+    for diagnostic in &imported.diagnostics {
+        eprintln!(
+            "{}{}: {}",
+            diagnostic.location,
+            diagnostic
+                .property
+                .as_ref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default(),
+            diagnostic.message
+        );
+    }
+    let bytes = imported.document.to_bytes()?;
+    stage_and_publish(&[(destination, bytes)], force)
+}
+
 /// Convert a DOCX file to another format.
+#[allow(clippy::too_many_arguments)]
 pub fn convert(
     file: &Path,
     to: &str,
@@ -620,9 +774,16 @@ pub fn convert(
     force: bool,
     dpi: u32,
     font_dir: Option<&Path>,
+    revision_view: RevisionView,
+    revision_style: RevisionStyle,
     image: ImageOptions<'_>,
 ) -> Result<()> {
+    check_revision_style(revision_view, revision_style)?;
     let doc = Document::open(file)?;
+    let render_options = rdocx::RenderOptions {
+        revision_view,
+        revision_style,
+    };
 
     let default_ext = match to {
         "pdf" => "pdf",
@@ -639,6 +800,21 @@ pub fn convert(
         }
     };
 
+    if revision_view == RevisionView::Tracked && matches!(default_ext, "html" | "md") {
+        return Err("--revision-view tracked applies only to PDF and image output".into());
+    }
+
+    if font_dir.is_some() && matches!(default_ext, "html" | "md") {
+        return Err("--font-dir applies only to PDF and image output".into());
+    }
+    let fonts = font_dir
+        .map(oxml_layout::FontFile::from_dir)
+        .transpose()?
+        .unwrap_or_default();
+    let font_refs = fonts
+        .iter()
+        .map(|font| (font.family.as_str(), font.data.as_slice()))
+        .collect::<Vec<_>>();
     let output_path = match output {
         Some(p) => p.to_path_buf(),
         None => default_output_path(file, default_ext),
@@ -652,17 +828,13 @@ pub fn convert(
     let mut stdout = io::stdout().lock();
     match to {
         "pdf" => {
-            let bytes = if let Some(dir) = font_dir {
-                let font_files = Document::load_fonts_from_dir(dir);
-                let font_refs: Vec<(&str, &[u8])> = font_files
-                    .iter()
-                    .map(|f| (f.family.as_str(), f.data.as_slice()))
-                    .collect();
-                doc.to_pdf_with_fonts(&font_refs)?
-            } else {
-                doc.to_pdf()?
-            };
+            let layout =
+                doc.layout_with_fonts_and_bundled_fallback_and_options(&font_refs, render_options)?;
+            let bytes = oxml_pdf::render_to_pdf_checked(&layout.layout)?;
             stage_and_publish(&[(output_path.clone(), bytes)], force)?;
+            for diagnostic in &layout.layout.diagnostics {
+                eprintln!("{}", diagnostic.message);
+            }
         }
         "html" => {
             let mut html = doc.to_html();
@@ -680,7 +852,8 @@ pub fn convert(
         }
         "png" | "jpg" | "jpeg" | "tif" | "tiff" => {
             let (format, extension) = parse_image_format(to, image.quality, image.transparent)?;
-            let layout = doc.layout_deterministic()?;
+            let layout =
+                doc.layout_with_fonts_and_bundled_fallback_and_options(&font_refs, render_options)?;
             let selected = selected_zero_based_pages(layout.layout.pages.len(), image.pages)?;
             match format {
                 RasterFormat::Tiff => {
@@ -732,6 +905,9 @@ pub fn convert(
                     }
                 }
             }
+            for diagnostic in &layout.layout.diagnostics {
+                eprintln!("{}", diagnostic.message);
+            }
             return Ok(());
         }
         _ => unreachable!(),
@@ -741,13 +917,91 @@ pub fn convert(
     Ok(())
 }
 
-/// Structural diff between two DOCX files.
-pub fn diff(file_a: &Path, file_b: &Path) -> Result<()> {
+/// Compare the paragraph text of every story of two DOCX files.
+///
+/// The body paragraphs keep their historical `[i]` locations, every other
+/// paragraph is located by its story. `diff_status` is set before anything is
+/// printed, so the verdict survives a reader that closes standard output.
+pub fn diff(file_a: &Path, file_b: &Path, json_output: bool, diff_status: &mut i32) -> Result<()> {
     let doc_a = Document::open(file_a)?;
     let doc_b = Document::open(file_b)?;
+    let (streams_a, mut not_compared) = diff_streams(file_a, &doc_a)?;
+    let (streams_b, not_compared_b) = diff_streams(file_b, &doc_b)?;
+    for entry in not_compared_b {
+        if !not_compared.contains(&entry) {
+            not_compared.push(entry);
+        }
+    }
 
-    let paras_a: Vec<String> = doc_a.paragraphs().iter().map(|p| p.text()).collect();
-    let paras_b: Vec<String> = doc_b.paragraphs().iter().map(|p| p.text()).collect();
+    // Streams pair by name, in the order of the first file and then of the
+    // streams that only the second file has.
+    let mut names: Vec<&str> = streams_a
+        .iter()
+        .map(|stream| stream.name.as_str())
+        .collect();
+    for stream in &streams_b {
+        if !names.contains(&stream.name.as_str()) {
+            names.push(&stream.name);
+        }
+    }
+    let mut changes = Vec::new();
+    for name in names {
+        changes.extend(diff_items(
+            stream_items(&streams_a, name),
+            stream_items(&streams_b, name),
+        ));
+    }
+    let count = |a: bool, b: bool| {
+        changes
+            .iter()
+            .filter(|(old, new)| old.is_some() == a && new.is_some() == b)
+            .count()
+    };
+    let (changed, added, removed) = (count(true, true), count(false, true), count(true, false));
+    *diff_status = if !not_compared.is_empty() {
+        2
+    } else if changes.is_empty() {
+        0
+    } else {
+        1
+    };
+
+    if json_output {
+        let side = |item: &Option<DiffItem>, field: fn(&DiffItem) -> &str| {
+            item.as_ref().map(|item| field(item).to_owned())
+        };
+        let differences = changes
+            .iter()
+            .map(|(old, new)| {
+                let (change, story) = match (old, new) {
+                    (Some(item), Some(_)) => ("changed", item.story),
+                    (None, Some(item)) => ("added", item.story),
+                    (Some(item), None) => ("removed", item.story),
+                    (None, None) => unreachable!("a change has at least one side"),
+                };
+                json!({
+                    "change": change,
+                    "story": story,
+                    "location_a": side(old, |item| &item.location),
+                    "text_a": side(old, |item| &item.text),
+                    "location_b": side(new, |item| &item.location),
+                    "text_b": side(new, |item| &item.text),
+                })
+            })
+            .collect::<Vec<_>>();
+        print_json(json!({
+            "file_a": file_a.display().to_string(),
+            "file_b": file_b.display().to_string(),
+            "scope": "all-supported-stories",
+            "revision_view": "accepted",
+            "changed": changed,
+            "added": added,
+            "removed": removed,
+            "differences": differences,
+            "not_compared": not_compared,
+        }))?;
+        return Ok(());
+    }
 
     let mut stdout = io::stdout().lock();
     writeln!(
@@ -765,72 +1019,523 @@ pub fn diff(file_a: &Path, file_b: &Path) -> Result<()> {
         doc_b.table_count()
     )?;
     writeln!(stdout)?;
-
-    // Simple LCS-based diff on paragraph texts
-    let lcs = compute_lcs(&paras_a, &paras_b);
-    let mut i = 0;
-    let mut j = 0;
-    let mut k = 0;
-
-    while k < lcs.len() {
-        // Output removed lines before the match
-        while i < paras_a.len() && paras_a[i] != lcs[k] {
-            writeln!(stdout, "- [{}] {}", i + 1, paras_a[i])?;
-            i += 1;
+    for (old, new) in &changes {
+        if let Some(item) = old {
+            writeln!(stdout, "- [{}] {}", item.location, item.text)?;
         }
-        // Output added lines before the match
-        while j < paras_b.len() && paras_b[j] != lcs[k] {
-            writeln!(stdout, "+ [{}] {}", j + 1, paras_b[j])?;
-            j += 1;
+        if let Some(item) = new {
+            writeln!(stdout, "+ [{}] {}", item.location, item.text)?;
         }
-        // Skip the common line
-        i += 1;
-        j += 1;
-        k += 1;
     }
-
-    // Remaining lines
-    while i < paras_a.len() {
-        writeln!(stdout, "- [{}] {}", i + 1, paras_a[i])?;
-        i += 1;
+    if !changes.is_empty() {
+        writeln!(stdout)?;
     }
-    while j < paras_b.len() {
-        writeln!(stdout, "+ [{}] {}", j + 1, paras_b[j])?;
-        j += 1;
+    for entry in &not_compared {
+        writeln!(stdout, "(not compared: {entry})")?;
     }
-
-    let changes = paras_a.len() + paras_b.len() - 2 * lcs.len();
-    if changes == 0 {
+    if changes.is_empty() && not_compared.is_empty() {
         writeln!(stdout, "(no differences in paragraph text)")?;
-    } else {
-        writeln!(stdout, "\n{changes} paragraph(s) differ.")?;
+    } else if !changes.is_empty() {
+        writeln!(
+            stdout,
+            "{changed} paragraph(s) changed, {added} added, {removed} removed."
+        )?;
+    }
+    Ok(())
+}
+
+/// One compared paragraph or block content control: its story kind, its
+/// location as `diff` prints it between brackets, and its accepted-view text.
+#[derive(Clone)]
+struct DiffItem {
+    story: &'static str,
+    location: String,
+    text: String,
+}
+
+/// The items that `diff` compares as one sequence, such as the body, the
+/// tables of the body, or one header. Streams of two files pair by name.
+struct DiffStream {
+    name: String,
+    items: Vec<DiffItem>,
+}
+
+/// Read every story of a document into comparable streams, and name the
+/// stories that could not be read instead of dropping them silently.
+fn diff_streams(file: &Path, doc: &Document) -> Result<(Vec<DiffStream>, Vec<String>)> {
+    let body = doc
+        .paragraphs()
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| DiffItem {
+            story: "body",
+            location: (index + 1).to_string(),
+            text: paragraph.text(),
+        })
+        .collect();
+    let mut streams = vec![DiffStream {
+        name: "body".to_owned(),
+        items: body,
+    }];
+
+    // The table cells of the body use the `text --json` traversal. A table
+    // inside a block content control is left to the body paragraphs, which
+    // already hold its text.
+    let document = parsed_main_document(file)?;
+    let mut cells = Vec::new();
+    let mut table_number = 0;
+    for (body_index, content) in document.body.content.iter().enumerate() {
+        if let BodyContent::Table(table) = content {
+            table_number += 1;
+            let mut paragraphs = Vec::new();
+            collect_table_paragraphs(body_index, &[], table, &mut paragraphs);
+            cells.extend(paragraphs.iter().map(|paragraph| DiffItem {
+                story: "table_cell",
+                location: format!("table {table_number}, {}", json_path_label(paragraph)),
+                text: paragraph["text"].as_str().unwrap_or_default().to_owned(),
+            }));
+        }
+    }
+    streams.push(DiffStream {
+        name: "tables".to_owned(),
+        items: cells,
+    });
+
+    let mut not_compared = Vec::new();
+    match other_story_streams(doc) {
+        Ok((other, unsupported)) => {
+            streams.extend(other);
+            not_compared.extend(unsupported);
+        }
+        Err(error) => not_compared.push(format!(
+            "headers, footers, footnotes, endnotes, comments and text boxes of {} ({error})",
+            file.display()
+        )),
+    }
+    Ok((streams, not_compared))
+}
+
+/// Label a `text --json` paragraph path one-based, such as `row 1, cell 2,
+/// paragraph 1`.
+fn json_path_label(paragraph: &Value) -> String {
+    paragraph["path"]
+        .as_array()
+        .map(|segments| {
+            segments
+                .iter()
+                .map(|segment| {
+                    format!(
+                        "{} {}",
+                        segment["kind"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .replace('-', " "),
+                        segment["index"].as_u64().unwrap_or_default() + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Read the stories beyond the main body and its tables: text boxes of the
+/// body, headers and footers named by section and type, footnotes, endnotes,
+/// and comments. Each package part is one stream. Only the direct paragraphs
+/// and block content controls of a story are read, so the text of an inline
+/// control or a field is not compared twice.
+fn other_story_streams(doc: &Document) -> Result<(Vec<DiffStream>, Vec<String>)> {
+    // A header or footer part is named by the first section that references
+    // it explicitly, so that a renamed part still pairs with its section.
+    let mut section_names: Vec<(String, String)> = Vec::new();
+    for section in 0..doc.section_count() {
+        for (kind, kind_name) in [
+            (HeaderFooterKind::Header, "header"),
+            (HeaderFooterKind::Footer, "footer"),
+        ] {
+            for (hdr_type, type_name) in [
+                (HdrFtrType::Default, "default"),
+                (HdrFtrType::First, "first"),
+                (HdrFtrType::Even, "even"),
+            ] {
+                if let Some(story) = doc.section_story(section, kind, hdr_type)?
+                    && !story.is_inherited()
+                    && !section_names
+                        .iter()
+                        .any(|(part, _)| part == story.story().part_name())
+                {
+                    section_names.push((
+                        story.story().part_name().to_owned(),
+                        format!("{kind_name} {type_name}, section {}", section + 1),
+                    ));
+                }
+            }
+        }
     }
 
-    Ok(())
+    let mut main_part = None;
+    let mut streams: Vec<(String, DiffStream)> = Vec::new();
+    let mut unsupported = Vec::new();
+    // The current owner and its paragraph and content control counts so far.
+    let mut owner: Option<(StoryId, [usize; 2])> = None;
+    for item in doc.story_item_snapshots()? {
+        let story = item.location().story();
+        let part = story.part_name();
+        if story.kind() == StoryKind::Body {
+            main_part = Some(part.to_owned());
+            continue;
+        }
+        if story.kind() == StoryKind::TableCell && main_part.as_deref() == Some(part) {
+            continue;
+        }
+        if !item.is_direct_child() {
+            continue;
+        }
+        // Paragraphs and block content controls count apart within their
+        // owner, so `paragraph 2` is the second paragraph of its story.
+        let (item_name, is_paragraph) = match item.location().item_kind() {
+            StoryItemKind::Paragraph => ("paragraph", true),
+            StoryItemKind::ContentControl => ("content control", false),
+            // A table's text is read from its cells, which are stories of
+            // their own, and the other direct items carry no text.
+            _ => continue,
+        };
+        if owner.as_ref().is_none_or(|(current, _)| current != story) {
+            owner = Some((story.clone(), [0, 0]));
+        }
+        let ordinal = match &mut owner {
+            Some((_, counts)) => {
+                let count = &mut counts[usize::from(!is_paragraph)];
+                *count += 1;
+                *count
+            }
+            None => unreachable!("the owner was just set"),
+        };
+        let (story_name, owner_name) = match story.kind() {
+            StoryKind::Header => ("header", None),
+            StoryKind::Footer => ("footer", None),
+            StoryKind::Footnote => ("footnote", Some("footnote")),
+            StoryKind::Endnote => ("endnote", Some("endnote")),
+            StoryKind::Comment => ("comment", Some("comment")),
+            StoryKind::TableCell => ("table_cell", Some("table cell")),
+            StoryKind::TextBox => ("text_box", Some("text box")),
+            _ => {
+                let entry = format!("a story of an unsupported kind in {part}");
+                if !unsupported.contains(&entry) {
+                    unsupported.push(entry);
+                }
+                continue;
+            }
+        };
+        let position = match streams
+            .iter()
+            .position(|(stream_part, _)| stream_part == part)
+        {
+            Some(position) => position,
+            None => {
+                let name = section_names
+                    .iter()
+                    .find(|(named_part, _)| named_part == part)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| match story.kind() {
+                        StoryKind::Header | StoryKind::Footer => format!("{story_name} {part}"),
+                        StoryKind::Footnote => "footnotes".to_owned(),
+                        StoryKind::Endnote => "endnotes".to_owned(),
+                        StoryKind::Comment => "comments".to_owned(),
+                        _ if main_part.as_deref() == Some(part) => String::new(),
+                        _ => part.to_owned(),
+                    });
+                streams.push((
+                    part.to_owned(),
+                    DiffStream {
+                        name,
+                        items: Vec::new(),
+                    },
+                ));
+                streams.len() - 1
+            }
+        };
+        let stream = &mut streams[position].1;
+        // A note or a comment names itself. A header or a footer takes the
+        // name of its stream, and a cell or a text box is placed in it.
+        let mut location = Vec::new();
+        let names_itself = matches!(
+            story.kind(),
+            StoryKind::Footnote | StoryKind::Endnote | StoryKind::Comment
+        );
+        if !names_itself && !stream.name.is_empty() {
+            location.push(stream.name.clone());
+        }
+        if let Some(owner_name) = owner_name {
+            location.push(format!("{owner_name} {}", story.owner_index() + 1));
+        }
+        location.push(format!("{item_name} {ordinal}"));
+        stream.items.push(DiffItem {
+            story: story_name,
+            location: location.join(", "),
+            text: item.text().unwrap_or_default().to_owned(),
+        });
+    }
+    Ok((
+        streams.into_iter().map(|(_, stream)| stream).collect(),
+        unsupported,
+    ))
+}
+
+/// The items of the stream with this name, or none when the file lacks it.
+fn stream_items<'a>(streams: &'a [DiffStream], name: &str) -> &'a [DiffItem] {
+    streams
+        .iter()
+        .find(|stream| stream.name == name)
+        .map_or(&[], |stream| stream.items.as_slice())
+}
+
+/// A removed item, an added item, or both for a changed item.
+type ItemChange = (Option<DiffItem>, Option<DiffItem>);
+
+/// Pair the items of two streams that differ. Matched items come from a
+/// shortest edit script between their texts. Between two matches, removed
+/// and added items pair in order as changed items, and the rest stay removed
+/// or added.
+fn diff_items(a: &[DiffItem], b: &[DiffItem]) -> Vec<ItemChange> {
+    // Equal texts share one number, so the edit search compares integers.
+    let mut numbers: HashMap<&str, u32> = HashMap::new();
+    let mut numbered = Vec::with_capacity(a.len() + b.len());
+    for item in a.iter().chain(b) {
+        let next = numbers.len() as u32;
+        numbered.push(*numbers.entry(item.text.as_str()).or_insert(next));
+    }
+    let (numbers_a, numbers_b) = numbered.split_at(a.len());
+    let mut matches = Vec::new();
+    let mut frontiers = Frontiers::new(a.len() + b.len());
+    matching_indexes(
+        numbers_a,
+        0..a.len(),
+        numbers_b,
+        0..b.len(),
+        &mut frontiers,
+        &mut matches,
+    );
+    matches.push((a.len(), b.len()));
+    let mut changes = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    for (next_i, next_j) in matches {
+        let removed = &a[i..next_i];
+        let added = &b[j..next_j];
+        for index in 0..removed.len().max(added.len()) {
+            changes.push((removed.get(index).cloned(), added.get(index).cloned()));
+        }
+        i = next_i + 1;
+        j = next_j + 1;
+    }
+    changes
+}
+
+/// The forward and backward furthest-reaching `x` of each diagonal in
+/// Myers' search, indexed by the diagonal `k` offset to stay non-negative.
+struct Frontiers {
+    forward: Vec<usize>,
+    backward: Vec<usize>,
+    offset: isize,
+}
+
+impl Frontiers {
+    fn new(total: usize) -> Self {
+        let size = total + 3;
+        Self {
+            forward: vec![0; 2 * size + 1],
+            backward: vec![0; 2 * size + 1],
+            offset: size as isize,
+        }
+    }
+
+    fn slot(&self, k: isize) -> usize {
+        (k + self.offset) as usize
+    }
+}
+
+/// Collect the matched index pairs of a shortest edit script between two
+/// ranges in order, by Myers' linear-space divide and conquer: O((N+M)D)
+/// time and O(N+M) memory, where D is the number of edits. A few edits in a
+/// long story therefore stay cheap.
+fn matching_indexes(
+    a: &[u32],
+    mut a_range: Range<usize>,
+    b: &[u32],
+    mut b_range: Range<usize>,
+    frontiers: &mut Frontiers,
+    matches: &mut Vec<(usize, usize)>,
+) {
+    while !a_range.is_empty() && !b_range.is_empty() && a[a_range.start] == b[b_range.start] {
+        matches.push((a_range.start, b_range.start));
+        a_range.start += 1;
+        b_range.start += 1;
+    }
+    let mut suffix = 0;
+    while !a_range.is_empty() && !b_range.is_empty() && a[a_range.end - 1] == b[b_range.end - 1] {
+        a_range.end -= 1;
+        b_range.end -= 1;
+        suffix += 1;
+    }
+    if !a_range.is_empty() && !b_range.is_empty() {
+        let (x, y) = middle_snake(a, a_range.clone(), b, b_range.clone(), frontiers);
+        matching_indexes(a, a_range.start..x, b, b_range.start..y, frontiers, matches);
+        matching_indexes(a, x..a_range.end, b, y..b_range.end, frontiers, matches);
+    }
+    matches.extend((0..suffix).map(|offset| (a_range.end + offset, b_range.end + offset)));
+}
+
+/// Find a point on a shortest edit path that splits it into two halves of
+/// about half its edits each. Both ranges are non-empty and differ at both
+/// ends, so each half has fewer edits than the whole.
+fn middle_snake(
+    a: &[u32],
+    a_range: Range<usize>,
+    b: &[u32],
+    b_range: Range<usize>,
+    frontiers: &mut Frontiers,
+) -> (usize, usize) {
+    let (n, m) = (a_range.len(), b_range.len());
+    let delta = n as isize - m as isize;
+    let odd = delta & 1 == 1;
+    let one = frontiers.slot(1);
+    frontiers.forward[one] = 0;
+    frontiers.backward[one] = 0;
+    let common_prefix = |x: usize, y: usize| {
+        a[a_range.start + x..a_range.end]
+            .iter()
+            .zip(&b[b_range.start + y..b_range.end])
+            .take_while(|(left, right)| left == right)
+            .count()
+    };
+    let common_suffix = |x: usize, y: usize| {
+        a[a_range.start..a_range.end - x]
+            .iter()
+            .rev()
+            .zip(b[b_range.start..b_range.end - y].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count()
+    };
+    for d in 0..=(n + m).div_ceil(2) as isize {
+        for k in (-d..=d).rev().step_by(2) {
+            let (below, above) = (frontiers.slot(k - 1), frontiers.slot(k + 1));
+            let mut x =
+                if k == -d || (k != d && frontiers.forward[below] < frontiers.forward[above]) {
+                    frontiers.forward[above]
+                } else {
+                    frontiers.forward[below] + 1
+                };
+            let y = (x as isize - k) as usize;
+            let start = (x, y);
+            if x < n && y < m {
+                x += common_prefix(x, y);
+            }
+            let slot = frontiers.slot(k);
+            frontiers.forward[slot] = x;
+            if odd
+                && (k - delta).abs() < d
+                && x + frontiers.backward[frontiers.slot(delta - k)] >= n
+            {
+                return (a_range.start + start.0, b_range.start + start.1);
+            }
+        }
+        for k in (-d..=d).rev().step_by(2) {
+            let (below, above) = (frontiers.slot(k - 1), frontiers.slot(k + 1));
+            let mut x =
+                if k == -d || (k != d && frontiers.backward[below] < frontiers.backward[above]) {
+                    frontiers.backward[above]
+                } else {
+                    frontiers.backward[below] + 1
+                };
+            let mut y = (x as isize - k) as usize;
+            if x < n && y < m {
+                let common = common_suffix(x, y);
+                x += common;
+                y += common;
+            }
+            let slot = frontiers.slot(k);
+            frontiers.backward[slot] = x;
+            if !odd
+                && (k - delta).abs() <= d
+                && x + frontiers.forward[frontiers.slot(delta - k)] >= n
+            {
+                return (a_range.end - x, b_range.end - y);
+            }
+        }
+    }
+    unreachable!("two non-empty ranges always meet within half their total length of edits")
+}
+
+fn comment_position_json(
+    document: &Document,
+    position: &rdocx::StoryRunPosition,
+    items: &mut HashMap<rdocx::ContentLocation, rdocx::StoryItemSnapshot>,
+) -> Result<Value> {
+    if !items.contains_key(&position.location) {
+        items.insert(
+            position.location.clone(),
+            document.story_range_paragraph_snapshot(&position.location)?,
+        );
+    }
+    let snapshot = &items[&position.location];
+    let location = snapshot.location();
+    Ok(json!({
+        "story_kind": story_kind_name(location.story().kind()),
+        "part_name": location.story().part_name(),
+        "owner_index": location.story().owner_index(),
+        "item_kind": "paragraph",
+        "index_path": location.index_path(),
+        "run_index": position.run_index,
+        "direct_body_index": snapshot.direct_body_index(),
+    }))
 }
 
 /// List Word comments in their package order.
 pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
     let doc = Document::open(file)?;
     let comments = doc.comments();
+    let mut anchors = if json_output {
+        doc.comment_anchor_snapshots()?
+    } else {
+        Default::default()
+    };
+    let mut items = if json_output {
+        doc.story_item_snapshots()?
+            .into_iter()
+            .map(|item| (item.location().clone(), item))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     let records = comments
         .iter()
-        .map(|comment| {
-            json!({
-                "id": comment.id(),
-                "author": comment.author(),
-                "initials": comment.initials(),
-                "date": comment.date(),
-                "text": comment.text(),
-                "parent_id": comment.parent_id(),
-                "resolved": comment.resolved(),
-            })
+        .map(|comment| -> Result<Value> {
+            let (range, anchor_text) = if json_output {
+                anchors
+                    .remove(&comment.id())
+                    .ok_or_else(|| io::Error::other("checked comment ownership record missing"))?
+            } else {
+                (None, None)
+            };
+            let anchor = range
+                .map(|range| -> Result<Value> {
+                    Ok(json!({
+                        "start": comment_position_json(&doc, &range.start, &mut items)?,
+                        "end": comment_position_json(&doc, &range.end, &mut items)?,
+                    }))
+                })
+                .transpose()?;
+            Ok(json!({
+                "id": comment.id(), "author": comment.author(), "initials": comment.initials(),
+                "date": comment.date(), "text": comment.text(), "parent_id": comment.parent_id(),
+                "resolved": comment.resolved(), "anchor_text": anchor_text, "anchor": anchor,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let mut stdout = io::stdout().lock();
     if json_output {
         print_json(json!({
-            "scope": "main",
+            "scope": "all_stories",
             "comments": records,
         }))?;
     } else if comments.is_empty() {
@@ -854,11 +1559,19 @@ pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where `comment add` anchors its comment.
+pub enum CommentAnchor<'a> {
+    /// A zero-based half-open body run range.
+    Range(RunRange),
+    /// The zero-based occurrence of a literal text in the main story.
+    Text { text: &'a str, occurrence: usize },
+}
+
 /// Add one Word comment and publish the complete mutated document atomically.
 #[allow(clippy::too_many_arguments)]
 pub fn comment_add(
     file: &Path,
-    range: RunRange,
+    anchor: CommentAnchor<'_>,
     author: &str,
     initials: Option<&str>,
     text: &str,
@@ -867,13 +1580,42 @@ pub fn comment_add(
     json_output: bool,
 ) -> Result<()> {
     let mut doc = Document::open(file)?;
-    let id = doc.add_comment_with_date(range, author, initials, text, date)?;
+    let id = match anchor {
+        CommentAnchor::Range(range) => {
+            doc.add_comment_with_date(range, author, initials, text, date)?
+        }
+        CommentAnchor::Text {
+            text: anchor,
+            occurrence,
+        } => doc.add_comment_on_text(anchor, occurrence, author, initials, text, date)?,
+    };
     publish_document(&mut doc, output)?;
     mutation_record(
         json_output,
         "main",
         "add",
         json!({ "comment_id": id }),
+        output,
+    )
+}
+
+/// Move one existing thread and publish only the reopened complete package.
+pub fn comment_move(
+    file: &Path,
+    id: i32,
+    text: &str,
+    occurrence: usize,
+    output: &Path,
+    json_output: bool,
+) -> Result<()> {
+    let mut doc = Document::open(file)?;
+    doc.move_comment_to_text(id, text, occurrence)?;
+    publish_document(&mut doc, output)?;
+    mutation_record(
+        json_output,
+        "main",
+        "move",
+        json!({"comment_id": id}),
         output,
     )
 }
@@ -1057,6 +1799,35 @@ pub fn parse_comparison_granularity(
         .ok_or_else(|| {
             format!("unknown comparison granularity {name:?}, expected run, word, or character")
         })
+}
+
+pub fn parse_revision_view(name: &str) -> std::result::Result<RevisionView, String> {
+    match name {
+        "accepted" => Ok(RevisionView::Accepted),
+        "tracked" => Ok(RevisionView::Tracked),
+        _ => Err(format!(
+            "unknown revision view {name:?}, expected accepted or tracked"
+        )),
+    }
+}
+
+pub fn parse_revision_style(name: &str) -> std::result::Result<RevisionStyle, String> {
+    match name {
+        "plain" => Ok(RevisionStyle::Plain),
+        "legal" => Ok(RevisionStyle::Legal),
+        _ => Err(format!(
+            "unknown revision style {name:?}, expected plain or legal"
+        )),
+    }
+}
+
+/// Refuse a revision style other than plain outside the tracked view, which
+/// alone marks revisions.
+fn check_revision_style(view: RevisionView, style: RevisionStyle) -> Result<()> {
+    if style != RevisionStyle::Plain && view != RevisionView::Tracked {
+        return Err("--revision-style applies only with --revision-view tracked".into());
+    }
+    Ok(())
 }
 
 /// Parse one `--ignore-story` value.
@@ -1309,66 +2080,76 @@ fn print_json(payload: Value) -> Result<()> {
     Ok(())
 }
 
-/// Compute the longest common subsequence of two string slices.
-fn compute_lcs(a: &[String], b: &[String]) -> Vec<String> {
-    let m = a.len();
-    let n = b.len();
-    let mut dp = vec![vec![0u32; n + 1]; m + 1];
-
-    for i in 1..=m {
-        for j in 1..=n {
-            dp[i][j] = if a[i - 1] == b[j - 1] {
-                dp[i - 1][j - 1] + 1
-            } else {
-                dp[i - 1][j].max(dp[i][j - 1])
-            };
-        }
-    }
-
-    // Backtrack
-    let mut result = Vec::new();
-    let mut i = m;
-    let mut j = n;
-    while i > 0 && j > 0 {
-        if a[i - 1] == b[j - 1] {
-            result.push(a[i - 1].clone());
-            i -= 1;
-            j -= 1;
-        } else if dp[i - 1][j] >= dp[i][j - 1] {
-            i -= 1;
-        } else {
-            j -= 1;
-        }
-    }
-
-    result.reverse();
-    result
+pub struct ReplaceInput<'a> {
+    pub pair: Option<(String, String)>,
+    pub map: Option<&'a Path>,
+    pub expect: Option<usize>,
+    pub regex: bool,
 }
 
-/// Replace a placeholder in a DOCX file and save to output.
+/// Replace one pair or an ordered map through the shared checked transaction.
 pub fn replace(
     file: &Path,
-    placeholder: &str,
-    value: &str,
-    expect: Option<usize>,
+    input: ReplaceInput<'_>,
     output: &Path,
+    json_output: bool,
 ) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    let pairs = if let Some(map) = input.map {
+        oxml_cli_support::parse_replacement_map(&std::fs::read_to_string(map)?)?
+    } else {
+        let (placeholder, value) = input.pair.ok_or("replace requires a pair or --map")?;
+        vec![oxml_cli_support::ReplacementPair {
+            placeholder,
+            value,
+            expect: input.expect,
+        }]
+    };
+    let borrowed = pairs
+        .iter()
+        .map(|pair| (pair.placeholder.as_str(), pair.value.as_str(), pair.expect))
+        .collect::<Vec<_>>();
     let mut doc = Document::open(file)?;
-    let count = doc.try_replace_text(placeholder, value)?;
-    if let Some(expected) = expect
-        && count != expected
-    {
-        return Err(format!(
-            "expected {expected} replacement(s) of \"{placeholder}\", found {count}"
-        )
-        .into());
+    let counts = if input.regex {
+        doc.try_replace_all_regex_expected(&borrowed)?
+    } else {
+        doc.try_replace_all_expected(&borrowed)?
     }
+    .map_err(|mismatch| {
+        format!(
+            "pair {}: expected {} replacement(s) of {:?}, found {}",
+            mismatch.index, mismatch.expected, mismatch.placeholder, mismatch.found
+        )
+    })?;
+    let total = counts
+        .iter()
+        .try_fold(0usize, |sum, count| sum.checked_add(*count))
+        .ok_or("replacement total overflow")?;
     publish_document(&mut doc, output)?;
+    if json_output {
+        return print_json(
+            json!({"operation":"replace","mode":if input.regex {"regex"} else {"literal"},
+            "pairs":pairs.iter().zip(&counts).enumerate().map(|(index,(pair,count))|json!({"index":index,"placeholder":pair.placeholder,"value":pair.value,"count":count,"expected":pair.expect})).collect::<Vec<_>>(),
+            "total_count":total,"output":output.display().to_string()}),
+        );
+    }
     let mut stdout = io::stdout().lock();
-    writeln!(
-        stdout,
-        "Replaced {count} occurrence(s) of \"{placeholder}\" -> \"{value}\""
-    )?;
+    for (pair, count) in pairs.iter().zip(counts) {
+        if input.regex {
+            writeln!(
+                stdout,
+                "Replaced {count} occurrence(s) of pattern {:?} -> {:?}",
+                pair.placeholder, pair.value
+            )?;
+        } else {
+            writeln!(
+                stdout,
+                "Replaced {count} occurrence(s) of \"{}\" -> \"{}\"",
+                pair.placeholder, pair.value
+            )?;
+        }
+    }
     writeln!(stdout, "Written to {}", output.display())?;
     Ok(())
 }
@@ -1382,11 +2163,27 @@ pub fn render(
     options: RenderOptions<'_>,
 ) -> Result<()> {
     validate_dpi(dpi)?;
+    check_revision_style(options.revision_view, options.revision_style)?;
     let doc = Document::open(file)?;
     let out_dir = output_dir.unwrap_or_else(|| Path::new("."));
     let (format, extension) =
         parse_image_format(options.format, options.quality, options.transparent)?;
-    let layout = doc.layout_deterministic()?;
+    let fonts = options
+        .font_dir
+        .map(oxml_layout::FontFile::from_dir)
+        .transpose()?
+        .unwrap_or_default();
+    let font_refs = fonts
+        .iter()
+        .map(|font| (font.family.as_str(), font.data.as_slice()))
+        .collect::<Vec<_>>();
+    let layout = doc.layout_with_fonts_and_bundled_fallback_and_options(
+        &font_refs,
+        rdocx::RenderOptions {
+            revision_view: options.revision_view,
+            revision_style: options.revision_style,
+        },
+    )?;
     let selected = selected_render_pages(layout.layout.pages.len(), options.page, options.pages)?;
     let stem = file.file_stem().unwrap_or_default().to_string_lossy();
     let legacy_single_page = options.page.is_some();
@@ -1453,6 +2250,10 @@ pub fn render(
                 writeln!(stdout, "Rendered {} page(s) at {dpi} DPI", selected.len())?;
             }
         }
+    }
+
+    for diagnostic in &layout.layout.diagnostics {
+        eprintln!("{}", diagnostic.message);
     }
 
     Ok(())
@@ -1578,166 +2379,15 @@ fn validate_dpi(dpi: f64) -> Result<()> {
 /// Advisory findings (empty paragraphs, missing metadata) are reported but do
 /// not affect the exit status.
 pub fn validate(file: &Path) -> Result<bool> {
-    let mut errors: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    // --- Structural errors ---
-
-    // Every relationship must point at a part that is actually in the package.
-    let package = oxml_opc::OpcPackage::open(file)?;
-    if let Some(doc_part) = package.main_document_part() {
-        if package.get_part(&doc_part).is_none() {
-            errors.push(format!("main document part {doc_part} is missing"));
-        }
-        if let Some(rels) = package.get_part_rels(&doc_part) {
-            for rel in &rels.items {
-                // External targets live outside the package by definition.
-                if rel.target_mode.as_deref() == Some("External") {
-                    continue;
-                }
-                let target = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
-                if package.get_part(&target).is_none() {
-                    errors.push(format!(
-                        "relationship {} points at missing part {target}",
-                        rel.id
-                    ));
-                }
-            }
-        }
-    } else {
-        errors.push("package declares no main document relationship".to_string());
-    }
-
-    // Every part needs a declared content type.
-    for part_name in package.parts.keys() {
-        if package.content_types.content_type_for(part_name).is_none() {
-            errors.push(format!("part {part_name} has no declared content type"));
+    let report = rdocx::validate_document_file(file)?;
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for finding in report.findings {
+        match finding.severity {
+            rdocx::ValidationSeverity::Error => errors.push(finding.message),
+            rdocx::ValidationSeverity::Warning => warnings.push(finding.message),
         }
     }
-
-    // Markup Compatibility requires every prefix that `mc:Ignorable` or
-    // `mc:MustUnderstand` lists to be declared, and a consumer may reject a
-    // part that breaks the rule. A part that does not parse as XML is
-    // outside this check.
-    let mut xml_parts = package
-        .parts
-        .iter()
-        .filter(|(part_name, _)| {
-            package
-                .content_types
-                .content_type_for(part_name)
-                .is_some_and(|content_type| content_type.ends_with("xml"))
-        })
-        .collect::<Vec<_>>();
-    xml_parts.sort();
-    for (part_name, xml) in xml_parts {
-        let Ok(findings) = rdocx_oxml::namespace::undeclared_compatibility_prefixes(xml) else {
-            continue;
-        };
-        for (attribute, prefix) in findings {
-            errors.push(format!(
-                "part {part_name} lists undeclared prefix `{prefix}` in mc:{attribute}"
-            ));
-        }
-    }
-
-    // Every XML part the main document relates to must be well formed. The
-    // style ids that its story parts name are checked once the document opens.
-    let mut style_references = Vec::new();
-    if let Some(doc_part) = package.main_document_part() {
-        let mut parts = vec![(doc_part.clone(), true)];
-        for rel in package
-            .get_part_rels(&doc_part)
-            .iter()
-            .flat_map(|rels| &rels.items)
-        {
-            if rel.target_mode.as_deref() == Some("External") {
-                continue;
-            }
-            let target = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
-            let story = STORY_RELATIONSHIPS.contains(&rel.rel_type.as_str());
-            if !parts.iter().any(|(known, _)| *known == target) {
-                parts.push((target, story));
-            }
-        }
-        for (part_name, story) in parts {
-            let is_xml = package
-                .content_types
-                .content_type_for(&part_name)
-                .is_some_and(|content_type| {
-                    content_type.ends_with("+xml") || content_type.ends_with("/xml")
-                });
-            let Some(xml) = package.get_part(&part_name).filter(|_| is_xml) else {
-                continue;
-            };
-            match xml_style_references(xml) {
-                Err(detail) => {
-                    errors.push(format!("part {part_name} is not well-formed XML: {detail}"));
-                }
-                Ok(references) if story => style_references.extend(
-                    references
-                        .into_iter()
-                        .map(|(kind, style_id)| (kind, style_id, part_name.clone())),
-                ),
-                Ok(_) => {}
-            }
-        }
-    }
-
-    // A malformed part can keep the document from opening. The errors found
-    // so far explain why, so they are reported together with the failure.
-    let doc = match Document::open(file) {
-        Ok(doc) => doc,
-        Err(error) if !errors.is_empty() => {
-            errors.push(format!("the document does not open: {error}"));
-            return report_validation(file, &errors, &warnings);
-        }
-        Err(error) => return Err(error.into()),
-    };
-
-    // Word falls back to the default style for a style id that no style
-    // defines, so the style that the document names is silently lost.
-    for (kind, style_id, part_name) in style_references {
-        let issue = format!("{kind} style {style_id:?} used in {part_name} is not defined");
-        if doc.style(&style_id).is_none() && !errors.contains(&issue) {
-            errors.push(issue);
-        }
-    }
-
-    // --- Advisory findings ---
-
-    if doc.content_count() == 0 {
-        warnings.push("Document has no content (no paragraphs or tables)".to_string());
-    }
-
-    let empty_count = doc
-        .paragraphs()
-        .iter()
-        .filter(|p| p.text().trim().is_empty())
-        .count();
-    if empty_count > 0 {
-        warnings.push(format!("{empty_count} empty paragraph(s) found"));
-    }
-
-    let mut prev_level: Option<u32> = None;
-    for (level, _) in doc.headings() {
-        if let Some(prev) = prev_level
-            && level > prev + 1
-        {
-            warnings.push(format!(
-                "Heading level gap: Heading{prev} -> Heading{level} (skipped level(s))"
-            ));
-        }
-        prev_level = Some(level);
-    }
-
-    if doc.title().is_none() {
-        warnings.push("Missing document title".to_string());
-    }
-    if doc.author().is_none() {
-        warnings.push("Missing document author".to_string());
-    }
-
     report_validation(file, &errors, &warnings)
 }
 
@@ -1866,9 +2516,1233 @@ fn word_value(
     Ok(None)
 }
 
+/// Parse a `NAME=VALUE` assignment, splitting at the first `=`.
+pub fn parse_assignment(text: &str) -> std::result::Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
+        _ => Err(format!("expected NAME=VALUE, found {text:?}")),
+    }
+}
+
+/// A date and time read from the command line, with the offset from UTC in
+/// minutes that it names, if any.
+struct ParsedDateTime {
+    value: FieldDateTime,
+    offset_minutes: Option<i32>,
+}
+
+/// Parse `YYYY-MM-DD`, optionally followed by `THH:MM`, `THH:MM:SS` or
+/// `THH:MM:SS.fff`, and by `Z` or an offset such as `+02:00` or `-0500`.
+fn parse_date_time(text: &str) -> std::result::Result<ParsedDateTime, String> {
+    let invalid = || {
+        format!(
+            "expected a date such as 2026-10-10, 2026-10-10T08:30:00, \
+             2026-10-10T08:30:00Z or 2026-10-10T08:30:00+02:00, found {text:?}"
+        )
+    };
+    let digits = |part: &str, count: usize| {
+        (part.len() == count && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
+    };
+    let (rest, offset_minutes) = if let Some(rest) = text.strip_suffix('Z') {
+        (rest, Some(0))
+    } else {
+        // An offset follows the date, or the time when there is one.
+        let search_from = text.find('T').unwrap_or(text.len().min(10));
+        if !text.is_char_boundary(search_from) {
+            return Err(invalid());
+        }
+        match text[search_from..].rfind(['+', '-']) {
+            Some(position) => {
+                let (rest, offset) = text.split_at(search_from + position);
+                let sign = if offset.starts_with('-') { -1 } else { 1 };
+                let offset = offset[1..].replace(':', "");
+                let (hours, minutes) = (
+                    digits(offset.get(0..2).unwrap_or_default(), 2),
+                    digits(offset.get(2..).unwrap_or_default(), 2),
+                );
+                let (Some(hours), Some(minutes)) = (hours, minutes) else {
+                    return Err(invalid());
+                };
+                if hours > 23 || minutes > 59 {
+                    return Err(invalid());
+                }
+                (rest, Some(sign * (hours * 60 + minutes) as i32))
+            }
+            None => (text, None),
+        }
+    };
+    let (date, time) = rest.split_once('T').unwrap_or((rest, "00:00:00"));
+    let time = time.split_once('.').map_or(time, |(whole, fraction)| {
+        if fraction.bytes().all(|byte| byte.is_ascii_digit()) && !fraction.is_empty() {
+            whole
+        } else {
+            ""
+        }
+    });
+    let date = date.split('-').collect::<Vec<_>>();
+    let time = time.split(':').collect::<Vec<_>>();
+    let [year, month, day] = date.as_slice() else {
+        return Err(invalid());
+    };
+    let (hour, minute, second) = match time.as_slice() {
+        [hour, minute] => (*hour, *minute, "00"),
+        [hour, minute, second] => (*hour, *minute, *second),
+        _ => return Err(invalid()),
+    };
+    let year = digits(year, 4).ok_or_else(invalid)?;
+    let month = digits(month, 2).filter(|month| (1..=12).contains(month));
+    let month = month.ok_or_else(invalid)? as u8;
+    let day = digits(day, 2).ok_or_else(invalid)? as u8;
+    let year = i32::try_from(year).map_err(|_| invalid())?;
+    if year == 0 {
+        return Err(invalid());
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return Err(invalid());
+    }
+    let hour = digits(hour, 2)
+        .filter(|hour| *hour < 24)
+        .ok_or_else(invalid)?;
+    let minute = digits(minute, 2).filter(|minute| *minute < 60);
+    let second = digits(second, 2).filter(|second| *second < 60);
+    Ok(ParsedDateTime {
+        value: FieldDateTime {
+            year,
+            month,
+            day,
+            hour: hour as u8,
+            minute: minute.ok_or_else(invalid)? as u8,
+            second: second.ok_or_else(invalid)? as u8,
+        },
+        offset_minutes,
+    })
+}
+
+/// Parse the wall-clock `--now` of a DATE or TIME field, which names no
+/// time zone.
+pub fn parse_field_date_time(text: &str) -> std::result::Result<FieldDateTime, String> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 19
+        || !bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
+    {
+        return Err(format!(
+            "--now requires YYYY-MM-DDTHH:MM:SS civil time without fractions or offsets, found {text:?}"
+        ));
+    }
+    let parsed = parse_date_time(text)?;
+    if parsed.offset_minutes.is_some() {
+        return Err(format!(
+            "--now is the wall-clock time the fields show, give it without Z or an offset, \
+             found {text:?}"
+        ));
+    }
+    Ok(parsed.value)
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
+/// Update supported caches through one native outer transaction.
+pub fn fields_update(
+    file: &Path,
+    now: Option<FieldDateTime>,
+    output: &Path,
+    json_output: bool,
+) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    let source_path = std::fs::canonicalize(file)?;
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("field input filename must be valid Unicode")?
+        .to_owned();
+    let file_path = source_path
+        .to_str()
+        .ok_or("field input path must be valid Unicode")?
+        .to_owned();
+    let mut doc = Document::open(file)?;
+    let report = doc.update_all_fields(&FieldEvaluationContext {
+        now,
+        file_name: Some(file_name),
+        file_path: Some(file_path),
+        ..Default::default()
+    })?;
+    publish_document(&mut doc, output)?;
+    mutation_record(
+        json_output,
+        "all-supported-stories",
+        "update",
+        json!({"ordinary_fields":report.ordinary_updated,"ordinary_updated":report.ordinary_updated,
+        "now":now.map(|n| format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",n.year,n.month,n.day,n.hour,n.minute,n.second)),
+        "page_fields":report.layout.page_fields,"num_pages_fields":report.layout.num_pages_fields,"page_reference_fields":report.layout.page_reference_fields,
+        "section_fields":report.layout.section_fields,"section_pages_fields":report.layout.section_pages_fields,
+        "layout":{"page_fields":report.layout.page_fields,"num_pages_fields":report.layout.num_pages_fields,
+            "page_reference_fields":report.layout.page_reference_fields,"section_fields":report.layout.section_fields,
+            "section_pages_fields":report.layout.section_pages_fields,"diagnostics":report.layout.diagnostics},
+        "evaluations":report.evaluations.iter().map(rdocx::FieldEvaluation::to_json_value).collect::<Vec<_>>(),
+        "diagnostics":report.diagnostics,"total_updated":report.total_updated,"saved_cache_scope":report.saved_cache_scope}),
+        output,
+    )
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FillControl {
+    tag: Option<String>,
+    alias: Option<String>,
+    id: Option<i32>,
+    kind: Option<rdocx_oxml::content_control::SdtType>,
+}
+
+fn fill_control_inventory(document: &Document) -> Vec<FillControl> {
+    document
+        .content_controls()
+        .into_iter()
+        .map(|control| FillControl {
+            tag: control.tag().map(str::to_owned),
+            alias: control.alias().map(str::to_owned),
+            id: control.id(),
+            kind: control.control_type(),
+        })
+        .collect()
+}
+
+enum FillTarget {
+    Control {
+        index: usize,
+        by_tag: bool,
+        value: String,
+    },
+    Legacy {
+        index: usize,
+        value: rdocx::LegacyFormFieldValue,
+    },
+}
+
+fn parse_form_values(path: &Path) -> Result<Vec<(String, Value)>> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 1024 * 1024;
+    const MAX_ASSIGNMENTS: usize = 4096;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("--values exceeds 1 MiB".into());
+    }
+    let text = std::str::from_utf8(&bytes)?;
+    let mut rest = text
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .strip_prefix('{')
+        .ok_or("--values requires a flat JSON object")?;
+    let mut values = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(tail) = rest.strip_prefix('}') {
+            if !tail.trim_matches([' ', '\t', '\r', '\n']).is_empty() || values.is_empty() {
+                return Err(
+                    "--values requires a nonempty JSON object without trailing data".into(),
+                );
+            }
+            return Ok(values);
+        }
+        if values.len() == MAX_ASSIGNMENTS {
+            return Err("--values exceeds 4096 assignments".into());
+        }
+        let mut key_stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let key = key_stream.next().ok_or("missing form key")??;
+        rest = rest[key_stream.byte_offset()..].trim_start_matches([' ', '\t', '\r', '\n']);
+        rest = rest
+            .strip_prefix(':')
+            .ok_or("expected ':' after form key")?
+            .trim_start_matches([' ', '\t', '\r', '\n']);
+        if key.is_empty() || !keys.insert(key.clone()) {
+            return Err(format!("empty or duplicate form key {key:?}").into());
+        }
+        if !matches!(
+            rest.as_bytes().first(),
+            Some(b'"' | b't' | b'f' | b'0'..=b'9')
+        ) {
+            return Err(format!(
+                "form value for {key:?} must be a string, bool or nonnegative integer"
+            )
+            .into());
+        }
+        // Decode one scalar, never an object map that could discard duplicate keys.
+        let mut scalar_stream = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        let value = scalar_stream.next().ok_or("missing form value")??;
+        match &value {
+            Value::String(_) | Value::Bool(_) => {}
+            Value::Number(number)
+                if number
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .is_some() => {}
+            _ => return Err(format!("invalid scalar form value for {key:?}").into()),
+        }
+        rest = rest[scalar_stream.byte_offset()..].trim_start_matches([' ', '\t', '\r', '\n']);
+        values.push((key, value));
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail.trim_start_matches([' ', '\t', '\r', '\n']);
+            if rest.starts_with('}') {
+                return Err("trailing comma in form values".into());
+            }
+        } else if !rest.starts_with('}') {
+            return Err("expected ',' or '}' after form value".into());
+        }
+    }
+}
+
+fn select_form_targets(
+    values: &[(String, Value)],
+    controls: &[FillControl],
+    fields: &[rdocx::LegacyFormFieldInfo],
+) -> Result<Vec<FillTarget>> {
+    let mut targets = Vec::with_capacity(values.len());
+    let mut selected = std::collections::HashSet::new();
+    for (key, value) in values {
+        let control_matches = controls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, control)| {
+                (control.tag.as_deref() == Some(key) || control.alias.as_deref() == Some(key))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let legacy_matches = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| (field.name.as_deref() == Some(key)).then_some(index))
+            .collect::<Vec<_>>();
+        if control_matches.len() + legacy_matches.len() != 1 {
+            let locations = legacy_matches
+                .iter()
+                .map(|index| format!("{}#{}", fields[*index].source_part, fields[*index].ordinal))
+                .collect::<Vec<_>>();
+            return Err(format!("form key {key:?} requires exactly one target, found SDT indices {control_matches:?} and legacy locations {locations:?}").into());
+        }
+        let target = if let Some(&index) = control_matches.first() {
+            if !selected.insert((true, index)) {
+                return Err(
+                    format!("form key {key:?} assigns an already selected SDT target").into(),
+                );
+            }
+            let control = &controls[index];
+            let value = match value {
+                Value::String(value) => value.clone(),
+                Value::Bool(value)
+                    if control.kind == Some(rdocx_oxml::content_control::SdtType::CheckBox) =>
+                {
+                    value.to_string()
+                }
+                _ => {
+                    return Err(format!(
+                        "SDT form key {key:?} requires string, or bool for checkbox"
+                    )
+                    .into());
+                }
+            };
+            FillTarget::Control {
+                index,
+                by_tag: control.tag.as_deref() == Some(key),
+                value,
+            }
+        } else {
+            let index = legacy_matches[0];
+            if !selected.insert((false, index)) {
+                return Err(
+                    format!("form key {key:?} assigns an already selected legacy target").into(),
+                );
+            }
+            let value = match (fields[index].kind, value) {
+                (rdocx::LegacyFormFieldKind::TextInput, Value::String(value)) => {
+                    rdocx::LegacyFormFieldValue::Text(value.clone())
+                }
+                (rdocx::LegacyFormFieldKind::CheckBox, Value::Bool(value)) => {
+                    rdocx::LegacyFormFieldValue::Checked(*value)
+                }
+                (rdocx::LegacyFormFieldKind::DropDownList, Value::Number(value)) => {
+                    rdocx::LegacyFormFieldValue::SelectedIndex(usize::try_from(
+                        value.as_u64().ok_or("invalid dropdown integer")?,
+                    )?)
+                }
+                _ => return Err(format!("legacy form key {key:?} has the wrong value kind").into()),
+            };
+            FillTarget::Legacy { index, value }
+        };
+        targets.push(target);
+    }
+    Ok(targets)
+}
+
+// Existing setters can remove typed legacy fields, but do not author new SDTs.
+// Re-resolve only explicit selectors against their frozen unique metadata. A
+// removed unrelated control must not turn a later vector index into authority.
+fn selected_control_is_current(
+    document: &Document,
+    key: &str,
+    by_tag: bool,
+    expected: &FillControl,
+) -> bool {
+    let inventory = fill_control_inventory(document);
+    let mut matches = inventory.iter().filter(|control| {
+        if by_tag {
+            control.tag.as_deref() == Some(key)
+        } else {
+            control.alias.as_deref() == Some(key)
+        }
+    });
+    matches.next() == Some(expected) && matches.next().is_none()
+}
+
+pub fn fill_values(
+    file: &Path,
+    values_path: &Path,
+    output: &Path,
+    json_output: bool,
+) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    let values = parse_form_values(values_path)?;
+    let document = Document::open(file)?;
+    let controls = fill_control_inventory(&document);
+    let fields = document.legacy_form_fields()?;
+    let targets = select_form_targets(&values, &controls, &fields)?;
+    let mut candidate = document.clone_for_staging();
+    let mut rows = vec![Value::Null; targets.len()];
+    let has_legacy = targets
+        .iter()
+        .any(|target| matches!(target, FillTarget::Legacy { .. }));
+    for (slot, target) in targets.iter().enumerate() {
+        if let FillTarget::Control {
+            index,
+            by_tag,
+            value,
+        } = target
+        {
+            if !selected_control_is_current(&candidate, &values[slot].0, *by_tag, &controls[*index])
+            {
+                return Err(
+                    format!("SDT identity drift before form key {:?}", values[slot].0).into(),
+                );
+            }
+            let key = &values[slot].0;
+            let count = if *by_tag {
+                candidate.set_content_control_value_by_tag(key, value)?
+            } else {
+                candidate.set_content_control_value_by_alias(key, value)?
+            };
+            if count != 1
+                || !selected_control_is_current(&candidate, key, *by_tag, &controls[*index])
+            {
+                return Err(format!(
+                    "SDT overlap or identity drift for form key {key:?} at index {index}"
+                )
+                .into());
+            }
+            rows[slot] = json!({"key":key,"target_kind":"content_control","selector_route":if *by_tag {"tag"} else {"alias"},"count":1});
+        }
+    }
+    for (slot, target) in targets.iter().enumerate() {
+        if let FillTarget::Control { index, by_tag, .. } = target
+            && !selected_control_is_current(&candidate, &values[slot].0, *by_tag, &controls[*index])
+        {
+            return Err("selected SDT target disappeared or changed during form fill".into());
+        }
+    }
+    let mut expected_fields = fields;
+    if has_legacy && candidate.legacy_form_fields()? != expected_fields {
+        return Err(
+            "mixed form fill refused: SDT edits changed the pre-edit legacy inventory".into(),
+        );
+    }
+    for (slot, target) in targets.iter().enumerate() {
+        if let FillTarget::Legacy { index, value } = target {
+            if candidate.legacy_form_fields()? != expected_fields {
+                return Err("legacy form identity or metadata drift before assignment".into());
+            }
+            let selected = &expected_fields[*index];
+            let updated = candidate.set_legacy_form_field_value(
+                &selected.source_part,
+                selected.ordinal,
+                value.clone(),
+            )?;
+            let mut expected = selected.clone();
+            expected.value = value.clone();
+            if updated != expected {
+                return Err("legacy form identity or value did not survive assignment".into());
+            }
+            expected_fields[*index] = expected;
+            if candidate.legacy_form_fields()? != expected_fields {
+                return Err("legacy form inventory drift after assignment".into());
+            }
+            rows[slot] = json!({"key":values[slot].0,"target_kind":"legacy_form_field","selector_route":"name","source_part":updated.source_part,"ordinal":updated.ordinal,"count":1});
+        }
+    }
+    let bytes = candidate.to_bytes()?;
+    let mut reopened = Document::from_bytes(&bytes)?;
+    if has_legacy && reopened.legacy_form_fields()? != expected_fields {
+        return Err("form inventory did not survive final reopen".into());
+    }
+    for (slot, target) in targets.iter().enumerate() {
+        if let FillTarget::Control { index, by_tag, .. } = target
+            && !selected_control_is_current(&reopened, &values[slot].0, *by_tag, &controls[*index])
+        {
+            return Err("selected SDT target did not survive final reopen".into());
+        }
+    }
+    publish_document(&mut reopened, output)?;
+    mutation_record(
+        json_output,
+        "accepted-main-body-and-supported-legacy-stories",
+        "fill",
+        json!({"assignments":rows,"count":values.len()}),
+        output,
+    )
+}
+
+pub fn fill(
+    file: &Path,
+    pairs: &[(String, String)],
+    output: &Path,
+    json_output: bool,
+) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    if pairs.is_empty() {
+        return Err("fill requires at least one --tag".into());
+    }
+    let borrowed = pairs
+        .iter()
+        .map(|(tag, value)| (tag.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let mut doc = Document::open(file)?;
+    let counts = doc.fill_content_control_tags(&borrowed)?;
+    publish_document(&mut doc, output)?;
+    mutation_record(
+        json_output,
+        "accepted-main-body",
+        "fill",
+        json!({"tags":pairs.iter().zip(counts).map(|((tag,value),count)|json!({"tag":tag,"value":value,"count":count})).collect::<Vec<_>>()}),
+        output,
+    )
+}
+
+fn core_properties_json(core: Option<&CoreProperties>) -> Value {
+    let field = |value: fn(&CoreProperties) -> &Option<String>| {
+        core.and_then(|core| value(core).as_deref())
+    };
+    json!({
+        "title": field(|core| &core.title),
+        "author": field(|core| &core.creator),
+        "subject": field(|core| &core.subject),
+        "keywords": field(|core| &core.keywords),
+        "description": field(|core| &core.description),
+        "category": field(|core| &core.category),
+        "last_modified_by": field(|core| &core.last_modified_by),
+        "created": field(|core| &core.created),
+        "modified": field(|core| &core.modified),
+        "content_status": field(|core| &core.content_status),
+        "identifier": field(|core| &core.identifier),
+        "language": field(|core| &core.language),
+        "last_printed": field(|core| &core.last_printed),
+        "revision": field(|core| &core.revision),
+        "version": field(|core| &core.version),
+    })
+}
+
+fn custom_property_json(property: &CustomProperty) -> Value {
+    let (kind, value) = match &property.value {
+        CustomPropertyValue::Lpstr(text) => ("lpstr", json!(text)),
+        CustomPropertyValue::Lpwstr(text) => ("lpwstr", json!(text)),
+        CustomPropertyValue::I4(value) => ("integer", json!(value)),
+        CustomPropertyValue::R8(value) => ("number", json!(value)),
+        CustomPropertyValue::Bool(value) => ("boolean", json!(value)),
+        CustomPropertyValue::FileTime(value) => ("date", json!(value)),
+        CustomPropertyValue::Empty => ("empty", Value::Null),
+        CustomPropertyValue::Raw(_) => ("other", Value::Null),
+    };
+    json!({ "name": property.name, "type": kind, "value": value, "pid": property.pid, "fmtid":property.fmtid, "raw_xml":match &property.value { CustomPropertyValue::Raw(raw)=>Some(raw), _=>None } })
+}
+
+/// Print the core and custom properties.
+pub fn meta_get(file: &Path, json_output: bool) -> Result<()> {
+    let doc = Document::open(file)?;
+    let core = core_properties_json(doc.core_properties());
+    let custom = doc
+        .custom_properties()
+        .iter()
+        .map(custom_property_json)
+        .collect::<Vec<_>>();
+    if json_output {
+        return print_json(json!({ "core": core, "custom": custom }));
+    }
+    let mut stdout = io::stdout().lock();
+    if let Value::Object(fields) = &core {
+        for (name, value) in fields {
+            if let Some(value) = value.as_str() {
+                writeln!(stdout, "{name}: {value}")?;
+            }
+        }
+    }
+    for property in &custom {
+        writeln!(
+            stdout,
+            "custom {} ({}): {}",
+            property["name"].as_str().unwrap_or_default(),
+            property["type"].as_str().unwrap_or_default(),
+            match &property["value"] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            }
+        )?;
+    }
+    Ok(())
+}
+
+/// The property changes of one `meta set` command.
+pub struct MetaChanges {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub custom: Vec<(String, String)>,
+    pub remove_custom: Vec<String>,
+}
+
+pub fn meta_set(
+    file: &Path,
+    changes: &MetaChanges,
+    output: &Path,
+    json_output: bool,
+) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    let values = [
+        &changes.title,
+        &changes.author,
+        &changes.subject,
+        &changes.keywords,
+        &changes.description,
+        &changes.category,
+    ];
+    if values.iter().all(|v| v.is_none())
+        && changes.custom.is_empty()
+        && changes.remove_custom.is_empty()
+    {
+        return Err("meta set requires an assignment".into());
+    }
+    let mut named = std::collections::HashSet::new();
+    for name in changes
+        .custom
+        .iter()
+        .map(|(name, _)| name)
+        .chain(&changes.remove_custom)
+    {
+        if !named.insert(name) {
+            return Err(format!("custom property {name:?} is named twice").into());
+        }
+    }
+    let parsed = changes
+        .custom
+        .iter()
+        .map(|(name, text)| Ok((name, parse_custom_value(text)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut doc = Document::open(file)?;
+    if values.iter().any(|v| v.is_some()) {
+        let mut core = doc.core_properties().cloned().unwrap_or_default();
+        let slots = [
+            &mut core.title,
+            &mut core.creator,
+            &mut core.subject,
+            &mut core.keywords,
+            &mut core.description,
+            &mut core.category,
+        ];
+        for (value, slot) in values.into_iter().zip(slots) {
+            if let Some(value) = value {
+                *slot = (!value.is_empty()).then(|| value.clone());
+            }
+        }
+        doc.set_core_properties(core)?;
+    }
+    for (name, mut value) in parsed {
+        let existing = doc.custom_property(name);
+        let (pid, fmtid) = if let Some(property) = existing {
+            if matches!(property.value, CustomPropertyValue::Lpstr(_))
+                && let CustomPropertyValue::Lpwstr(text) = value
+            {
+                value = CustomPropertyValue::Lpstr(text);
+            }
+            (property.pid, property.fmtid.clone())
+        } else {
+            let pid = doc
+                .custom_properties()
+                .iter()
+                .map(|p| p.pid)
+                .max()
+                .unwrap_or(1)
+                .max(1)
+                .checked_add(1)
+                .ok_or("custom property PID overflow")?;
+            (pid, "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}".to_owned())
+        };
+        doc.set_custom_property(CustomProperty {
+            pid,
+            fmtid,
+            name: Some(name.clone()),
+            value,
+        })?;
+    }
+    for name in &changes.remove_custom {
+        doc.remove_custom_property(name)?;
+    }
+    publish_document(&mut doc, output)?;
+    mutation_record(
+        json_output,
+        "document",
+        "set",
+        json!({"core":core_properties_json(doc.core_properties()),"custom":doc.custom_properties().iter().map(custom_property_json).collect::<Vec<_>>()}),
+        output,
+    )
+}
+
+fn parse_custom_value(text: &str) -> Result<CustomPropertyValue> {
+    let (kind, value) = text
+        .split_once(':')
+        .ok_or("custom value requires TYPE:VALUE")?;
+    Ok(match kind {
+        "str" => CustomPropertyValue::Lpwstr(value.to_owned()),
+        "int" => CustomPropertyValue::I4(value.parse()?),
+        "float" => {
+            let number = value.parse::<f64>()?;
+            if !number.is_finite() {
+                return Err("custom float must be finite".into());
+            }
+            CustomPropertyValue::R8(number)
+        }
+        "bool" => CustomPropertyValue::Bool(match value {
+            "true" => true,
+            "false" => false,
+            _ => return Err("custom bool requires true or false".into()),
+        }),
+        "filetime" if valid_custom_filetime(value) => {
+            CustomPropertyValue::FileTime(value.to_owned())
+        }
+        "empty" if value.is_empty() => CustomPropertyValue::Empty,
+        _ => return Err(format!("invalid custom property type or value {kind:?}").into()),
+    })
+}
+
+fn valid_custom_filetime(value: &str) -> bool {
+    let b = value.as_bytes();
+    if b.len() < 20
+        || !b.is_ascii()
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return false;
+    }
+    let number = |start: usize, end: usize| -> Option<u32> {
+        b[start..end]
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| value[start..end].parse().ok())
+            .flatten()
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let mut at = 19;
+    if b.get(at) == Some(&b'.') {
+        at += 1;
+        let start = at;
+        while b.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        if at == start {
+            return false;
+        }
+    }
+    if b.get(at) == Some(&b'Z') {
+        return at + 1 == b.len();
+    }
+    if !matches!(b.get(at), Some(b'+') | Some(b'-')) || at + 6 != b.len() || b[at + 3] != b':' {
+        return false;
+    }
+    number(at + 1, at + 3).is_some_and(|n| n <= 23)
+        && number(at + 4, at + 6).is_some_and(|n| n <= 59)
+}
+
+fn picture_json(picture: &PictureOccurrence, file: Option<&str>) -> Value {
+    json!({"story":story_json(picture.location.story()),"index_path":picture.location.index_path(),
+        "ordinal":picture.ordinal,"relationship_id":picture.relationship_id,"media_part_name":picture.media_part_name,
+        "content_type":picture.content_type,"width_emu":picture.width,"height_emu":picture.height,"description":picture.description,
+        "title":picture.title,"name":picture.name,"decorative":picture.decorative,"anchored":picture.anchored,
+        "status":if picture.external_url.is_some(){"external"}else{"internal"},"url":picture.external_url,"file":file})
+}
+
+/// Extract each internal media part once using generated safe names and rollback-capable publication.
+pub fn images_extract(file: &Path, dir: &Path, json_output: bool) -> Result<()> {
+    let doc = Document::open(file)?;
+    let pictures = doc.pictures()?;
+    let mut outputs = Vec::new();
+    let mut names = HashMap::new();
+    let mut listing = Vec::new();
+    for picture in &pictures {
+        let name = if let Some(part) = &picture.media_part_name {
+            if !names.contains_key(part) {
+                let ext = match picture.content_type.as_str() {
+                    "image/png" => "png",
+                    "image/jpeg" => "jpg",
+                    "image/gif" => "gif",
+                    "image/tiff" => "tiff",
+                    "image/bmp" => "bmp",
+                    "image/svg+xml" => "svg",
+                    "image/x-emf" => "emf",
+                    "image/x-wmf" => "wmf",
+                    _ => "bin",
+                };
+                let name = format!("image-{:06}.{ext}", names.len() + 1);
+                outputs.push((dir.join(&name), picture.bytes.clone()));
+                names.insert(part.clone(), name);
+            }
+            names.get(part).map(String::as_str)
+        } else {
+            None
+        };
+        listing.push(picture_json(picture, name));
+    }
+    let destinations = outputs
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    ensure_output_paths_allowed(&destinations, file, false)?;
+    ensure_output_paths_available(&destinations)?;
+    let existed = match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err("image destination must be a real directory".into());
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !outputs.is_empty() {
+        if !existed {
+            std::fs::create_dir(dir)?;
+        }
+        if let Err(error) = stage_and_publish(&outputs, false) {
+            if !existed {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(error);
+        }
+    }
+    if json_output {
+        print_json(
+            json!({"operation":"images-extract","pictures":listing,"extracted_parts":outputs.len(),"directory":dir.display().to_string()}),
+        )
+    } else {
+        writeln!(
+            io::stdout(),
+            "Extracted {} media part(s), {} picture occurrence(s)",
+            outputs.len(),
+            pictures.len()
+        )?;
+        Ok(())
+    }
+}
+
+/// Inputs for one explicitly licensed embedded font face.
+pub struct FontEmbedOptions<'a> {
+    pub name: &'a str,
+    pub font: &'a Path,
+    pub kind: &'a str,
+    pub license_authorized: bool,
+    pub license_identity: &'a str,
+    pub font_key: Option<&'a str>,
+    pub subsetted: bool,
+    pub output: &'a Path,
+    pub json: bool,
+}
+
+fn font_kind(value: &str) -> Result<rdocx::EmbeddedFontKind> {
+    match value {
+        "regular" => Ok(rdocx::EmbeddedFontKind::Regular),
+        "bold" => Ok(rdocx::EmbeddedFontKind::Bold),
+        "italic" => Ok(rdocx::EmbeddedFontKind::Italic),
+        "bold-italic" => Ok(rdocx::EmbeddedFontKind::BoldItalic),
+        _ => Err("font kind must be regular, bold, italic or bold-italic".into()),
+    }
+}
+fn font_kind_name(kind: rdocx::EmbeddedFontKind) -> &'static str {
+    match kind {
+        rdocx::EmbeddedFontKind::Regular => "regular",
+        rdocx::EmbeddedFontKind::Bold => "bold",
+        rdocx::EmbeddedFontKind::Italic => "italic",
+        rdocx::EmbeddedFontKind::BoldItalic => "bold-italic",
+    }
+}
+fn font_setting(value: Option<&str>) -> Result<Option<Option<bool>>> {
+    value
+        .map(|value| match value {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            "none" => Ok(None),
+            _ => Err("font setting must be true, false or none".into()),
+        })
+        .transpose()
+}
+fn read_font_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: usize = 64 * 1024 * 1024;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err("font input must be a local regular file".into());
+    }
+    let mut file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err("font input must be a local regular file".into());
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let request = chunk.len().min(LIMIT - bytes.len() + 1);
+        let count = file.read(&mut chunk[..request])?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > LIMIT - bytes.len() {
+            return Err("font input exceeds 64 MiB".into());
+        }
+        bytes.try_reserve(count)?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+pub fn font_embed(file: &Path, options: &FontEmbedOptions<'_>) -> Result<()> {
+    ensure_output_paths_allowed(&[options.output.to_path_buf()], file, false)?;
+    ensure_output_paths_allowed(&[options.output.to_path_buf()], options.font, false)?;
+    ensure_output_paths_available(&[options.output.to_path_buf()])?;
+    if !options.license_authorized || options.license_identity.trim().is_empty() {
+        return Err(
+            "font embedding needs explicit authorization and a nonempty license identity".into(),
+        );
+    }
+    let data = read_font_file(options.font)?;
+    let kind = font_kind(options.kind)?;
+    let mut document = Document::open(file)?;
+    let key = match options.font_key {
+        Some(key) => key.to_owned(),
+        None => rdocx::derive_font_key(&data)?,
+    };
+    document.embed_font(
+        options.name,
+        rdocx::EmbeddedFont {
+            kind,
+            data,
+            font_key: key,
+            subsetted: options.subsetted,
+            license: rdocx::FontEmbeddingLicense::new(
+                options.license_authorized,
+                options.license_identity,
+            ),
+        },
+    )?;
+    let bytes = document.to_bytes_for_path(options.output)?;
+    stage_and_publish(&[(options.output.to_path_buf(), bytes)], false)?;
+    font_mutation_record("embed", options.name, options.output, options.json)
+}
+pub fn font_remove(
+    file: &Path,
+    name: &str,
+    kind: Option<&str>,
+    output: &Path,
+    as_json: bool,
+) -> Result<()> {
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_available(&[output.to_path_buf()])?;
+    let mut document = Document::open(file)?;
+    let removed = if let Some(kind) = kind {
+        document
+            .remove_embedded_font(name, font_kind(kind)?)?
+            .is_some()
+    } else {
+        document.remove_font(name)?.is_some()
+    };
+    let bytes = document.to_bytes_for_path(output)?;
+    stage_and_publish(&[(output.to_path_buf(), bytes)], false)?;
+    if as_json {
+        print_json(json!({"scope": "font", "action": "remove", "name": name,
+        "kind": kind, "removed": removed, "output": output.display().to_string()}))
+    } else {
+        writeln!(io::stdout(), "Removed: {removed}")?;
+        Ok(())
+    }
+}
+fn font_mutation_record(action: &str, name: &str, output: &Path, as_json: bool) -> Result<()> {
+    if as_json {
+        print_json(json!({"scope": "font", "action": action, "name": name,
+        "output": output.display().to_string()}))
+    } else {
+        writeln!(
+            io::stdout(),
+            "{action}: {name}\nWritten to {}",
+            output.display()
+        )?;
+        Ok(())
+    }
+}
+pub fn font_settings(
+    file: &Path,
+    embed: Option<&str>,
+    system: Option<&str>,
+    subset: Option<&str>,
+    output: Option<&Path>,
+    as_json: bool,
+) -> Result<()> {
+    let embed = font_setting(embed)?;
+    let system = font_setting(system)?;
+    let subset = font_setting(subset)?;
+    let changed = embed.is_some() || system.is_some() || subset.is_some();
+    if changed != output.is_some() {
+        return Err(
+            "font settings mutations require --output and at least one explicit setting".into(),
+        );
+    }
+    if let Some(output) = output {
+        ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+        ensure_output_paths_available(&[output.to_path_buf()])?;
+    }
+    let mut document = Document::open(file)?;
+    if let Some(value) = embed {
+        document.set_embed_true_type_fonts(value)?;
+    }
+    if let Some(value) = system {
+        document.set_embed_system_fonts(value)?;
+    }
+    if let Some(value) = subset {
+        document.set_save_subset_fonts(value)?;
+    }
+    let flags = json!({"embed_true_type_fonts": document.embed_true_type_fonts()?,
+        "embed_system_fonts": document.embed_system_fonts()?,
+        "save_subset_fonts": document.save_subset_fonts()?});
+    if let Some(output) = output {
+        let bytes = document.to_bytes_for_path(output)?;
+        stage_and_publish(&[(output.to_path_buf(), bytes)], false)?;
+    }
+    if as_json {
+        print_json(json!({"scope": "font", "settings": flags,
+        "output": output.map(|path| path.display().to_string())}))
+    } else {
+        writeln!(io::stdout(), "{}", serde_json::to_string_pretty(&flags)?)?;
+        Ok(())
+    }
+}
+
+pub fn font_list(file: &Path, as_json: bool) -> Result<()> {
+    let document = Document::open(file)?;
+    let fonts = document
+        .try_fonts()?
+        .iter()
+        .enumerate()
+        .map(|(record_index, font)| {
+            let faces = font.embedded_fonts.iter().enumerate().map(|(face_index, face)| {
+            let (part_name, stored_len) = document.font_part_metadata(record_index, face_index)?;
+            Ok(json!({"kind": font_kind_name(face.kind), "format": "odttf", "part_name": part_name,
+                "stored_len": stored_len, "decoded_len": face.data.len(), "font_key": face.font_key,
+                "subsetted": face.subsetted}))
+        }).collect::<Result<Vec<_>>>()?;
+            Ok(
+                json!({"name": font.name, "alternate_name": font.alternate_name,
+            "family": font.family, "pitch": font.pitch, "faces": faces}),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if as_json {
+        print_json(json!({"fonts": fonts}))
+    } else {
+        for font in fonts {
+            writeln!(
+                io::stdout(),
+                "{}: {} face(s)",
+                font["name"].as_str().unwrap_or(""),
+                font["faces"].as_array().map_or(0, Vec::len)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// Bound file reads before allocation, independently of the native material parser.
+fn signing_material_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > LIMIT {
+        return Err("signing material must contain between 1 byte and 1 MiB".into());
+    }
+    Ok(bytes)
+}
+
+/// Sign a private candidate, then publish one complete new output with no replacement.
+pub fn sign(file: &Path, key: &Path, cert: &Path, output: &Path, as_json: bool) -> Result<()> {
+    oxml_cli_support::ensure_output_paths_allowed(&[output.to_owned()], file, false)?;
+    let key = signing_material_file(key)?;
+    let cert = signing_material_file(cert)?;
+    let mut candidate = rdocx::Document::open(file)?;
+    let report = candidate.sign(&key, &cert)?;
+    if !report.cryptographically_valid || !report.coverage_complete {
+        return Err("new signature did not authenticate complete current content".into());
+    }
+    let record = oxml_cli_support::signature_report_json(&report);
+    let bytes = candidate.to_bytes()?;
+    let mut staged = oxml_cli_support::StagedOutputSet::new();
+    staged.stage_bytes(output, &bytes)?;
+    staged.publish()?;
+    if as_json {
+        print_json(serde_json::json!({"signature": record}))?;
+    } else {
+        writeln!(
+            io::stdout(),
+            "Signed {} with complete package coverage (certificate trust not evaluated)",
+            output.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// Return true only for at least one signature, all valid with complete coverage.
+pub fn verify_signatures(file: &Path, as_json: bool) -> Result<bool> {
+    let mut current = rdocx::Document::open(file)?;
+    let bytes = current.to_bytes()?;
+    let reports = rdocx::Document::from_bytes(&bytes)?.verify_signatures()?;
+    let valid = !reports.is_empty()
+        && reports
+            .iter()
+            .all(|report| report.cryptographically_valid && report.coverage_complete);
+    let status = if reports.is_empty() {
+        "unsigned"
+    } else if reports.iter().any(|report| !report.cryptographically_valid) {
+        "invalid"
+    } else if reports.iter().any(|report| !report.coverage_complete) {
+        "partial"
+    } else {
+        "valid"
+    };
+    if as_json {
+        let records = reports
+            .iter()
+            .map(oxml_cli_support::signature_report_json)
+            .collect::<Vec<_>>();
+        print_json(serde_json::json!({"status": status, "signatures": records}))?;
+    } else {
+        writeln!(
+            io::stdout(),
+            "Signatures: {status} (certificate trust not evaluated)"
+        )?;
+        for report in &reports {
+            writeln!(
+                io::stdout(),
+                "{}: valid={}, complete={}",
+                report.signature_part,
+                report.cryptographically_valid,
+                report.coverage_complete
+            )?;
+            writeln!(
+                io::stdout(),
+                "{}",
+                oxml_cli_support::signature_report_json(report)
+            )?;
+        }
+    }
+    Ok(valid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Myers matches of `diff` are a longest common subsequence: equal,
+    /// strictly increasing pairs as many as the quadratic table finds.
+    #[test]
+    fn diff_matches_are_a_longest_common_subsequence() {
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % bound
+        };
+        for _ in 0..2_000 {
+            let alphabet = next(4) + 1;
+            let a: Vec<u32> = (0..next(30)).map(|_| next(alphabet) as u32).collect();
+            let b: Vec<u32> = (0..next(30)).map(|_| next(alphabet) as u32).collect();
+            let mut matches = Vec::new();
+            let mut frontiers = Frontiers::new(a.len() + b.len());
+            matching_indexes(&a, 0..a.len(), &b, 0..b.len(), &mut frontiers, &mut matches);
+            assert!(matches.iter().all(|&(i, j)| a[i] == b[j]), "{a:?} {b:?}");
+            assert!(
+                matches
+                    .windows(2)
+                    .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1),
+                "{a:?} {b:?} {matches:?}"
+            );
+            let mut lengths = vec![vec![0; b.len() + 1]; a.len() + 1];
+            for i in 1..=a.len() {
+                for j in 1..=b.len() {
+                    lengths[i][j] = if a[i - 1] == b[j - 1] {
+                        lengths[i - 1][j - 1] + 1
+                    } else {
+                        lengths[i - 1][j].max(lengths[i][j - 1])
+                    };
+                }
+            }
+            assert_eq!(matches.len(), lengths[a.len()][b.len()], "{a:?} {b:?}");
+        }
+    }
 
     #[test]
     fn inspect_json_uses_the_shared_schema_one_envelope() {
@@ -1891,6 +3765,14 @@ mod tests {
                     "keywords": document.keywords(),
                 },
                 "styles_used": styles,
+                "word_count": 0,
+                "character_count": 0,
+                "page_count": 1,
+                "count_scope": "accepted-main-body",
+                "character_include_spaces": true,
+                "page_count_source": "deterministic-layout",
+                "diagnostics": [],
+                "pictures": [],
             })
         );
     }
@@ -1917,6 +3799,8 @@ mod tests {
             false,
             96,
             None,
+            RevisionView::Accepted,
+            RevisionStyle::Plain,
             ImageOptions {
                 pages: None,
                 quality: 90,

@@ -3,6 +3,35 @@
 Owner: `oxml-opc`, with media naming in `oxml-media`.
 
 ## The package
+Bibliography source transactions resolve the qualified source collection
+through the document-owned custom XML graph. Source identity, GUID, relationship
+owner and schema particle checks precede publication. Unmodeled members,
+namespace scopes, repeated producer values, raw LCID and RefOrder occurrences
+and unrelated package parts remain preserved. Duplicate or ambiguous identities,
+malformed graphs, referenced deletion and stale paths refuse atomically.
+No-op source replacement retains identical source bytes.
+
+Citation and bibliography cache updates use a staged package and only publish
+after every eligible owner succeeds. One recognized unfinished standard branch
+aborts the whole update, including earlier candidate edits. Noncatalogue paths
+retain their complete cache with report diagnostics. Locked fields and protected
+producer topologies keep their own retained or refusal boundary. Simple fields
+expand only when their qualified owner and producer attributes are proved.
+Structured results preserve physical begin/separate/end spans, outside content,
+first/interior paragraph context and IEEE label/cell/grid ownership.
+Ordinary save does not refresh these caches or rewrite source metadata.
+
+
+Generated-table edits stage source targets and provisional cache paragraphs
+in one candidate. Only the owned separator-to-end cache span is replaced.
+Supported simple generated owners expand to complex fields with the exact
+producer instruction and result XML retained during expansion. Expanded names
+and ancestor namespace bindings qualify every owner and generated paragraph.
+Locked fields, unsupported formatting, unsupported locales and unmeasured sort
+keys retain their complete owner and cache with diagnostics. Unknown source
+XML and original style definitions stay untouched. Missing, ambiguous or
+unplaced required targets and malformed spans abort without publishing any
+candidate part.
 
 ```rust
 pub struct OpcPackage {
@@ -85,7 +114,11 @@ and application properties with exact content types and internal
 relationships. `Document::new()` selects Word-compatible DOCX. DOCM and DOTM
 declare macro-capable main-part identity without inventing a VBA project. Empty
 core properties omit created and modified timestamps, so equivalent fresh
-constructions remain byte-identical.
+constructions remain byte-identical. Fresh application properties stamp the
+crate major and minor version as an `XX.YYYY` AppVersion, the form Word opens.
+Reading a package repairs a malformed AppVersion on save. An `rdocx` property
+gets the current stamp, another producer loses that attribute, and a valid
+AppVersion leaves its original part byte-identical.
 Word-compatible construction includes the common Word style definitions in its
 initial styles part. It does not add a template part or alter producer styles
 when opening an existing package.
@@ -98,6 +131,34 @@ records are not public story owners. Each `StoryId` includes the normalized
 source part, owner kind, source-order ordinal, and a structural fingerprint.
 Any changed owner makes a retained identity stale before indexed content can be
 resolved.
+
+Rich footnote authoring reserves the relationship-resolved footnotes part,
+adds one normal note with an available internal ID, and inserts its body
+reference in one staged package. Reorder moves only the selected note element
+within the part. Removal deletes that element and every matching body
+reference before the candidate is reopened. Common story edits preserve
+untouched note children, separator records, producer prefixes, and unrelated
+part relationships. Pictures and hyperlinks use the footnotes part relationship
+set, and comment anchors in note paragraphs use the comments part.
+
+Endnote authoring uses the relationship-resolved endnotes part and its own
+normal ID namespace. Creation inserts the note and body reference together.
+Reorder moves an exact endnote element, while removal deletes that element and
+its body references. The staged package reopens before publication. Endnote
+story edits preserve separator records, unknown children, and unrelated
+relationships. Pictures and hyperlinks are owned by the endnotes part.
+
+Checked document and section note policies retain unmodelled property children
+while writing position, format, start, and restart in schema order. The
+document policy lives in the relationship-resolved settings part. An authored
+separator, continuation separator, or continuation notice replaces only its
+special note owner in the relevant note part. The corresponding settings note
+property records the special ID. This namespace remains separate from normal
+note IDs and unselected special records do not render. Removing only the
+numbering or placement policy retains special-record selection and unmodelled
+property children. Special records are never public note stories. Custom reference
+marks live in the body reference and in the note owner's marker run. Package
+mutation is staged through save and reopen before publication.
 
 Revision inventory uses these same supported story owners and reports their
 `StoryId` with each record. A revision reachable by resolution without a
@@ -117,6 +178,14 @@ boundary. Unmodelled and rejected subtrees remain opaque and byte-preserved.
 Story-wide hyperlink projection retains the source byte position only while
 building its result, then returns existing locations and link records in that
 physical order. Relationship lookup remains scoped to the owning story part.
+Private complex-field excerpts wrap exact sibling runs in one namespace context,
+including inherited aliases, default bindings and authoritative foreign shadows.
+Local declarations retain their original positions. The wrapper is never saved.
+Text and hyperlink scans preserve the field marker interval inside that excerpt,
+and hyperlink endpoints translate back only within the original source interval.
+A hyperlink wrapper inside a complex field remains subject to the existing typed
+source-equality admission proof rather than becoming an admitted field merely
+because the private scanner can read that shape.
 
 The main Word document reader accepts one namespace-correct `document` root
 and one namespace-correct `body` child, rejects truncation, duplicate roots,
@@ -143,6 +212,29 @@ invalid paths, bounds failures, kind mismatches, non-text items, XML failures,
 and reopen failures leave the original document bytes and facade-owned package
 state unchanged.
 
+Scoped literal replacement uses the existing run-aware matcher through an owned
+Document transaction. `try_replace_text_at` checks paragraph, table and block
+control locations, including supported two-segment control paragraph paths.
+A recursive facade handle maps by actual direct paragraph identity. Nested
+control and table paragraphs have no two-segment location.
+The hidden cell-coordinate entrance selects one physical cell or one of its
+paragraphs. Whole-cell scope includes supported nested tables and controls.
+Fields, drawings and opaque story items are not independently writable targets.
+Matching retains existing wrapper, revision and field boundaries and never
+joins paragraphs or searches another textbox story. Count mismatch and zero
+matches publish nothing. Positive edits serialize and reopen the complete
+candidate before one commit.
+
+Main-source selection preserves original unselected bytes. Existing strict
+namespace replay proves the current canonical physical owner inventory. Two
+private existing-model projections replace the canonical and proposed retained
+selected spans with the same collision-free schema-valid sentinel. Normalized
+baseline equivalence and exact probe equality, with one observable sentinel in
+each, prove the physical position even among identical siblings. Selected and
+unrelated producer property normalization is supported. The sentinel never
+enters the published candidate. Namespace, projection or reopening refusal
+leaves the live model and package untouched.
+
 Generic story content mutation uses the same package boundary. Existing-item
 destinations are canonical flattened locations that must resolve to actual
 direct owner children. The explicit story-end destination remains before body
@@ -158,6 +250,14 @@ candidate without changing the live document. Direct body inventory recognizes
 section properties only among preserved nodes, so ordinary paragraphs and
 tables do not repeat namespace-prefix scans. One clone still performs one
 identity-freshening pass and one complete staged reopen.
+
+Python HTML insertion resolves a required live paragraph to its physical story
+and direct-child boundary. Foreign, stale and unsupported owners refuse before
+publication. Native conversion, package validation and detached diagnostic
+allocation finish on a staged candidate before document or revision changes.
+Empty insertion preserves existing handles. Markdown template import preserves
+style, numbering, header, footer and opaque package graphs while replacing the
+main body before its final section boundary.
 
 HTML fragment insertion uses the same transaction. `HtmlImageResource` maps an
 exact source string to caller-owned bytes and a filename. Data-URI images are
@@ -197,9 +297,11 @@ namespace-aware XML on every canonicalization. Removing a paragraph retires a
 zero-use occurrence without deleting the relationship definition retained by
 its owned fragment. Same-owner clones keep a shared relationship definition
 and remap every live reference simultaneously. Each live authored picture
-occurrence receives its own global `wp:docPr` identity. Producer-owned raw
-references remain fixed occupants, and image part naming follows final
-serialized relationship order.
+occurrence receives its own global `wp:docPr` identity. A producer may repeat
+a drawing ID within one part. Its occurrence count is retained, and a staged
+mutation rejects an increase in that count. Fresh authored IDs avoid the
+package-wide occupied union. Producer-owned raw references remain fixed
+occupants, and image part naming follows final serialized relationship order.
 
 Theme and font authoring retain the relationship-resolved targets already in a
 package. A missing theme or font table receives one collision-safe part,
@@ -384,8 +486,43 @@ document. The relationship must be internal, its normalized target must not
 escape the package root, the part must exist, and its override must use the
 Word glossary content type. Duplicate, external, traversal-shaped, missing,
 wrong-type, and malformed-root graphs fail before document mutation.
-Building-block replacement enters the canonical staged preparation and
-provenance-reconciling reopen path before publication.
+Glossary creation reserves one internal relationship, part and override as
+one bundle. Last-entry removal retains that valid empty part. Creation,
+replacement, removal and placeholder binding enter canonical staged
+preparation and provenance-reconciling reopen before publication. Fragment
+content resolves its dependency closure from the physical glossary owner.
+Typed creation rejects dependency references requiring a source package.
+Fragment creation, fragment body update, reverse capture and insertion omit
+qualified comment markers before review dependency capture. Omission includes
+selected note and textbox content and retains mixed run properties, wrappers,
+foreign lookalikes, comments and PIs. New direct replacement bodies follow the
+same marker omission policy. Dependency-free typed creation retains its
+existing refusal of comment-bearing bodies. Metadata-only updates keep the
+existing body and review state.
+
+A glossary comments relationship identifies an independent physical review
+owner only when exactly one valid internal target has qualified comment
+content. The same strict thread and companion graph handles main and local
+cleanup. Shared physical review dependencies, ambiguous, external, missing or
+malformed local mappings refuse. A physical note source with qualified comment
+markers cannot belong to both review owners. Shared unannotated notes remain
+valid. Local companion relationships without local
+comments definitions also refuse. With no local review edges, legacy
+main-owned glossary markers retain strict main ownership proof. Local producer
+comment parts and relationships remain retained after complete owned cleanup.
+Forward transfer bounds marker omission and initial note selection to the
+namespace-complete prepared body content being transferred. Retained root
+producer payload stays outside that interval and glossary dependency capture.
+Generic transfer keeps its existing dependency admission. Final section properties join
+omission only when the fragment includes them, retaining their physical
+section owner and existing generic identity admission. Forward transfer derives its recursive note closure from the prepared selected
+main body, omitting only referenced note owners and their selected textbox
+content. Unselected owners in the same physical note part retain their bytes
+and do not affect omission refusal. Reverse capture uses the same bounded
+main-owned note traversal before constructing a main-owned fragment. A glossary-local note
+relationship refuses projection through main numeric note ownership. It never
+selects an unrelated equal-id main note.
+
 
 Both facades resolve core properties through the package-level
 `CORE_PROPERTIES` relationship and retain its normalized target. Immutable
@@ -432,6 +569,15 @@ writes the style's `w:numPr` and the effective definition or replacement
 level's `w:pStyle` on a staged document, validates both style and numbering
 graphs, serializes the candidate, and then publishes it. Unlinking requires the
 same exact style, instance, and level tuple and removes both edges together.
+A style `w:numPr` that holds a `w:ilvl` and no `w:numId`, as python-docx's
+default `Subtitle` does, owns no link. It takes the instance of its `basedOn`
+chain, as layout and Word do, and has no numbering when the chain has none.
+Linking such a style replaces its level, and unlinking it later removes its
+`w:numPr` rather than restoring the level. When a numbering level names such a
+style back, unlinking removes only that name. Unlinking one that no level names
+changes nothing. A paragraph `w:ilvl` without a
+`w:numId` takes the instance of its style chain in the same way, which is how a
+repeated template paragraph is checked.
 
 Numbering parsers retain namespace declarations and compatibility attributes
 from modelled containers. Unknown level and override children use their schema
@@ -447,7 +593,7 @@ in their original namespace and schema positions. Typed `w:ilvl` and `w:numId`
 updates remain before retained `w:numberingChange` and insertion properties.
 Self-closing `w:numPr` carriers copy any inherited namespace binding required
 by a retained root attribute onto the serialized carrier.
-An unchanged plain numeric leaf may use the typed serializer's indentation,
+An unchanged plain numeric leaf may use the typed serializer's layout,
 while malformed or extended source leaves remain byte-exact.
 
 Every standard `w:numFmt` token has a typed representation. Producer-defined
@@ -466,8 +612,10 @@ safely, leaving the opened package bytes authoritative.
 The main document, header, footer, comments, footnotes, endnotes, and styles
 roots retain their other attributes, such as `mc:Ignorable`, in source order.
 A rewrite keeps each compatibility attribute with declarations for every
-prefix it lists. An unchanged part keeps its exact producer bytes, including
-an empty self-closed comments root.
+prefix it lists. The typed Word part serializers write without indentation, so
+rewritten document, story, comment, style and numbering parts retain compact
+layout and gain no whitespace-only text between elements. An unchanged part
+keeps its exact producer bytes, including an empty self-closed comments root.
 Story insertion reads the retained main-part XML while it matches the typed
 model. Picture insertion adds one paragraph at its body boundary. Canonical
 relationship and drawing identifiers are patched into that retained XML, so
@@ -494,15 +642,25 @@ only when a retained attribute uses its prefix, because the alias machinery
 already materializes a binding onto every element that needs one, and recording
 a declaration a child carries for itself would emit it twice. A root carrying
 nothing but declarations retains no record at all. On the way back out, the
-canonical `w14` binding is not copied onto the written element, since the part
-root that owns the element declares it in what Word and python-docx write, and
-the authored identity write makes the same assumption. Together these keep a
+canonical `w` and `w14` bindings are not copied onto the written element, since
+the part root that owns the element declares them in what Word and python-docx
+write, and the element's own `w:` name and the authored identity write make the
+same assumption. A binding of either prefix to another URI is still copied. Together these keep a
 reopened save byte identical to the save it was read from. A part root that
 does not declare `w14`, such as one rdocx wrote or one under an element that
 declared the prefix itself, gains the canonical declaration when the written
 content uses the prefix. The serializers of the document, header, footer,
 note and comment parts and the comparison output of every story add it, so the
-written part stays namespace well formed.
+written part stays namespace well formed. During complete part serialization,
+a retained attribute also omits same-URI bindings already guaranteed by that
+part root: `r` and `mc` for the main document, canonical `wp` when that root
+actually writes it, `r` and conditionally canonical `wp` for headers and
+footers, and `r` for footnotes and endnotes. Standalone paragraphs and
+comments keep their own bindings. A scoped serializer context restores its
+previous guarantees after nested calls and errors. The retained-attribute
+regression checks one declaration of each canonical prefix at the document
+root, alongside producer attributes, a new binding, and an unchanged
+unmodelled child.
 
 A paragraph cut out of its part and parsed on its own carries none of the
 declarations of its part. The table-of-contents rebuild adds the bindings the
@@ -540,7 +698,7 @@ decimal `w:spacing/@w:line` value is normalized with exact decimal arithmetic
 to the nearest integer twip, with exact halves rounded away from zero.
 Exponent notation, malformed forms, non-finite spellings, and numeric values
 outside the signed 32-bit range remain errors. The modeled value serializes as
-one canonical integer without widening decimal acceptance to sibling measures.
+one canonical integer while other modeled integer measurements use the same exact rounding rule.
 
 Direct paragraph `m:oMath` and `m:oMathPara` children use that same owner and
 boundary discipline. The reader accepts any prefix bound to the Transitional
@@ -561,6 +719,16 @@ matrix, and diagnostic limits. Its writer emits one default MathML namespace,
 stable attributes, ordered children, and explicit `mo` fences. `mfenced` is
 accepted only on input. Unsupported safe content is diagnosed, and descendants
 are retained only at the declared transparent `semantics` boundary.
+
+The bounded LaTeX subset preserves `\pi`, `\to` and `\rightarrow`, `\infty`,
+upright `\lim`, and explicit `\,` thin spacing. Ordinary characters are single
+TeX atoms, so scripts bind to their original base before compatible runs merge.
+The supported inline `lim` uses the existing subscript expression. MathML `mathvariant` accepts
+`normal`, and `mspace` accepts exactly `0.167em` or `thinmathspace`. The writer
+preserves supported upright formatting and meaningful U+2009 spacing. Unsupported
+variants, widths, and LaTeX spacing commands retain ordered loss diagnostics.
+An invisible U+2061 function application operator normalizes only directly after
+the supported upright `lim` token, with other operators retained.
 
 Logical owner identity includes exact normalized raw marker multiplicity and
 the resolved namespace facts of owner-dependent element and attribute uses.
@@ -614,6 +782,16 @@ producer declarations and compatibility attributes in source order. Comment
 range and reference anchors remain ordered among neighbouring paragraph and
 run XML. A document without a comments relationship does not gain a comments
 part, relationship, or override during an ordinary save.
+
+Story-qualified marker edits resolve both endpoints through the same body,
+table-cell, text-box, header, footer, note or comment owner. Block content
+controls expose their contained paragraphs under a second path segment in
+each owner. Namespace-resolved scans pair bookmark, comment, permission and
+proofing markers in accepted-view order. Rewrites splice only the affected
+paragraph bytes into its owning part and retain unrelated siblings and
+unsupported markers. Invalid owner paths, crossing or unmatched pairs, stale
+snapshots, duplicate names and exhausted identifiers reject the staged edit
+without changing the live package.
 
 The Word facade resolves an existing settings part through the main document's
 `SETTINGS` relationship and retains the normalized target instead of assuming
@@ -743,6 +921,22 @@ resolvable. Section-aware text watermark replacement touches only the selected
 API-owned shape. It neither synthesizes unrelated header variants nor enables
 the document-wide even-and-odd setting.
 
+Comment deletion uses namespace-qualified raw source markers across every
+relationship-resolved Word story, including preserved wrappers and revisions.
+The same inventory validates orphan roots without interpreting accepted-view
+ranges. Point references are valid and linked replies need no separate anchor.
+Deletion of a demonstrably undefined marker follows the existing editing
+lifecycle because there is no definition to orphan. Absence is proved from
+qualified raw definition entries at the actual relationship target. Missing
+or ambiguous owned sources refuse, and CLI validation still reports dangling
+markers.
+Complete thread removal splices only owned definition and companion rows,
+using last-paragraph ids and commentsIds durable linkage for
+commentsExtensible. Actual internal relationship targets remain authoritative.
+Ambiguous linkage, a surviving endpoint or reference, or unrelated anchors
+inside a removed comment definition refuse atomically. Unknown root and entry
+payload remains unchanged outside the selected owned rows.
+
 Threaded comments add a document relationship using the Microsoft
 `commentsExtended` relationship type. The facade retains its resolved target
 and writes the standard
@@ -751,7 +945,9 @@ content type at that exact part. New comment state creates both relationships
 and both overrides together. An ordinary save retains an accepted standard
 override and unrelated comments-extended sidecar XML. Existing custom targets
 remain authoritative, and removal of the final API-owned thread removes only
-the parts, relationships, and overrides created by the typed model.
+the parts, relationships, and overrides created by the typed model only when
+no opaque root attributes or children remain. Imported empty parts and
+unrelated companion payload are retained.
 
 Modern PowerPoint collaboration follows two independent relationship scopes.
 The presentation part owns at most one Microsoft authors relationship, and
@@ -863,6 +1059,15 @@ document state. The mutation becomes visible only after the typed ChartML,
 SpreadsheetML workbook, relationships, content types, structured drawing,
 theme projection, and shared identifier owner all validate.
 
+Chart data replacement resolves the unique current graphic-frame identity,
+its namespace-owned relationship and the actual chart/workbook graph. Shared
+chart or workbook parts use copy-on-write, including style and colour edges.
+Case-equivalent occupied part names cannot be overwritten. Replacement retains
+unselected package entries and source-splices owned relationship/frame targets
+so namespace aliases, foreign attributes and opaque children survive. Cache,
+formula and worksheet changes publish together after validation. Exact no-op
+and failed candidates leave the complete live graph unchanged.
+
 An authored Word chart requires one effective internal document-theme edge.
 Its target must exist, carry the exact theme content type, and parse as a
 DrawingML theme. A valid related theme is reused. Otherwise the facade stages
@@ -954,6 +1159,39 @@ numbered part after the greatest occupied suffix. The sniffed canonical
 extension and content type are registered with the package. Each source slide
 creates or reuses its own internal image relationship to that shared part, with
 a relative target resolved from the slide part name.
+Cross-presentation slide import uses complete byte equality for images,
+audio and video, including parts outside `/ppt/media/`. One staged destination
+candidate preflights the selected graph and allocates copied parts, slide IDs,
+relationship scopes and slide-jump maps before publication. Shared parts use
+one source-to-destination part map. Charts include their workbook, style and
+colour dependencies. Embedded objects retain bytes and previews. Notes,
+comments and actual author or person references retain their qualified owners.
+External relationships preserve their address and mode. Unsupported internal
+types report the actual type and owner path before any destination change.
+
+Classic and modern comment identities have separate collision checks. Required
+parent records, replies and assigned persons join the selected closure. Authors
+merge by complete supported identity, not display name. Qualified numeric and
+relationship references remap together, while foreign lookalikes and opaque
+root or record payload remain preserved. Unmapped slide jumps release only the
+actual owned action and unused relationship, preserving shared references and
+click sounds, and produce an owner-specific diagnostic.
+
+Source-formatting import carries required presentation-global table styles and
+embedded font graphs without overwriting destination definitions. Equal graphs
+may be reused only with complete source, namespace and relationship proof.
+Relationship roots, ordered records, opaque payload and effective namespace
+contexts participate in equality. Only graph-proven assigned IDs and resolved
+target identities normalize for comparison. Copied relationship targets are
+resolved from the original owner and written relative to the actual new owner
+without changing retained record metadata.
+Style collisions remap selected imported references to noncolliding identities.
+Source-default style inheritance is preserved explicitly when destination
+defaults differ. Stored font programs retain their original bytes and qualified
+face descriptions. A conflicting same-typeface face or ambiguous opaque
+metadata refuses atomically when both owners cannot be preserved. Only source-enabled programs participate, preserving the source activation
+state. No copied font is re-encoded or assigned fabricated license
+authorization.
 
 The presentation HTML importer accepts image bytes only through
 `HtmlImageResource`. The HTML source string is an exact lookup key. Missing
@@ -1011,6 +1249,12 @@ advances. Fill bytes and truncated input return safely. Preserve these
 invariants when the reader moves to `oxml-media`.
 
 ## Package integrity
+
+A qualified self-closing Word comment owner has an empty paragraph inventory.
+Its record and opaque attributes remain byte-preserved through listing, field
+updates and save/reopen. Namespace ownership and excerpt bounds are checked
+before source offsets become editable coordinates. Foreign lookalikes do not
+become story owners, and invalid scopes return errors.
 
 Both facades expose a `validate()` that is cheap, non-panicking, and run
 automatically under `debug_assertions` before `save`. It checks dangling
@@ -1087,11 +1331,11 @@ external slide layouts reject before any destination part or relationship is
 published.
 
 Word table widths, cell widths, table indents, and default cell margins share
-one exact signed-integer projection. The parser accepts integer lexical forms
-and decimals only when the nonempty fractional portion contains zeroes. It
-checked-parses the integer portion into `i32` without floating point. Fractional
-values, exponent forms, empty fractions, overflow, percentages, universal
-measures, and malformed input fail explicitly instead of becoming zero. Missing
+one exact signed-integer projection. Modeled integer measurements accept decimal
+lexical values and round to the nearest integer, with exact halves away from
+zero. The unrounded value must fit the target type. Exponent forms, empty
+fractions, overflow, percentages, universal measures, and malformed input fail
+with an element and attribute diagnostic instead of becoming zero. Missing
 widths retain their existing default. Attributes are selected by the bound
 WordprocessingML namespace, and serialization writes the canonical integer with
 fixed `w` attributes in schema order while unmodelled table content retains its
@@ -1162,8 +1406,9 @@ Row and cell property readers select modeled elements and attributes by their
 bound WordprocessingML namespace. Foreign same-local children remain raw in
 their exact schema slots. Changed modeled children use canonical `w` prefixes
 and row or cell `xsd:sequence`, while unrelated row, cell, and border extension
-bytes remain exact. Checked nested tables are nonempty and retain the required
-trailing cell paragraph.
+bytes remain exact. Nested tables retain the required trailing cell paragraph
+because Word refuses a cell ending with a table. Checked nested tables are also
+nonempty.
 
 Paragraph property readers select every modeled `w:pPr` child and attribute by
 its bound WordprocessingML namespace, and a foreign same-local child stays
@@ -1241,6 +1486,15 @@ children remain at their schema positions. Unchanged projections reuse the
 preserved subtree. A typed mutation writes one canonical modeled child in
 `CT_Style` sequence order and reinserts unmodelled direct children once.
 
+Rendering can use a default table style found only through the main document's
+internal `stylesWithEffects` relationship. The target resolves relative to the
+actual main part. This fallback reads a sole self-contained default table style
+only when the main styles have no table default and its ID does not collide.
+It requires a Word `styles` root, complete direct style-owner projection and
+unique IDs. Missing, malformed, ambiguous or unprojected catalogues contribute
+no fallback. Other effects styles are not merged. Rendering uses an owned
+style copy and leaves both source parts, relationships and opaque XML intact.
+
 The style projection also owns `link`, automatic redefinition, visibility,
 gallery priority, quick-format, and locking values. Readers accept any prefix
 bound to the WordprocessingML namespace. Writers emit the fixed `w` prefix and
@@ -1302,8 +1556,14 @@ Verification is read-only. A loaded package retains the original content-types
 bytes while its typed content types remain unchanged, so saving does not
 invalidate a signature by reserializing equivalent XML.
 
-Signature creation accepts only a PKCS#8 DER RSA private key and an X.509 DER
-certificate with the matching public key. It builds the signature origin,
+Signature creation accepts a PKCS#8 DER RSA private key and an X.509 DER
+certificate with the matching public key, or their single unencrypted PRIVATE
+KEY and CERTIFICATE PEM envelopes. Each input is bounded at1MiB before copying
+or decoding. DER bytes pass unchanged to strict ASN.1 parsing. PEM permits
+ASCII whitespace outside the block and in wrapped standard padded base64.
+Wrong labels, multiple blocks, encrypted or PKCS#1 formats, malformed padding,
+non-ASCII framing and trailers refuse without publishing state. The one
+private normalization path feeds all native, Python and CLI consumers. It builds the signature origin,
 signature part, content-type overrides, and internal relationships on a cloned
 package. Collision-free names never replace occupied parts. The manifest uses
 content-type-qualified references in deterministic part and relationship
@@ -1322,6 +1582,16 @@ changing package or document state. Saving keeps the comments and
 comments-extended relationship graph reachable from the main document, with
 matching overrides and namespace declarations. A failed validation or
 allocation leaves anchors, typed parts, relationships, and overrides unchanged.
+
+Comment moves stage marker removal, narrowly qualified Google wrapper pruning,
+destination placement and package reopen together. Unchanged definition and
+companion parts retain their owned identities. Typed run references retain
+unmodeled source through boundary-owned raw carriers that never emit twice or
+survive typed removal or replacement. Numeric identity alone does not make an
+independent raw element a typed carrier. Unordered raw references remain
+verbatim, while plain id-only Word aliases retain canonical serialization. Literal comment matching qualifies Word markers and text in the actual staged main-part source, including ancestor-local table, cell, paragraph and control scopes. Complete-source namespace validation refuses unresolved element or attribute prefixes even outside the selected range. Comment moves replay existing qualified nested-owner declarations before replacing their main source and before the literal safeguard. Only the uniquely proved selected owner may refresh its private logical snapshot after authorized marker changes, with its exact raw namespace markers and namespace facts preserved. Ambiguous owners refuse, while all unselected owners retain strict replay. Source removal derives retained owners from the original package after the same qualified selected-marker edits, so transported whole runs disappear while mixed runs retain their declarations and non-reference source sequence. The captured reference remains namespace-closed for restoration. This preserves raw alias fields without changing the story fingerprint axis. Rich anchor projection consumes the namespace-closed original paragraph source and preserves those bindings through its private endpoint-fidelity probe. Tabs and breaks remain zero width only for the literal matching safeguard, while the rich reader retains their display characters.
+Mixed reference runs retain neighboring
+raw children, comments and processing instructions in source order.
 
 Tracked-revision resolution is also staged above the package boundary. The
 facade resolves selected revision placements in the main document, headers,
@@ -1343,8 +1613,14 @@ package's main-document bytes are authoritative. Exact source spans flow through
 body items, paragraphs, tables, rows, cells, controls, and runs, including when
 another child of the same owner changes. An unchanged drawing-bearing run keeps
 its complete wrapper, local namespace declarations, extended drawing children,
-and relationship identifier. Policy
-projection removes only the selected comparison facts. Ignored formatting,
+and relationship identifier. Compared pictures align by the bytes of their
+relationship targets. A changed picture keeps the original media for rejection
+and carries the edited media only when tracked content references it. A
+repeated image may use a new relationship to an existing media part, so the
+redline keeps one part per distinct payload. Imported media retains the edited
+content type, and the complete package is reopened before either resolution is
+checked. Policy projection removes only the selected comparison facts. Ignored
+formatting,
 textual whitespace, fields, comments, and story categories retain the original
 bytes. Character and word alignment carries source ownership and raw-child
 boundaries, keeps non-text content atomic, and emits each preserved child once.
@@ -1455,17 +1731,31 @@ document identities before insertion. Any value-kind, marker, relationship,
 identity, callback, allocation, serialization, or reopen failure discards the
 entire prospective result.
 
-Cross-document body fragments carry their source package so retained XML stays
-authoritative while the selected closure is rebuilt in the destination. The
-closure starts from selected main-story and comment-story relationship
-references, follows internal targets recursively, and copies only reachable
-parts with their exact content types. Style and numbering graphs are pruned to
-the selected references and their transitive links before deterministic reuse
-or renaming. Every destination relationship id, part name, comment id,
-bookmark id, drawing id, style id, and numbering id is reserved before any
-selected XML is rewritten. An external edge, missing target, malformed
-relationship part, invalid ownership range, or exhausted allocator rejects the
-candidate without publishing package or typed state.
+Cross-document block fragments carry their source package so retained XML stays
+authoritative across every supported owner. Local namespace declarations and
+unrelated destination XML survive insertion. The closure starts at selected
+story references and required note and comment companions, follows internal
+OPC targets through cycles, and copies reachable payloads with exact content
+types and part-local relationship IDs. External edges retain their target,
+mode and type and are never fetched.
+
+Style aliases and links, numbering overrides and custom XML binding stores
+are resolved with their companions. Store collisions rewrite the selected
+bindings and copied item-property IDs together. Note references are rewritten
+from complete maps, including forward, backward and cyclic references. Note,
+comment-thread, bookmark, paired-marker and revision identities are fresh.
+Equivalent reuse is limited to proven style and numbering comparisons and
+relationship-free leaf payloads. Identity-bearing item properties that need a
+store-ID rewrite are never reused.
+
+Selected XML is changed only inside one staged transaction. The package is
+serialized and reopened before the live destination changes. Missing targets,
+malformed graphs, incomplete ownership, exhausted allocators, unsafe embedded
+part-name rewrites and integrity-bound signatures that cannot remain valid
+reject atomically. Existing destination signature coverage is invalidated by
+the normal mutation policy. Opaque graphs are preserved without new decoding
+or rendering support. Rich mail merge retains its separate prohibition on
+external fragment edges.
 
 Dynamic table-of-contents rebuild uses the same staged package rule. It scans
 the relationship-resolved main document by expanded WordprocessingML names,
@@ -1493,8 +1783,12 @@ defect the source view already has is one that open, save, layout, and text
 replacement accept, so the rebuild retains it and reports it once in check
 order. A defect only the staged view has was introduced by the rebuild, such
 as a new canonical style completing a dangling producer link into a one-way
-link, and it rejects the rebuild. Public style mutation retains strict
-whole-graph validation.
+link, and it rejects the rebuild. Public style mutation also compares counted graph defects before and after
+staging. Existing repeated style IDs and multiple defaults remain in their
+source order. An edit by repeated ID changes its first definition, while
+removal deletes every definition with that ID. A newly introduced defect, or
+an additional occurrence of an existing defect, rejects the candidate. Strict
+whole-graph validation remains available to report producer defects.
 Old-result exclusion adds a total nested-run order within each accepted
 revision or content-control owner, so fields on opposite sides of a marker in
 one wrapper remain distinguishable. The outer coordinate is the typed
@@ -1507,6 +1801,22 @@ slots exactly as they do in the typed paragraph parser. A direct simple field
 advances a modeled run boundary only when its parsed instruction is nonempty.
 Hyperlink revisions and direct runs sharing one outer coordinate receive
 distinct nested ordinals.
+An unchanged main document with no modeled relationship mask candidates
+inventories qualified relationships from retained source XML. Read-only saves
+preserve complete original main-part bytes, including ambiguous local namespace
+owners. Dirty comment edits and owner relocation retain strict unique namespace
+replay and atomic refusal without source or thread metadata publication.
+Rich comment anchor queries retain the unique replay requirement. Exact
+raw-source literal range evidence does not imply rich query admission.
+Entry-owned TOC boundary paragraphs retain their original root attributes and
+opaque property payload. Generated entry styles and tabs overlay only their
+qualified owned source elements in schema order. Started style elements are
+removed as complete elements. Namespace aliases and default bindings identify
+Word owners by URI, while foreign and rebound lookalikes remain opaque. End
+runs and suffix siblings close their inherited namespaces when moved from a
+removed paragraph root. Duplicate or malformed owned properties refuse before
+publication. Unsafe boundary overlays retain the existing safe generic layout,
+with a named atomic refusal for an unsupported single-paragraph boundary.
 Generated entry paragraphs replace only the recorded range. The instruction
 runs, matching field markers, neighbouring raw XML, relationships, and every
 other package part remain outside the edit set. The provisional package and
@@ -1544,3 +1854,192 @@ story ownership, and non-decimal section page formats retain their original
 cache. Every written field becomes clean. A parse, layout, source-correlation,
 serialization, or reopen failure publishes neither package bytes nor typed
 state.
+
+Generated-table source projection retains every producer namespace binding,
+including a foreign binding for the conventional `w` prefix. A safe alias for
+Word content rebuilds through the checked inventory. If checked target insertion
+requires canonical serialization under a retained conflicting prefix, the
+existing serializer boundary refuses atomically and preserves the complete
+package and cache. Projection never rebinds opaque content to make insertion
+possible. Simple cache expansion closes each replayed subtree over the owner's
+namespace scope and validates the staged part before publication. Opened and
+self-closing simple owners use the same ownership and refusal checks.
+
+
+### Checked related-story publication
+
+Rich Word authoring resolves the physical paragraph or table owner before
+allocating media or relationships. A picture run and its owner relationship,
+or a note record and its main-story reference, publish in one reopened
+candidate. Related tables and nested cells retain their actual part paths.
+New sections inherit resolved page geometry without copying header or footer
+references. Creating an even-page story enables the corresponding settings
+flag in the same candidate. Failed validation or reopen changes no source,
+identifier allocation or public revision.
+
+DrawingML watermark identity belongs to the selected header representation.
+Replacement and removal require an unchanged fingerprint covering the complete
+API-owned source, including relationship operands. Replacement retires the
+qualified old owner and unreferenced image relationship before allocating the
+new image, so final canonicalization cannot invalidate that fingerprint.
+Pruning removes only API-owned media with no remaining package references.
+Unrelated producer relationships and opaque owners survive. Namespace context
+used for drawing projection remains separate from physical saved XML.
+
+DrawingML text watermark compatibility preserves one WPS choice and a real VML type136 textpath fallback in the same physical owner. Inactive fallback projection cannot paint a second watermark. Half-opacity is admitted before header, relationship or drawing-identity allocation, and other requested text opacity values refuse atomically.
+
+## Checked Word operation source ownership
+
+Captured hyperlink records bind the current physical owner and its ordinal.
+Unrelated link changes retain a proven surviving owner. Removing a link
+retires its captured record even when an identical public record remains or
+is inserted later. Public-field equality cannot resurrect captured authority.
+Manually constructed records retain their separate unique-match contract.
+
+Read-only symbol layout retains explicit Word symbol and numbering source
+codes. Owned diagnostics describe an unknown semantic mapping without rewriting
+that source or claiming an existing fallback glyph is missing.
+
+Document import closes the native fragment dependency graph before publication. Physical locations retain story identity, item kind and index path. Invalid destination indices refuse even when the imported document is empty. Reading properties or exporting text does not allocate package parts. Custom-property snapshots retain PID, fmtid, type and raw unsupported values. App-property mutations act on the latest owner and preserve unrelated producer fields.
+
+Checkbox admission and state selection use expanded Word2010 names, including qualified aliases and the default namespace. Only the selected qualified checked value changes. Foreign same-name elements, attributes, namespace declarations and opaque child order remain source-owned. The selected Unicode scalar and state font are admitted together before any matching control changes. Forbidden XML text and late invalid state values refuse the entire operation.
+
+Checked paragraph, regular-run, table, cell and section-property replacement
+first resolves the actual held physical owner. One complete expected expanded-
+name root, modeled sequence and known property profiles, relationship kind and
+target, introduced identifiers and owner-local section restrictions are
+admitted before staging. A reopened candidate publishes atomically. Identical
+source replacement preserves exact bytes and revisions. Source-bound namespace
+markers retain their actual producer identity and reject ambiguous
+reinterpretation. Consumed paragraph/run readers preserve the caller cursor
+and physical closing QName. Explicit foreign names remain opaque, and legacy
+assumed-run recognition is confined to consumed roots without a supplied Word
+namespace binding. Admission is linear before recursive construction. Modeled
+control paths use an inclusive budget256 with control cost1 and actual typed
+text-box cost16, resetting between siblings. Recognized tables retain the
+inclusive32 boundary. Iterative borrowed-model admission precedes staging
+clones and serialization. Opaque foreign routes do not consume modeled nesting
+authority.
+
+Checked table, cell and section replacement retains expanded root attribute
+names and decoded values, with the required namespace bindings. Attribute
+quoting and entity spelling may be normalized by reconstruction. Captured
+adjacent foreign children retain their exact bytes through replacement,
+scalar edits and save/reopen cycles. Namespace closure supplies the emitted
+owner bindings without rewriting the preserved foreign child payload.
+
+## Picture extraction and one-shot publication
+
+Word picture occurrences retain physical story ownership separately from
+shared media identity. Case aliases resolve to the actual owning package key.
+External IMAGE relationships retain URL metadata and have no embedded bytes,
+media part or extracted file. Linked resizing remains unsupported.
+Extraction preloads complete source bytes, then publishes generated flat names
+for each unique internal part in deterministic first-occurrence order.
+Distinct parts remain distinct even when their bytes match. Missing internal
+media/relationships refuse before output creation. Symlink directories,
+existing destinations and input aliases refuse. Empty extraction creates no
+unnecessary directory. Recoverable nonreplacing publication failure removes
+this invocation's files and an empty newly created directory, preserving
+preexisting unrelated files. Cleanup is best effort and does not promise
+crash-atomic multi-file renames.
+
+Ordered replacement, tag fill, combined fields and slide creation/placement
+use one candidate and checked final publication. Late count, owner or
+serialization failure cannot publish a partial native edit. New CLI mutation
+outputs use the existing extension-based package class and VBA/signature
+contracts, and success JSON follows file publication.
+
+## Checked PowerPoint XML transactions
+
+Checked replacement resolves relationships from the selected physical owner
+part. Internal slide targets must be actual slide parts. Image targets must
+match their actual format and registered content type, with bounded complete
+decoding for supported raster formats. New unsupported media facts refuse.
+Retained unsupported facts require unchanged relationship, type and target
+bytes. Arbitrary empty relationship IDs cannot bypass source ownership.
+
+The transaction preserves unrelated parts and opaque payloads. Actual
+inherited namespace bindings close standalone owner XML, including opaque
+prefixes. A changed selected owner forces emission of its owning part even
+when typed equality ignores source-root markup. Existing relationship,
+metadata and signature invalidation rules apply before candidate publication.
+Exact source no-ops do not rewrite package bytes.
+
+A successful checked edit releases only known reference-bearing relationships
+owned by the original selected fragment and absent from the complete updated
+physical owner XML. Sibling, group and retained opaque qualified references
+keep their rows alive. Foreign namespace lookalikes do not create relationship
+authority. Surviving relationship metadata remains source-preserved. Only
+internal payload targets released by that operation enter candidate pruning,
+including newly unreachable chart and workbook descendants. Other incoming
+package edges preserve shared targets, and unrelated producer orphans survive.
+External references are never fetched. Cleanup stays inside the cloned
+transaction and completes before serialize, reopen and live publication.
+
+## Embedded font package transactions
+
+Word writes checked single-face sfnt input as ODTTF with its explicit or
+deterministically derived uppercase OOXML GUID. Embedding can stage a missing
+font record and the owned embedTrueTypeFonts setting together with the font
+part and relationship. Descriptive font records retain their source attributes
+and child slots. Font/settings readers resolve actual namespace URIs, accept
+source aliases and distinguish absence from false. Removing a last face retains
+the explicit embed setting until its setter changes it.
+
+PowerPoint embeds an uncompressed EOT version0x00020001, flags0 envelope in a
+font part referenced by the presentation's qualified font list. Four face
+relationship slots retain schema order. Root embedTrueTypeFonts and
+saveSubsetFonts attributes are tri-state. Imported compressed EOT and unknown
+formats remain opaque and exact through no-op saves and unrelated edits.
+Unsupported decoding is reported with absent decoded bytes. License identity
+is checked caller input and has no fabricated PresentationML metadata field.
+
+Before publication, both providers validate actual source ownership, internal
+font relationship kind, unique relationship identity, resolved target and part
+content type. Invalid or ambiguous graphs refuse atomically. Replacing shared
+targets retains all reachable source references, including preserved opaque
+references. EOT headers, string ranges, sfnt directory/table ranges and declared
+lengths are bounded before allocation. No-op operations retain byte identity
+and existing live owners.
+
+Library preservation and native application resave are distinct contracts.
+PowerPoint's qualified positive retains both complete authored EOT parts
+through native save and normal reopen, while remapping relationship IDs and
+normalizing presentation font metadata. Invalid raw sfnt data can remain
+stored without being used by the native application. Missing-font warnings
+are recorded separately from XML repair.
+
+Word may replace embedded font names and GUIDs, add other font parts and save
+an empty bold part under its documented one-font-per-name behavior. Disabling
+embedding can remove font parts on native save even while the already loaded
+document still paints an embedded face. A normal reopened copy can then use
+fallback. These observed native changes do not authorize the library to discard
+opaque source or reinterpret missing decoded bytes as a successfully used font.
+
+## Presentation semantic export resources
+
+Semantic export resolves hyperlinks and images from their actual owning slide
+part. Internal slide links use normalized, case-insensitive OPC part identity.
+Links to omitted hidden slides produce diagnostics. No external resource is
+fetched. Safe HTTP, HTTPS, mail and telephone links retain their target.
+
+Owned image content type, signature and complete body must agree before any
+output is written. Compressed image input is limited to128MiB, decoded images
+and cumulative animation/page data to64MiB, each dimension to16,384 and
+frame/page/scan counts to1,024. Unsupported image encoding returns a precise
+error. The native picture-body validator completes before export destinations
+or assets are allocated. Original image bytes are exported unchanged. Byte-identical pictures
+share one SHA-256 asset name while each picture occurrence remains present.
+
+Native save methods stage and sync the text and every adjacent asset before
+publication. An existing destination, repeated destination or publication
+failure leaves the source and existing outputs unchanged and removes newly
+published outputs. CLI staging applies its explicit overwrite policy to the
+whole output set while protecting the input, including aliases and hard links.
+
+## ZIP identity and container metadata
+
+The workspace uses zip9.0.3. Decoded names try UTF8 regardless of the ZIP flag and otherwise CP437. OPC normalization and duplicate detection operate on those decoded names. ODT retains its separate raw central-name UTF8 check. ODP keeps contextual decoder errors and existing traversal, duplicate, compression and expansion limits. No new strict raw-name policy is implied.
+
+Ordinary Deflate entries use central-directory made-by version20. Retained ZIP8 native packages also use version20, so the source-only prediction of a45-to20 output change is refuted. Entry order, selected compression backend, fixed timestamps and permissions remain deterministic. Container bytes can differ while exact inflated XML and opaque member bytes remain equal. ZIP64 and malformed header behavior require dedicated controls, not a general byte-neutrality claim.

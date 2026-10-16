@@ -18,7 +18,94 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum FontCommand {
+    /// List native font records and faces
+    List {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Embed one caller-owned font face with explicit license authorization
+    Embed {
+        file: PathBuf,
+        /// Exact font record/typeface name
+        #[arg(long)]
+        name: String,
+        /// Local TrueType or OpenType font file
+        #[arg(long)]
+        font: PathBuf,
+        #[arg(long, default_value = "regular", value_parser = ["regular", "bold", "italic", "bold-italic"])]
+        kind: String,
+        /// Explicitly authorize embedding under the identified license
+        #[arg(long, required = true)]
+        license_authorized: bool,
+        #[arg(long)]
+        license_identity: String,
+        /// Explicit OOXML font key, otherwise derived from checked font bytes
+        #[arg(long)]
+        font_key: Option<String>,
+        /// Mark this Word face as subsetted
+        #[arg(long)]
+        subsetted: bool,
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a named font record, or only the selected embedded face
+    Remove {
+        file: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_parser = ["regular", "bold", "italic", "bold-italic"])]
+        kind: Option<String>,
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read flags, or set explicitly named tri-state flags into a new output
+    Settings {
+        file: PathBuf,
+        #[arg(long, value_parser = ["true", "false", "none"])]
+        embed_true_type_fonts: Option<String>,
+        /// Include system fonts: true, false or none (remove setting)
+        #[arg(long, value_parser = ["true", "false", "none"])]
+        embed_system_fonts: Option<String>,
+        #[arg(long, value_parser = ["true", "false", "none"])]
+        save_subset_fonts: Option<String>,
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Sign current package content with a local PKCS#8 key and X.509 certificate
+    Sign {
+        file: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify signatures and complete coverage, without asserting chain trust
+    VerifySignatures {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List, embed, remove and configure explicitly licensed fonts
+    Font {
+        #[command(subcommand)]
+        command: FontCommand,
+    },
     /// Print document structure: paragraph/table count, styles, images, metadata
     Inspect {
         /// Path to the DOCX file
@@ -39,6 +126,9 @@ enum Command {
     Layout {
         /// Path to the DOCX file
         file: PathBuf,
+        /// Directory of caller fonts used before bundled fallback
+        #[arg(long)]
+        font_dir: Option<PathBuf>,
         /// Output point-space body fragments as schema-1 JSON
         #[arg(long)]
         json: bool,
@@ -49,52 +139,94 @@ enum Command {
         file: PathBuf,
         /// Output format: pdf, html, md, png, jpeg, tiff
         #[arg(long, short = 't')]
-        to: String,
+        to: Option<String>,
         /// Output file path (defaults to input with new extension)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
+        /// DOCX template for HTML or Markdown input
+        #[arg(long)]
+        template: Option<PathBuf>,
         /// Replace existing output files, but never the input file
         #[arg(long)]
         force: bool,
         /// DPI for image rendering (default: 150)
-        #[arg(long, default_value = "150")]
-        dpi: u32,
-        /// Directory containing font files (.ttf/.otf) to use for PDF rendering
+        #[arg(long)]
+        dpi: Option<u32>,
+        /// Directory containing caller font files (.ttf/.otf/.ttc)
         #[arg(long)]
         font_dir: Option<PathBuf>,
+        /// Revision view for PDF and image output
+        #[arg(long, value_parser = commands::parse_revision_view)]
+        revision_view: Option<rdocx::RevisionView>,
+        /// Paint tracked changes using plain or legal styling
+        #[arg(long, value_parser = commands::parse_revision_style)]
+        revision_style: Option<rdocx::RevisionStyle>,
         /// One-based page range for image output, such as 1,3-5
         #[arg(long)]
         pages: Option<String>,
         /// JPEG quality from 1 through 100
-        #[arg(long, default_value = "90")]
-        quality: u8,
+        #[arg(long)]
+        quality: Option<u8>,
         /// Preserve unpainted PNG pixels as transparent
         #[arg(long)]
         transparent: bool,
     },
-    /// Structural diff between two DOCX files
+    /// Compare the paragraph text of every story of two DOCX files
+    ///
+    /// Compares the body paragraphs, the table cells of the body, the text
+    /// boxes, the headers and footers of each section, the footnotes, the
+    /// endnotes, and the comments. A changed paragraph prints a `-` and a `+`
+    /// line, each located between brackets: `[2]` for the second body
+    /// paragraph, or a story location such as `[table 1, row 1, cell 2,
+    /// paragraph 1]` or `[header default, section 1, paragraph 1]`. A story
+    /// that cannot be read is named as not compared.
     Diff {
         /// First DOCX file
         file_a: PathBuf,
         /// Second DOCX file
         file_b: PathBuf,
+        /// Output the differences as schema-1 JSON
+        #[arg(long)]
+        json: bool,
+        /// Exit with 1 when the files differ and 2 on an error, as `diff` does
+        #[arg(long)]
+        exit_code: bool,
     },
     /// Replace placeholders in a DOCX file
+    ///
+    /// Give one pair with -p and -v, or many with --map. Nothing is written
+    /// unless every pair with an expected count replaced exactly that count.
     Replace {
         /// Path to the DOCX file
         file: PathBuf,
-        /// Placeholder string
-        #[arg(long, short = 'p')]
-        placeholder: String,
-        /// Replacement value
-        #[arg(long, short = 'v')]
-        value: String,
+        /// Placeholder string, a regular expression with --regex
+        #[arg(
+            long,
+            short = 'p',
+            required_unless_present = "map",
+            requires = "value",
+            conflicts_with = "map"
+        )]
+        placeholder: Option<String>,
+        /// Replacement value, where $1 names a capture group with --regex
+        #[arg(long, short = 'v', requires = "placeholder")]
+        value: Option<String>,
+        /// JSON file holding an array of pairs, applied in order, such as
+        /// [{"placeholder": "{{name}}", "value": "Ada", "expect": 2}]
+        #[arg(long, value_name = "PAIRS_JSON")]
+        map: Option<PathBuf>,
+        /// Read each placeholder as a regular expression
+        #[arg(long)]
+        regex: bool,
         /// Output file path
         #[arg(long, short = 'o')]
         output: PathBuf,
         /// Require exactly this many replacements before publishing output
-        #[arg(long)]
+        #[arg(long, conflicts_with = "map")]
         expect: Option<usize>,
+        /// Output the count of each pair as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Validate OOXML conformance
     Validate {
@@ -105,6 +237,9 @@ enum Command {
     Render {
         /// Path to the DOCX file
         file: PathBuf,
+        /// Directory of caller fonts used before bundled fallback
+        #[arg(long)]
+        font_dir: Option<PathBuf>,
         /// Output directory (defaults to current directory)
         #[arg(long, short = 'o')]
         output_dir: Option<PathBuf>,
@@ -123,6 +258,13 @@ enum Command {
         /// Output format: png, jpeg, tiff
         #[arg(long, default_value = "png")]
         format: String,
+        /// Revision view to render
+        #[arg(long, default_value = "accepted", value_parser = commands::parse_revision_view)]
+        revision_view: rdocx::RevisionView,
+        /// How the tracked view marks revisions: plain, or legal for blue
+        /// insertions, red deletions and green moves
+        #[arg(long, default_value = "plain", value_parser = commands::parse_revision_style)]
+        revision_style: rdocx::RevisionStyle,
         /// JPEG quality from 1 through 100
         #[arg(long, default_value = "90")]
         quality: u8,
@@ -192,6 +334,138 @@ enum Command {
         #[command(subcommand)]
         command: TocCommand,
     },
+    /// Update field results
+    Fields {
+        #[command(subcommand)]
+        command: FieldsCommand,
+    },
+    /// Extract physical pictures from supported story owners
+    Images {
+        #[command(subcommand)]
+        command: ImagesCommand,
+    },
+    /// Read and write core and custom document properties
+    Meta {
+        #[command(subcommand)]
+        command: MetaCommand,
+    },
+    /// Set the value of content controls by tag
+    ///
+    /// Every --tag must name at least one control of the body,
+    /// or nothing is written. A control bound to custom XML gets the value in
+    /// its bound part too.
+    Fill {
+        /// Path to the DOCX file
+        file: PathBuf,
+        /// Set every control whose tag is NAME, repeatable
+        #[arg(long = "tag", value_name = "NAME=VALUE", conflicts_with = "values", value_parser = commands::parse_assignment)]
+        tags: Vec<(String, String)>,
+        /// Fill exact content-control tags, aliases and legacy names from flat JSON
+        #[arg(long, value_name = "VALUES.json", conflicts_with = "tags")]
+        values: Option<PathBuf>,
+        /// Output DOCX file
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Output the count of each assignment as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FieldsCommand {
+    /// Update PAGE, NUMPAGES, PAGEREF, SECTIONPAGES, DATE, TIME, SEQ, REF and
+    /// the other supported field results
+    ///
+    /// Field results that need a value the document does not hold, such as a
+    /// mail-merge field, keep their cached result. Page numbers come from
+    /// rdocx's own pagination.
+    Update {
+        /// Path to the DOCX file
+        file: PathBuf,
+        /// Civil date and time for DATE and TIME fields, exactly
+        /// YYYY-MM-DDTHH:MM:SS, unresolved when absent
+        #[arg(long, value_parser = commands::parse_field_date_time)]
+        now: Option<rdocx::FieldDateTime>,
+        /// Output DOCX file
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Output the operation record as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImagesCommand {
+    /// Write each internal media part of supported physical pictures into a directory and list them
+    ///
+    /// Story ownership is reported. External links are listed without fetching.
+    Extract {
+        /// Path to the DOCX file
+        file: PathBuf,
+        /// Output directory, created when absent
+        dir: PathBuf,
+        /// Output the listing as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// Parsed once per run, so the size of the `set` variant costs nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum MetaCommand {
+    /// Print the core and custom properties
+    Get {
+        /// Path to the DOCX file
+        file: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set core properties and add, replace or remove custom properties
+    Set {
+        /// Path to the DOCX file
+        file: PathBuf,
+        #[command(flatten)]
+        core: CoreArgs,
+        /// Add or replace a custom property, repeatable. An existing number,
+        /// integer or Boolean property keeps its type
+        #[arg(long = "custom", value_name = "NAME=TYPE:VALUE", value_parser = commands::parse_assignment)]
+        custom: Vec<(String, String)>,
+        /// Remove a custom property, repeatable
+        #[arg(long = "remove-custom", value_name = "NAME")]
+        remove_custom: Vec<String>,
+        /// Output DOCX file
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Output the properties written as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args)]
+struct CoreArgs {
+    /// Title
+    #[arg(long)]
+    title: Option<String>,
+    /// Author (dc:creator)
+    #[arg(long)]
+    author: Option<String>,
+    /// Subject
+    #[arg(long)]
+    subject: Option<String>,
+    /// Keywords
+    #[arg(long)]
+    keywords: Option<String>,
+    /// Description (comments)
+    #[arg(long)]
+    description: Option<String>,
+    /// Category
+    #[arg(long)]
+    category: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -204,24 +478,59 @@ enum CommentCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Add a comment over a zero-based half-open body run range
+    /// Add a comment over a zero-based half-open body run range, or on a
+    /// piece of text with --anchor
     Add {
         /// Path to the DOCX file
         file: PathBuf,
         #[command(flatten)]
         range: CommentRangeArgs,
+        /// Anchor the comment on this literal, case-sensitive text of the
+        /// main story instead of a run range
+        #[arg(
+            long,
+            conflicts_with_all = ["start_paragraph", "start_run", "end_paragraph", "end_run"]
+        )]
+        anchor: Option<String>,
+        /// Zero-based occurrence of the --anchor text in document order,
+        /// 0 when absent
+        #[arg(
+            long,
+            requires = "anchor",
+            conflicts_with_all = ["start_paragraph", "start_run", "end_paragraph", "end_run"]
+        )]
+        occurrence: Option<usize>,
         /// Comment author
         #[arg(long)]
         author: String,
         /// Optional comment author initials
         #[arg(long)]
         initials: Option<String>,
-        /// Comment text
+        /// Comment text, one paragraph per line
         #[arg(long)]
         text: String,
         /// RFC 3339 comment timestamp, omitted from the comment when absent
         #[arg(long)]
         date: Option<String>,
+        /// Output DOCX file
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Output the operation record as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an existing root comment onto literal main-story text
+    Move {
+        /// Path to the DOCX file
+        file: PathBuf,
+        /// Existing root comment id
+        id: i32,
+        /// Literal case-sensitive destination text
+        #[arg(long)]
+        text: String,
+        /// Zero-based destination occurrence
+        #[arg(long, default_value_t = 0)]
+        occurrence: usize,
         /// Output DOCX file
         #[arg(long, short = 'o')]
         output: PathBuf,
@@ -239,7 +548,7 @@ enum CommentCommand {
         /// Reply author
         #[arg(long)]
         author: String,
-        /// Reply text
+        /// Reply text, one paragraph per line
         #[arg(long)]
         text: String,
         /// RFC 3339 reply timestamp, omitted from the reply when absent
@@ -285,19 +594,19 @@ enum CommentCommand {
 #[derive(Args)]
 struct CommentRangeArgs {
     /// Zero-based body paragraph index at the inclusive start
-    #[arg(long)]
-    start_paragraph: usize,
+    #[arg(long, required_unless_present = "anchor")]
+    start_paragraph: Option<usize>,
     /// Zero-based run boundary at the inclusive start, counting the runs that
     /// `text --json` lists
-    #[arg(long)]
-    start_run: usize,
+    #[arg(long, required_unless_present = "anchor")]
+    start_run: Option<usize>,
     /// Zero-based body paragraph index at the exclusive end
-    #[arg(long)]
-    end_paragraph: usize,
+    #[arg(long, required_unless_present = "anchor")]
+    end_paragraph: Option<usize>,
     /// Zero-based run boundary at the exclusive end, counting the runs that
     /// `text --json` lists
-    #[arg(long)]
-    end_run: usize,
+    #[arg(long, required_unless_present = "anchor")]
+    end_run: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -370,10 +679,42 @@ enum TocCommand {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    #[cfg(windows)]
+    {
+        // Full document comparison can exceed the one MiB Windows main-thread stack.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_cli)
+            .expect("start rdocx CLI thread")
+            .join()
+            .expect("rdocx CLI thread panicked");
+    }
+    #[cfg(not(windows))]
+    run_cli();
+}
 
-    // `validate` is the one command whose exit status carries a verdict, so it
-    // is dispatched separately from the commands that only report errors.
+fn run_cli() {
+    let cli = Cli::parse();
+    let signing_command = matches!(&cli.command, Command::Sign { .. });
+    if let Command::VerifySignatures { file, json } = &cli.command {
+        let result = commands::verify_signatures(file, *json);
+        let flushed = io::stdout().flush();
+        match (result, flushed) {
+            (Ok(true), Ok(())) => return,
+            (Ok(false), Ok(())) => process::exit(1),
+            (Err(error), _) => {
+                eprintln!("Error: {error}");
+                process::exit(1);
+            }
+            (_, Err(error)) => {
+                eprintln!("Error: {error}");
+                process::exit(1);
+            }
+        }
+    }
+
+    // `validate` always carries a verdict in its exit status, so it is
+    // dispatched separately from the commands that only report errors.
     if let Command::Validate { file } = &cli.command {
         match commands::validate(file) {
             Ok(true) => return,
@@ -385,51 +726,159 @@ fn main() {
         }
     }
 
+    // `diff --exit-code` carries a verdict too: 1 for files that differ, which
+    // survives a closed standard output, and 2 for an error.
+    let diff_exit_code = matches!(
+        cli.command,
+        Command::Diff {
+            exit_code: true,
+            ..
+        }
+    );
+    let mut diff_status = 0;
+
     let result = match cli.command {
+        Command::VerifySignatures { .. } => unreachable!("verification is dispatched above"),
+        Command::Sign {
+            file,
+            key,
+            cert,
+            output,
+            json,
+        } => commands::sign(&file, &key, &cert, &output, json),
+        Command::Font { command } => match command {
+            FontCommand::List { file, json } => commands::font_list(&file, json),
+            FontCommand::Embed {
+                file,
+                name,
+                font,
+                kind,
+                license_authorized,
+                license_identity,
+                font_key,
+                subsetted,
+                output,
+                json,
+            } => commands::font_embed(
+                &file,
+                &commands::FontEmbedOptions {
+                    name: &name,
+                    font: &font,
+                    kind: &kind,
+                    license_authorized,
+                    license_identity: &license_identity,
+                    font_key: font_key.as_deref(),
+                    subsetted,
+                    output: &output,
+                    json,
+                },
+            ),
+            FontCommand::Remove {
+                file,
+                name,
+                kind,
+                output,
+                json,
+            } => commands::font_remove(&file, &name, kind.as_deref(), &output, json),
+            FontCommand::Settings {
+                file,
+                embed_true_type_fonts,
+                embed_system_fonts,
+                save_subset_fonts,
+                output,
+                json,
+            } => commands::font_settings(
+                &file,
+                embed_true_type_fonts.as_deref(),
+                embed_system_fonts.as_deref(),
+                save_subset_fonts.as_deref(),
+                output.as_deref(),
+                json,
+            ),
+        },
+
         Command::Inspect { file, json } => commands::inspect(&file, json),
         Command::Text { file, json } => commands::text(&file, json),
-        Command::Layout { file, json } => commands::layout(&file, json),
+        Command::Layout {
+            file,
+            json,
+            font_dir,
+        } => commands::layout(&file, json, font_dir.as_deref()),
         Command::Convert {
             file,
             to,
             output,
+            template,
             force,
             dpi,
             font_dir,
+            revision_view,
+            revision_style,
             pages,
             quality,
             transparent,
-        } => commands::convert(
+        } => commands::convert_input(
             &file,
-            &to,
+            to.as_deref(),
+            template.as_deref(),
+            dpi.is_some()
+                || revision_view.is_some()
+                || revision_style.is_some()
+                || quality.is_some()
+                || pages.is_some()
+                || transparent
+                || font_dir.is_some(),
             output.as_deref(),
             force,
-            dpi,
+            dpi.unwrap_or(150),
             font_dir.as_deref(),
+            revision_view.unwrap_or(rdocx::RevisionView::Accepted),
+            revision_style.unwrap_or(rdocx::RevisionStyle::Plain),
             commands::ImageOptions {
                 pages: pages.as_deref(),
-                quality,
+                quality: quality.unwrap_or(90),
                 transparent,
             },
         ),
-        Command::Diff { file_a, file_b } => commands::diff(&file_a, &file_b),
+        Command::Diff {
+            file_a,
+            file_b,
+            json,
+            exit_code: _,
+        } => commands::diff(&file_a, &file_b, json, &mut diff_status),
         Command::Replace {
             file,
             placeholder,
             value,
+            map,
+            regex,
             output,
             expect,
-        } => commands::replace(&file, &placeholder, &value, expect, &output),
+            json,
+        } => commands::replace(
+            &file,
+            commands::ReplaceInput {
+                pair: placeholder.zip(value),
+                map: map.as_deref(),
+                expect,
+                regex,
+            },
+            &output,
+            json,
+        ),
         // Handled above so its exit code can reflect the verdict.
         Command::Validate { .. } => unreachable!(),
         Command::Render {
             file,
+            font_dir,
             output_dir,
             force,
             dpi,
             page,
             pages,
             format,
+            revision_view,
+            revision_style,
             quality,
             transparent,
         } => commands::render(
@@ -438,9 +887,12 @@ fn main() {
             force,
             dpi,
             commands::RenderOptions {
+                font_dir: font_dir.as_deref(),
                 page,
                 pages: pages.as_deref(),
                 format: &format,
+                revision_view,
+                revision_style,
                 quality,
                 transparent,
             },
@@ -450,6 +902,8 @@ fn main() {
             CommentCommand::Add {
                 file,
                 range,
+                anchor,
+                occurrence,
                 author,
                 initials,
                 text,
@@ -458,15 +912,34 @@ fn main() {
                 json,
             } => commands::comment_add(
                 &file,
-                rdocx::RunRange {
-                    start: rdocx::RunPosition {
-                        body_index: range.start_paragraph,
-                        run_index: range.start_run,
+                match (
+                    anchor.as_deref(),
+                    range.start_paragraph,
+                    range.start_run,
+                    range.end_paragraph,
+                    range.end_run,
+                ) {
+                    (Some(anchor), ..) => commands::CommentAnchor::Text {
+                        text: anchor,
+                        occurrence: occurrence.unwrap_or(0),
                     },
-                    end: rdocx::RunPosition {
-                        body_index: range.end_paragraph,
-                        run_index: range.end_run,
-                    },
+                    (
+                        None,
+                        Some(start_paragraph),
+                        Some(start_run),
+                        Some(end_paragraph),
+                        Some(end_run),
+                    ) => commands::CommentAnchor::Range(rdocx::RunRange {
+                        start: rdocx::RunPosition {
+                            body_index: start_paragraph,
+                            run_index: start_run,
+                        },
+                        end: rdocx::RunPosition {
+                            body_index: end_paragraph,
+                            run_index: end_run,
+                        },
+                    }),
+                    (None, ..) => unreachable!("clap requires the range without --anchor"),
                 },
                 &author,
                 initials.as_deref(),
@@ -475,6 +948,14 @@ fn main() {
                 &output,
                 json,
             ),
+            CommentCommand::Move {
+                file,
+                id,
+                text,
+                occurrence,
+                output,
+                json,
+            } => commands::comment_move(&file, id, &text, occurrence, &output, json),
             CommentCommand::Reply {
                 file,
                 id,
@@ -563,6 +1044,54 @@ fn main() {
             &output,
             json,
         ),
+        Command::Fields { command } => match command {
+            FieldsCommand::Update {
+                file,
+                now,
+                output,
+                json,
+            } => commands::fields_update(&file, now, &output, json),
+        },
+        Command::Images { command } => match command {
+            ImagesCommand::Extract { file, dir, json } => {
+                commands::images_extract(&file, &dir, json)
+            }
+        },
+        Command::Meta { command } => match command {
+            MetaCommand::Get { file, json } => commands::meta_get(&file, json),
+            MetaCommand::Set {
+                file,
+                core,
+                custom,
+                remove_custom,
+                output,
+                json,
+            } => commands::meta_set(
+                &file,
+                &commands::MetaChanges {
+                    title: core.title,
+                    author: core.author,
+                    subject: core.subject,
+                    keywords: core.keywords,
+                    description: core.description,
+                    category: core.category,
+                    custom,
+                    remove_custom,
+                },
+                &output,
+                json,
+            ),
+        },
+        Command::Fill {
+            file,
+            tags,
+            values,
+            output,
+            json,
+        } => match values {
+            Some(values) => commands::fill_values(&file, &values, &output, json),
+            None => commands::fill(&file, &tags, &output, json),
+        },
         Command::Toc { command } => match command {
             TocCommand::Rebuild { file, output, json } => {
                 commands::toc_rebuild(&file, &output, json)
@@ -579,9 +1108,12 @@ fn main() {
         let closed_stdout = e
             .downcast_ref::<io::Error>()
             .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe);
-        if !closed_stdout {
+        if !closed_stdout || signing_command {
             eprintln!("Error: {e}");
-            process::exit(1);
+            process::exit(if diff_exit_code { 2 } else { 1 });
         }
+    }
+    if diff_exit_code && diff_status != 0 {
+        process::exit(diff_status);
     }
 }

@@ -36,10 +36,22 @@ The workbook is what "Edit Data" opens. PowerPoint will render a chart whose
 workbook is missing, but the file is malformed and editing is broken. This is
 why the minimal SpreadsheetML writer is not optional.
 
+Word comparison identifies a chart by its complete owned resource graph,
+including the embedded workbook, retained sidecars, content types and relationship
+topology. A changed chart receives tracked drawing replacement and a distinct
+collision-safe package graph. Repeated drawings sharing one edited resource retain
+one shared destination. Accepting revisions selects the edited chart and workbook,
+while rejecting selects the original. These identities follow the surviving
+drawing relationships rather than conventional chart filenames. Unused original
+parts remain preserved. Chart graph discovery and copying share checked depth,
+aggregate part and payload-plus-relationship byte limits. External target metadata
+is preserved without fetching its target.
+
 ## `oxml-sml`, deliberately minimal
 
-A **writer only**, and never a general SpreadsheetML implementation. The
-implemented `Workbook` accepts one validated worksheet name and one or more
+A bounded chart-workbook writer and formula-owned cell merger, never a general
+SpreadsheetML implementation. The implemented `Workbook` accepts one
+validated worksheet name and one or more
 directly constructed `Column::Text` or `Column::Number` values. It rejects names
 outside Excel's 31 UTF-16-code-unit and forbidden-character boundary, more than
 16,384 columns, more than 1,048,575 data values in any column, and nonfinite
@@ -82,6 +94,15 @@ Microsoft Excel 16.104, Info.plist build 16.104.25121423, opened its one
 cells. LibreOffice Calc 26.2.5.2, build
 `cd7284b4cbbfeb507e630c1aac019f4157393acb`, imported and re-exported the same
 workbook without a conversion error, preserving that worksheet and cell range.
+
+Imported replacement targets only qualified embedded workbook ranges named by
+chart formulas. It preserves unrelated ZIP members, worksheets, names,
+comments and existing styles. Removed series clear their data cells and ordinary
+headers, while table-owned headers remain byte-exact to keep the retained table
+metadata consistent. Table ownership resolves qualified worksheet references
+through their actual internal relationships. Number-format additions append
+styles rather than replacing them. External or computed formulas and writes into populated
+unowned cells fail before either chart or workbook publication.
 
 ## The ChartML model
 
@@ -535,13 +556,20 @@ the embedded workbook. An external workbook, malformed ChartML or
 SpreadsheetML, missing relationship target, nested archive limit, or remaining
 raw trace rejects the complete document mutation.
 
-The reviewed Word candidate has SHA-256
+The reviewed Word candidate had SHA-256
 `79e9b9ff9e7557dbd09a365bb8c189806e700ed48ca768b27d7158cf2b41370b`.
 Microsoft Word 16.104, Info.plist build 16.104.25121423, opened that exact file
-without a repair warning. In the human-action gate, Edit Data opened the
-embedded workbook in Excel and the user successfully changed the chart data.
-The workbook initially carried `Category` and `Revenue` columns with `North,
-12.5`, `South, 19.0`, and `West, 14.25`.
+without a repair warning. In the human-action gate on that file, Edit Data
+opened the embedded workbook in Excel and the user successfully changed the
+chart data. The workbook initially carried `Category` and `Revenue` columns
+with `North, 12.5`, `South, 19.0`, and `West, 14.25`.
+
+The part serializers then stopped indenting, which moved the candidate to
+SHA-256 `904e718b1fe0e524be7df75430705a8a70e03089ed96460ad008c4016c36ad3d`
+with the same elements, attributes and text. Microsoft Word 16.111, build
+16.111.26072617, opened and exported that file without a repair warning. The
+Word 16.104 gate and the human Edit Data gate have not been run on it, and the
+ignored gate test still asserts Word 16.104.
 
 The native chart candidate has SHA-256
 `e6e9f7eef1c774d0414c5d0c3f1202da1a28635b5d089e15455b7adc3f66cb00`.
@@ -675,11 +703,25 @@ annotations. Individual
 `c:dLbl` delete, visibility, number-format, position, and separator overrides
 are projected privately by logical index from their namespace-resolved raw
 subtrees. Those subtrees remain byte-preserved as the only serialization source.
-A present legend shell emits one resolved series-colour swatch and shaped
-series name per row in the upper-right of the plot. Bars, line and radar
-strokes, pie and doughnut wedges, areas, scatter and line markers, and legend
-swatches all consume the same resolved series colour. Unsupported legend
-placement children remain preserved and do not change this default layout.
+A present legend projects namespace-owned `legendPos` and `overlay` scalars.
+Missing position means right and a missing overlay child means false. Supported
+positions are right, left, top, bottom and top-right. Real shaped series names
+and colour keys are measured before plot selection. Exterior non-overlay bands
+reserve the required width or height, while overlay legends keep the full plot.
+Top and bottom entries wrap within the available width. Excessive labels or
+insufficient chart bounds return a contextual error instead of clipping text.
+Absent legends reserve no band. Bars, lines, wedges, areas, markers and legend
+swatches consume the same resolved series colour.
+
+`LegendPosition` and `LegendSettings` are shared native values. Source-preserving
+legend getters and setters validate the XML document, resolve actual inherited
+namespace bindings and reject duplicate or malformed owned scalars atomically.
+Foreign lookalikes, attributes and unedited children remain opaque. Effective
+no-ops return original bytes. Edited scalar children follow schema order.
+Hiding removes the complete owned legend and its settings. Position or overlay
+edits while absent are no-ops, while showing creates the requested settings
+with right and false defaults. Unsupported legend layout payloads remain
+preserved without changing this bounded automatic placement.
 
 Package assembly resolves chart relationships in separate slide, layout and
 master scopes and parses internal targets as `CT_ChartSpace`. The resolver
@@ -717,3 +759,30 @@ Roughly six to eight weeks, which is why this is its own milestone and why
 `00-vision.md` records it as the dominant term in the overall estimate. It is
 self-contained: nothing else in the plan depends on it, so it can move without
 reshaping the rest.
+
+
+## Python authoring and owned replacement
+
+Both package roots export `CategoryChartData`, `XyChartData` and
+`XL_CHART_TYPE` for the seven native kinds. Ordered category series use one
+shared number format. XY series require identical ordered finite X vectors.
+Heterogeneous vectors refuse before mutation rather than discarding X data.
+
+Word `Document.add_chart(chart_type, chart_data, width, height, after=None)`
+returns the actual paragraph. The optional keyword-only owner must be a live
+direct body paragraph of the same document. Native `add_chart_after` validates
+its physical body position before candidate assembly. Cell, related-story,
+foreign and retired owners refuse without changing the document.
+
+PowerPoint `slide.shapes.add_chart(chart_type, left, top, width, height,
+chart_data)` returns an owned graphic frame through the existing shape handle.
+Its `has_chart` and live `chart` expose kind, category and ordered series
+snapshots. Native reads and `replace_chart_data` resolve unique shape IDs,
+including nested groups. Unsupported projections remain explicit errors.
+
+Surviving series keep ordinal identity, stable idx/order, formatting and raw
+extensions. Added series use native defaults. Source-aware replacement retains
+axes, title, legend, aliases, foreign attributes and unmodeled children. Both
+bindings stage candidates and allocate returned handles before prepared
+publication. True no-op and allocation or validation failures preserve package
+bytes, revisions and existing owners.

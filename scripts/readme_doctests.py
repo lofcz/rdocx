@@ -62,7 +62,7 @@ class ReadmeCase:
 
 
 README_CASES = (
-    ReadmeCase("rdocx", "rdocx", REPO_ROOT / "README.md", 3),
+    ReadmeCase("rdocx", "rdocx", REPO_ROOT / "README.md", 5),
     ReadmeCase(
         "rdocx-opc",
         "rdocx_opc",
@@ -149,7 +149,7 @@ README_CASES = (
         "rpptx",
         "rpptx",
         REPO_ROOT / "crates/rpptx/README.md",
-        1,
+        2,
     ),
     ReadmeCase(
         "rpptx-chart",
@@ -179,26 +179,26 @@ README_CASES = (
 
 README_REQUIRED_TEXT = {
     REPO_ROOT / "README.md": (
-        'rdocx = "0.14.0"',
-        'rdocx = { version = "0.14.0", default-features = false }',
+        'rdocx = "0.16.1"',
+        'rdocx = { version = "0.16.1", default-features = false }',
         "rdocx convert report.docx --to pdf -o report.pdf",
         "rdocx convert report.docx --to html -o report.html",
         "rdocx convert report.docx --to md -o report.md",
         'rdocx replace report.docx --placeholder "Draft" --value "Final" -o final.docx',
     ),
     REPO_ROOT / "crates/rdocx-cli/README.md": (
-        "cargo install rdocx-cli --version '^0.14.0'",
+        "cargo install rdocx-cli --version '^0.16.1'",
         "rdocx convert report.docx --to pdf -o report.pdf",
     ),
-    REPO_ROOT / "crates/rdocx-html/README.md": ('rdocx-html = "0.14.0"',),
-    REPO_ROOT / "crates/rdocx-layout/README.md": ('rdocx-layout = "0.14.0"',),
+    REPO_ROOT / "crates/rdocx-html/README.md": ('rdocx-html = "0.16.1"',),
+    REPO_ROOT / "crates/rdocx-layout/README.md": ('rdocx-layout = "0.16.1"',),
     REPO_ROOT / "crates/rdocx-opc/README.md": (
-        'rdocx-opc = "0.14.0"',
+        'rdocx-opc = "0.16.1"',
         "use rdocx_opc::OpcPackage;",
     ),
-    REPO_ROOT / "crates/rdocx-oxml/README.md": ('rdocx-oxml = "0.14.0"',),
+    REPO_ROOT / "crates/rdocx-oxml/README.md": ('rdocx-oxml = "0.16.1"',),
     REPO_ROOT / "crates/rdocx-pdf/README.md": (
-        'rdocx-pdf = "0.14.0"',
+        'rdocx-pdf = "0.16.1"',
         "use rdocx_pdf::render_to_pdf;",
     ),
     REPO_ROOT / "crates/oxml-cli-support/README.md": (
@@ -233,7 +233,7 @@ README_REQUIRED_TEXT = {
     REPO_ROOT / "crates/oxml-chart/README.md": ("AxisId::new(10_000_001)?",),
     REPO_ROOT / "crates/rpptx-chart/README.md": ("AxisId::new(10_000_001)?",),
     REPO_ROOT / "crates/rpptx-cli/README.md": (
-        "cargo install rpptx-cli --version '^0.12.1'",
+        "cargo install rpptx-cli --version '^0.14.1'",
         "rpptx convert deck.pptx --to pdf -o deck.pdf",
     ),
     REPO_ROOT / "crates/rpptx-py/README.md": (
@@ -367,58 +367,66 @@ MEASUREMENT_COLUMNS = (
 )
 MEASUREMENT_DATE = "2026-09-19"
 ARCHIVE_REMEASUREMENT_DATES = {
-    "oxml-layout": "2026-10-02",
-    "rdocx-html": "2026-10-01",
-    "oxml-cli-support": "2026-09-29",
-    "oxml-core": "2026-10-01",
-    "oxml-drawing": "2026-10-01",
-    "oxml-opc": "2026-10-01",
-    "oxml-pdf": "2026-10-02",
-    "rdocx": "2026-10-02",
-    "rdocx-cli": "2026-09-30",
-    "rdocx-layout": "2026-10-02",
-    "rdocx-oxml": "2026-10-02",
-    "rpptx": "2026-10-01",
-    "rpptx-cli": "2026-09-30",
-    "rpptx-layout": "2026-09-30",
-    "rpptx-oxml": "2026-10-01",
+    "rdocx-pdf": "2026-10-14",
+    "rdocx-opc": "2026-10-16",
+    "rdocx-html": "2026-10-14",
+    "oxml-cli-support": "2026-10-16",
+    "oxml-core": "2026-10-14",
+    "oxml-drawing": "2026-10-16",
+    "oxml-opc": "2026-10-16",
+    "oxml-pdf": "2026-10-16",
+    "rdocx": "2026-10-16",
+    "rdocx-cli": "2026-10-16",
+    "rdocx-layout": "2026-10-16",
+    "rdocx-oxml": "2026-10-16",
+    "rpptx": "2026-10-16",
+    "rpptx-cli": "2026-10-16",
+    "rpptx-layout": "2026-10-16",
+    "rpptx-oxml": "2026-10-16",
+    "oxml-chart": "2026-10-16",
+    "oxml-layout": "2026-10-16",
+    "rpptx-render": "2026-10-16",
+    "oxml-media": "2026-10-14",
+    "oxml-sml": "2026-10-16",
+    "rpptx-chart": "2026-10-16",
+}
+ARCHIVE_REMEASUREMENT_PLATFORMS = {
+    "oxml-layout": "Linux x86_64, Rust 1.97.1",
+    "oxml-pdf": "Linux x86_64, Rust 1.97.1",
+    "rdocx-layout": "Linux x86_64, Rust 1.97.1",
+    "rdocx-oxml": "Linux x86_64, Rust 1.97.1",
+    "rdocx": "Linux x86_64, Rust 1.97.1",
 }
 MEASUREMENT_PLATFORM = "macOS 26.6.2, Apple M5 Max, arm64"
-ARCHIVE_REMEASUREMENT_PLATFORMS = {
-    "oxml-layout": "Linux x86_64, CachyOS, Rust 1.97.1",
-    "oxml-pdf": "Linux x86_64, CachyOS, Rust 1.97.1",
-    "rdocx": "Linux x86_64, CachyOS, Rust 1.97.1",
-    "rdocx-layout": "Linux x86_64, CachyOS, Rust 1.97.1",
-    "rdocx-oxml": "Linux x86_64, CachyOS, Rust 1.97.1",
-}
 ARCHIVE_COMPRESSION_TOLERANCE_BYTES = 64
 ARCHIVE_MEASUREMENTS = {
-    "oxml-chart": (102_042, 659_367, 6),
-    "oxml-cli-support": (8_614, 30_840, 6),
-    "oxml-core": (21_794, 104_404, 15),
-    "oxml-drawing": (169_686, 1_171_264, 24),
-    "oxml-layout": (4_893_289, 9_716_400, 53),
-    "oxml-media": (12_252, 50_992, 6),
-    "oxml-opc": (99_473, 385_350, 12),
-    "oxml-pdf": (74_696, 342_064, 14),
-    "oxml-sml": (12_511, 49_803, 6),
-    "rdocx": (1_226_542, 7_123_589, 36),
-    "rdocx-cli": (56_783, 251_246, 8),
-    "rdocx-html": (18_116, 70_742, 11),
-    "rdocx-layout": (270_547, 1_450_124, 15),
-    "rdocx-opc": (3_655, 9_668, 6),
-    "rdocx-oxml": (410_105, 2_576_531, 32),
-    "rdocx-pdf": (8_111, 26_758, 6),
-    "rpptx": (441_567, 2_292_106, 16),
-    "rpptx-chart": (6_648, 21_136, 6),
-    "rpptx-cli": (40_733, 178_874, 8),
-    "rpptx-layout": (84_812, 483_510, 11),
-    "rpptx-oxml": (156_451, 1_055_648, 20),
-    "rpptx-render": (59_928, 329_994, 8),
+    "oxml-chart": (117_189, 733_377, 6),
+    "oxml-cli-support": (14_710, 55_732, 6),
+    "oxml-core": (21_804, 104_428, 15),
+    "oxml-drawing": (226_339, 1_491_701, 24),
+    "oxml-layout": (5170683, 10312186, 62),
+    "oxml-media": (12_259, 51_016, 6),
+    "oxml-opc": (110_295, 445_033, 12),
+    "oxml-pdf": (86108, 402164, 14),
+    "oxml-sml": (24_901, 115_289, 6),
+    "rdocx": (3757622, 52081457, 37),
+    "rdocx-cli": (108_558, 501_418, 8),
+    "rdocx-html": (27_450, 109_608, 11),
+    "rdocx-layout": (356580, 1953738, 15),
+    "rdocx-opc": (3_901, 10_535, 6),
+    "rdocx-oxml": (531751, 3278684, 32),
+    "rdocx-pdf": (8_124, 26_782, 6),
+    "rpptx": (724_605, 3_876_963, 16),
+    "rpptx-chart": (6_837, 21_809, 6),
+    "rpptx-cli": (66_411, 305_091, 8),
+    "rpptx-layout": (97_656, 566_294, 11),
+    "rpptx-oxml": (217_204, 1_378_568, 20),
+    "rpptx-render": (84_664, 461_174, 8),
+
 }
 PACKAGE_VERSIONS = {
-    **{name: "0.12.1" for name, _ in LOCAL_PATCHES if not name.startswith("rdocx")},
-    **{name: "0.14.0" for name, _ in LOCAL_PATCHES if name.startswith("rdocx")},
+    **{name: "0.14.1" for name, _ in LOCAL_PATCHES if not name.startswith("rdocx")},
+    **{name: "0.16.1" for name, _ in LOCAL_PATCHES if name.startswith("rdocx")},
 }
 PERFORMANCE_OBSERVATIONS = {
     "layout-throughput": "31,019.1 pages/s",
@@ -426,6 +434,7 @@ PERFORMANCE_OBSERVATIONS = {
     "pdf-throughput": "60,058.0 pages/s",
     "pdf-peak": "1.73 MiB",
 }
+PERFORMANCE_MEASUREMENT_VERSION = "rdocx 0.14.0"
 PERFORMANCE_COMMAND = (
     "`cargo test -p rdocx --test regression_test --release "
     "a_thousand_page_document_paginates_and_renders_within_the_declared_limits "
@@ -440,7 +449,7 @@ def archive_row(package: str) -> MeasurementRow:
         f"{compressed:,} compressed bytes, {members:,} member bytes, {count} members",
         PACKAGE_VERSIONS[package],
         ARCHIVE_REMEASUREMENT_PLATFORMS.get(package, MEASUREMENT_PLATFORM),
-        "`cargo package --locked --no-verify`",
+        "`cargo publish --workspace --dry-run --allow-dirty --locked`",
         f"Tracked `{package}` package inventory",
         "`python3 scripts/readme_doctests.py --record-measurements`",
         "gzip archive bytes, tar member bytes, tar member count",
@@ -453,7 +462,7 @@ MEASUREMENT_ROWS: dict[str, MeasurementRow] = {
     "layout-throughput": (
         "Large-document layout throughput",
         f"minimum 250 pages/s, observed {PERFORMANCE_OBSERVATIONS['layout-throughput']}",
-        "rdocx 0.14.0",
+        PERFORMANCE_MEASUREMENT_VERSION,
         MEASUREMENT_PLATFORM,
         "release, one test thread",
         "1,000 one-page paragraphs with deterministic fonts",
@@ -464,7 +473,7 @@ MEASUREMENT_ROWS: dict[str, MeasurementRow] = {
     "layout-peak": (
         "Large-document layout peak allocation",
         f"maximum 64 MiB, observed {PERFORMANCE_OBSERVATIONS['layout-peak']}",
-        "rdocx 0.14.0",
+        PERFORMANCE_MEASUREMENT_VERSION,
         MEASUREMENT_PLATFORM,
         "release, one test thread",
         "1,000 one-page paragraphs with deterministic fonts",
@@ -475,7 +484,7 @@ MEASUREMENT_ROWS: dict[str, MeasurementRow] = {
     "pdf-throughput": (
         "Large-document PDF throughput",
         f"minimum 1,000 pages/s, observed {PERFORMANCE_OBSERVATIONS['pdf-throughput']}",
-        "rdocx 0.14.0",
+        PERFORMANCE_MEASUREMENT_VERSION,
         MEASUREMENT_PLATFORM,
         "release, one test thread",
         "1,000 deterministic layout pages",
@@ -486,7 +495,7 @@ MEASUREMENT_ROWS: dict[str, MeasurementRow] = {
     "pdf-peak": (
         "Large-document PDF peak allocation",
         f"maximum 16 MiB, observed {PERFORMANCE_OBSERVATIONS['pdf-peak']}",
-        "rdocx 0.14.0",
+        PERFORMANCE_MEASUREMENT_VERSION,
         MEASUREMENT_PLATFORM,
         "release, one test thread",
         "1,000 deterministic layout pages",
@@ -673,8 +682,9 @@ def expected_measurement_version(
 ) -> str | None:
     if measurement_id.startswith("archive:"):
         return versions.get(measurement_id.removeprefix("archive:"))
-    version = versions.get("rdocx")
-    return None if version is None else f"rdocx {version}"
+    if measurement_id in SPEED_MEASUREMENTS:
+        return PERFORMANCE_MEASUREMENT_VERSION
+    return None
 
 
 def validate_measurement_evidence(

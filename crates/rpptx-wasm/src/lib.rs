@@ -137,6 +137,7 @@ mod tests {
     const WASM_OPT_ARGS: &[&str] = &[
         "-Oz",
         "--enable-bulk-memory",
+        "--enable-nontrapping-float-to-int",
         "<bindgen-wasm>",
         "-o",
         "<optimized-wasm>",
@@ -198,6 +199,7 @@ mod tests {
         let wasm_opt_args = vec![
             "-Oz".to_owned(),
             "--enable-bulk-memory".to_owned(),
+            "--enable-nontrapping-float-to-int".to_owned(),
             bindgen_wasm.display().to_string(),
             "-o".to_owned(),
             optimized_wasm.display().to_string(),
@@ -236,7 +238,7 @@ mod tests {
             ),
             wasm_opt_args: normalize_args(
                 wasm_opt_args,
-                &[(2, "<bindgen-wasm>"), (4, "<optimized-wasm>")],
+                &[(3, "<bindgen-wasm>"), (5, "<optimized-wasm>")],
             ),
             gzip_args: normalize_args(gzip_args, &[(3, "<optimized-wasm>")]),
             optimized_wasm: std::fs::read(optimized_wasm).expect("read optimized WASM"),
@@ -267,7 +269,7 @@ mod tests {
         if evidence.wasm_pack_version != "wasm-pack 0.15.0" {
             return Err("wasm-pack must be exactly 0.15.0".to_owned());
         }
-        if evidence.wasm_opt_version != "wasm-opt version 125" {
+        if evidence.wasm_opt_version != "wasm-opt version 125 (version_125)" {
             return Err("wasm-opt must be exactly version 125".to_owned());
         }
         let exact_args = |actual: &[String], expected: &[&str], tool: &str| {
@@ -334,7 +336,7 @@ mod tests {
         ];
         let mut evidence = SizePipelineEvidence {
             wasm_pack_version: "wasm-pack 0.15.0".to_owned(),
-            wasm_opt_version: "wasm-opt version 125".to_owned(),
+            wasm_opt_version: "wasm-opt version 125 (version_125)".to_owned(),
             wasm_pack_args: WASM_PACK_ARGS.iter().map(ToString::to_string).collect(),
             wasm_opt_args: WASM_OPT_ARGS.iter().map(ToString::to_string).collect(),
             gzip_args: GZIP_ARGS.iter().map(ToString::to_string).collect(),
@@ -354,6 +356,20 @@ mod tests {
             "wasm-pack did not use the reviewed pipeline arguments"
         );
         evidence.wasm_pack_args = WASM_PACK_ARGS.iter().map(ToString::to_string).collect();
+        evidence
+            .wasm_opt_args
+            .retain(|arg| arg != "--enable-nontrapping-float-to-int");
+        assert_eq!(
+            validate_size_pipeline(&evidence, "gzip").unwrap_err(),
+            "wasm-opt did not use the reviewed pipeline arguments"
+        );
+        evidence.wasm_opt_args = WASM_OPT_ARGS.iter().map(ToString::to_string).collect();
+        evidence.wasm_opt_version = "wasm-opt version 125".to_owned();
+        assert_eq!(
+            validate_size_pipeline(&evidence, "gzip").unwrap_err(),
+            "wasm-opt must be exactly version 125"
+        );
+        evidence.wasm_opt_version = "wasm-opt version 125 (version_125)".to_owned();
         evidence.gzip_args = ["-n", "-1", "-c", "<optimized-wasm>"]
             .into_iter()
             .map(ToString::to_string)
@@ -421,6 +437,51 @@ mod tests {
         assert_complete_package_round_trip(&source, &Uint8Array::new(&output).to_vec());
     }
 
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn fx225_list_style_parse_with_real_caller_state() {
+        let source = nontrivial_deck();
+        let mut author = rpptx::Presentation::from_bytes(&source).unwrap();
+        author
+            .slide_mut(0)
+            .unwrap()
+            .add_textbox(
+                rpptx::Emu(100),
+                rpptx::Emu(100),
+                rpptx::Emu(1_000_000),
+                rpptx::Emu(500_000),
+            )
+            .unwrap()
+            .set_text("Retained real caller")
+            .unwrap();
+        let mut package = OpcPackage::from_reader(Cursor::new(author.to_bytes().unwrap())).unwrap();
+        let slide = package.parts.get_mut("/ppt/slides/slide1.xml").unwrap();
+        let xml = String::from_utf8(slide.clone()).unwrap();
+        assert!(xml.contains("<a:lstStyle/>"));
+        let mut style =
+            String::from("<a:lstStyle xmlns:e='urn:fx225' e:proof='source'><a:defPPr/>");
+        for level in 1..=9 {
+            style.push_str(&format!(
+                "<a:lvl{level}pPr marL=\"{level}\"><a:defRPr lang=\"en-US\"/></a:lvl{level}pPr>"
+            ));
+        }
+        style.push_str("<e:opaque v='keep&amp;exact'/></a:lstStyle>");
+        *slide = xml.replace("<a:lstStyle/>", &style).into_bytes();
+        let mut buffer = Cursor::new(Vec::new());
+        package.write_to(&mut buffer).unwrap();
+        let source = buffer.into_inner();
+        let parsed = WasmPresentation::from_bytes(&source).unwrap();
+        let clone = parsed.to_bytes().unwrap();
+        assert_complete_package_round_trip(&source, &clone);
+        let output = OpcPackage::from_reader(Cursor::new(clone)).unwrap();
+        assert!(String::from_utf8_lossy(&output.parts["/ppt/slides/slide1.xml"]).contains(&style));
+        assert_eq!(
+            author.len(),
+            1,
+            "the real authoring caller remains live through parsing"
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn render_profile_returns_a_complete_pdf() {
@@ -465,30 +526,31 @@ mod tests {
         let wasm_manifest = include_str!("../Cargo.toml");
 
         assert!(workspace_manifest.contains(
-            "rpptx = { path = \"crates/rpptx\", version = \"0.12.1\", default-features = false }"
+            "rpptx = { path = \"crates/rpptx\", version = \"0.14.1\", default-features = false }"
         ));
         assert!(
             facade_manifest
                 .contains("default = [\"default-template\", \"render\", \"system-fonts\"]")
         );
         for dependency in [
-            "dep:gif",
             "dep:jpeg-encoder",
+            "dep:lopdf",
+            "lopdf/wasm_js",
             "dep:miniz_oxide",
             "dep:oxml-pdf",
             "dep:rpptx-layout",
             "dep:rpptx-render",
-            "dep:tiny-skia",
         ] {
             assert!(facade_manifest.contains(&format!("\"{dependency}\"")));
         }
-        for dependency in [
-            "gif = { workspace = true, optional = true }",
-            "jpeg-encoder = { workspace = true, optional = true, features = [\"std\"] }",
-            "tiny-skia = { workspace = true, optional = true }",
-        ] {
-            assert!(facade_manifest.contains(dependency));
-            assert!(!wasm_manifest.contains(dependency));
+        let optional_jpeg =
+            "jpeg-encoder = { workspace = true, optional = true, features = [\"std\"] }";
+        assert!(facade_manifest.contains(optional_jpeg));
+        assert!(!wasm_manifest.contains(optional_jpeg));
+        for dependency in ["gif", "tiny-skia", "zune-jpeg", "tiff"] {
+            assert!(facade_manifest.contains(&format!("{dependency}.workspace = true")));
+            assert!(!facade_manifest.contains(&format!("\"dep:{dependency}\"")));
+            assert!(!wasm_manifest.contains(&format!("{dependency}.workspace")));
         }
         assert!(wasm_manifest.contains("default = []"));
         assert!(wasm_manifest.contains("render = [\"rpptx/render\"]"));

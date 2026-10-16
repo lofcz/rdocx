@@ -32,13 +32,27 @@ and a zero-finding `/microscope`. Run `/verify --full` and `/sprint-review` once
 sprint result. A formal dependency-prefix checkpoint completes its reviewed
 prerequisite using scoped evidence and focused integration checks so a
 dependent F-ID can start. It does not run the full workspace or sprint review.
-The release workflow retains its separate full gate before publication.
+The release workflow retains its separate full gate and final approval after
+`/close-sprint` has merged and pushed `main`. A prepared family tag points to
+that exact reviewed main merge SHA.
 
 Review commands never patch the diff they audit. When an orchestration command
 such as `/run-sprint` invokes a review, the completed review returns control to
 the orchestrator. It may enter a separate remediation phase and launch the next
 independent review pass in the same user invocation. The boundary separates
 review from remediation, not one agent session from the next.
+
+### External CI source availability
+
+When an approved feature requires actual external CI execution of its new
+workflow, that gate can require reviewed source on GitHub before feature
+completion. Use the source availability checkpoint in `/run-sprint`. Every
+local check, applicable local risk rider and independent microscope must pass
+first. Record the named external gates as pending. The feature remains
+approved and in-progress, without completion ledgers or dependency unblocking.
+Only the clean reviewed canonical sprint ref may be pushed at this checkpoint.
+No worker push, force push, main merge, tag or publication is permitted.
+Actual CI evidence must bind the pushed SHA before ordinary completion.
 
 ## Parallel work
 

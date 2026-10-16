@@ -4,11 +4,12 @@ use oxml_core::Twips;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer, XmlVersion};
 
+use crate::document::{CT_NoteProperties, CT_SectPr};
 use crate::error::{OxmlError, Result};
 use crate::math::{MathProperties, fixed_math_prefix_is_safe, is_math_element};
 use crate::namespace::W_NS;
 use crate::numbering::{namespace_bindings, word_prefixes_at};
-use crate::properties::{is_word_attribute, is_word_element};
+use crate::properties::{is_word_attribute, is_word_element, parse_integer_measurement};
 use crate::raw_xml::capture_element;
 
 /// The editing operation permitted by `w:documentProtection`.
@@ -520,6 +521,8 @@ pub struct CT_Settings {
     do_not_track_moves: Option<bool>,
     do_not_track_formatting: Option<bool>,
     document_protection: Option<DocumentProtection>,
+    footnote_properties: Option<CT_NoteProperties>,
+    endnote_properties: Option<CT_NoteProperties>,
     default_tab_stop: Option<Twips>,
     automatic_hyphenation: Option<bool>,
     consecutive_hyphen_limit: Option<i32>,
@@ -548,6 +551,158 @@ pub struct CT_Settings {
 }
 
 impl CT_Settings {
+    /// Return the presence-sensitive embedded TrueType font setting.
+    pub fn embed_true_type_fonts(&self) -> Result<Option<bool>> {
+        self.font_flag(b"embedTrueTypeFonts")
+    }
+
+    /// Set or remove only the owned embedded TrueType font setting.
+    pub fn set_embed_true_type_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        self.set_font_flag(b"embedTrueTypeFonts", value)
+    }
+
+    /// Return the presence-sensitive embedded system font setting.
+    pub fn embed_system_fonts(&self) -> Result<Option<bool>> {
+        self.font_flag(b"embedSystemFonts")
+    }
+
+    /// Set or remove only the owned embedded system font setting.
+    pub fn set_embed_system_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        self.set_font_flag(b"embedSystemFonts", value)
+    }
+
+    /// Return the presence-sensitive font subsetting setting.
+    pub fn save_subset_fonts(&self) -> Result<Option<bool>> {
+        self.font_flag(b"saveSubsetFonts")
+    }
+
+    /// Set or remove only the owned font subsetting setting.
+    pub fn set_save_subset_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        self.set_font_flag(b"saveSubsetFonts", value)
+    }
+
+    fn font_flag(&self, local: &[u8]) -> Result<Option<bool>> {
+        let source = self.to_xml()?;
+        let occurrences = find_top_level_children(&source, local)?;
+        if occurrences.len() > 1 {
+            return Err(OxmlError::InvalidValue("ambiguous font setting".to_owned()));
+        }
+        let Some((raw, inherited)) = occurrences.first() else {
+            return Ok(None);
+        };
+        let mut reader = Reader::from_reader(raw.as_slice());
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element) => {
+                let prefixes = word_prefixes_at(&element, inherited)?;
+                let mut values = 0;
+                for attribute in element.attributes() {
+                    if is_word_attribute(attribute?.key.as_ref(), b"val", &prefixes) {
+                        values += 1;
+                    }
+                }
+                if values > 1 {
+                    return Err(OxmlError::InvalidValue(
+                        "ambiguous expanded font setting value".to_owned(),
+                    ));
+                }
+                parse_toggle(&element, &prefixes)?
+                    .map(Some)
+                    .ok_or_else(|| OxmlError::InvalidValue("invalid font setting value".to_owned()))
+            }
+            _ => Err(OxmlError::InvalidValue(
+                "missing font setting root".to_owned(),
+            )),
+        }
+    }
+
+    fn set_font_flag(&mut self, local: &[u8], value: Option<bool>) -> Result<()> {
+        if self.font_flag(local)? == value {
+            return Ok(());
+        }
+        let source = self.to_xml()?;
+        let occurrences = find_top_level_children(&source, local)?;
+        let replacement = match (occurrences.first(), value) {
+            (Some((raw, inherited)), Some(enabled)) => rewrite_word_root_attribute(
+                raw,
+                inherited,
+                b"val",
+                if enabled { "1" } else { "0" },
+            )?,
+            (Some((raw, inherited)), None) => {
+                let mut reader = Reader::from_reader(raw.as_slice());
+                let mut root = true;
+                loop {
+                    match reader.read_event()? {
+                        Event::Start(element) | Event::Empty(element) if root => {
+                            root = false;
+                            let prefixes = word_prefixes_at(&element, inherited)?;
+                            for attribute in element.attributes() {
+                                let attribute = attribute?;
+                                if attribute.key.as_ref() != b"xmlns"
+                                    && !attribute.key.as_ref().starts_with(b"xmlns:")
+                                    && !is_word_attribute(attribute.key.as_ref(), b"val", &prefixes)
+                                {
+                                    return Err(OxmlError::InvalidValue(
+                                        "cannot delete opaque font setting attributes".to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                        Event::End(_) => {}
+                        Event::Text(text) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+                        Event::Eof => break,
+                        _ => {
+                            return Err(OxmlError::InvalidValue(
+                                "cannot delete opaque font setting payload".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            (None, Some(enabled)) => {
+                write_toggle_setting(&format!("w:{}", std::str::from_utf8(local)?), enabled)?
+            }
+            (None, None) => return Ok(()),
+        };
+        self.source_xml = Some(rewrite_ordered_child(
+            &source,
+            SETTINGS_ORDER,
+            local,
+            &replacement,
+            is_word_element,
+        )?);
+        Ok(())
+    }
+
+    /// Change only the owned background-display toggle, retaining its opaque payload.
+    pub fn set_display_background_shape(&mut self, enabled: bool) -> Result<()> {
+        let source = self.to_xml()?;
+        let occurrences = find_top_level_children(&source, b"displayBackgroundShape")?;
+        if occurrences.len() > 1 {
+            return Err(OxmlError::InvalidValue(
+                "cannot rewrite ambiguous w:displayBackgroundShape".to_owned(),
+            ));
+        }
+        let replacement = match occurrences.first() {
+            Some((raw, inherited)) => rewrite_word_root_attribute(
+                raw,
+                inherited,
+                b"val",
+                if enabled { "1" } else { "0" },
+            )?,
+            None => write_toggle_setting("w:displayBackgroundShape", enabled)?,
+        };
+        self.source_xml = Some(rewrite_ordered_child(
+            &source,
+            SETTINGS_ORDER,
+            b"displayBackgroundShape",
+            &replacement,
+            is_word_element,
+        )?);
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -599,6 +754,33 @@ impl CT_Settings {
                         };
                         let total = model.tally.record(&["mathPr"], parsed.is_some());
                         assign(&mut model.math_properties, parsed, total);
+                        buffer.clear();
+                        continue;
+                    }
+                    if depth == 1
+                        && (is_word_element(element.name().as_ref(), b"footnotePr", &prefixes)
+                            || is_word_element(element.name().as_ref(), b"endnotePr", &prefixes))
+                    {
+                        let footnote =
+                            is_word_element(element.name().as_ref(), b"footnotePr", &prefixes);
+                        let name = if footnote { "footnotePr" } else { "endnotePr" };
+                        let properties = if started {
+                            CT_SectPr::parse_note_properties(
+                                &mut reader,
+                                &prefixes,
+                                &[],
+                                name.as_bytes(),
+                            )?
+                        } else {
+                            CT_NoteProperties::default()
+                        };
+                        let total = model.tally.record(&[name], true);
+                        let slot = if footnote {
+                            &mut model.footnote_properties
+                        } else {
+                            &mut model.endnote_properties
+                        };
+                        assign(slot, Some(properties), total);
                         buffer.clear();
                         continue;
                     }
@@ -935,6 +1117,52 @@ impl CT_Settings {
 }
 
 impl CT_Settings {
+    /// Document-wide footnote policy, before a section override.
+    pub fn footnote_properties(&self) -> Option<&CT_NoteProperties> {
+        self.footnote_properties.as_ref()
+    }
+
+    /// Document-wide endnote policy, before a section override.
+    pub fn endnote_properties(&self) -> Option<&CT_NoteProperties> {
+        self.endnote_properties.as_ref()
+    }
+
+    /// Replace document-wide footnote policy in schema order.
+    pub fn set_footnote_properties(&mut self, properties: CT_NoteProperties) -> Result<()> {
+        let mut writer = Writer::new(Vec::new());
+        properties.to_xml(&mut writer, "w:footnotePr")?;
+        self.finish_set("footnotePr", writer.into_inner())?;
+        self.footnote_properties = Some(properties);
+        Ok(())
+    }
+
+    /// Replace document-wide endnote policy in schema order.
+    pub fn set_endnote_properties(&mut self, properties: CT_NoteProperties) -> Result<()> {
+        let mut writer = Writer::new(Vec::new());
+        properties.to_xml(&mut writer, "w:endnotePr")?;
+        self.finish_set("endnotePr", writer.into_inner())?;
+        self.endnote_properties = Some(properties);
+        Ok(())
+    }
+
+    /// Remove document-wide footnote policy.
+    pub fn remove_footnote_properties(&mut self) -> Result<Option<CT_NoteProperties>> {
+        if !self.begin_removal("footnotePr")? {
+            return Ok(None);
+        }
+        self.finish_removal("footnotePr")?;
+        Ok(self.footnote_properties.take())
+    }
+
+    /// Remove document-wide endnote policy.
+    pub fn remove_endnote_properties(&mut self) -> Result<Option<CT_NoteProperties>> {
+        if !self.begin_removal("endnotePr")? {
+            return Ok(None);
+        }
+        self.finish_removal("endnotePr")?;
+        Ok(self.endnote_properties.take())
+    }
+
     /// Report every supported child the typed model could not own.
     ///
     /// A package authored entirely through the public API can only produce
@@ -1905,6 +2133,8 @@ impl CT_Settings {
             && self.do_not_track_moves.is_none()
             && self.do_not_track_formatting.is_none()
             && self.document_protection.is_none()
+            && self.footnote_properties.is_none()
+            && self.endnote_properties.is_none()
             && self.default_tab_stop.is_none()
             && self.automatic_hyphenation.is_none()
             && self.consecutive_hyphen_limit.is_none()
@@ -1985,6 +2215,16 @@ impl CT_Settings {
         }
         if let Some(protection) = &self.document_protection {
             emit(write_document_protection(protection)?);
+        }
+        if let Some(properties) = &self.footnote_properties {
+            let mut child = Writer::new(Vec::new());
+            properties.to_xml(&mut child, "w:footnotePr")?;
+            emit(child.into_inner());
+        }
+        if let Some(properties) = &self.endnote_properties {
+            let mut child = Writer::new(Vec::new());
+            properties.to_xml(&mut child, "w:endnotePr")?;
+            emit(child.into_inner());
         }
         if let Some(value) = self.default_tab_stop {
             emit(write_valued_setting(
@@ -2574,13 +2814,91 @@ pub(crate) fn capture_empty_element(element: &BytesStart<'_>) -> Result<Vec<u8>>
     Ok(raw)
 }
 
+/// Replace one qualified scalar attribute without serializing producer bytes.
+pub(crate) fn rewrite_word_root_attribute(
+    raw: &[u8],
+    inherited: &[String],
+    local: &[u8],
+    value: &str,
+) -> Result<Vec<u8>> {
+    let mut reader = Reader::from_reader(raw);
+    let element = loop {
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element) => break element,
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) => {}
+            Event::Text(text) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            _ => return Err(OxmlError::InvalidValue("missing property root".to_owned())),
+        }
+    };
+    let prefixes = word_prefixes_at(&element, inherited)?;
+    let mut owned = None;
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| OxmlError::InvalidValue(error.to_string()))?;
+        if is_word_attribute(attribute.key.as_ref(), local, &prefixes) {
+            if owned.is_some() {
+                return Err(OxmlError::InvalidValue(
+                    "duplicate expanded property attribute".to_owned(),
+                ));
+            }
+            let start = (attribute.value.as_ref().as_ptr() as usize)
+                .checked_sub(raw.as_ptr() as usize)
+                .ok_or_else(|| {
+                    OxmlError::InvalidValue("attribute source was not retained".to_owned())
+                })?;
+            let end = start + attribute.value.len();
+            if end > raw.len() {
+                return Err(OxmlError::InvalidValue(
+                    "attribute source was not retained".to_owned(),
+                ));
+            }
+            owned = Some((start, end));
+        }
+    }
+    let mut output = raw.to_vec();
+    if let Some((start, end)) = owned {
+        output.splice(start..end, value.bytes());
+    } else {
+        let prefix = prefixes
+            .iter()
+            .find(|prefix| !prefix.is_empty() && !prefix.starts_with('\0'));
+        let bindings = namespace_bindings(&prefixes);
+        let (prefix, declaration) = match prefix {
+            Some(prefix) => (prefix.clone(), String::new()),
+            None => {
+                let mut prefix = "pagePropertyWord".to_owned();
+                while bindings.iter().any(|(name, _)| name == &prefix)
+                    || element.attributes().flatten().any(|attribute| {
+                        attribute.key.as_ref() == format!("xmlns:{prefix}").as_bytes()
+                    })
+                {
+                    prefix.push('x');
+                }
+                let declaration = format!(" xmlns:{prefix}=\"{W_NS}\"");
+                (prefix, declaration)
+            }
+        };
+        let end = reader.buffer_position() as usize;
+        let insert = if raw.get(end.saturating_sub(2)) == Some(&b'/') {
+            end - 2
+        } else {
+            end - 1
+        };
+        let attribute = format!(
+            "{declaration} {prefix}:{}=\"{value}\"",
+            std::str::from_utf8(local)?
+        );
+        output.splice(insert..insert, attribute.bytes());
+    }
+    Ok(output)
+}
+
 pub(crate) fn word_value(element: &BytesStart<'_>, prefixes: &[String]) -> Option<String> {
     word_attribute(element, b"val", prefixes).ok().flatten()
 }
 
 fn parse_twips(element: &BytesStart<'_>, prefixes: &[String]) -> Option<Twips> {
-    word_value(element, prefixes)?
-        .parse::<i32>()
+    let value = word_value(element, prefixes)?;
+    parse_integer_measurement::<i32>(element.name().as_ref(), b"w:val", &value)
         .ok()
         .filter(|value| *value >= 0)
         .map(Twips)
@@ -3395,6 +3713,149 @@ fn write_document_protection(protection: &DocumentProtection) -> Result<Vec<u8>>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fx220_font_flags_preserve_presence_aliases_payload_and_order() {
+        for (local, getter, setter) in [
+            (
+                "embedTrueTypeFonts",
+                CT_Settings::embed_true_type_fonts as fn(&CT_Settings) -> Result<Option<bool>>,
+                CT_Settings::set_embed_true_type_fonts
+                    as fn(&mut CT_Settings, Option<bool>) -> Result<()>,
+            ),
+            (
+                "embedSystemFonts",
+                CT_Settings::embed_system_fonts,
+                CT_Settings::set_embed_system_fonts,
+            ),
+            (
+                "saveSubsetFonts",
+                CT_Settings::save_subset_fonts,
+                CT_Settings::set_save_subset_fonts,
+            ),
+        ] {
+            for prefix in ["a:", ""] {
+                let binding = if prefix.is_empty() {
+                    format!("xmlns=\"{W_NS}\"")
+                } else {
+                    format!("xmlns:a=\"{W_NS}\"")
+                };
+                let source = format!(
+                    "<{prefix}settings {binding} xmlns:z=\"{W_NS}\" xmlns:x=\"urn:foreign\"><{prefix}view z:val=\"print\"/><x:{local} x:val=\"foreign\"/><{prefix}{local} z:val='off' x:keep='&amp;'><x:payload exact='yes'/></{prefix}{local}><{prefix}defaultTabStop z:val=\"720\"/></{prefix}settings>"
+                );
+                let mut model = CT_Settings::from_xml(source.as_bytes()).unwrap();
+                assert_eq!(getter(&model).unwrap(), Some(false));
+                setter(&mut model, Some(false)).unwrap();
+                assert_eq!(model.to_xml().unwrap(), source.as_bytes());
+                setter(&mut model, Some(true)).unwrap();
+                assert_eq!(getter(&model).unwrap(), Some(true));
+                let written = String::from_utf8(model.to_xml().unwrap()).unwrap();
+                assert!(
+                    written.contains("x:keep='&amp;'")
+                        && written.contains("<x:payload exact='yes'/>")
+                        && written.contains(&format!("<x:{local} x:val=\"foreign\"/>"))
+                );
+                let before = model.to_xml().unwrap();
+                assert!(setter(&mut model, None).is_err());
+                assert_eq!(model.to_xml().unwrap(), before);
+            }
+            let mut model = CT_Settings::new();
+            assert_eq!(getter(&model).unwrap(), None);
+            setter(&mut model, Some(false)).unwrap();
+            assert_eq!(getter(&model).unwrap(), Some(false));
+            setter(&mut model, None).unwrap();
+            assert_eq!(getter(&model).unwrap(), None);
+            for payload in [
+                format!("<w:{local} w:val=\"invalid\"/>"),
+                format!("<w:{local}/><w:{local}/>"),
+                format!("<w:{local} w:val=\"1\" a:val=\"0\"/>"),
+            ] {
+                let source = format!(
+                    "<w:settings xmlns:w=\"{W_NS}\" xmlns:a=\"{W_NS}\">{payload}</w:settings>"
+                );
+                let mut model = CT_Settings::from_xml(source.as_bytes()).unwrap();
+                assert!(getter(&model).is_err());
+                assert!(setter(&mut model, Some(true)).is_err());
+                assert_eq!(model.to_xml().unwrap(), source.as_bytes());
+            }
+        }
+        let source = format!(
+            "<w:settings xmlns:w=\"{W_NS}\"><w:view w:val=\"print\"/><w:defaultTabStop w:val=\"720\"/></w:settings>"
+        );
+        let mut model = CT_Settings::from_xml(source.as_bytes()).unwrap();
+        model.set_save_subset_fonts(Some(false)).unwrap();
+        model.set_embed_system_fonts(Some(true)).unwrap();
+        model.set_embed_true_type_fonts(Some(true)).unwrap();
+        let xml = String::from_utf8(model.to_xml().unwrap()).unwrap();
+        assert!(xml.find("embedTrueTypeFonts").unwrap() < xml.find("embedSystemFonts").unwrap());
+        assert!(xml.find("embedSystemFonts").unwrap() < xml.find("saveSubsetFonts").unwrap());
+        assert!(xml.find("saveSubsetFonts").unwrap() < xml.find("defaultTabStop").unwrap());
+    }
+
+    #[test]
+    fn fx220_multiple_font_flags_serialize_after_true_to_false_change() {
+        let mut model = CT_Settings::new();
+        model.set_embed_true_type_fonts(Some(true)).unwrap();
+        model.set_save_subset_fonts(Some(false)).unwrap();
+        model.set_embed_true_type_fonts(Some(false)).unwrap();
+        let bytes = model.to_xml().unwrap();
+        assert!(
+            oxml_core::xml::validate_strict_xml_1_0(&bytes).is_ok(),
+            "settings: {bytes:?}"
+        );
+        let reopened = CT_Settings::from_xml(&bytes).unwrap();
+        assert_eq!(reopened.embed_true_type_fonts().unwrap(), Some(false));
+        assert_eq!(reopened.save_subset_fonts().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn fx220_root_attribute_insertions_preserve_namespace_context_for_all_consumers() {
+        let opaque = "<pagePropertyWord:payload fact='kept'/>";
+        for prefix in ["a:", ""] {
+            let binding = if prefix.is_empty() {
+                format!("xmlns=\"{W_NS}\"")
+            } else {
+                format!("xmlns:a=\"{W_NS}\"")
+            };
+            for local in ["embedTrueTypeFonts", "displayBackgroundShape"] {
+                let source = format!(
+                    "<{prefix}settings {binding} xmlns:pagePropertyWord='urn:producer'><{prefix}{local} xmlns:w='urn:foreign'>{opaque}</{prefix}{local}></{prefix}settings>"
+                );
+                let mut model = CT_Settings::from_xml(source.as_bytes()).unwrap();
+                if local == "embedTrueTypeFonts" {
+                    model.set_embed_true_type_fonts(Some(false)).unwrap();
+                    assert_eq!(model.embed_true_type_fonts().unwrap(), Some(false));
+                } else {
+                    model.set_display_background_shape(false).unwrap();
+                }
+                let bytes = model.to_xml().unwrap();
+                oxml_core::xml::validate_strict_xml_1_0(&bytes).unwrap();
+                let xml = std::str::from_utf8(&bytes).unwrap();
+                assert!(xml.contains(opaque));
+                assert!(xml.contains("xmlns:pagePropertyWord='urn:producer'"));
+                assert!(xml.contains("xmlns:w='urn:foreign'"));
+                if prefix.is_empty() {
+                    assert!(xml.contains("xmlns:pagePropertyWordx="));
+                    assert!(xml.contains("pagePropertyWordx:val=\"0\""));
+                } else {
+                    assert!(xml.contains("a:val=\"0\""));
+                }
+            }
+        }
+        let raw = format!(
+            "<background xmlns='{W_NS}' xmlns:w='urn:foreign' xmlns:pagePropertyWord='urn:producer'>{opaque}</background>"
+        );
+        let mut document = crate::document::CT_Document::new();
+        document.background_xml = Some(raw.into_bytes());
+        document.set_background_color("FF1122").unwrap();
+        let bytes = document.to_xml().unwrap();
+        oxml_core::xml::validate_strict_xml_1_0(&bytes).unwrap();
+        let xml = std::str::from_utf8(&bytes).unwrap();
+        assert!(xml.contains(opaque));
+        assert!(xml.contains("xmlns:pagePropertyWord='urn:producer'"));
+        assert!(xml.contains("xmlns:w='urn:foreign'"));
+        assert!(xml.contains("pagePropertyWordx:color=\"FF1122\""));
+    }
+
     use super::*;
 
     fn settings(mode: &str, enforcement: &str, formatting: &str) -> Vec<u8> {
@@ -3856,6 +4317,19 @@ mod tests {
     }
 
     #[test]
+    fn decimal_twips_settings_round_and_keep_their_bytes() {
+        let xml = format!(
+            r#"<w:settings xmlns:w="{W_NS}"><w:defaultTabStop w:val="720.0"/><w:hyphenationZone w:val="356.5"/></w:settings>"#,
+        );
+        let settings = CT_Settings::from_xml(xml.as_bytes()).unwrap();
+
+        assert_eq!(settings.default_tab_stop(), Some(Twips(720)));
+        assert_eq!(settings.hyphenation_zone(), Some(Twips(357)));
+        assert!(settings.diagnostics().is_empty());
+        assert_eq!(settings.to_xml().unwrap(), xml.as_bytes());
+    }
+
+    #[test]
     fn duplicate_and_malformed_supported_children_report_diagnostics() {
         let xml = format!(
             r#"<w:settings xmlns:w="{W_NS}"><w:view w:val="print"/><w:view w:val="normal"/><w:zoom w:val="nonsense"/><w:defaultTabStop w:val="-12"/><w:compat><w:noTabHangInd w:val="maybe"/></w:compat><w:docVars><w:docVar w:name="A"/></w:docVars></w:settings>"#,
@@ -4042,5 +4516,65 @@ mod tests {
         let reopened = CT_Settings::from_xml(output.as_bytes()).unwrap();
         assert_eq!(reopened.mail_merge().unwrap().check_errors, Some(2));
         assert_eq!(reopened.diagnostics(), &[]);
+    }
+
+    #[test]
+    fn note_policy_preserves_unknown_note_and_section_xml() {
+        let xml = format!(
+            r#"<q:settings xmlns:q="{W_NS}" xmlns:x="urn:producer"><q:footnotePr><q:pos q:val="beneathText"/><x:keep x:flag="exact"/><q:numFmt q:val="decimal"/><q:endnote q:id="9"/><q:footnote q:id="-1"/></q:footnotePr><q:endnotePr><q:numStart q:val="4"/></q:endnotePr></q:settings>"#
+        );
+        let mut settings = CT_Settings::from_xml(xml.as_bytes()).unwrap();
+        assert_eq!(settings.to_xml().unwrap(), xml.as_bytes());
+        let mut footnote = settings.footnote_properties().unwrap().clone();
+        assert_eq!(footnote.pos.as_deref(), Some("beneathText"));
+        assert_eq!(footnote.special_references, vec![-1]);
+        footnote.num_start = Some(3);
+        settings.set_footnote_properties(footnote).unwrap();
+        let written = String::from_utf8(settings.to_xml().unwrap()).unwrap();
+        assert!(written.contains(r#"<x:keep x:flag="exact"/>"#), "{written}");
+        assert!(written.contains(r#"<q:endnote q:id="9"/>"#), "{written}");
+        assert!(written.contains(r#"<w:numStart w:val="3"/>"#), "{written}");
+        let reopened = CT_Settings::from_xml(written.as_bytes()).unwrap();
+        assert_eq!(reopened.footnote_properties().unwrap().num_start, Some(3));
+        assert_eq!(
+            reopened.footnote_properties().unwrap().special_references,
+            vec![-1]
+        );
+        assert_eq!(reopened.endnote_properties().unwrap().num_start, Some(4));
+
+        let section_xml = format!(
+            r#"<q:document xmlns:q="{W_NS}" xmlns:x="urn:producer"><q:body><q:p/><q:sectPr><q:footnotePr><q:pos q:val="pageBottom"/><x:keep x:flag="section-exact"/><q:numFmt q:val="decimal"/></q:footnotePr></q:sectPr></q:body></q:document>"#
+        );
+        let mut document = crate::document::CT_Document::from_xml(section_xml.as_bytes()).unwrap();
+        document
+            .body
+            .sect_pr
+            .as_mut()
+            .unwrap()
+            .footnote_pr
+            .as_mut()
+            .unwrap()
+            .num_start = Some(5);
+        let rewritten = String::from_utf8(document.to_xml().unwrap()).unwrap();
+        assert!(
+            rewritten.contains(r#"<x:keep x:flag="section-exact"/>"#),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"<w:numStart w:val="5"/>"#),
+            "{rewritten}"
+        );
+        let reopened_section =
+            crate::document::CT_Document::from_xml(rewritten.as_bytes()).unwrap();
+        assert_eq!(
+            reopened_section
+                .body
+                .sect_pr
+                .unwrap()
+                .footnote_pr
+                .unwrap()
+                .num_start,
+            Some(5)
+        );
     }
 }

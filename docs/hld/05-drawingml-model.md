@@ -74,7 +74,13 @@ producer drawing payload while preventing destination identity collisions.
 parent is part of the contract. Emitting `a:ln` before `a:solidFill` inside
 `a:spPr` produces a repair prompt, not a warning. Every writer in this crate
 emits in schema order, and `OrderedRawChildren` keeps unmodelled siblings in
-their original slots rather than appending them at the end.
+their original slots rather than appending them at the end. An `a:extLst` read
+inside `a:ln` is held in the last slot, so a head or tail end added later is
+still written before it. A known sibling that the schema places after a
+modelled slot is recorded after that slot even when the slot was empty on read.
+An `a:scene3d` read from an `a:spPr` without an `a:effectLst` therefore still
+follows an effect list added later, and an `a:reflection` still follows an
+outer shadow added to its list.
 
 **`a:t` whitespace.** Leading and trailing whitespace is significant and needs
 `xml:space="preserve"`. Cheap to guard, and infuriating to diagnose later.
@@ -205,6 +211,32 @@ correctly inside a non-rectangular shape and would otherwise have to be invented
 
 The generated table and its provenance are covered in `08-rendering-spec.md`.
 
+The concrete shape-property inheritance operation stages missing geometry,
+fill, line and effect groups into a clone. A local transform retains its
+rotation and flip values, including explicit zero and false, while absent
+optional offset, extent and child coordinates inherit individually. An absent
+local transform inherits the complete lower transform. Copied opaque children
+retain their source namespace authority and schema position. Conflicting
+opaque owner metadata refuses atomically rather than rebinding local payload.
+The operation retains original source XML and its typed projection for
+admission. Unrepresentable opaque metadata on modeled descendants refuses
+from either the local or inherited owner, even without a namespace conflict.
+Those retained source facts do not participate in ordinary shape-property
+equality or serialization.
+
+`CT_Shape::style_for_materialization` prepares the actual source-scoped
+shape style without mutating the owner or clearing its current reference
+selections. Source-format notes stage direct fill, line, effect and font
+appearance before calling `materialize_style_references`. That operation
+validates the qualified owned style references, sets the fill, line and effect
+matrix indexes to zero and selects the schema None font collection. It stages
+the complete edit before publishing it. Original namespace authority, ordered
+opaque payload and foreign lookalikes remain preserved or receive a named
+atomic refusal when they cannot be represented. Legitimate modeled reference
+edits participate in preparation rather than being replaced by stale source
+snapshots. These materialization-specific source facts do not change ordinary
+style equality or writing.
+
 ## Text body
 
 ```
@@ -232,11 +264,17 @@ or `a:buSzPts`, and `a:buClr`.
 `CT_TextBody` maintains at least one paragraph. Its minimal constructor creates
 one empty paragraph, and whole-frame text replacement retains body properties,
 the optional list style, and the first paragraph's formatting and end
-properties while replacing the ordered text choices with one regular run.
-Clearing text therefore leaves one empty paragraph rather than an invalid empty
-body. Paragraph and run append operations preserve caller order. Fields and
-line breaks remain in place unless the caller explicitly replaces that
-paragraph's text.
+properties while replacing the ordered text choices with one regular run per
+line. Clearing text therefore leaves one empty paragraph rather than an invalid
+empty body. As in python-pptx, each line feed starts a paragraph and each
+vertical tab becomes an `a:br` carrying the run's formatting. Every new
+paragraph takes the first paragraph's properties, end properties and first run
+formatting, so each line looks as the replaced first line did, while preserved
+paragraph content stays with the first. The `rpptx` paragraph handle turns
+both a line feed and a vertical tab into an `a:br`, and run text stays literal.
+Paragraph and run append operations preserve caller order. Fields and line
+breaks remain in place unless the caller explicitly replaces that paragraph's
+text.
 
 Typed content transfer moves a non-empty body's paragraphs into another text
 body without flattening runs, fields, bullets, or formatting. The source keeps
@@ -274,7 +312,12 @@ than two lines of spacing opens. A typed `all_caps` replaces a preserved
 `cap="small"` on write, so a character-property element never carries two
 `cap` attributes. `CT_TextBodyProperties` writes a preserved `a:prstTxWarp`,
 `a:scene3d`, 3D, or extension child at its schema slot, so an autofit choice
-added after parsing still precedes a preserved scene or extension.
+added after parsing still precedes a preserved scene or extension. It types
+only the insets, `anchor`, `wrap`, `vert` and `spcFirstLastPara`, and keeps
+every other `a:bodyPr` attribute, such as `rot`, `numCol`, `spcCol` or
+`anchorCtr`, verbatim in source order after the typed ones. Editing any shape
+of a slide therefore leaves the columns and text rotation of every text body
+on it unchanged, although the renderer still draws one upright column.
 
 The presentation facade projects direct shape offset and extent, non-visual id
 and name, and the text body's explicit autofit choice through borrowed handles.
@@ -296,6 +339,36 @@ their stored logical text.
 properties. The reader accepts any prefix, and the writer emits `a:defPPr`
 before the ascending level properties with fixed `a:` prefixes. Unmodelled
 siblings remain in their original positions around those typed children.
+
+Character properties, paragraph properties and list styles each expose a
+concrete `with_inherited_defaults` operation. Local schema choices win,
+including explicit false, zero and no-bullet values. Missing paragraph and
+character defaults inherit without replacing unrelated local choices, and
+list default properties remain distinct from the nine level properties.
+Inheritance stages a clone and preserves qualified opaque attributes and
+ordered children. Copied lower children close their required namespaces,
+while inherited unqualified scalar attributes add no unrelated namespace
+bindings to the local owner. Ambiguous opaque metadata conflicts refuse
+without changing either input.
+
+### Character-owner source and caps
+
+`a:rPr`, default character properties and terminal paragraph properties model
+`cap="all"`, `cap="small"` and `cap="none"`. Setting either caps mode to a
+boolean selects that direct mode and clears the opposite direct mode. Clearing
+one mode leaves the other mode intact. Parsed conflicting direct modes are
+rejected by checked authoring. Highlight owns a direct DrawingML colour choice.
+Its live colour view retains source attributes, opaque children and existing
+transform payloads. An edit that cannot retain an unmodelled transform
+attribute refuses before changing the owner.
+
+Imported character properties and click links interpret owned elements and
+relationship attributes by namespace URI, including ancestor declarations,
+aliases and local rebinding. Foreign lookalikes and unqualified opaque `id`
+attributes stay lexical source payload. Source-aware changes keep the original
+qualified root, declarations, attributes and sibling order. Newly generated
+owned descendants locally close their required DrawingML and relationship
+namespaces rather than inheriting a foreign fixed-prefix binding.
 
 ## Tables
 
@@ -358,15 +431,16 @@ fill or line form that the neutral paint model cannot render remains typed and
 produces a stable resolver diagnostic.
 
 `CT_TableStyleList` models the optional default style id and the ordered style
-records. Each style can expose whole-table, band, edge, and corner regions. A
-region models its cell fill or fill reference, text bold and italic state,
-theme font reference, text colour, outer borders, and inside horizontal and
-vertical borders. Producer wrapper elements such as `a:fill`, `a:tcBdr`, and
-its edge children remain part of the modelled schema path. Empty wrappers and
-unmodelled siblings retain their original form.
+records. Each style can expose its table background fill or fill reference,
+keeping the background effect as XML, and its whole-table, band, edge, and
+corner regions. A region models its cell fill or fill reference, text bold
+and italic state, theme font reference, text colour, outer borders, and inside
+horizontal and vertical borders. Producer wrapper elements such as `a:fill`,
+`a:tcBdr`, and its edge children remain part of the modelled schema path.
+Empty wrappers and unmodelled siblings retain their original form.
 The model does not insert definitions for Office's built-in table styles into
-`ppt/tableStyles.xml`. Resolution supplies those definitions when a table names
-a known built-in ID and the package has no matching style record.
+`ppt/tableStyles.xml`. `CT_TableStyle::builtin` supplies the 74 known
+PowerPoint definitions by GUID when the package has no matching style record.
 
 Readers accept any element prefix. Writers use fixed `a:` prefixes and schema
 child order for the modelled subset. Table writers emit `a:tblPr`,
@@ -374,6 +448,12 @@ child order for the modelled subset. Table writers emit `a:tblPr`,
 extracts `a:tbl` from a larger XML part passes the ancestor namespace bindings
 to `from_xml_with_inherited_namespaces`, which keeps opaque producer-prefixed
 content namespace-complete in standalone output.
+
+A direct cell anchor parses and writes the namespace-owned `a:tcPr/@anchor`
+without rewriting the text body's `a:bodyPr`. Aliased element owners and rebound
+foreign lookalikes remain distinct. Getter reads and absent clears create no
+property node. Changed cell-property owners retain unrelated attributes,
+children and source order.
 
 ## Theme
 
@@ -418,3 +498,34 @@ writer retains ownership of fixed-prefix `a:srgbClr` serialization.
 Anything not in the list above is captured verbatim through
 `oxml_core::raw_xml::capture_element` and re-emitted in place. That is not a
 fallback, it is the design: parse what you render, preserve the rest.
+
+## PowerPoint field and theme access
+
+Paragraph field insertion supports slidenum, the imported datetime alias and datetime1 through
+datetime13. It preserves absent versus empty cached text, copies the selected
+paragraph formatting and allocates an identity unique across slide, layout and
+master fields. No automatic date operation reads a clock or locale. The caller
+supplies automatic cached text explicitly.
+
+Each presentation master exposes its own relationship-resolved Theme. Live
+colours include all twelve scheme slots as the existing scalar RGB values, with
+checked absolute RGB assignment. Major and minor font sets expose writable
+Latin, East Asian and complex-script typefaces. An absent slot remains absent
+instead of borrowing a different master's theme. Theme edits patch selected
+qualified source attributes and remove only recognised colour transforms when
+assigning absolute RGB. Unsafe selected opaque content refuses. Unselected
+lexical attributes, supplemental mappings and format scheme source remain exact.
+Selected scheme transfer closes actual namespace and compatibility policy from
+its source owner without changing the destination theme root.
+
+## Direct script and spacing properties
+
+Character spacing admits centipoints and universal pt/in/cm/mm/pc/pi units.
+Python reads an explicit value as Length and writes EMU divided by127 with
+truncation toward zero. Baseline is a signed fraction from-1 to1, represented
+as a truncated DrawingML percentage. Language updates the qualified retained
+character-property start token without discarding unrelated attributes. Latin,
+East Asian and complex-script faces remain independent typed font slots.
+Bullet scheme/start, colour, fractional size and font edit their own choices.
+An imported absolute point bullet size is preserved and is not reported as a
+fractional size or as a follows-text choice.

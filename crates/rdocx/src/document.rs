@@ -20,7 +20,7 @@ use quick_xml::Writer;
 use quick_xml::XmlVersion;
 use quick_xml::escape::resolve_xml_entity;
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::{Namespace, ResolveResult};
+use quick_xml::name::{Namespace, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
 use rdocx_oxml::MathProperties;
 use rdocx_oxml::content_control::{CT_Sdt, SdtContent, StorySdtOwner};
@@ -32,11 +32,11 @@ use rdocx_oxml::drawing::{
     AnchorAlignH, AnchorAlignV, CT_Anchor, CT_Drawing, CT_Inline, ST_RelativeFromH,
     ST_RelativeFromV, SourceRect, WrapType, drawing_ns,
 };
-use rdocx_oxml::font_table::{EmbeddedFontReference, FontFaceKind, FontTable};
+use rdocx_oxml::font_table::{EmbeddedFontReference, FontFaceKind, FontRecord, FontTable};
 use rdocx_oxml::header_footer::{
     CT_HdrFtr, HdrFtrRef, HdrFtrType, VmlWatermark, replace_authored_watermark,
 };
-use rdocx_oxml::namespace::matches_local_name;
+use rdocx_oxml::namespace::{M_NS, MC_NS, W_NS, matches_local_name};
 use rdocx_oxml::numbering::{
     CT_AbstractNum, CT_Lvl, CT_Num, CT_NumLvl, CT_Numbering, ST_LvlSuffix, ST_NumberFormat,
 };
@@ -51,7 +51,8 @@ use rdocx_oxml::shared::{ST_Jc, ST_PageOrientation, ST_SectionType};
 use rdocx_oxml::styles::{CT_Styles, StyleType};
 use rdocx_oxml::table::{CT_Row, CT_Tbl, CT_Tc, CellContent, ST_VerticalJc, VMerge};
 use rdocx_oxml::text::{
-    CT_P, CT_R, RunContent, story_field_instruction_has_name, story_simple_field_is_typed,
+    CT_P, CT_R, RangeAnchor, RunContent, SpecialCharacter, story_field_instruction_has_name,
+    story_simple_field_is_typed,
 };
 use rdocx_oxml::units::Twips;
 use rdocx_oxml::web_settings::CT_WebSettings;
@@ -60,6 +61,7 @@ use oxml_core::custom_properties::{CustomProperties, CustomProperty};
 use rdocx_oxml::core_properties::CoreProperties;
 
 use crate::Length;
+use crate::comments::{StoryRunPosition, StoryRunRange};
 use crate::content_control::ContentControlRef;
 use crate::error::{Error, Result};
 use crate::paragraph::{Paragraph, ParagraphRef};
@@ -73,6 +75,135 @@ use crate::table::{Table, TableRef, row_cell_ranges, validate_table_topology};
 pub struct RenderOptions {
     /// The tracked-revision view to render.
     pub revision_view: rdocx_layout::RevisionView,
+    /// How the tracked view marks revisions.
+    pub revision_style: rdocx_layout::RevisionStyle,
+}
+
+/// Which of Word's independent note streams a policy governs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteFamily {
+    Footnote,
+    Endnote,
+}
+
+/// Special content placed before or after a note that continues across pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteSpecialRecord {
+    Separator,
+    ContinuationSeparator,
+    ContinuationNotice,
+}
+
+impl NoteSpecialRecord {
+    fn note_type(self) -> rdocx_oxml::footnotes::NoteType {
+        use rdocx_oxml::footnotes::NoteType;
+        match self {
+            Self::Separator => NoteType::Separator,
+            Self::ContinuationSeparator => NoteType::ContinuationSeparator,
+            Self::ContinuationNotice => NoteType::ContinuationNotice,
+        }
+    }
+}
+
+/// Marker formats the native renderer can reproduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteNumberFormat {
+    Decimal,
+    UpperRoman,
+    LowerRoman,
+    UpperLetter,
+    LowerLetter,
+}
+
+impl NoteNumberFormat {
+    fn xml_value(self) -> &'static str {
+        match self {
+            Self::Decimal => "decimal",
+            Self::UpperRoman => "upperRoman",
+            Self::LowerRoman => "lowerRoman",
+            Self::UpperLetter => "upperLetter",
+            Self::LowerLetter => "lowerLetter",
+        }
+    }
+}
+
+/// Boundary at which numeric note markers start over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteRestart {
+    Continuous,
+    EachSection,
+    EachPage,
+}
+
+impl NoteRestart {
+    fn xml_value(self) -> &'static str {
+        match self {
+            Self::Continuous => "continuous",
+            Self::EachSection => "eachSect",
+            Self::EachPage => "eachPage",
+        }
+    }
+}
+
+/// Boundary at which note content appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotePlacement {
+    PageBottom,
+    BeneathText,
+    SectionEnd,
+    DocumentEnd,
+}
+
+impl NotePlacement {
+    fn xml_value(self) -> &'static str {
+        match self {
+            Self::PageBottom => "pageBottom",
+            Self::BeneathText => "beneathText",
+            Self::SectionEnd => "sectEnd",
+            Self::DocumentEnd => "docEnd",
+        }
+    }
+}
+
+/// A complete visible note policy. `start` is one-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotePolicy {
+    pub format: NoteNumberFormat,
+    pub start: u32,
+    pub restart: NoteRestart,
+    pub placement: NotePlacement,
+}
+
+impl NotePolicy {
+    fn properties(self, family: NoteFamily) -> Result<CT_NoteProperties> {
+        if self.start == 0 {
+            return Err(Error::Other(
+                "note numbering must start above zero".to_owned(),
+            ));
+        }
+        let valid = matches!(
+            (family, self.placement),
+            (
+                NoteFamily::Footnote,
+                NotePlacement::PageBottom | NotePlacement::BeneathText
+            ) | (
+                NoteFamily::Endnote,
+                NotePlacement::SectionEnd | NotePlacement::DocumentEnd
+            )
+        );
+        if !valid {
+            return Err(Error::Other(
+                "placement is invalid for this note family".to_owned(),
+            ));
+        }
+        Ok(CT_NoteProperties {
+            pos: Some(self.placement.xml_value().to_owned()),
+            num_fmt: Some(self.format.xml_value().to_owned()),
+            num_start: Some(self.start),
+            num_restart: Some(self.restart.xml_value().to_owned()),
+            ..CT_NoteProperties::default()
+        })
+    }
 }
 
 /// The package class declared by a Word main document part.
@@ -92,8 +223,12 @@ pub enum WordPackageClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordCreationProfile {
     /// The compact package graph historically emitted by `rdocx`.
+    ///
+    /// It has no settings part, so it names no compatibility mode.
     Minimal(WordPackageClass),
     /// A Word-compatible blank package with the standard owned support parts.
+    ///
+    /// Its settings name compatibility mode 15, as Word's own new documents do.
     WordCompatible(WordPackageClass),
 }
 
@@ -167,6 +302,29 @@ pub struct EmbeddedFont {
     pub font_key: String,
     pub subsetted: bool,
     pub license: FontEmbeddingLicense,
+}
+
+/// Derive a deterministic uppercase OOXML key from checked single-face font bytes.
+pub fn derive_font_key(data: &[u8]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    if !valid_authored_sfnt(data) {
+        return Err(Error::Other(
+            "font-key derivation requires a bounded supported sfnt font".to_owned(),
+        ));
+    }
+    let digest = Sha256::digest(data);
+    let hex = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    Ok(format!(
+        "{{{}-{}-{}-{}-{}}}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
 }
 
 impl EmbeddedFont {
@@ -379,6 +537,8 @@ pub struct PictureOptions {
     pub anchor: Option<PictureAnchor>,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub title: Option<String>,
+    pub decorative: bool,
 }
 
 /// Text flow direction inside an authored Word text box.
@@ -399,6 +559,15 @@ pub struct TextBoxOptions {
     pub rotation_degrees: f64,
     pub text_direction: TextBoxDirection,
     pub fill_color: Option<String>,
+}
+
+/// Appearance of one section-variant image watermark.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageWatermarkOptions {
+    pub width: Length,
+    pub height: Length,
+    pub rotation_degrees: f64,
+    pub opacity: f64,
 }
 
 /// Appearance of one section-variant text watermark.
@@ -491,11 +660,118 @@ impl From<DrawingWrap> for WrapType {
     }
 }
 
+// Qualified physical geometry, separate from the legacy typed parser's
+// permissive local-name fields. Foreign lookalikes remain opaque.
+fn picture_source_extent(
+    raw: &[u8],
+    scope: &BTreeMap<String, String>,
+    anchored: bool,
+) -> Result<Option<(i64, i64)>> {
+    let closed = close_content_fragment_namespaces(raw, scope)?;
+    let mut reader = NsReader::from_reader(closed.as_slice());
+    let mut depth = 0usize;
+    let mut extent = None;
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let word_drawing = matches!(namespace,ResolveResult::Bound(Namespace(uri)) if uri==drawing_ns::WP.as_bytes());
+        match event {
+            Event::Start(ref tag) | Event::Empty(ref tag) => {
+                let local = tag.local_name();
+                if depth == 0
+                    && (!word_drawing
+                        || local.as_ref() != if anchored { b"anchor" } else { b"inline" })
+                {
+                    return Ok(None);
+                }
+                if depth == 1 && word_drawing && local.as_ref() == b"extent" {
+                    if extent.is_some() {
+                        return Err(Error::Other("picture has duplicate owned extents".into()));
+                    }
+                    let number = |name: &str| -> Result<i64> {
+                        let attr = tag
+                            .try_get_attribute(name)
+                            .map_err(|error| Error::Other(error.to_string()))?
+                            .ok_or_else(|| Error::Other(format!("picture extent has no {name}")))?;
+                        let value = attr
+                            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                            .map_err(|error| Error::Other(error.to_string()))?;
+                        value
+                            .parse()
+                            .map_err(|_| Error::Other("picture extent is not an integer".into()))
+                    };
+                    extent = Some((number("cx")?, number("cy")?));
+                }
+                if matches!(event, Event::Start(_)) {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Other("picture source is malformed".into()))?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    extent
+        .map(Some)
+        .ok_or_else(|| Error::Other("picture has no owned extent".into()))
+}
+
+fn picture_drawing(relationship_id: &str, drawing_id: u32, options: &PictureOptions) -> CT_Drawing {
+    let source_rect = options.crop.map(|crop| SourceRect {
+        left: crop.left,
+        top: crop.top,
+        right: crop.right,
+        bottom: crop.bottom,
+    });
+    match options.anchor {
+        Some(anchor_options) => {
+            let mut anchor = CT_Anchor::background(
+                relationship_id,
+                options.width.to_emu(),
+                options.height.to_emu(),
+            );
+            apply_picture_anchor(&mut anchor, anchor_options);
+            anchor.doc_pr_id = drawing_id;
+            anchor.name = options.name.clone();
+            anchor.description = options.description.clone();
+            anchor.title = options.title.clone();
+            anchor.decorative = options.decorative;
+            anchor.source_rect = source_rect;
+            CT_Drawing::anchor(anchor)
+        }
+        None => {
+            let mut inline = CT_Inline::new(
+                relationship_id,
+                options.width.to_emu(),
+                options.height.to_emu(),
+            );
+            inline.doc_pr_id = drawing_id;
+            inline.name = options.name.clone();
+            inline.description = options.description.clone();
+            inline.title = options.title.clone();
+            inline.decorative = options.decorative;
+            inline.source_rect = source_rect;
+            CT_Drawing::inline(inline)
+        }
+    }
+}
+
 fn validate_picture_options(options: &PictureOptions) -> Result<()> {
     if options.width.to_emu() <= 0 || options.height.to_emu() <= 0 {
         return Err(Error::Other(
             "picture width and height must be positive".to_owned(),
         ));
+    }
+    for value in [&options.name, &options.description, &options.title]
+        .into_iter()
+        .flatten()
+    {
+        oxml_core::xml::reject_non_xml_characters("picture metadata", value)?;
     }
     if let Some(crop) = options.crop {
         for (name, value) in [
@@ -608,6 +884,137 @@ fn apply_picture_anchor(anchor: &mut CT_Anchor, options: PictureAnchor) {
     anchor.dist_l = rdocx_oxml::units::Emu(options.distance_left.to_emu());
     anchor.dist_r = rdocx_oxml::units::Emu(options.distance_right.to_emu());
     anchor.relative_height = options.relative_height;
+}
+
+// Locate only the unchanged API-owned alternate representation. Raw unrelated
+// header content and any edits outside this exact owner remain outside the splice.
+fn drawingml_watermark_span(xml: &[u8]) -> Result<Option<(Range<usize>, u32)>> {
+    let mut reader = quick_xml::NsReader::from_reader(xml);
+    let mut depth = 0usize;
+    struct WatermarkOwner {
+        start: usize,
+        depth: usize,
+        marker: Option<(u32, String)>,
+    }
+    let mut alternate: Option<WatermarkOwner> = None;
+    let mut selected = None;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|error| Error::Other(format!("watermark owner scan failed: {error}")))?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let local = element.local_name();
+                let namespace = match namespace {
+                    quick_xml::name::ResolveResult::Bound(namespace) => namespace.as_ref().to_vec(),
+                    _ => Vec::new(),
+                };
+                if namespace == b"http://schemas.openxmlformats.org/markup-compatibility/2006"
+                    && local.as_ref() == b"AlternateContent"
+                    && alternate.is_none()
+                {
+                    alternate = Some(WatermarkOwner {
+                        start,
+                        depth,
+                        marker: None,
+                    });
+                }
+                if namespace == b"http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    && local.as_ref() == b"drawing"
+                    && alternate.is_none()
+                {
+                    alternate = Some(WatermarkOwner {
+                        start,
+                        depth,
+                        marker: None,
+                    });
+                }
+                if namespace
+                    == b"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+                    && local.as_ref() == b"docPr"
+                {
+                    let mut name = None;
+                    let mut id = None;
+                    let mut description = None;
+                    for attribute in element.attributes() {
+                        let attribute = attribute.map_err(rdocx_oxml::OxmlError::from)?;
+                        let value = attribute
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                element.decoder(),
+                            )
+                            .map_err(rdocx_oxml::OxmlError::from)?
+                            .into_owned();
+                        match attribute.key.as_ref() {
+                            b"name" => name = Some(value),
+                            b"id" => id = value.parse::<u32>().ok(),
+                            b"descr" => description = Some(value),
+                            _ => {}
+                        }
+                    }
+                    if name.as_deref() == Some("RDOCX DrawingML Watermark") {
+                        let owner = alternate.as_mut().ok_or_else(|| {
+                            Error::Other("watermark identity is outside its alternate owner".into())
+                        })?;
+                        if owner.marker.is_some() {
+                            return Err(Error::Other(
+                                "duplicate watermark identity is unsupported".into(),
+                            ));
+                        }
+                        owner.marker = Some((
+                            id.ok_or_else(|| {
+                                Error::Other("watermark drawing identity is invalid".into())
+                            })?,
+                            description.ok_or_else(|| {
+                                Error::Other("watermark source qualification is missing".into())
+                            })?,
+                        ));
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Other("watermark owner depth is invalid".into()))?;
+                if alternate.as_ref().is_some_and(|owner| owner.depth == depth) {
+                    let owner = alternate.take().unwrap();
+                    let start = owner.start;
+                    if let Some((id, description)) = owner.marker {
+                        if selected.is_some() {
+                            return Err(Error::Other(
+                                "multiple API watermark owners are unsupported".into(),
+                            ));
+                        }
+                        let end = reader.buffer_position() as usize;
+                        let text = std::str::from_utf8(&xml[start..end])
+                            .map_err(|error| Error::Other(error.to_string()))?;
+                        let attribute = format!(" descr=\"{description}\"");
+                        let checksum = description
+                            .strip_prefix("rdocx-watermark-text-v1:")
+                            .or_else(|| description.strip_prefix("rdocx-watermark-image-v1:"))
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                Error::Other("watermark source qualification is invalid".into())
+                            })?;
+                        if text.matches(&attribute).count() != 1
+                            || structural_fingerprint(text.replacen(&attribute, "", 1).as_bytes())?
+                                != checksum
+                        {
+                            return Err(Error::Other("API watermark has opaque or externally changed source, replacement refused".into()));
+                        }
+                        selected = Some((start..end, id));
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(selected)
 }
 
 fn authored_text_box_alternate_content(
@@ -851,6 +1258,29 @@ pub struct ContentLocation {
     is_end: bool,
 }
 
+/// Frozen facts for one admitted physical picture in a checked paragraph.
+/// Relationship IDs identify media, not drawing occurrences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureOccurrence {
+    pub location: ContentLocation,
+    pub ordinal: usize,
+    pub relationship_id: String,
+    /// Internal media identity, independent of relationship spelling and bytes.
+    pub media_part_name: Option<String>,
+    /// External image source is metadata only and is never fetched.
+    pub external_url: Option<String>,
+    pub width: i64,
+    pub height: i64,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub title: Option<String>,
+    pub decorative: bool,
+    pub anchored: bool,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    source: Vec<u8>,
+}
+
 /// Owned direct story content that can be inserted without a second document tree.
 #[derive(Debug, Clone)]
 pub struct ContentFragment {
@@ -886,7 +1316,16 @@ pub struct ReplacementCountMismatch {
     pub found: usize,
 }
 
-/// An owned main-body range and the package dependencies it can reach.
+enum ScopedReplacementTarget<'a> {
+    Item(&'a ContentLocation),
+    RelatedCell(&'a StoryId),
+    Cell {
+        coordinates: (usize, usize, usize),
+        paragraph: Option<usize>,
+    },
+}
+
+/// An owned story range and the package dependencies it can reach.
 #[derive(Debug, Clone)]
 pub struct DocumentFragment {
     package: Vec<u8>,
@@ -959,7 +1398,48 @@ impl Default for FragmentConflictPolicy {
 }
 
 impl DocumentFragment {
-    /// Capture one non-empty, half-open range of direct main-body items.
+    pub(crate) fn from_part_content(
+        document: &Document,
+        source_part: &str,
+        selected: Vec<u8>,
+    ) -> Result<Self> {
+        validate_fragment_block_content(&selected)?;
+        let mut candidate = document.clone_for_staging();
+        candidate.prepare_staged_package()?;
+        candidate.project_fragment_part_content(source_part, selected)?;
+        let mut output = std::io::Cursor::new(Vec::new());
+        candidate.package.write_to(&mut output)?;
+        Ok(Self {
+            package: output.into_inner(),
+            include_final_section_properties: false,
+        })
+    }
+
+    pub(crate) fn import_content_staged(
+        &self,
+        candidate: &mut Document,
+        destination_part: &str,
+        policy: FragmentConflictPolicy,
+    ) -> Result<Vec<u8>> {
+        let xml = crate::field::import_document_fragment_content(
+            candidate,
+            &self.package,
+            self.include_final_section_properties,
+            policy,
+            destination_part,
+        )?;
+        package_authoritative_body_fragment(
+            &xml,
+            self.include_final_section_properties,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn contains_section_properties(&self) -> bool {
+        self.include_final_section_properties
+    }
+
+    /// Capture one non-empty, half-open range of direct story items.
     ///
     /// `start` is included and `end` is excluded. Section properties can be
     /// included only when `end` is the main body's final boundary.
@@ -971,24 +1451,33 @@ impl DocumentFragment {
     ) -> Result<Self> {
         let mut candidate = document.clone_for_staging();
         candidate.prepare_staged_package()?;
-        if start.story != end.story
-            || start.story.kind != StoryKind::Body
-            || start.story.part_name != candidate.doc_part_name
-        {
+        if start.story != end.story {
             return Err(Error::Other(
-                "document fragment ranges must share the checked main-body owner".to_owned(),
+                "document fragment ranges must share one checked story owner".to_owned(),
             ));
         }
-        let (source, owner) = candidate.story_source_and_owner(&start.story)?;
+        let (source, owner) = candidate.fragment_story_source_and_owner(&start.story)?;
         let source_xml = source.xml.into_owned();
-        let (_, start_index, item_count) = validated_content_boundary(&source_xml, &owner, start)?;
-        let (_, end_index, _) = validated_content_boundary(&source_xml, &owner, end)?;
+        let (owner, _, start_index, item_count) =
+            fragment_content_boundary(&source_xml, &owner, start)?;
+        let (_, checked_owner) = candidate.fragment_story_source_and_owner(&end.story)?;
+        let (end_owner, _, end_index, _) =
+            fragment_content_boundary(&source_xml, &checked_owner, end)?;
+        if owner.full != end_owner.full {
+            return Err(Error::Other(
+                "document fragment range splits block ownership".to_owned(),
+            ));
+        }
         if start_index >= end_index {
             return Err(Error::Other(
                 "document fragment range must contain at least one direct body item".to_owned(),
             ));
         }
-        if include_final_section_properties && end_index != item_count {
+        if include_final_section_properties
+            && (start.story.kind != StoryKind::Body
+                || start.index_path.len() != 1
+                || end_index != item_count)
+        {
             return Err(Error::Other(
                 "section-inclusive document fragments must end at the main-body boundary"
                     .to_owned(),
@@ -999,6 +1488,11 @@ impl DocumentFragment {
             .first()
             .map(|item| item.full.start)
             .ok_or_else(|| Error::Other("document fragment source body is empty".to_owned()))?;
+        for item in &items[start_index..end_index] {
+            let scope = story_namespace_scope_at(&source_xml, item.full.start)?;
+            let xml = close_content_fragment_namespaces(&source_xml[item.full.clone()], &scope)?;
+            validate_fragment_block_item(&xml)?;
+        }
         let content_end = story_owner_content_end(&source_xml, &owner)?;
         let selected_start = items[start_index].full.start;
         let selected_end = if end_index == item_count {
@@ -1006,12 +1500,28 @@ impl DocumentFragment {
         } else {
             items[end_index].full.start
         };
-        let selected = source_xml[selected_start..selected_end].to_vec();
-        let mut updated = source_xml;
-        updated.splice(content_start..content_end, selected);
-        candidate
-            .package
-            .set_part(&candidate.doc_part_name, updated);
+        if start.story.kind == StoryKind::Body
+            && start.story.part_name == candidate.doc_part_name
+            && start.index_path.len() == 1
+            && (end.is_end || end.index_path.len() == 1)
+        {
+            let selected = source_xml[selected_start..selected_end].to_vec();
+            let mut updated = source_xml;
+            updated.splice(content_start..content_end, selected);
+            candidate
+                .package
+                .set_part(&candidate.doc_part_name, updated);
+        } else {
+            let mut selected = Vec::new();
+            for item in &items[start_index..end_index] {
+                let scope = story_namespace_scope_at(&source_xml, item.full.start)?;
+                selected.extend(close_content_fragment_namespaces(
+                    &source_xml[item.full.clone()],
+                    &scope,
+                )?);
+            }
+            candidate.project_fragment_part_content(&source.part_name, selected)?;
+        }
         let mut output = std::io::Cursor::new(Vec::new());
         candidate.package.write_to(&mut output)?;
         Ok(Self {
@@ -1111,6 +1621,14 @@ pub struct StoryItemRef<'a> {
     location: ContentLocation,
 }
 
+/// One exact owner slice used for generated-table discovery and cache edits.
+pub(crate) struct GeneratedStoryOwner {
+    pub(crate) story: StoryId,
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) xml: Vec<u8>,
+    pub(crate) namespaces: BTreeMap<String, String>,
+}
+
 /// One owned story-item projection materialized from a single story inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoryItemSnapshot {
@@ -1191,7 +1709,7 @@ impl<'a> StoryItemRef<'a> {
 
     pub fn text(&self) -> Result<Option<String>> {
         let (source, item) = self.document.story_item_source(&self.location)?;
-        story_item_text(source.xml.as_ref(), &item)
+        story_item_text(source.xml.as_ref(), &item, &[], 0..source.xml.len(), 0)
     }
 
     /// Return modeled hyperlinks in source order with story-scoped targets.
@@ -1548,6 +2066,473 @@ fn typed_numbering_leaf_has_unmodeled(raw: &[u8], word_prefixes: &[String]) -> b
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParagraphVisibilityScope {
+    FacadeRecursive,
+    DirectBody,
+}
+
+type ParagraphVisibilityPath = Vec<(&'static [u8], usize)>;
+type ParagraphVisibilityOwners<'a> = Vec<(ParagraphVisibilityPath, &'a CT_P)>;
+
+// Pair typed owners with their structural encounter slots. Raw children and
+// formatting are not owner slots. Tables directly in body or cells stay opaque.
+fn paragraph_visibility_owners(
+    document: &Document,
+    scope: ParagraphVisibilityScope,
+) -> ParagraphVisibilityOwners<'_> {
+    fn control<'a>(
+        sdt: &'a CT_Sdt,
+        owner: &'static [u8],
+        path: &[(&'static [u8], usize)],
+        out: &mut ParagraphVisibilityOwners<'a>,
+    ) {
+        let mut slot = 0;
+        for child in &sdt.content {
+            let name: &'static [u8] = match child {
+                SdtContent::Paragraph(_) if matches!(owner, b"body" | b"tc") => b"p",
+                SdtContent::Table(_) if matches!(owner, b"body" | b"tc") => b"tbl",
+                SdtContent::Row(_) if owner == b"tbl" => b"tr",
+                SdtContent::Cell(_) if owner == b"tr" => b"tc",
+                SdtContent::ContentControl(_) => b"sdt",
+                _ => continue,
+            };
+            let mut next = path.to_vec();
+            next.push((name, slot));
+            slot += 1;
+            match child {
+                SdtContent::Paragraph(p) => out.push((next, p)),
+                SdtContent::Table(t) => table(t, &next, out),
+                SdtContent::Row(r) => row(r, &next, out),
+                SdtContent::Cell(c) => cell(c, &next, out),
+                SdtContent::ContentControl(c) => control(c, owner, &next, out),
+                _ => {}
+            }
+        }
+    }
+    fn table<'a>(
+        t: &'a CT_Tbl,
+        path: &[(&'static [u8], usize)],
+        out: &mut ParagraphVisibilityOwners<'a>,
+    ) {
+        let mut slot = 0;
+        for index in 0..=t.rows.len() {
+            for (_, _, c) in t.content_controls.iter().filter(|(at, _, _)| *at == index) {
+                let mut next = path.to_vec();
+                next.push((b"sdt", slot));
+                slot += 1;
+                control(c, b"tbl", &next, out);
+            }
+            if let Some(r) = t.rows.get(index) {
+                let mut next = path.to_vec();
+                next.push((b"tr", slot));
+                slot += 1;
+                row(r, &next, out);
+            }
+        }
+    }
+    fn row<'a>(
+        r: &'a CT_Row,
+        path: &[(&'static [u8], usize)],
+        out: &mut ParagraphVisibilityOwners<'a>,
+    ) {
+        let mut slot = 0;
+        for index in 0..=r.cells.len() {
+            for (_, _, c) in r.content_controls.iter().filter(|(at, _, _)| *at == index) {
+                let mut next = path.to_vec();
+                next.push((b"sdt", slot));
+                slot += 1;
+                control(c, b"tr", &next, out);
+            }
+            if let Some(c) = r.cells.get(index) {
+                let mut next = path.to_vec();
+                next.push((b"tc", slot));
+                slot += 1;
+                cell(c, &next, out);
+            }
+        }
+    }
+    fn cell<'a>(
+        c: &'a CT_Tc,
+        path: &[(&'static [u8], usize)],
+        out: &mut ParagraphVisibilityOwners<'a>,
+    ) {
+        for (slot, child) in c.content.iter().enumerate() {
+            let name: &'static [u8] = match child {
+                CellContent::Paragraph(_) => b"p",
+                CellContent::Table(_) => b"tbl",
+                CellContent::ContentControl(_) => b"sdt",
+            };
+            let mut next = path.to_vec();
+            next.push((name, slot));
+            match child {
+                CellContent::Paragraph(p) => out.push((next, p)),
+                CellContent::ContentControl(c) => control(c, b"tc", &next, out),
+                CellContent::Table(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut slot = 0;
+    for child in &document.document.body.content {
+        let name: &'static [u8] = match child {
+            BodyContent::Paragraph(_) => b"p",
+            BodyContent::Table(_) => b"tbl",
+            BodyContent::ContentControl(_) => b"sdt",
+            BodyContent::RawXml(_) => continue,
+        };
+        let path = vec![(name, slot)];
+        slot += 1;
+        match child {
+            BodyContent::Paragraph(p) => out.push((path, p)),
+            BodyContent::ContentControl(c)
+                if scope == ParagraphVisibilityScope::FacadeRecursive =>
+            {
+                control(c, b"body", &path, &mut out)
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn paragraph_has_typed_visible_content(paragraph: &CT_P) -> bool {
+    let mut pending = paragraph.accepted_bookmark_runs();
+    while let Some(run) = pending.pop() {
+        if !run.alt_drawings.is_empty() {
+            return true;
+        }
+        for content in &run.content {
+            match content {
+                RunContent::Text(text) if !text.text.trim().is_empty() => return true,
+                RunContent::Tab
+                | RunContent::Break(_)
+                | RunContent::Symbol { .. }
+                | RunContent::Drawing(_)
+                | RunContent::FootnoteRef { .. }
+                | RunContent::EndnoteRef { .. } => return true,
+                RunContent::SpecialCharacter(character)
+                    if !matches!(character, SpecialCharacter::SoftHyphen) =>
+                {
+                    return true;
+                }
+                RunContent::Field(field) => {
+                    if let Some(runs) = field.cached_result_runs() {
+                        // A consistent owned result may contain only deleted text.
+                        // Its public string cache remains a text extraction projection.
+                        pending.extend(runs);
+                    } else if !field.cached_result.trim().is_empty() {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Match the facade's body paragraph inventory, including nested block controls,
+/// and mark visible nontext children without entering direct body tables or opaque wrappers.
+fn paragraph_visibility_from_main_source(
+    document: &Document,
+    xml: &[u8],
+    scope: ParagraphVisibilityScope,
+) -> Result<Vec<bool>> {
+    let owners = paragraph_visibility_owners(document, scope);
+    let mut owner_paths = Vec::new();
+    let mut slot_stack: Vec<(ParagraphVisibilityPath, usize)> = Vec::new();
+    let mut reader = NsReader::from_reader(xml);
+    // Qualified Word name, admitted path, paragraph boundary, typed content slot.
+    let mut open: Vec<(Vec<u8>, bool, bool, bool)> = Vec::new();
+    let mut in_paragraph = false;
+    let mut visible = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let event_start = usize::try_from(reader.buffer_position())
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(rdocx_oxml::OxmlError::from)?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let local = element.local_name();
+                let word = matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W_NS.as_bytes());
+                let math = matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == M_NS.as_bytes());
+                let compatibility = matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == MC_NS.as_bytes());
+                let parent = open.last().map(|(name, _, _, _)| name.as_slice());
+                let admitted_parent = open.last().is_some_and(|(_, admitted, _, _)| *admitted);
+                // A control inherits its physical container's admitted child kinds.
+                let container = if parent == Some(b"sdtContent") {
+                    open.iter().rev().find_map(|(name, admitted, _, _)| {
+                        (*admitted && matches!(name.as_slice(), b"body" | b"tbl" | b"tr" | b"tc"))
+                            .then_some(name.as_slice())
+                    })
+                } else {
+                    parent
+                };
+                let typed_control = if word
+                    && local.as_ref() == b"sdt"
+                    && admitted_parent
+                    && matches!(event, Event::Start(_))
+                {
+                    let prefixes = reader
+                        .resolver()
+                        .bindings()
+                        .filter(|(_, namespace)| namespace.as_ref() == W_NS.as_bytes())
+                        .map(|(prefix, _)| match prefix {
+                            PrefixDeclaration::Default => Ok(String::new()),
+                            PrefixDeclaration::Named(prefix) => {
+                                std::str::from_utf8(prefix).map(str::to_owned)
+                            }
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|error| Error::Other(error.to_string()))?;
+                    let owner = if in_paragraph {
+                        StorySdtOwner::Inline
+                    } else {
+                        match container {
+                            Some(b"tbl") => StorySdtOwner::Table,
+                            Some(b"tr") => StorySdtOwner::Row,
+                            _ => StorySdtOwner::Block,
+                        }
+                    };
+                    let mut probe = reader.clone();
+                    probe
+                        .read_to_end(element.name())
+                        .map_err(rdocx_oxml::OxmlError::from)?;
+                    let end = usize::try_from(probe.buffer_position())
+                        .map_err(|error| Error::Other(error.to_string()))?;
+                    let source = xml.get(event_start..end).ok_or_else(|| {
+                        Error::Other("content-control source span is invalid".to_owned())
+                    })?;
+                    CT_Sdt::story_raw_is_typed(source, &prefixes, owner)
+                } else {
+                    false
+                };
+                let first_content = word
+                    && local.as_ref() == b"sdtContent"
+                    && admitted_parent
+                    && parent == Some(b"sdt")
+                    && matches!(event, Event::Start(_))
+                    && open.last().is_some_and(|(_, _, _, seen)| !seen);
+                let mut paragraph = false;
+                let admitted = if in_paragraph {
+                    if admitted_parent
+                        && ((word
+                            && parent == Some(b"r")
+                            && matches!(
+                                local.as_ref(),
+                                b"drawing"
+                                    | b"pict"
+                                    | b"object"
+                                    | b"sym"
+                                    | b"tab"
+                                    | b"br"
+                                    | b"cr"
+                                    | b"footnoteReference"
+                                    | b"endnoteReference"
+                            ))
+                            || (math && matches!(local.as_ref(), b"oMath" | b"oMathPara")))
+                        && let Some(flag) = visible.last_mut()
+                    {
+                        *flag = true;
+                    }
+                    admitted_parent
+                        && ((word
+                            && matches!(
+                                local.as_ref(),
+                                b"t" | b"r"
+                                    | b"hyperlink"
+                                    | b"ins"
+                                    | b"moveTo"
+                                    | b"smartTag"
+                                    | b"customXml"
+                                    | b"sdt"
+                                    | b"sdtContent"
+                                    | b"dir"
+                                    | b"bdo"
+                            )
+                            && match local.as_ref() {
+                                b"sdt" => typed_control,
+                                b"sdtContent" => first_content,
+                                _ => true,
+                            })
+                            || (compatibility
+                                && matches!(
+                                    local.as_ref(),
+                                    b"AlternateContent" | b"Choice" | b"Fallback"
+                                )))
+                } else if word {
+                    match local.as_ref() {
+                        b"document" => open.is_empty(),
+                        b"body" => admitted_parent && parent == Some(b"document"),
+                        b"sdt" => {
+                            scope == ParagraphVisibilityScope::FacadeRecursive
+                                && typed_control
+                                && matches!(container, Some(b"body" | b"tbl" | b"tr" | b"tc"))
+                        }
+                        b"sdtContent" => first_content,
+                        b"tbl" => {
+                            admitted_parent
+                                && parent == Some(b"sdtContent")
+                                && matches!(container, Some(b"body" | b"tc"))
+                        }
+                        b"tr" => admitted_parent && container == Some(b"tbl"),
+                        b"tc" => admitted_parent && container == Some(b"tr"),
+                        b"p" if admitted_parent && matches!(container, Some(b"body" | b"tc")) => {
+                            visible.push(false);
+                            paragraph = true;
+                            if matches!(event, Event::Start(_)) {
+                                in_paragraph = true;
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                let structural: Option<&'static [u8]> = if !in_paragraph || paragraph {
+                    match local.as_ref() {
+                        b"p" if paragraph => Some(b"p"),
+                        b"sdt" if word && typed_control && admitted_parent => Some(b"sdt"),
+                        b"tbl"
+                            if word
+                                && admitted_parent
+                                && matches!(container, Some(b"body" | b"tc")) =>
+                        {
+                            Some(b"tbl")
+                        }
+                        b"tr" if word && admitted_parent && container == Some(b"tbl") => {
+                            Some(b"tr")
+                        }
+                        b"tc" if word && admitted_parent && container == Some(b"tr") => Some(b"tc"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let mut path = slot_stack
+                    .last()
+                    .map(|(path, _)| path.clone())
+                    .unwrap_or_default();
+                if let Some(name) = structural {
+                    if let Some((_, slot)) = slot_stack.last_mut() {
+                        path.push((name, *slot));
+                        *slot += 1;
+                    }
+                    if paragraph {
+                        owner_paths.push(path.clone());
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    // sdtContent shares its control's child scope. Other structural
+                    // containers own a fresh set of direct structural slots.
+                    let slot = if first_content {
+                        slot_stack.last().map_or(0, |(_, slot)| *slot)
+                    } else {
+                        0
+                    };
+                    slot_stack.push((path, slot));
+                }
+                if first_content && let Some((_, _, _, seen)) = open.last_mut() {
+                    *seen = true;
+                }
+                if matches!(event, Event::Start(_)) {
+                    open.push((
+                        if word {
+                            local.as_ref().to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        admitted,
+                        paragraph,
+                        false,
+                    ));
+                }
+            }
+            Event::End(_) => {
+                slot_stack.pop();
+                if open.pop().is_some_and(|(_, _, paragraph, _)| paragraph) {
+                    in_paragraph = false;
+                }
+            }
+            Event::Text(text)
+                if open
+                    .last()
+                    .is_some_and(|(name, admitted, _, _)| *admitted && name == b"t") =>
+            {
+                let text = text
+                    .decode()
+                    .map_err(|error| Error::Other(error.to_string()))?;
+                let text = quick_xml::escape::unescape(&text)
+                    .map_err(|error| Error::Other(error.to_string()))?;
+                if !text.trim().is_empty()
+                    && let Some(flag) = visible.last_mut()
+                {
+                    *flag = true;
+                }
+            }
+            Event::CData(text)
+                if open
+                    .last()
+                    .is_some_and(|(name, admitted, _, _)| *admitted && name == b"t") =>
+            {
+                let text = text
+                    .decode()
+                    .map_err(|error| Error::Other(error.to_string()))?;
+                if !text.trim().is_empty()
+                    && let Some(flag) = visible.last_mut()
+                {
+                    *flag = true;
+                }
+            }
+            Event::GeneralRef(reference)
+                if open
+                    .last()
+                    .is_some_and(|(name, admitted, _, _)| *admitted && name == b"t") =>
+            {
+                let name = reference
+                    .decode()
+                    .map_err(|error| Error::Other(error.to_string()))?;
+                let encoded = format!("&{name};");
+                let text = quick_xml::escape::unescape(&encoded)
+                    .map_err(|error| Error::Other(error.to_string()))?;
+                if !text.trim().is_empty()
+                    && let Some(flag) = visible.last_mut()
+                {
+                    *flag = true;
+                }
+            }
+            Event::Eof if !open.is_empty() => {
+                return Err(Error::Other(
+                    "main document ends inside an element".to_owned(),
+                ));
+            }
+            Event::Eof => {
+                if owner_paths.len() != owners.len()
+                    || owner_paths
+                        .iter()
+                        .zip(&owners)
+                        .any(|(source, (model, _))| source != model)
+                {
+                    return Err(Error::Other(
+                        "main document paragraph owners do not match validation scope".to_owned(),
+                    ));
+                }
+                return Ok(owners
+                    .iter()
+                    .zip(visible)
+                    .map(|((_, p), nontext)| paragraph_has_typed_visible_content(p) || nontext)
+                    .collect());
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
 #[derive(Default)]
 struct DocumentNamespaceScopes {
     root_declarations: Vec<(String, String)>,
@@ -1864,6 +2849,7 @@ fn namespace_prefix(declaration_name: &str) -> String {
 
 #[derive(Debug)]
 struct NestedNamespaceOwner {
+    source: Range<usize>,
     local_name: String,
     declarations: Vec<(String, String)>,
     snapshot: LogicalOwnerSnapshot,
@@ -2245,7 +3231,173 @@ fn logical_owner_snapshot(
     }
 }
 
-fn marker_raw_without_owner_declarations(
+fn namespace_marker_without_owner_declarations(
+    raw: &[u8],
+    declarations: &[(String, String)],
+    inherited_bindings: &[(String, String)],
+    direct_drawing_child: bool,
+) -> Result<NamespaceMarker> {
+    // The drawing reader closes namespaces lost with its drawing wrapper on
+    // the retained inline/anchor root. Admit only that concrete relocation.
+    // Every other declaration and every nonnamespace byte stays significant.
+    let mut reader = quick_xml::Reader::from_reader(raw);
+    reader.config_mut().trim_text(false);
+    let mut depth = 0usize;
+    let mut root_bindings = inherited_bindings.to_vec();
+    let mut child = None;
+    let mut relocatable = Vec::new();
+    let mut closure_facts = Vec::new();
+    let mut root_seen = false;
+    let mut qualified = true;
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader
+            .read_event()
+            .map_err(|error| Error::Other(format!("invalid namespace marker XML: {error}")))?
+        {
+            Event::Start(element) | Event::Empty(element) => {
+                let empty = raw[before..reader.buffer_position() as usize].ends_with(b"/>");
+                if depth == 0 {
+                    if direct_drawing_child
+                        && matches!(element.local_name().as_ref(), b"inline" | b"anchor")
+                    {
+                        apply_namespace_declarations(&element, &mut root_bindings)?;
+                        let name = element.name();
+                        let name = std::str::from_utf8(name.as_ref()).map_err(|error| {
+                            Error::Other(format!("invalid namespace marker QName: {error}"))
+                        })?;
+                        let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+                        if inherited_namespace(&root_bindings, prefix)
+                            == Some(
+                                "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+                            )
+                        {
+                            let mut removable = declarations.to_vec();
+                            for (prefix, uri) in [
+                                ("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+                                (
+                                    "pic",
+                                    "http://schemas.openxmlformats.org/drawingml/2006/picture",
+                                ),
+                            ] {
+                                closure_facts.push((
+                                    prefix.to_owned(),
+                                    inherited_namespace(&root_bindings, prefix).map(str::to_owned),
+                                ));
+                                if inherited_namespace(&root_bindings, prefix) == Some(uri) {
+                                    removable.push((format!("xmlns:{prefix}"), uri.to_owned()));
+                                }
+                            }
+                            return Ok(NamespaceMarker {
+                                raw: strip_marker_root_namespace_declarations(raw, &removable)?,
+                                namespace_facts: closure_facts,
+                            });
+                        }
+                    }
+                    if root_seen || element.local_name().as_ref() != b"drawing" {
+                        qualified = false;
+                        break;
+                    }
+                    root_seen = true;
+                    apply_namespace_declarations(&element, &mut root_bindings)?;
+                    let name = std::str::from_utf8(element.name().as_ref())
+                        .map_err(|error| {
+                            Error::Other(format!("invalid namespace marker QName: {error}"))
+                        })?
+                        .to_owned();
+                    let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+                    qualified &=
+                        inherited_namespace(&root_bindings, prefix) == Some(WORD_NAMESPACE);
+                    qualified &= element.attributes().all(|attribute| {
+                        attribute.is_ok_and(|attribute| {
+                            let key = attribute.key.as_ref();
+                            key == b"xmlns" || key.starts_with(b"xmlns:")
+                        })
+                    });
+                } else if depth == 1 {
+                    if child.is_some() {
+                        qualified = false;
+                        break;
+                    }
+                    let mut bindings = root_bindings.clone();
+                    apply_namespace_declarations(&element, &mut bindings)?;
+                    let name = std::str::from_utf8(element.name().as_ref())
+                        .map_err(|error| {
+                            Error::Other(format!("invalid namespace marker QName: {error}"))
+                        })?
+                        .to_owned();
+                    let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+                    qualified &= matches!(element.local_name().as_ref(), b"inline" | b"anchor")
+                        && inherited_namespace(&bindings, prefix)
+                            == Some(
+                                "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+                            );
+                    for (prefix, uri) in [
+                        ("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+                        (
+                            "pic",
+                            "http://schemas.openxmlformats.org/drawingml/2006/picture",
+                        ),
+                    ] {
+                        closure_facts.push((
+                            prefix.to_owned(),
+                            inherited_namespace(&bindings, prefix).map(str::to_owned),
+                        ));
+                        if inherited_namespace(&bindings, prefix) == Some(uri) {
+                            relocatable.push((format!("xmlns:{prefix}"), uri.to_owned()));
+                        }
+                    }
+                    child = Some((before, empty.then_some(reader.buffer_position() as usize)));
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 1
+                    && let Some((_, end)) = &mut child
+                {
+                    *end = Some(reader.buffer_position() as usize);
+                }
+            }
+            Event::Text(text) if depth <= 1 => {
+                qualified &= text.iter().all(u8::is_ascii_whitespace);
+            }
+            Event::Comment(_) | Event::PI(_) | Event::CData(_) | Event::GeneralRef(_)
+                if depth <= 1 =>
+            {
+                qualified = false;
+            }
+            Event::Decl(_) | Event::DocType(_) => {
+                qualified = false;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if qualified && let Some((start, Some(end))) = child {
+        let mut root_declarations = declarations.to_vec();
+        root_declarations.extend(relocatable.iter().cloned());
+        let mut normalized =
+            strip_marker_root_namespace_declarations(&raw[..start], &root_declarations)?;
+        normalized.extend_from_slice(&strip_marker_root_namespace_declarations(
+            &raw[start..end],
+            &relocatable,
+        )?);
+        normalized.extend_from_slice(&raw[end..]);
+        return Ok(NamespaceMarker {
+            raw: normalized,
+            namespace_facts: closure_facts,
+        });
+    }
+    Ok(NamespaceMarker {
+        raw: strip_marker_root_namespace_declarations(raw, declarations)?,
+        namespace_facts: Vec::new(),
+    })
+}
+
+fn strip_marker_root_namespace_declarations(
     raw: &[u8],
     declarations: &[(String, String)],
 ) -> Result<Vec<u8>> {
@@ -2340,7 +3492,7 @@ fn namespace_owner_markers(
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack = Vec::new();
-    let mut element_stack: Vec<Vec<u8>> = Vec::new();
+    let mut element_stack: Vec<(Vec<u8>, String, bool)> = Vec::new();
     let mut empty_markers = Vec::new();
     let mut expanded_markers = Vec::new();
     // Candidate owners are inspected before their retained declarations have
@@ -2358,6 +3510,17 @@ fn namespace_owner_markers(
             .read_event_into(&mut buffer)
             .map_err(|error| Error::Other(format!("invalid namespace owner marker: {error}")))?;
         let end = reader.buffer_position() as usize;
+        let direct_drawing_child =
+            element_stack
+                .last()
+                .is_some_and(|(local, prefix, closure_qualified)| {
+                    *closure_qualified
+                        && local == b"drawing"
+                        && inherited_namespace(
+                            scope_stack.last().map(Vec::as_slice).unwrap_or_default(),
+                            prefix,
+                        ) == Some(WORD_NAMESPACE)
+                });
         match event {
             Event::Start(element) => {
                 let mut bindings = scope_stack.last().cloned().unwrap_or_default();
@@ -2381,7 +3544,7 @@ fn namespace_owner_markers(
                         &element,
                         declarations,
                         &bindings,
-                        element_stack.last().map(Vec::as_slice),
+                        element_stack.last().map(|element| element.0.as_slice()),
                         &shadowed,
                         allow_redundant_local_bindings,
                     )
@@ -2395,8 +3558,40 @@ fn namespace_owner_markers(
                         (prefix, namespace)
                     })
                     .collect::<Vec<_>>();
-                stack.push((start, facts));
-                element_stack.push(element.local_name().as_ref().to_vec());
+                stack.push((
+                    start,
+                    facts,
+                    scope_stack.last().cloned().unwrap_or_default(),
+                    direct_drawing_child,
+                ));
+                let name = element.name();
+                let name = std::str::from_utf8(name.as_ref()).map_err(|error| {
+                    Error::Other(format!("invalid namespace marker QName: {error}"))
+                })?;
+                let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+                let closure_qualified = if element.local_name().as_ref() == b"drawing"
+                    && inherited_namespace(&bindings, prefix) == Some(WORD_NAMESPACE)
+                {
+                    let end = story_element_end(owner_xml, start)?;
+                    // Child markers may normalize only inside the same actual
+                    // minimal drawing route. A QName alone cannot authorize
+                    // relocation past opaque wrapper attributes or siblings.
+                    !namespace_marker_without_owner_declarations(
+                        &owner_xml[start..end],
+                        declarations,
+                        scope_stack.last().map(Vec::as_slice).unwrap_or_default(),
+                        false,
+                    )?
+                    .namespace_facts
+                    .is_empty()
+                } else {
+                    false
+                };
+                element_stack.push((
+                    element.local_name().as_ref().to_vec(),
+                    prefix.to_owned(),
+                    closure_qualified,
+                ));
                 scope_stack.push(bindings);
                 shadow_stack.push(shadowed);
                 depth += 1;
@@ -2423,7 +3618,7 @@ fn namespace_owner_markers(
                         &element,
                         declarations,
                         &bindings,
-                        element_stack.last().map(Vec::as_slice),
+                        element_stack.last().map(|element| element.0.as_slice()),
                         &shadowed,
                         allow_redundant_local_bindings,
                     )
@@ -2431,19 +3626,23 @@ fn namespace_owner_markers(
                     Vec::new()
                 };
                 if !used_prefixes.is_empty() {
-                    let namespace_facts = used_prefixes
+                    let mut namespace_facts = used_prefixes
                         .into_iter()
                         .map(|prefix| {
                             let namespace =
                                 inherited_namespace(&bindings, &prefix).map(str::to_owned);
                             (prefix, namespace)
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    let marker = namespace_marker_without_owner_declarations(
+                        &owner_xml[start..end],
+                        declarations,
+                        scope_stack.last().map(Vec::as_slice).unwrap_or_default(),
+                        direct_drawing_child,
+                    )?;
+                    namespace_facts.extend(marker.namespace_facts);
                     empty_markers.push(NamespaceMarker {
-                        raw: marker_raw_without_owner_declarations(
-                            &owner_xml[start..end],
-                            declarations,
-                        )?,
+                        raw: marker.raw,
                         namespace_facts,
                     });
                 }
@@ -2453,14 +3652,23 @@ fn namespace_owner_markers(
                 scope_stack.pop();
                 shadow_stack.pop();
                 element_stack.pop();
-                if let Some((marker_start, namespace_facts)) = stack.pop()
+                if let Some((
+                    marker_start,
+                    mut namespace_facts,
+                    inherited_bindings,
+                    direct_drawing_child,
+                )) = stack.pop()
                     && !namespace_facts.is_empty()
                 {
+                    let marker = namespace_marker_without_owner_declarations(
+                        &owner_xml[marker_start..end],
+                        declarations,
+                        &inherited_bindings,
+                        direct_drawing_child,
+                    )?;
+                    namespace_facts.extend(marker.namespace_facts);
                     expanded_markers.push(NamespaceMarker {
-                        raw: marker_raw_without_owner_declarations(
-                            &owner_xml[marker_start..end],
-                            declarations,
-                        )?,
+                        raw: marker.raw,
                         namespace_facts,
                     });
                 }
@@ -2621,6 +3829,7 @@ fn nested_modeled_namespace_owners(xml: &[u8]) -> Result<Vec<NestedNamespaceOwne
             marker_multiset_matches(&markers, &candidate_markers, true)
         });
         owners.push(NestedNamespaceOwner {
+            source: span.start..span.end,
             local_name: span.local_name.clone(),
             declarations,
             snapshot,
@@ -2966,6 +4175,35 @@ impl<'a> SectionRef<'a> {
     }
 }
 
+/// Severity of a document section validation finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSeverity {
+    Error,
+    Warning,
+}
+
+/// One stable section validation fact, in document order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationFinding {
+    pub severity: ValidationSeverity,
+    pub message: String,
+}
+
+/// Read-only validation results over the current document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub findings: Vec<ValidationFinding>,
+}
+
+impl ValidationReport {
+    /// Warnings do not invalidate a document.
+    pub fn is_valid(&self) -> bool {
+        self.findings
+            .iter()
+            .all(|finding| finding.severity != ValidationSeverity::Error)
+    }
+}
+
 /// A mutable borrowed view of one section in document order.
 pub struct Section<'a> {
     ordinal: usize,
@@ -3184,6 +4422,46 @@ impl Section<'_> {
         self.inner.endnote_pr = Some(Box::new(properties));
     }
 
+    /// Set a checked section override while retaining unmodelled note-property children.
+    pub fn set_note_policy(&mut self, family: NoteFamily, policy: NotePolicy) -> Result<()> {
+        let checked = policy.properties(family)?;
+        let slot = match family {
+            NoteFamily::Footnote => &mut self.inner.footnote_pr,
+            NoteFamily::Endnote => &mut self.inner.endnote_pr,
+        };
+        let properties = slot.get_or_insert_with(Box::default);
+        properties.pos = checked.pos;
+        properties.num_fmt = checked.num_fmt;
+        properties.num_start = checked.num_start;
+        properties.num_restart = checked.num_restart;
+        Ok(())
+    }
+
+    /// Remove an explicit section note override so document defaults apply.
+    pub fn remove_note_policy(&mut self, family: NoteFamily) -> Option<CT_NoteProperties> {
+        let slot = match family {
+            NoteFamily::Footnote => &mut self.inner.footnote_pr,
+            NoteFamily::Endnote => &mut self.inner.endnote_pr,
+        };
+        let properties = slot.as_mut()?;
+        if properties.pos.is_none()
+            && properties.num_fmt.is_none()
+            && properties.num_start.is_none()
+            && properties.num_restart.is_none()
+        {
+            return None;
+        }
+        let removed = (**properties).clone();
+        properties.pos = None;
+        properties.num_fmt = None;
+        properties.num_start = None;
+        properties.num_restart = None;
+        if properties.special_references.is_empty() && properties.extra_xml.is_empty() {
+            *slot = None;
+        }
+        Some(removed)
+    }
+
     /// Return the printer trays feeding the first page and every later page.
     pub fn paper_source(&self) -> Option<(Option<u32>, Option<u32>)> {
         SectionRef {
@@ -3220,6 +4498,51 @@ impl Section<'_> {
     /// Set this section's page border frame.
     pub fn set_page_borders(&mut self, borders: CT_PageBorders) {
         self.inner.page_borders = Some(Box::new(borders));
+    }
+
+    /// Edit one page-frame edge without replacing other edges or opaque owners.
+    /// Width is in eighth-points and spacing in points, as specified by OOXML.
+    pub fn set_page_border(
+        &mut self,
+        edge: &str,
+        style: &str,
+        width: u32,
+        space: u32,
+        color: &str,
+    ) -> Result<()> {
+        let style = rdocx_oxml::shared::ST_Border::from_str(style)?;
+        if !(2..=96).contains(&width) || space > 31 {
+            return Err(Error::Other(
+                "page border width must be 2..96 eighth-points and spacing 0..31 points".into(),
+            ));
+        }
+        if color.len() != 6 || !color.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Other(
+                "page border color requires six hexadecimal digits".into(),
+            ));
+        }
+        if !matches!(edge, "top" | "left" | "bottom" | "right") {
+            return Err(Error::Other(
+                "page border edge must be top, left, bottom or right".into(),
+            ));
+        }
+        let borders = self.inner.page_borders.get_or_insert_with(Box::default);
+        let slot = match edge {
+            "top" => &mut borders.top,
+            "left" => &mut borders.left,
+            "bottom" => &mut borders.bottom,
+            "right" => &mut borders.right,
+            _ => unreachable!(),
+        };
+        let mut border = slot
+            .clone()
+            .unwrap_or_else(|| rdocx_oxml::borders::CT_BorderEdge::new(style));
+        border.set_literal_color(color)?;
+        border.val = style;
+        border.sz = Some(width);
+        border.space = Some(space);
+        *slot = Some(border);
+        Ok(())
     }
 
     /// Borrow this section's margin line numbering.
@@ -3435,6 +4758,11 @@ pub(crate) struct DocumentIdentifiers {
     bookmark_ids: HashSet<i32>,
     comment_ids: HashSet<i32>,
     drawing_ids: HashSet<u32>,
+    /// Per part, the `wp:docPr/@id` values the opened XML repeats, with
+    /// their occurrence count. Producers repeat them and consumers renumber
+    /// or ignore them, so a scan accepts them. A staged edit keeps the counts
+    /// of the opened document and may not exceed them.
+    repeated_drawing_ids: HashMap<String, HashMap<u32, usize>>,
     abstract_numbering_ids: HashSet<u32>,
     numbering_instance_ids: HashSet<u32>,
     part_names: HashSet<String>,
@@ -3467,6 +4795,7 @@ impl DocumentIdentifiers {
             bookmark_ids: HashSet::new(),
             comment_ids: HashSet::new(),
             drawing_ids: HashSet::new(),
+            repeated_drawing_ids: HashMap::new(),
             abstract_numbering_ids: HashSet::new(),
             numbering_instance_ids: HashSet::new(),
             part_names: package
@@ -3576,7 +4905,7 @@ impl DocumentIdentifiers {
             if let Some(categories) = identity_parts.get(&part_name_identity(part_name))
                 && identifier_xml_is_well_formed(bytes)
             {
-                let mut part_drawing_ids = HashSet::new();
+                let mut part_drawing_ids = HashMap::new();
                 identifiers
                     .scan_xml_definitions(bytes, categories, &mut part_drawing_ids)
                     .map_err(|error| {
@@ -3584,7 +4913,17 @@ impl DocumentIdentifiers {
                             "cannot scan identifiers in XML part {part_name}: {error}"
                         ))
                     })?;
-                identifiers.drawing_ids.extend(part_drawing_ids);
+                let repeated = part_drawing_ids
+                    .iter()
+                    .filter(|(_, count)| **count > 1)
+                    .map(|(id, count)| (*id, *count))
+                    .collect::<HashMap<_, _>>();
+                if !repeated.is_empty() {
+                    identifiers
+                        .repeated_drawing_ids
+                        .insert(part_name_identity(part_name), repeated);
+                }
+                identifiers.drawing_ids.extend(part_drawing_ids.into_keys());
             }
         }
         identifiers.preserved_relationship_ids = identifiers.relationship_ids.clone();
@@ -3630,7 +4969,7 @@ impl DocumentIdentifiers {
         &mut self,
         xml: &[u8],
         categories: &HashSet<IdentifierXmlCategory>,
-        part_drawing_ids: &mut HashSet<u32>,
+        part_drawing_ids: &mut HashMap<u32, usize>,
     ) -> Result<()> {
         let mut reader = NsReader::from_reader(xml);
         let mut buffer = Vec::new();
@@ -3681,7 +5020,7 @@ impl DocumentIdentifiers {
         reader: &NsReader<&[u8]>,
         element: &BytesStart<'_>,
         category: IdentifierXmlCategory,
-        part_drawing_ids: &mut HashSet<u32>,
+        part_drawing_ids: &mut HashMap<u32, usize>,
     ) -> Result<()> {
         for attribute in element.attributes() {
             let attribute = attribute.map_err(|error| Error::Other(error.to_string()))?;
@@ -3714,7 +5053,7 @@ impl DocumentIdentifiers {
                     let value = value
                         .parse::<u32>()
                         .map_err(|_| Error::Other(format!("invalid drawing id {value}")))?;
-                    Self::insert_unique(part_drawing_ids, value, "drawing")?;
+                    *part_drawing_ids.entry(value).or_default() += 1;
                 }
                 IdentifierXmlCategory::Bookmark => {
                     let value = value
@@ -3752,6 +5091,33 @@ impl DocumentIdentifiers {
             break;
         }
         Ok(())
+    }
+
+    /// Refuse a `wp:docPr/@id` occurrence that a staged edit added to an id
+    /// its part already uses. Repetitions the source document had are kept.
+    fn reject_new_repeated_drawing_ids(&self, source: &Self) -> Result<()> {
+        let mut added = self
+            .repeated_drawing_ids
+            .iter()
+            .flat_map(|(part_name, repeated)| {
+                repeated.iter().filter_map(move |(id, count)| {
+                    let kept = source
+                        .repeated_drawing_ids
+                        .get(part_name)
+                        .and_then(|repeated| repeated.get(id))
+                        .copied()
+                        .unwrap_or(1);
+                    (*count > kept).then_some((part_name, *id))
+                })
+            })
+            .collect::<Vec<_>>();
+        added.sort_unstable();
+        match added.first() {
+            Some((part_name, id)) => Err(Error::Other(format!(
+                "duplicate drawing id {id} in authored XML of part {part_name}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     fn insert_unique<T: std::hash::Hash + Eq + std::fmt::Display + Copy>(
@@ -3857,6 +5223,8 @@ impl DocumentIdentifiers {
             rel_types::NUMBERING => "rdocxDeferredNumbering",
             rel_types::SETTINGS => "rdocxDeferredSettings",
             rel_types::FOOTNOTES => "rdocxDeferredFootnotes",
+            rel_types::ENDNOTES => "rdocxDeferredEndnotes",
+            rel_types::GLOSSARY_DOCUMENT => "rdocxDeferredGlossary",
             rel_types::COMMENTS => "rdocxDeferredComments",
             crate::comments::COMMENTS_EXTENDED_REL_TYPE => "rdocxDeferredCommentsExtended",
             _ => {
@@ -4134,6 +5502,11 @@ impl DocumentIdentifiers {
         }
     }
 
+    pub(crate) fn preserve_fragment_part(&mut self, part_name: &str) {
+        self.preserved_part_names
+            .insert(part_name_identity(part_name));
+    }
+
     pub(crate) fn observe_package_graph(&mut self, package: &OpcPackage) -> Result<()> {
         for part_name in package
             .parts
@@ -4200,6 +5573,8 @@ impl DocumentIdentifiers {
     }
 
     fn reconcile_provenance(&mut self, source: &Self) {
+        self.repeated_drawing_ids
+            .clone_from(&source.repeated_drawing_ids);
         self.preserved_relationship_ids = intersect_relationship_registry(
             &source.preserved_relationship_ids,
             &self.relationship_ids,
@@ -4425,7 +5800,7 @@ fn reserve_part_from_set(
     }
 }
 
-fn part_name_identity(part_name: &str) -> String {
+pub(crate) fn part_name_identity(part_name: &str) -> String {
     part_name.to_ascii_lowercase()
 }
 
@@ -5167,8 +6542,20 @@ fn bundle_relationship_precedes_story(rel_type: &str) -> bool {
 thread_local! {
     static LAYOUT_INVOCATIONS: Cell<usize> = const { Cell::new(0) };
     static FAIL_NEXT_HEADER_FOOTER_SERIALIZATION: Cell<bool> = const { Cell::new(false) };
-    static STORY_SOURCE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_NEXT_SCOPED_REOPEN: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_STAGED_REOPEN: Cell<bool> = const { Cell::new(false) };
+    pub(crate) static STORY_SOURCE_BUILDS: Cell<usize> = const { Cell::new(0) };
     static STORY_TEXT_PREFIX_BYTES: Cell<usize> = const { Cell::new(0) };
+    static STORY_OWNER_SCANS: Cell<usize> = const { Cell::new(0) };
+    static STORY_NAMESPACE_SCANS: Cell<usize> = const { Cell::new(0) };
+    static FX237_LEGACY_CELL_STEPS: Cell<usize> = const { Cell::new(0) };
+    static FX237_NAMESPACE_FRAME_COPIES: Cell<usize> = const { Cell::new(0) };
+    static FX237_ITEM_SCANS: Cell<usize> = const { Cell::new(0) };
+    static FX237_PREFIX_NAMESPACE_BYTES: Cell<usize> = const { Cell::new(0) };
+    static FX237_TABLE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static FX237_CELL_VISITS: Cell<usize> = const { Cell::new(0) };
+    static FX211_PROFILE: Cell<[usize; 12]> = const { Cell::new([0; 12]) };
+    static FX211_PROFILE_CONTEXT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -5273,26 +6660,46 @@ fn new_word_compatible_package(
 fn default_application_properties() -> AppProperties {
     let mut properties = AppProperties::default();
     properties.application = Some("rdocx".to_owned());
-    properties.application_version = Some(word_app_version(env!("CARGO_PKG_VERSION")));
+    properties.application_version = Some(rdocx_app_version());
     properties
 }
 
-/// `docProps/app.xml` `AppVersion` in the `XX.YYYY` shape ECMA-376 requires
-/// (Word writes `16.0000`).
-///
-/// A semver string such as `0.14.0` is not a cosmetic problem: Word parses the
-/// value as a number with the user's regional format, so on a comma-decimal
-/// locale (cs-CZ, sk-SK, pl-PL, de-DE, ...) Word 16 refuses the whole document
-/// with error 5121 "Word experienced an error trying to open the file", both
-/// in normal open and in Protected View. On en-US the same bytes open fine.
-fn word_app_version(crate_version: &str) -> String {
-    let mut parts = crate_version
-        .split(|c: char| !c.is_ascii_digit())
-        .map(|part| part.parse::<u32>().unwrap_or(0).min(99));
-    let major = parts.next().unwrap_or(0);
-    let minor = parts.next().unwrap_or(0);
-    let patch = parts.next().unwrap_or(0);
-    format!("{major:02}.{minor:02}{patch:02}")
+/// The AppVersion rdocx stamps. ECMA-376 Part 1, 22.2.2.3 fixes AppVersion to
+/// the form XX.YYYY, and Word refuses to open a package whose AppVersion has
+/// another shape, such as 0.14.0.
+fn rdocx_app_version() -> String {
+    format!(
+        "{:0>2}.{:0>4}",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR")
+    )
+}
+
+/// Repair an AppVersion Word would refuse, as rdocx 0.14.0 wrote it: rdocx's
+/// own properties take the current stamp, and any other producer's value is
+/// dropped. A valid AppVersion is left alone, so its part stays byte-identical.
+fn repair_application_version(mut properties: AppProperties) -> AppProperties {
+    if properties
+        .application_version
+        .as_deref()
+        .is_some_and(|version| !is_app_version(version))
+    {
+        properties.application_version =
+            (properties.application.as_deref() == Some("rdocx")).then(rdocx_app_version);
+    }
+    properties
+}
+
+/// Whether `version` has the `XX.YYYY` form ECMA-376 Part 1, 22.2.2.3 gives AppVersion.
+fn is_app_version(version: &str) -> bool {
+    version.split_once('.').is_some_and(|(major, minor)| {
+        major.len() == 2
+            && minor.len() == 4
+            && major
+                .bytes()
+                .chain(minor.bytes())
+                .all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn equivalent_abstract_numbering(left: &CT_AbstractNum, right: &CT_AbstractNum) -> bool {
@@ -5300,7 +6707,14 @@ fn equivalent_abstract_numbering(left: &CT_AbstractNum, right: &CT_AbstractNum) 
     let mut right = right.clone();
     left.abstract_num_id = 0;
     right.abstract_num_id = 0;
-    left == right
+    // Parsed leaf snapshots record prior typed values. Compare the actual
+    // owned XML projection, including opaque attributes and children, rather
+    // than the preservation bookkeeping used to produce that projection.
+    let mut left_xml = quick_xml::Writer::new(Vec::new());
+    let mut right_xml = quick_xml::Writer::new(Vec::new());
+    left.to_xml(&mut left_xml).is_ok()
+        && right.to_xml(&mut right_xml).is_ok()
+        && left_xml.into_inner() == right_xml.into_inner()
 }
 
 fn equivalent_numbering_instance(left: &CT_Num, right: &CT_Num, abstract_num_id: u32) -> bool {
@@ -5313,15 +6727,24 @@ fn equivalent_numbering_instance(left: &CT_Num, right: &CT_Num, abstract_num_id:
     right.num_id = 0;
     left.abstract_num_id = abstract_num_id;
     right.abstract_num_id = abstract_num_id;
-    left.abstract_num_id_raw = None;
-    right.abstract_num_id_raw = None;
-    left == right
+    let mut left_xml = quick_xml::Writer::new(Vec::new());
+    let mut right_xml = quick_xml::Writer::new(Vec::new());
+    left.to_xml(&mut left_xml).is_ok()
+        && right.to_xml(&mut right_xml).is_ok()
+        && left_xml.into_inner() == right_xml.into_inner()
 }
 
 struct StorySource<'a> {
     root_kind: StoryKind,
     part_name: String,
     xml: Cow<'a, [u8]>,
+}
+
+pub(crate) struct TextBoxCacheParagraph {
+    pub(crate) location: ContentLocation,
+    pub(crate) xml: Vec<u8>,
+    pub(crate) owner_index: usize,
+    pub(crate) paragraph_index: usize,
 }
 
 #[derive(Clone)]
@@ -5341,6 +6764,149 @@ struct StoryItemSpan {
     complex_field: bool,
     complex_ancestors: Vec<usize>,
     sdt_context: Option<StorySdtContext>,
+}
+
+// Paired source events prove physical correspondence while permitting only
+// namespace declarations to differ. Non-namespace source remains exact.
+#[allow(clippy::type_complexity)] // Concrete physical map and changed namespace offsets form one proof.
+fn comment_namespace_source_boundaries(
+    canonical: &[u8],
+    restored: &[u8],
+) -> Result<Option<(BTreeMap<usize, usize>, Vec<usize>)>> {
+    let mut left = NsReader::from_reader(canonical);
+    let mut right = NsReader::from_reader(restored);
+    let mut boundaries = BTreeMap::new();
+    let mut changed_namespace_facts = Vec::new();
+    loop {
+        let left_start = left.buffer_position() as usize;
+        let right_start = right.buffer_position() as usize;
+        let a = left.read_event().map_err(|e| Error::Other(e.to_string()))?;
+        let b = right
+            .read_event()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let same = match (&a, &b) {
+            (Event::Start(a), Event::Start(b)) | (Event::Empty(a), Event::Empty(b)) => {
+                let attributes = |element: &BytesStart<'_>| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+                    element
+                        .attributes()
+                        .filter_map(|attribute| match attribute {
+                            Ok(attribute)
+                                if attribute.key.as_ref() == b"xmlns"
+                                    || attribute.key.as_ref().starts_with(b"xmlns:") =>
+                            {
+                                None
+                            }
+                            Ok(attribute) => Some(Ok((
+                                attribute.key.as_ref().to_vec(),
+                                attribute.value.as_ref().to_vec(),
+                            ))),
+                            Err(error) => Some(Err(Error::Other(error.to_string()))),
+                        })
+                        .collect()
+                };
+                let a_attributes = attributes(a)?;
+                let b_attributes = attributes(b)?;
+                let same_namespaces = left.resolver().resolve_element(a.name()).0
+                    == right.resolver().resolve_element(b.name()).0
+                    && a.attributes()
+                        .filter_map(|attribute| attribute.ok())
+                        .filter(|attribute| {
+                            attribute.key.as_ref() != b"xmlns"
+                                && !attribute.key.as_ref().starts_with(b"xmlns:")
+                        })
+                        .all(|attribute| {
+                            left.resolver().resolve_attribute(attribute.key).0
+                                == right.resolver().resolve_attribute(attribute.key).0
+                        });
+                if !same_namespaces {
+                    changed_namespace_facts.push(left_start);
+                }
+                a.name() == b.name() && a_attributes == b_attributes
+            }
+            _ => a == b,
+        };
+        if !same {
+            return Ok(None);
+        }
+        boundaries.insert(left_start, right_start);
+        boundaries.insert(
+            left.buffer_position() as usize,
+            right.buffer_position() as usize,
+        );
+        if matches!(a, Event::Eof) {
+            break;
+        }
+    }
+    Ok(Some((boundaries, changed_namespace_facts)))
+}
+
+// Existing checked paragraph paths shared by discovery and rich projection.
+// Neither consumer invents a second index axis. Every owner of one source and
+// every control in it is scanned from its own excerpt, with each family of
+// scopes inventoried in one pass, so no owner or control rereads the source
+// from its start. One list per owner, in the order given.
+#[allow(clippy::type_complexity)] // One located span list per owner.
+fn story_range_paragraph_spans(
+    xml: &[u8],
+    owners: &[(StoryId, StoryOwnerSpan)],
+) -> Result<Vec<Vec<(ContentLocation, Range<usize>)>>> {
+    let owner_scopes =
+        story_namespace_scopes_at(xml, owners.iter().map(|(_, owner)| owner.full.start))?;
+    let mut inventories = Vec::with_capacity(owners.len());
+    for (_, owner) in owners {
+        let scope = owner_scopes.get(&owner.full.start).ok_or_else(|| {
+            Error::Other("story owner namespace scope was not inventoried".to_owned())
+        })?;
+        inventories.push(scan_story_items_with_scope(xml, owner, scope)?);
+    }
+    let control_scopes = story_namespace_scopes_at(
+        xml,
+        inventories
+            .iter()
+            .flatten()
+            .filter(|item| item.kind == StoryItemKind::ContentControl)
+            .map(|item| item.full.start),
+    )?;
+    story_range_paragraph_spans_from_inventory(xml, owners, &inventories, &control_scopes)
+}
+
+#[allow(clippy::type_complexity)] // Story-ordered paragraphs retain checked locations and source spans.
+fn story_range_paragraph_spans_from_inventory(
+    xml: &[u8],
+    owners: &[(StoryId, StoryOwnerSpan)],
+    inventories: &[Vec<StoryItemSpan>],
+    control_scopes: &HashMap<usize, BTreeMap<String, String>>,
+) -> Result<Vec<Vec<(ContentLocation, Range<usize>)>>> {
+    let mut spans = Vec::with_capacity(owners.len());
+    for ((story, _), items) in owners.iter().zip(inventories) {
+        let mut paragraphs = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let item_spans = match item.kind {
+                StoryItemKind::Paragraph => vec![(vec![index], item.full.clone())],
+                StoryItemKind::ContentControl => {
+                    let scope = control_scopes.get(&item.full.start).ok_or_else(|| {
+                        Error::Other(
+                            "content control namespace scope was not inventoried".to_owned(),
+                        )
+                    })?;
+                    scan_story_control_paragraphs_with_scope(xml, item, scope)?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(paragraph, span)| (vec![index, paragraph], span))
+                        .collect()
+                }
+                _ => continue,
+            };
+            for (path, span) in item_spans {
+                paragraphs.push((
+                    ContentLocation::new(story.clone(), StoryItemKind::Paragraph, path),
+                    span,
+                ));
+            }
+        }
+        spans.push(paragraphs);
+    }
+    Ok(spans)
 }
 
 struct StoryLinkSpan {
@@ -5381,6 +6947,7 @@ struct XmlElementFrame {
     sdt_context: Option<StorySdtContext>,
     word_prefixes: Vec<String>,
     opaque: bool,
+    typed_sdt_content_seen: bool,
 }
 
 fn word_element(namespace: &ResolveResult<'_>) -> bool {
@@ -5475,7 +7042,7 @@ fn modeled_word_child(parent: &[u8], child: &[u8]) -> bool {
         }
         b"ins" | b"del" | b"moveFrom" | b"moveTo" => matches!(
             child,
-            b"r" | b"hyperlink" | b"ins" | b"del" | b"moveFrom" | b"moveTo"
+            b"r" | b"sdt" | b"hyperlink" | b"ins" | b"del" | b"moveFrom" | b"moveTo"
         ),
         b"fldSimple" => child == b"r",
         _ => false,
@@ -5686,6 +7253,338 @@ fn story_word_prefixes_at(
     Ok(prefixes)
 }
 
+// Locate the selected reference's actual run without changing raw attributes.
+fn comment_reference_run_span(xml: &[u8], owner: &Range<usize>, id: i32) -> Result<Range<usize>> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::<(bool, Vec<u8>, usize)>::new();
+    let mut found = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (ns, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let word = word_element(&ns);
+        drop(ns);
+        match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                if word
+                    && element.local_name().as_ref() == b"commentReference"
+                    && owner.contains(&before)
+                {
+                    let mut selected = false;
+                    for attr in element.attributes() {
+                        let attr = attr.map_err(|error| Error::Other(error.to_string()))?;
+                        let (ns, local) = reader.resolver().resolve_attribute(attr.key);
+                        if word_element(&ns) && local.as_ref() == b"id" {
+                            selected = attr
+                                .decoded_and_normalized_value(
+                                    XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| Error::Other(error.to_string()))?
+                                .parse::<i32>()
+                                .ok()
+                                == Some(id);
+                        }
+                    }
+                    if selected {
+                        let start = stack
+                            .iter()
+                            .rev()
+                            .find(|(word, name, _)| *word && name == b"r")
+                            .map(|(_, _, start)| *start)
+                            .ok_or_else(|| {
+                                Error::Other("comment reference has no source run".into())
+                            })?;
+                        found.push(start..story_element_end(xml, start)?);
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    stack.push((word, element.local_name().as_ref().to_vec(), before));
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if found.len() != 1 {
+        return Err(Error::Other(
+            "comment move requires one qualified reference run".into(),
+        ));
+    }
+    Ok(found.remove(0))
+}
+
+#[allow(clippy::type_complexity)] // Concrete edit spans, reference bytes and original run span.
+fn comment_move_source_edits(
+    xml: &[u8],
+    selected: &[Range<usize>],
+) -> Result<(Vec<Range<usize>>, Vec<u8>, Range<usize>)> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::<(bool, Vec<u8>, usize)>::new();
+    let mut reference = None;
+    let mut controls = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (ns, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let word = word_element(&ns);
+        drop(ns);
+        match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                if selected.iter().any(|span| span.start == before) {
+                    for (_, _, start) in stack
+                        .iter()
+                        .filter(|(word, name, _)| *word && name == b"sdt")
+                    {
+                        let span = *start..story_element_end(xml, *start)?;
+                        if !controls.contains(&span) {
+                            controls.push(span);
+                        }
+                    }
+                    if word && element.local_name().as_ref() == b"commentReference" {
+                        let start = stack
+                            .iter()
+                            .rev()
+                            .find(|(word, name, _)| *word && name == b"r")
+                            .map(|(_, _, start)| *start)
+                            .ok_or_else(|| {
+                                Error::Other("comment reference has no source run".into())
+                            })?;
+                        if reference
+                            .replace(start..story_element_end(xml, start)?)
+                            .is_some()
+                        {
+                            return Err(Error::Other(
+                                "comment move has duplicate reference runs".into(),
+                            ));
+                        }
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    stack.push((word, element.local_name().as_ref().to_vec(), before));
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    let reference_span = reference
+        .ok_or_else(|| Error::Other("comment move has no selected reference run".into()))?;
+    let scope = story_namespace_scope_at(xml, reference_span.start)?;
+    let reference = close_content_fragment_namespaces(&xml[reference_span.clone()], &scope)?;
+    // Only the selected direct reference and run properties travel. Other
+    // children retain their exact source sequence, even when visible text and
+    // opaque producer payload share this run with the reference.
+    let selected_reference = selected
+        .iter()
+        .find(|span| reference_span.contains(&span.start))
+        .ok_or_else(|| Error::Other("comment move reference source was not selected".into()))?;
+    let mut original_reader = quick_xml::Reader::from_reader(&xml[reference_span.clone()]);
+    original_reader
+        .read_event()
+        .map_err(|error| Error::Other(error.to_string()))?;
+    let original_open_end = original_reader.buffer_position() as usize;
+    let mut reader = NsReader::from_reader(reference.as_slice());
+    let mut depth = 0usize;
+    let mut reference_found = false;
+    let mut open_end = 0usize;
+    let mut close_start = 0usize;
+    let mut kept = Vec::new();
+    let mut mixed = false;
+    let mut properties_count = 0usize;
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (ns, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let word = word_element(&ns);
+        drop(ns);
+        let after = reader.buffer_position() as usize;
+        match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                if depth == 0 {
+                    open_end = after;
+                }
+                if depth == 1 {
+                    let end = if matches!(event, Event::Empty(_)) {
+                        after
+                    } else {
+                        story_element_end(&reference, before)?
+                    };
+                    let is_selected = before
+                        == selected_reference.start - reference_span.start + open_end
+                            - original_open_end;
+                    if is_selected && word && element.local_name().as_ref() == b"commentReference" {
+                        if reference_found {
+                            return Err(Error::Other("comment reference run is ambiguous".into()));
+                        }
+                        reference_found = true;
+                        kept.push(before..end);
+                    } else if word && element.local_name().as_ref() == b"rPr" {
+                        properties_count += 1;
+                        kept.push(before..end);
+                    } else {
+                        mixed = true;
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_start = before;
+                }
+            }
+            Event::Text(text) if depth == 1 && !text.iter().all(u8::is_ascii_whitespace) => {
+                mixed = true;
+            }
+            Event::Comment(_) | Event::PI(_) if depth == 1 => {
+                mixed = true;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !reference_found || properties_count > 1 || close_start == 0 {
+        return Err(Error::Other(
+            "comment reference is not a uniquely separable direct run child".into(),
+        ));
+    }
+    let mut transport = reference[..open_end].to_vec();
+    for span in kept {
+        transport.extend_from_slice(&reference[span]);
+    }
+    transport.extend_from_slice(&reference[close_start..]);
+    let mut edits = selected
+        .iter()
+        .filter(|span| !reference_span.contains(&span.start))
+        .cloned()
+        .collect::<Vec<_>>();
+    edits.push(if mixed {
+        selected_reference.clone()
+    } else {
+        reference_span.clone()
+    });
+    controls.sort_by_key(|span| std::cmp::Reverse(span.start));
+    for control in controls {
+        let mut fragment = xml[control.clone()].to_vec();
+        let mut contained = edits
+            .iter()
+            .filter(|span| control.start <= span.start && span.end <= control.end)
+            .cloned()
+            .collect::<Vec<_>>();
+        contained.sort_by_key(|span| span.start);
+        for span in contained.iter().rev() {
+            fragment.drain(span.start - control.start..span.end - control.start);
+        }
+        if pure_empty_google_comment_control(
+            &fragment,
+            &story_namespace_scope_at(xml, control.start)?,
+        )? {
+            edits.retain(|span| !(control.start <= span.start && span.end <= control.end));
+            edits.push(control);
+        }
+    }
+    edits.sort_by_key(|span| span.start);
+    if edits.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(Error::Other("comment move edits overlap".into()));
+    }
+    Ok((edits, transport, reference_span))
+}
+
+fn pure_empty_google_comment_control(xml: &[u8], scope: &BTreeMap<String, String>) -> Result<bool> {
+    // An authored namespace declaration or any other root attribute is payload.
+    let mut raw_reader = quick_xml::Reader::from_reader(xml);
+    if !matches!(raw_reader.read_event(), Ok(Event::Start(ref root)) if root.attributes().next().is_none())
+    {
+        return Ok(false);
+    }
+    let closed = close_content_fragment_namespaces(xml, scope)?;
+    let mut reader = NsReader::from_reader(closed.as_slice());
+    let mut stack = Vec::<Vec<u8>>::new();
+    let mut tag = false;
+    let mut content = false;
+    let mut buffer = Vec::new();
+    loop {
+        let (ns, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let word = word_element(&ns);
+        drop(ns);
+        match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                let name = element.local_name().as_ref().to_vec();
+                let parent = stack.last().map(Vec::as_slice);
+                let allowed = word
+                    && matches!(
+                        (parent, name.as_slice()),
+                        (None, b"sdt")
+                            | (Some(b"sdt"), b"sdtPr" | b"sdtContent")
+                            | (Some(b"sdtPr"), b"tag")
+                            | (Some(b"sdtContent"), b"p")
+                    );
+                if !allowed {
+                    return Ok(false);
+                }
+                if name == b"sdtContent" {
+                    if content {
+                        return Ok(false);
+                    }
+                    content = true;
+                }
+                for attr in element.attributes() {
+                    let attr = attr.map_err(|error| Error::Other(error.to_string()))?;
+                    if stack.is_empty()
+                        && (attr.key.as_ref() == b"xmlns"
+                            || attr.key.as_ref().starts_with(b"xmlns:"))
+                    {
+                        continue;
+                    }
+                    let (ns, local) = reader.resolver().resolve_attribute(attr.key);
+                    if name != b"tag" || !word_element(&ns) || local.as_ref() != b"val" || tag {
+                        return Ok(false);
+                    }
+                    tag = attr
+                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                        .map_err(|error| Error::Other(error.to_string()))?
+                        .starts_with("goog_rdk_");
+                    if !tag {
+                        return Ok(false);
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    stack.push(name);
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Event::Eof => break,
+            _ => return Ok(false),
+        }
+        buffer.clear();
+    }
+    Ok(tag && content)
+}
+
 fn story_element_end(xml: &[u8], start: usize) -> Result<usize> {
     let fragment = xml
         .get(start..)
@@ -5720,10 +7619,156 @@ fn story_element_end(xml: &[u8], start: usize) -> Result<usize> {
     }
 }
 
+// Most elements inherit an unchanged map. Stop at the first declaration, then
+// let the original decoder apply the whole element to a full inherited copy.
+// Stopping here preserves namespace-value errors before later attribute errors.
+fn changed_story_namespace_scope(
+    inherited: &BTreeMap<String, String>,
+    element: &BytesStart<'_>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| {
+            Error::Other(format!("story namespace scope attribute failed: {error}"))
+        })?;
+        let name = attribute.key.as_ref();
+        if name == b"xmlns" || name.starts_with(b"xmlns:") {
+            #[cfg(test)]
+            FX237_NAMESPACE_FRAME_COPIES.set(FX237_NAMESPACE_FRAME_COPIES.get() + 1);
+            let mut scope = inherited.clone();
+            update_story_namespace_scope(&mut scope, element)?;
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn story_namespace_scope_at(
     xml: &[u8],
     offset: usize,
 ) -> Result<BTreeMap<String, String>> {
+    #[cfg(test)]
+    FX237_PREFIX_NAMESPACE_BYTES.set(FX237_PREFIX_NAMESPACE_BYTES.get() + offset.min(xml.len()));
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut scopes = vec![BTreeMap::<String, String>::new()];
+    let mut changed_frames = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("story namespace scope scan failed: {error}")))?
+        {
+            Event::Start(element) => {
+                let inherited = scopes.last().expect("initial namespace scope");
+                let changed = changed_story_namespace_scope(inherited, &element)?;
+                if before == offset {
+                    return Ok(changed.unwrap_or_else(|| inherited.clone()));
+                }
+                changed_frames.push(changed.is_some());
+                if let Some(scope) = changed {
+                    scopes.push(scope);
+                }
+            }
+            Event::Empty(element) => {
+                if before == offset {
+                    let inherited = scopes.last().expect("initial namespace scope");
+                    return Ok(changed_story_namespace_scope(inherited, &element)?
+                        .unwrap_or_else(|| inherited.clone()));
+                }
+            }
+            Event::End(_) => {
+                if changed_frames.pop() == Some(true) {
+                    scopes.pop();
+                }
+            }
+            Event::Eof => {
+                return Err(Error::Other(
+                    "story item namespace scope was not found".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+fn story_namespace_scopes_at(
+    xml: &[u8],
+    offsets: impl IntoIterator<Item = usize>,
+) -> Result<HashMap<usize, BTreeMap<String, String>>> {
+    let requested = offsets.into_iter().collect::<HashSet<_>>();
+    let mut found = HashMap::with_capacity(requested.len());
+    if requested.is_empty() {
+        return Ok(found);
+    }
+    #[cfg(test)]
+    STORY_NAMESPACE_SCANS.set(STORY_NAMESPACE_SCANS.get() + 1);
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut scopes = vec![BTreeMap::<String, String>::new()];
+    let mut changed_frames = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("story namespace scope scan failed: {error}")))?
+        {
+            Event::Start(element) => {
+                let inherited = scopes.last().expect("initial namespace scope");
+                // Snapshot inherited context and preserve the original early
+                // return before this target's declarations are validated.
+                if requested.contains(&before) {
+                    found.insert(before, inherited.clone());
+                    if found.len() == requested.len() {
+                        return Ok(found);
+                    }
+                }
+                let changed = changed_story_namespace_scope(inherited, &element)?;
+                changed_frames.push(changed.is_some());
+                if let Some(scope) = changed {
+                    scopes.push(scope);
+                }
+            }
+            Event::Empty(_) => {
+                if requested.contains(&before) {
+                    found.insert(
+                        before,
+                        scopes.last().expect("initial namespace scope").clone(),
+                    );
+                    if found.len() == requested.len() {
+                        return Ok(found);
+                    }
+                }
+            }
+            Event::End(_) => {
+                if changed_frames.pop() == Some(true) {
+                    scopes.pop();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    let missing = requested
+        .into_iter()
+        .filter(|offset| !found.contains_key(offset))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(found)
+    } else {
+        Err(Error::Other(format!(
+            "story namespace scopes were not found at offsets {missing:?}"
+        )))
+    }
+}
+
+#[cfg(test)]
+fn fx237_legacy_namespace_scope_at(xml: &[u8], offset: usize) -> Result<BTreeMap<String, String>> {
+    #[cfg(test)]
+    FX237_PREFIX_NAMESPACE_BYTES.set(FX237_PREFIX_NAMESPACE_BYTES.get() + offset.min(xml.len()));
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut scopes = vec![BTreeMap::<String, String>::new()];
@@ -5765,7 +7810,8 @@ pub(crate) fn story_namespace_scope_at(
     }
 }
 
-fn story_namespace_scopes_at(
+#[cfg(test)]
+fn fx237_legacy_namespace_scopes_at(
     xml: &[u8],
     offsets: impl IntoIterator<Item = usize>,
 ) -> Result<HashMap<usize, BTreeMap<String, String>>> {
@@ -5774,6 +7820,8 @@ fn story_namespace_scopes_at(
     if requested.is_empty() {
         return Ok(found);
     }
+    #[cfg(test)]
+    STORY_NAMESPACE_SCANS.set(STORY_NAMESPACE_SCANS.get() + 1);
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut scopes = vec![BTreeMap::<String, String>::new()];
@@ -5786,19 +7834,20 @@ fn story_namespace_scopes_at(
         {
             Event::Start(element) => {
                 let mut scope = scopes.last().cloned().unwrap_or_default();
-                update_story_namespace_scope(&mut scope, &element)?;
+                // Excerpts retain their own declarations on the original elements.
+                // A sibling sequence inherits only the context outside its first element.
                 if requested.contains(&before) {
                     found.insert(before, scope.clone());
                     if found.len() == requested.len() {
                         return Ok(found);
                     }
                 }
+                update_story_namespace_scope(&mut scope, &element)?;
                 scopes.push(scope);
             }
-            Event::Empty(element) => {
+            Event::Empty(_) => {
                 if requested.contains(&before) {
-                    let mut scope = scopes.last().cloned().unwrap_or_default();
-                    update_story_namespace_scope(&mut scope, &element)?;
+                    let scope = scopes.last().cloned().unwrap_or_default();
                     found.insert(before, scope);
                     if found.len() == requested.len() {
                         return Ok(found);
@@ -5870,42 +7919,82 @@ fn scan_story_items_with_scope(
     Ok(items)
 }
 
-fn local_story_item(
+fn scoped_story_item(
+    xml: &[u8],
     item: &StoryItemSpan,
-    source_start: usize,
-    closed_len: usize,
-    added: usize,
-) -> StoryItemSpan {
-    let local = |position: usize| {
-        if position == source_start {
-            0
-        } else {
-            position - source_start + added
+    scope: &BTreeMap<String, String>,
+) -> Result<(Vec<u8>, StoryItemSpan, usize)> {
+    let (closed, added, scan) = if item.complex_field {
+        // A complex field spans sibling runs. Bind their shared context on an
+        // inert envelope, leaving every source byte and local declaration intact.
+        let original = xml.get(item.scan.clone()).ok_or_else(|| {
+            Error::Other("complex story field lies outside its source part".to_owned())
+        })?;
+        let mut closed = b"<rdocx_story_excerpt".to_vec();
+        for (prefix, namespace) in scope {
+            closed.extend_from_slice(b" xmlns");
+            if !prefix.is_empty() {
+                closed.push(b':');
+                closed.extend_from_slice(prefix.as_bytes());
+            }
+            closed.extend_from_slice(b"=\"");
+            closed.extend_from_slice(quick_xml::escape::escape(namespace).as_bytes());
+            closed.push(b'"');
         }
+        closed.push(b'>');
+        let added = closed.len();
+        closed.extend_from_slice(original);
+        let end = closed.len();
+        closed.extend_from_slice(b"</rdocx_story_excerpt>");
+        (closed, added, added..end)
+    } else {
+        let (closed, added) = scoped_story_fragment(xml, item.scan.clone(), scope)?;
+        let end = closed.len();
+        (closed, added, 0..end)
     };
-    StoryItemSpan {
+    let source_len = item
+        .scan
+        .end
+        .checked_sub(item.scan.start)
+        .ok_or_else(|| Error::Other("story item has an inverted scan span".to_owned()))?;
+    let local = |position: usize| -> Result<usize> {
+        if !item.complex_field && position == item.scan.start {
+            return Ok(0);
+        }
+        position
+            .checked_sub(item.scan.start)
+            .filter(|relative| *relative <= source_len)
+            .and_then(|relative| relative.checked_add(added))
+            .ok_or_else(|| Error::Other("story item lies outside its scan span".to_owned()))
+    };
+    let full = local(item.full.start)?..local(item.full.end)?;
+    if full.start > full.end {
+        return Err(Error::Other(
+            "story item has an inverted source span".to_owned(),
+        ));
+    }
+    let local = StoryItemSpan {
         kind: item.kind,
-        full: local(item.full.start)..local(item.full.end),
-        scan: 0..closed_len,
+        full,
+        scan,
         direct_owner_child: item.direct_owner_child,
         complex_field: item.complex_field,
-        complex_ancestors: item
-            .complex_ancestors
-            .iter()
-            .map(|ancestor| local(*ancestor))
-            .collect(),
+        // Ancestors gate typed discovery in scan_story_items. Neither excerpt
+        // scanner consumes them, and an external ancestor has no local offset.
+        complex_ancestors: Vec::new(),
         sdt_context: item.sdt_context,
-    }
+    };
+    Ok((closed, local, added))
 }
 
 fn story_item_text_with_scope(
     xml: &[u8],
     item: &StoryItemSpan,
     scope: &BTreeMap<String, String>,
+    qualified_items: &[StoryItemSpan],
 ) -> Result<Option<String>> {
-    let (closed, added) = scoped_story_fragment(xml, item.scan.clone(), scope)?;
-    let local = local_story_item(item, item.scan.start, closed.len(), added);
-    story_item_text(&closed, &local)
+    let (closed, local, added) = scoped_story_item(xml, item, scope)?;
+    story_item_text(&closed, &local, qualified_items, item.scan.clone(), added)
 }
 
 fn scan_story_item_links_with_scope(
@@ -5913,24 +8002,34 @@ fn scan_story_item_links_with_scope(
     item: &StoryItemSpan,
     scope: &BTreeMap<String, String>,
 ) -> Result<Vec<StoryLinkSpan>> {
-    let (closed, added) = scoped_story_fragment(xml, item.scan.clone(), scope)?;
-    let local = local_story_item(item, item.scan.start, closed.len(), added);
+    let (closed, local, added) = scoped_story_item(xml, item, scope)?;
     let links = scan_story_item_links(&closed, &local)?;
-    let map = |position: usize| {
-        if position == 0 {
-            item.scan.start
-        } else {
-            item.scan.start + position - added
+    let map = |position: usize| -> Result<usize> {
+        if !item.complex_field && position == 0 {
+            return Ok(item.scan.start);
         }
+        position
+            .checked_sub(added)
+            .and_then(|relative| item.scan.start.checked_add(relative))
+            .filter(|source| item.scan.start <= *source && *source <= item.scan.end)
+            .ok_or_else(|| Error::Other("story hyperlink lies outside its source span".to_owned()))
     };
-    Ok(links
+    links
         .into_iter()
-        .map(|link| StoryLinkSpan {
-            full: map(link.full.start)..map(link.full.end),
-            rel_id: link.rel_id,
-            anchor: link.anchor,
+        .map(|link| {
+            let full = map(link.full.start)?..map(link.full.end)?;
+            if full.start > full.end {
+                return Err(Error::Other(
+                    "story hyperlink has an inverted source span".to_owned(),
+                ));
+            }
+            Ok(StoryLinkSpan {
+                full,
+                rel_id: link.rel_id,
+                anchor: link.anchor,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Scan one story's hyperlinks in physical source order, each paired with the
@@ -5954,12 +8053,12 @@ fn ordered_story_link_spans(
     item_scopes: &HashMap<usize, BTreeMap<String, String>>,
 ) -> Result<Vec<(ContentLocation, StoryLinkSpan)>> {
     let mut links = Vec::new();
-    for (index, item) in items.into_iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let scope = item_scopes.get(&item.scan.start).ok_or_else(|| {
             Error::Other("story item namespace scope was not inventoried".to_owned())
         })?;
         let owner_width = item.full.end - item.full.start;
-        for link in scan_story_item_links_with_scope(xml, &item, scope)? {
+        for link in scan_story_item_links_with_scope(xml, item, scope)? {
             let location = ContentLocation {
                 story: story.clone(),
                 item_kind: item.kind,
@@ -6033,6 +8132,47 @@ fn direct_story_content_items(xml: &[u8], owner: &StoryOwnerSpan) -> Result<Vec<
         items.push(item);
     }
     Ok(items)
+}
+
+pub(crate) fn validate_fragment_block_content(content: &[u8]) -> Result<()> {
+    let mut xml = format!(
+        r#"<w:document xmlns:w="{}"><w:body>"#,
+        rdocx_oxml::namespace::W_NS
+    )
+    .into_bytes();
+    xml.extend_from_slice(content);
+    xml.extend_from_slice(b"</w:body></w:document>");
+    let owner = scan_story_owners(&xml, StoryKind::Body)?
+        .into_iter()
+        .find(|owner| owner.kind == StoryKind::Body)
+        .ok_or_else(|| Error::Other("fragment content has no body owner".to_owned()))?;
+    for item in direct_story_content_items(&xml, &owner)? {
+        let scope = story_namespace_scope_at(&xml, item.full.start)?;
+        let item_xml = close_content_fragment_namespaces(&xml[item.full], &scope)?;
+        validate_fragment_block_item(&item_xml)?;
+    }
+    Ok(())
+}
+
+fn validate_fragment_block_item(xml: &[u8]) -> Result<()> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    if let (namespace, Event::Start(element) | Event::Empty(element)) = reader
+        .read_resolved_event_into(&mut buffer)
+        .map_err(|error| Error::Other(format!("invalid document fragment item: {error}")))?
+        && word_element(&namespace)
+    {
+        match element.local_name().as_ref() {
+            b"sdt" => validate_serialized_block_content_control(xml)?,
+            b"r" | b"hyperlink" | b"fldSimple" | b"drawing" | b"pict" => {
+                return Err(Error::Other(
+                    "document fragment boundaries admit block content only".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn story_owner_content_end(xml: &[u8], owner: &StoryOwnerSpan) -> Result<usize> {
@@ -6231,7 +8371,7 @@ fn reject_section_owning_content_fragment(fragment: &ContentFragment) -> Result<
     wrapped.extend_from_slice(b"</w:body></w:document>");
     let document = CT_Document::from_xml(&wrapped)?;
     let mut owns_section = false;
-    visit_body_paragraphs(&document.body.content, &mut |paragraph| {
+    visit_body_paragraphs(&document.body.content, false, &mut |paragraph| {
         owns_section |= paragraph
             .properties
             .as_ref()
@@ -6532,6 +8672,101 @@ fn validated_direct_content_item(
     Ok(item)
 }
 
+// Nested paragraph paths use the enclosing block control's content as the
+// effective block owner while keeping the underlying part's relationship scope.
+fn fragment_content_boundary(
+    xml: &[u8],
+    owner: &StoryOwnerSpan,
+    location: &ContentLocation,
+) -> Result<(StoryOwnerSpan, usize, usize, usize)> {
+    if location.is_end || location.index_path.len() == 1 {
+        let (boundary, index, count) = validated_content_boundary(xml, owner, location)?;
+        return Ok((owner.clone(), boundary, index, count));
+    }
+    let [control_index, paragraph_index] = location.index_path.as_slice() else {
+        return Err(StoryError::InvalidPath {
+            path: location.index_path.clone(),
+        }
+        .into());
+    };
+    if location.item_kind != StoryItemKind::Paragraph {
+        return Err(StoryError::InvalidPath {
+            path: location.index_path.clone(),
+        }
+        .into());
+    }
+    let items = scan_story_items(xml, owner)?;
+    let control = items.get(*control_index).ok_or(StoryError::OutOfBounds {
+        index: *control_index,
+        len: items.len(),
+    })?;
+    if control.kind != StoryItemKind::ContentControl
+        || control.sdt_context != Some(StorySdtContext::Block)
+    {
+        return Err(StoryError::InvalidPath {
+            path: location.index_path.clone(),
+        }
+        .into());
+    }
+    let paragraphs = scan_story_control_paragraphs(xml, control)?;
+    let paragraph = paragraphs
+        .get(*paragraph_index)
+        .ok_or(StoryError::OutOfBounds {
+            index: *paragraph_index,
+            len: paragraphs.len(),
+        })?;
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut stack = Vec::new();
+    let mut enclosing = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("fragment control owner scan failed: {error}")))?
+        {
+            Event::Start(element) => {
+                let (namespace, local) = reader.resolver().resolve_element(element.name());
+                stack.push((
+                    word_element(&namespace) && local.as_ref() == b"sdtContent",
+                    before,
+                ));
+            }
+            Event::End(_) => {
+                if let Some((true, start)) = stack.pop() {
+                    let end = reader.buffer_position() as usize;
+                    if start >= control.full.start
+                        && end <= control.full.end
+                        && start < paragraph.start
+                        && end > paragraph.end
+                    {
+                        enclosing.push(start..end);
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    let full = enclosing
+        .into_iter()
+        .min_by_key(|span| span.end - span.start)
+        .ok_or_else(|| Error::Other("fragment paragraph has no block control owner".to_owned()))?;
+    let effective = StoryOwnerSpan {
+        full,
+        ..owner.clone()
+    };
+    let direct = direct_story_content_items(xml, &effective)?;
+    let index = direct
+        .iter()
+        .position(|item| item.kind == StoryItemKind::Paragraph && item.full == *paragraph)
+        .ok_or_else(|| {
+            Error::Other("fragment paragraph is not a direct block control child".to_owned())
+        })?;
+    Ok((effective, paragraph.start, index, direct.len()))
+}
+
 fn validated_content_boundary(
     xml: &[u8],
     owner: &StoryOwnerSpan,
@@ -6625,6 +8860,432 @@ fn story_scope_matches_fragment(destination: &StoryId, fragment: &ContentFragmen
     fragment.source_part_name.as_deref() == Some(destination.part_name.as_str())
         && fragment.source_story_kind == Some(destination.kind)
         && fragment.source_owner_index == Some(destination.owner_index)
+}
+
+/// Concrete typed owners used only while qualifying replacement XML.
+/// Raw preservation payloads never acquire relationship type authority.
+enum WordXmlOwner<'a> {
+    Paragraph(&'a CT_P),
+    Run(&'a CT_R),
+    Table(&'a CT_Tbl),
+    Row(&'a CT_Row),
+    Cell(&'a CT_Tc),
+    Control(&'a CT_Sdt),
+}
+
+/// Qualify changed bookmark and comment identities through existing physical
+/// source inventories. Unchanged selected identities retain their owner proof.
+fn validate_element_xml_identity_change(
+    document: &Document,
+    story: &StoryId,
+    previous: &[u8],
+    incoming: &[u8],
+) -> Result<()> {
+    let old_comments = crate::comments::comment_source_markers(previous)?;
+    let new_comments = crate::comments::comment_source_markers(incoming)?;
+    if !old_comments
+        .iter()
+        .map(|marker| (marker.id, marker.family))
+        .eq(new_comments.iter().map(|marker| (marker.id, marker.family)))
+    {
+        let counts = |markers: &[crate::comments::CommentSourceMarker]| -> Result<BTreeMap<i32, [usize; 3]>> {
+            let mut counts = BTreeMap::new();
+            for marker in markers {
+                let entry = counts.entry(marker.id).or_insert([0usize; 3]);
+                entry[marker.family] = entry[marker.family].checked_add(1).ok_or_else(|| Error::Other("element XML comment count overflow".into()))?;
+            }
+            Ok(counts)
+        };
+        let before = counts(&old_comments)?;
+        let after = counts(&new_comments)?;
+        let mut old_order = BTreeMap::<i32, Vec<usize>>::new();
+        let mut new_order = BTreeMap::<i32, Vec<usize>>::new();
+        for marker in &old_comments {
+            old_order.entry(marker.id).or_default().push(marker.family);
+        }
+        for marker in &new_comments {
+            new_order.entry(marker.id).or_default().push(marker.family);
+        }
+        let changed = old_order
+            .keys()
+            .chain(new_order.keys())
+            .copied()
+            .filter(|id| old_order.get(id) != new_order.get(id))
+            .collect::<HashSet<_>>();
+        let mut prepared = document.clone_for_staging();
+        prepared.flush_to_package()?;
+        let inventory = prepared.comment_source_inventory_at(&prepared.doc_part_name)?;
+        if !inventory.contains_key(&story.part_name) {
+            return Err(Error::Other(
+                "element XML comment relationship scope is unsupported".into(),
+            ));
+        }
+        let mut total = BTreeMap::<i32, [usize; 3]>::new();
+        for markers in inventory.values() {
+            for (id, counts) in counts(markers)? {
+                let entry = total.entry(id).or_default();
+                for family in 0..3 {
+                    entry[family] = entry[family].checked_add(counts[family]).ok_or_else(|| {
+                        Error::Other("element XML comment inventory overflow".into())
+                    })?;
+                }
+            }
+        }
+        for id in &changed {
+            let id = *id;
+            let old = before.get(&id).copied().unwrap_or_default();
+            let new = after.get(&id).copied().unwrap_or_default();
+            if new.iter().any(|count| *count > 1) || new[0] != new[1] {
+                return Err(Error::Other(
+                    "element XML changed comment span outside the selected owner is unsupported"
+                        .into(),
+                ));
+            }
+            if new != [0; 3] {
+                prepared.fragment_comment_dependency(id)?;
+            }
+            let all = total.get(&id).copied().unwrap_or_default();
+            let mut combined = [0usize; 3];
+            for family in 0..3 {
+                combined[family] = all[family]
+                    .checked_sub(old[family])
+                    .and_then(|outside| outside.checked_add(new[family]))
+                    .ok_or_else(|| {
+                        Error::Other("element XML comment owner correspondence is invalid".into())
+                    })?;
+            }
+            if combined.iter().any(|count| *count > 1) || combined[0] != combined[1] {
+                return Err(Error::Other(
+                    "element XML comment ID collides or leaves an unmatched physical owner".into(),
+                ));
+            }
+        }
+        let mut started = HashSet::new();
+        for marker in &new_comments {
+            if !changed.contains(&marker.id) {
+                continue;
+            }
+            if marker.family == 0 {
+                started.insert(marker.id);
+            } else if marker.family == 1 && !started.contains(&marker.id) {
+                return Err(Error::Other(
+                    "element XML comment end precedes its start".into(),
+                ));
+            }
+        }
+    }
+    let counts = |markers: &[BookmarkMarkerSpan]| -> Result<BTreeMap<i32, [usize; 2]>> {
+        let mut counts = BTreeMap::new();
+        for marker in markers {
+            let id = marker
+                .id
+                .parse::<i32>()
+                .map_err(|_| Error::Other("element XML bookmark has an invalid ID".into()))?;
+            let count = counts.entry(id).or_insert([0usize; 2]);
+            let family = usize::from(!marker.start);
+            count[family] = count[family]
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("element XML bookmark count overflow".into()))?;
+        }
+        Ok(counts)
+    };
+    let previous_markers = bookmark_marker_spans(previous)?;
+    let incoming_markers = bookmark_marker_spans(incoming)?;
+    let before = counts(&previous_markers)?;
+    let after = counts(&incoming_markers)?;
+    let mut old_order = BTreeMap::<i32, Vec<bool>>::new();
+    let mut new_order = BTreeMap::<i32, Vec<bool>>::new();
+    for marker in &previous_markers {
+        old_order
+            .entry(marker.id.parse().unwrap())
+            .or_default()
+            .push(marker.start);
+    }
+    for marker in &incoming_markers {
+        new_order
+            .entry(marker.id.parse().unwrap())
+            .or_default()
+            .push(marker.start);
+    }
+    let changed = old_order
+        .keys()
+        .chain(new_order.keys())
+        .copied()
+        .filter(|id| old_order.get(id) != new_order.get(id))
+        .collect::<HashSet<_>>();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let (source, _) = document.story_source_and_owner(story)?;
+    let total = counts(&bookmark_marker_spans(&source.xml)?)?;
+    for id in &changed {
+        let id = *id;
+        let old = before.get(&id).copied().unwrap_or_default();
+        let new = after.get(&id).copied().unwrap_or_default();
+        if new != [0, 0] && new != [1, 1] {
+            return Err(Error::Other(
+                "element XML changed bookmark span outside the selected owner is unsupported"
+                    .into(),
+            ));
+        }
+        let total = total.get(&id).copied().unwrap_or_default();
+        let mut combined = [0usize; 2];
+        for family in 0..2 {
+            combined[family] = total[family]
+                .checked_sub(old[family])
+                .and_then(|outside| outside.checked_add(new[family]))
+                .ok_or_else(|| {
+                    Error::Other("element XML bookmark owner correspondence is invalid".into())
+                })?;
+        }
+        if combined != [0, 0] && combined != [1, 1] {
+            return Err(Error::Other(
+                "element XML bookmark ID collides or leaves an unmatched physical owner".into(),
+            ));
+        }
+    }
+    let mut started = HashSet::new();
+    for marker in &incoming_markers {
+        let id = marker
+            .id
+            .parse::<i32>()
+            .map_err(|_| Error::Other("element XML bookmark has an invalid ID".into()))?;
+        if !changed.contains(&id) {
+            continue;
+        }
+        if marker.start {
+            started.insert(id);
+        } else if !started.contains(&id) {
+            return Err(Error::Other(
+                "element XML bookmark end precedes its start".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_element_owner_relationships(
+    document: &Document,
+    story: &StoryId,
+    root: WordXmlOwner<'_>,
+) -> Result<()> {
+    let mut pending = vec![root];
+    while let Some(owner) = pending.pop() {
+        match owner {
+            WordXmlOwner::Paragraph(paragraph) => {
+                for hyperlink in &paragraph.hyperlinks {
+                    if let Some(id) = &hyperlink.rel_id {
+                        document.hyperlink_url_for_story(story, id)?;
+                    }
+                }
+                pending.extend(paragraph.runs.iter().map(WordXmlOwner::Run));
+                pending.extend(
+                    paragraph
+                        .content_controls
+                        .iter()
+                        .map(|(_, _, _, control)| WordXmlOwner::Control(control)),
+                );
+                for (_, _, revision) in &paragraph.revisions {
+                    if let Some(paragraph) = revision.content_paragraph() {
+                        pending.push(WordXmlOwner::Paragraph(paragraph));
+                    }
+                }
+                for ruby in &paragraph.rubies {
+                    pending.extend(ruby.ruby_text.iter().map(WordXmlOwner::Run));
+                }
+            }
+            WordXmlOwner::Run(run) => {
+                for content in &run.content {
+                    match content {
+                        RunContent::Field(field) => {
+                            field.validate_for_attachment()?;
+                            if let Some(runs) = field.cached_result_runs() {
+                                pending.extend(runs.iter().map(WordXmlOwner::Run));
+                            }
+                        }
+                        RunContent::FootnoteRef { id, .. } | RunContent::EndnoteRef { id, .. } => {
+                            if document.glossary_part_name.as_deref()
+                                == Some(story.part_name.as_str())
+                            {
+                                return Err(Error::Other(
+                                    "element XML glossary note reference scope is unsupported"
+                                        .into(),
+                                ));
+                            }
+                            let kind = if matches!(content, RunContent::FootnoteRef { .. }) {
+                                StoryKind::Footnote
+                            } else {
+                                StoryKind::Endnote
+                            };
+                            document.fragment_note_dependency(kind, *id)?;
+                        }
+                        RunContent::Drawing(drawing) => {
+                            if drawing.inline.is_some() && drawing.anchor.is_some() {
+                                return Err(Error::Other(
+                                    "element XML drawing has two modeled owners".into(),
+                                ));
+                            }
+                            let relationships = drawing
+                                .inline
+                                .as_ref()
+                                .map(|inline| {
+                                    (
+                                        &inline.embed_id,
+                                        inline.link_id.as_deref(),
+                                        inline.chart_rel_id.as_deref(),
+                                    )
+                                })
+                                .or_else(|| {
+                                    drawing.anchor.as_ref().map(|anchor| {
+                                        (
+                                            &anchor.embed_id,
+                                            anchor.link_id.as_deref(),
+                                            anchor.chart_rel_id.as_deref(),
+                                        )
+                                    })
+                                });
+                            if let Some((embed, link, chart)) = relationships {
+                                if !embed.is_empty() {
+                                    let target = document
+                                        .validate_internal_relationship_for_story(
+                                            story,
+                                            embed,
+                                            rel_types::IMAGE,
+                                        )?;
+                                    if !document
+                                        .package
+                                        .content_types
+                                        .content_type_for(&target)
+                                        .is_some_and(|kind| kind.starts_with("image/"))
+                                    {
+                                        return Err(Error::Other("element XML image relationship targets a non-image part".into()));
+                                    }
+                                }
+                                if let Some(id) = link {
+                                    let relationship = document
+                                        .package
+                                        .get_part_rels(&story.part_name)
+                                        .and_then(|relationships| relationships.get_by_id(id))
+                                        .ok_or_else(|| {
+                                            Error::Other(
+                                                "element XML linked image relationship is missing"
+                                                    .into(),
+                                            )
+                                        })?;
+                                    if relationship.rel_type != rel_types::IMAGE
+                                        || relationship.target_mode.as_deref() != Some("External")
+                                    {
+                                        return Err(Error::Other("element XML linked image requires an external image relationship".into()));
+                                    }
+                                }
+                                if let Some(id) = chart {
+                                    let target = document
+                                        .validate_internal_relationship_for_story(
+                                            story,
+                                            id,
+                                            rel_types::CHART,
+                                        )?;
+                                    let source =
+                                        document.package.get_part(&target).ok_or_else(|| {
+                                            Error::Other(
+                                                "element XML chart target is missing".into(),
+                                            )
+                                        })?;
+                                    if document.package.content_types.content_type_for(&target)
+                                        != Some(content_types::CHART)
+                                    {
+                                        return Err(Error::Other("element XML chart relationship targets a non-chart part".into()));
+                                    }
+                                    CT_ChartSpace::from_xml(source).map_err(|error| {
+                                        Error::Other(format!("element XML chart target: {error}"))
+                                    })?;
+                                }
+                            }
+                            if let Some(shape) = drawing
+                                .anchor
+                                .as_ref()
+                                .and_then(|anchor| anchor.shape.as_ref())
+                            {
+                                if let Some(body) = &shape.text_body {
+                                    for content in &body.content {
+                                        match content {
+                                            BodyContent::Paragraph(paragraph) => {
+                                                pending.push(WordXmlOwner::Paragraph(paragraph))
+                                            }
+                                            BodyContent::Table(table) => {
+                                                pending.push(WordXmlOwner::Table(table))
+                                            }
+                                            BodyContent::ContentControl(control) => {
+                                                pending.push(WordXmlOwner::Control(control))
+                                            }
+                                            BodyContent::RawXml(_) => {}
+                                        }
+                                    }
+                                } else {
+                                    pending.extend(shape.text.iter().map(WordXmlOwner::Paragraph));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WordXmlOwner::Table(table) => {
+                validate_table_topology(table)?;
+                pending.extend(table.rows.iter().map(WordXmlOwner::Row));
+                pending.extend(
+                    table
+                        .content_controls
+                        .iter()
+                        .map(|(_, _, control)| WordXmlOwner::Control(control)),
+                );
+            }
+            WordXmlOwner::Row(row) => {
+                pending.extend(row.cells.iter().map(WordXmlOwner::Cell));
+                pending.extend(
+                    row.content_controls
+                        .iter()
+                        .map(|(_, _, control)| WordXmlOwner::Control(control)),
+                );
+            }
+            WordXmlOwner::Cell(cell) => {
+                for content in &cell.content {
+                    match content {
+                        CellContent::Paragraph(paragraph) => {
+                            pending.push(WordXmlOwner::Paragraph(paragraph))
+                        }
+                        CellContent::Table(table) => pending.push(WordXmlOwner::Table(table)),
+                        CellContent::ContentControl(control) => {
+                            pending.push(WordXmlOwner::Control(control))
+                        }
+                    }
+                }
+            }
+            WordXmlOwner::Control(control) => {
+                for content in &control.content {
+                    match content {
+                        SdtContent::Paragraph(paragraph) => {
+                            pending.push(WordXmlOwner::Paragraph(paragraph))
+                        }
+                        SdtContent::Run(run) => pending.push(WordXmlOwner::Run(run)),
+                        SdtContent::Table(table) => pending.push(WordXmlOwner::Table(table)),
+                        SdtContent::Row(row) => pending.push(WordXmlOwner::Row(row)),
+                        SdtContent::Cell(cell) => pending.push(WordXmlOwner::Cell(cell)),
+                        SdtContent::ContentControl(control) => {
+                            pending.push(WordXmlOwner::Control(control))
+                        }
+                        SdtContent::RawXml(_) => {}
+                    }
+                }
+                for (_, revision) in control.revisions() {
+                    if let Some(paragraph) = revision.content_paragraph() {
+                        pending.push(WordXmlOwner::Paragraph(paragraph));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_fragment_relationships(
@@ -6817,7 +9478,11 @@ fn restart_merges_continued_below(table: &mut CT_Tbl, row_index: usize) -> Resul
     Ok(())
 }
 
-fn set_story_source_xml(document: &mut Document, part_name: &str, xml: Vec<u8>) -> Result<()> {
+pub(crate) fn set_story_source_xml(
+    document: &mut Document,
+    part_name: &str,
+    xml: Vec<u8>,
+) -> Result<()> {
     if part_name == document.doc_part_name {
         // The main-part story source is canonical XML. It drops a root
         // default namespace and every body declaration, and binds the root
@@ -6855,23 +9520,97 @@ fn set_story_source_xml(document: &mut Document, part_name: &str, xml: Vec<u8>) 
         document.footnotes = rdocx_oxml::footnotes::CT_Footnotes::from_xml(&xml)?;
         document.package.set_part(part_name, xml);
         document.footnotes_dirty = false;
+    } else if document.glossary_part_name.as_deref() == Some(part_name) {
+        document.glossary = Some(rdocx_oxml::glossary::CT_GlossaryDocument::from_xml(&xml)?);
+        document.package.set_part(part_name, xml);
+        document.glossary_dirty = false;
     } else {
         document.package.set_part(part_name, xml);
     }
     Ok(())
 }
 
-fn serialized_footnote_fragment(footnote: &rdocx_oxml::footnotes::CT_Footnote) -> Result<Vec<u8>> {
-    let serialized = rdocx_oxml::footnotes::CT_Footnotes {
-        footnotes: vec![footnote.clone()],
-    }
-    .to_xml_footnotes()?;
-    let owner = scan_story_owners(&serialized, StoryKind::Footnote)?
+fn serialized_note_fragment(
+    note: &rdocx_oxml::footnotes::CT_Footnote,
+    kind: StoryKind,
+) -> Result<Vec<u8>> {
+    let notes = rdocx_oxml::footnotes::CT_Footnotes {
+        footnotes: vec![note.clone()],
+    };
+    let serialized = match kind {
+        StoryKind::Footnote => notes.to_xml_footnotes()?,
+        StoryKind::Endnote => notes.to_xml_endnotes()?,
+        _ => return Err(Error::Other("invalid note story kind".to_owned())),
+    };
+    let owner = scan_story_owners_with_special(&serialized, kind, true)?
         .into_iter()
         .next()
-        .ok_or_else(|| Error::Other("serialized footnote has no story owner".to_owned()))?;
+        .ok_or_else(|| Error::Other("serialized note has no story owner".to_owned()))?;
     let scope = story_namespace_scope_at(&serialized, owner.full.start)?;
     close_content_fragment_namespaces(&serialized[owner.full], &scope)
+}
+
+fn serialized_footnote_fragment(footnote: &rdocx_oxml::footnotes::CT_Footnote) -> Result<Vec<u8>> {
+    serialized_note_fragment(footnote, StoryKind::Footnote)
+}
+
+fn remove_note_references(xml: &[u8], id: i32, kind: StoryKind) -> Result<Vec<u8>> {
+    let local_name = match kind {
+        StoryKind::Footnote => b"footnoteReference".as_slice(),
+        StoryKind::Endnote => b"endnoteReference".as_slice(),
+        _ => return Err(Error::Other("invalid note story kind".to_owned())),
+    };
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut ranges = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("footnote reference scan failed: {error}")))?;
+        let start = match &event {
+            Event::Start(start) | Event::Empty(start)
+                if word_element(&namespace) && start.local_name().as_ref() == local_name =>
+            {
+                start
+            }
+            Event::Eof => break,
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let mut reference_id = None;
+        for attribute in start.attributes() {
+            let attribute = attribute.map_err(|error| {
+                Error::Other(format!("footnote reference attribute scan failed: {error}"))
+            })?;
+            let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+            if word_element(&namespace) && local.as_ref() == b"id" {
+                let value = attribute
+                    .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                    .map_err(|error| {
+                        Error::Other(format!("footnote reference ID is invalid: {error}"))
+                    })?;
+                reference_id = value.parse::<i32>().ok();
+            }
+        }
+        if reference_id == Some(id) {
+            let end = if matches!(event, Event::Empty(_)) {
+                reader.buffer_position() as usize
+            } else {
+                story_element_end(xml, before)?
+            };
+            ranges.push(before..end);
+        }
+        buffer.clear();
+    }
+    let mut updated = xml.to_vec();
+    for range in ranges.into_iter().rev() {
+        updated.drain(range);
+    }
+    Ok(updated)
 }
 
 fn append_story_fragments_to_root(
@@ -7168,8 +9907,32 @@ fn complex_story_field_runs(xml: &[u8], item: &StoryItemSpan) -> Result<Vec<u8>>
     Ok(result)
 }
 
+// Match CT_Sdt's actual first nonempty content slot. Empty content and
+// subsequent content are retained raw, never visible modeled descendants.
+fn admit_story_sdt_content_slot(
+    stack: &mut [XmlElementFrame],
+    namespace: StoryNamespace,
+    local_name: &[u8],
+    empty: bool,
+) -> bool {
+    if namespace != StoryNamespace::Word || local_name != b"sdtContent" {
+        return true;
+    }
+    let Some(parent) = stack.last_mut() else {
+        return true;
+    };
+    if parent.namespace != StoryNamespace::Word || parent.local_name != b"sdt" {
+        return true;
+    }
+    if empty || parent.typed_sdt_content_seen {
+        return false;
+    }
+    parent.typed_sdt_content_seen = true;
+    true
+}
+
 fn modeled_story_event(
-    stack: &[XmlElementFrame],
+    stack: &mut [XmlElementFrame],
     namespace: StoryNamespace,
     local_name: &[u8],
     element: &BytesStart<'_>,
@@ -7179,6 +9942,9 @@ fn modeled_story_event(
     after: usize,
 ) -> Result<bool> {
     if !modeled_story_child(stack, namespace, local_name) {
+        return Ok(false);
+    }
+    if !admit_story_sdt_content_slot(stack, namespace, local_name, empty) {
         return Ok(false);
     }
     if namespace == StoryNamespace::MarkupCompatibility && local_name == b"Choice" {
@@ -7220,6 +9986,22 @@ fn modeled_story_event(
                 Some(StorySdtContext::Inline) => StorySdtOwner::Inline,
                 None => return Ok(false),
             };
+            #[cfg(test)]
+            {
+                let slot = match FX211_PROFILE_CONTEXT.get() {
+                    1 => Some(2),
+                    2 => Some(4),
+                    3 => Some(8),
+                    4 => Some(10),
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    let mut counts = FX211_PROFILE.get();
+                    counts[slot] += 1;
+                    counts[slot + 1] += raw.len();
+                    FX211_PROFILE.set(counts);
+                }
+            }
             return Ok(CT_Sdt::story_raw_is_typed(raw, &word_prefixes, owner));
         }
         if matches!(local_name, b"ins" | b"del" | b"moveFrom" | b"moveTo") {
@@ -7269,8 +10051,429 @@ fn first_text_box_start(xml: &[u8], start: usize) -> Result<Option<usize>> {
     }
 }
 
+struct PairedTextBoxCopy {
+    alternate: usize,
+    branch: usize,
+    range: Range<usize>,
+}
+
+fn scoped_alternate_text_box_copies(xml: &[u8]) -> Result<Vec<PairedTextBoxCopy>> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut stack = Vec::<XmlElementFrame>::new();
+    let mut copies = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("alternate text-box scan failed: {error}")))?;
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let (namespace, local) = reader.resolver().resolve_element(element.name());
+                let namespace = story_namespace(&namespace);
+                let local = local.as_ref();
+                // Inspect both representations using the same qualified structural
+                // routes as story discovery, without selecting or rewriting Fallback.
+                let alternate_branch = namespace == StoryNamespace::MarkupCompatibility
+                    && matches!(local, b"Choice" | b"Fallback")
+                    && stack.last().is_some_and(|parent| {
+                        parent.namespace == StoryNamespace::MarkupCompatibility
+                            && parent.local_name == b"AlternateContent"
+                    });
+                let branch_content = namespace == StoryNamespace::Word
+                    && matches!(local, b"drawing" | b"pict")
+                    && stack.last().is_some_and(|parent| {
+                        parent.namespace == StoryNamespace::MarkupCompatibility
+                            && matches!(parent.local_name.as_slice(), b"Choice" | b"Fallback")
+                    });
+                let modeled = stack.last().is_none_or(|parent| !parent.opaque)
+                    && (alternate_branch
+                        || branch_content
+                        || modeled_story_child(&stack, namespace, local))
+                    && admit_story_sdt_content_slot(&mut stack, namespace, local, empty);
+                if modeled && namespace == StoryNamespace::Word && local == b"txbxContent" {
+                    let end = if empty {
+                        reader.buffer_position() as usize
+                    } else {
+                        story_element_end(xml, before)?
+                    };
+                    for (index, alternate) in stack.iter().enumerate() {
+                        if alternate.namespace != StoryNamespace::MarkupCompatibility
+                            || alternate.local_name != b"AlternateContent"
+                            || alternate.opaque
+                        {
+                            continue;
+                        }
+                        if let Some(branch) = stack.get(index + 1)
+                            && branch.namespace == StoryNamespace::MarkupCompatibility
+                            && matches!(branch.local_name.as_slice(), b"Choice" | b"Fallback")
+                        {
+                            copies.push(PairedTextBoxCopy {
+                                alternate: alternate.full_start,
+                                branch: branch.full_start,
+                                range: before..end,
+                            });
+                        }
+                    }
+                }
+                if !empty {
+                    let sdt_context = story_element_sdt_context(&stack, namespace, local);
+                    stack.push(XmlElementFrame {
+                        namespace,
+                        local_name: local.to_vec(),
+                        is_word: namespace == StoryNamespace::Word,
+                        full_start: before,
+                        owner_kind: None,
+                        item_kind: None,
+                        direct_owner_child: false,
+                        sdt_context,
+                        word_prefixes: Vec::new(),
+                        opaque: !modeled,
+                        typed_sdt_content_seen: false,
+                    });
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(copies)
+}
+
+struct PairedTextEdit {
+    range: Range<usize>,
+    raw: Vec<u8>,
+}
+
+// Bounded physical correspondence inside one admitted AlternateContent.
+struct PairedTextBoxProjection {
+    signature: Vec<String>,
+    slots: Vec<(Vec<usize>, Range<usize>)>,
+}
+
+fn paired_text_box_projection(xml: &[u8], range: Range<usize>) -> Result<PairedTextBoxProjection> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut stack = Vec::<XmlElementFrame>::new();
+    let mut paths = Vec::<Option<Vec<usize>>>::new();
+    let mut children = Vec::<usize>::new();
+    let mut signature = Vec::new();
+    let mut slots = Vec::new();
+    let mut active = false;
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("paired text-box projection failed: {error}")))?;
+        let after = reader.buffer_position() as usize;
+        if !active {
+            if before != range.start {
+                if matches!(event, Event::Eof) {
+                    break;
+                }
+                buffer.clear();
+                continue;
+            }
+            active = true;
+        }
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let (namespace, local) = reader.resolver().resolve_element(element.name());
+                let namespace = story_namespace(&namespace);
+                let local = local.as_ref();
+                let inherited = if stack.is_empty() {
+                    story_namespace_scope_at(xml, before)?
+                        .into_iter()
+                        .filter(|(_, uri)| uri == rdocx_oxml::namespace::W_NS)
+                        .map(|(prefix, _)| prefix)
+                        .collect::<Vec<_>>()
+                } else {
+                    stack.last().unwrap().word_prefixes.clone()
+                };
+                let word_prefixes = story_word_prefixes_at(
+                    &element,
+                    &inherited,
+                    namespace == StoryNamespace::Word,
+                )?;
+                let modeled = !stack.last().is_some_and(|frame| frame.opaque)
+                    && modeled_story_event(
+                        &mut stack, namespace, local, &element, empty, xml, before, after,
+                    )?;
+                if !stack.is_empty()
+                    && modeled
+                    && ((namespace == StoryNamespace::Word && local == b"txbxContent")
+                        || namespace == StoryNamespace::MarkupCompatibility)
+                {
+                    return Err(Error::Other(
+                        "nested alternate/text-box correspondence is unsupported".into(),
+                    ));
+                }
+                let structural = modeled
+                    && namespace == StoryNamespace::Word
+                    && matches!(
+                        local,
+                        b"txbxContent" | b"p" | b"tbl" | b"tr" | b"tc" | b"sdt" | b"sdtContent"
+                    );
+                let path = if structural {
+                    let parent = paths.iter().rposition(Option::is_some);
+                    let mut path = parent.and_then(|i| paths[i].clone()).unwrap_or_default();
+                    if let Some(parent) = parent {
+                        path.push(children[parent]);
+                        children[parent] += 1;
+                    }
+                    let end = if empty {
+                        after
+                    } else {
+                        story_element_end(xml, before)?
+                    };
+                    slots.push((path.clone(), before..end));
+                    signature.push(format!("+{}", String::from_utf8_lossy(local)));
+                    if local == b"tbl" {
+                        let scope = story_namespace_scope_at(xml, before)?;
+                        let closed = close_content_fragment_namespaces(&xml[before..end], &scope)?;
+                        let mut wrapped =
+                            format!(r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>"#)
+                                .into_bytes();
+                        wrapped.extend_from_slice(&closed);
+                        wrapped.extend_from_slice(b"</w:body></w:document>");
+                        let parsed = CT_Document::from_xml(&wrapped)?;
+                        let Some(BodyContent::Table(table)) = parsed.body.content.first() else {
+                            return Err(Error::Other(
+                                "paired table is not a qualified table".into(),
+                            ));
+                        };
+                        validate_table_topology(table)?;
+                        let columns = table.grid.as_ref().map_or(0, |grid| grid.columns.len());
+                        signature.push(format!("grid:{columns}"));
+                        for row in &table.rows {
+                            let ranges = crate::table::row_cell_ranges(row, columns)?;
+                            signature.push(format!("row:{:?}", ranges));
+                            signature.push(format!(
+                                "omissions:{:?}:{:?}",
+                                row.properties.as_ref().and_then(|p| p.grid_before),
+                                row.properties.as_ref().and_then(|p| p.grid_after)
+                            ));
+                            for cell in &row.cells {
+                                signature.push(format!(
+                                    "merge:{:?}:{:?}",
+                                    cell.properties.as_ref().and_then(|p| p.v_merge),
+                                    cell.properties.as_ref().and_then(|p| p.h_merge.as_ref())
+                                ));
+                            }
+                        }
+                    }
+                    if local == b"p" {
+                        let scope = story_namespace_scope_at(xml, before)?;
+                        let closed = close_content_fragment_namespaces(&xml[before..end], &scope)?;
+                        signature.push(CT_P::from_xml_fragment(&closed)?.accepted_text());
+                    }
+                    Some(path)
+                } else {
+                    None
+                };
+                if modeled
+                    && namespace == StoryNamespace::Word
+                    && matches!(
+                        local,
+                        b"gridCol"
+                            | b"gridBefore"
+                            | b"gridAfter"
+                            | b"gridSpan"
+                            | b"vMerge"
+                            | b"hMerge"
+                    )
+                {
+                    let mut fact = String::from_utf8_lossy(local).into_owned();
+                    for attribute in element.attributes() {
+                        let attribute =
+                            attribute.map_err(|error| Error::Other(error.to_string()))?;
+                        let (attribute_namespace, attribute_local) =
+                            reader.resolver().resolve_attribute(attribute.key);
+                        if word_element(&attribute_namespace) && attribute_local.as_ref() == b"val"
+                        {
+                            fact.push(':');
+                            fact.push_str(
+                                &attribute
+                                    .decoded_and_normalized_value(
+                                        XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )
+                                    .map_err(|error| Error::Other(error.to_string()))?,
+                            );
+                        }
+                    }
+                    signature.push(fact);
+                }
+                if empty {
+                    if structural {
+                        signature.push("-".into());
+                    }
+                } else {
+                    let sdt_context = story_element_sdt_context(&stack, namespace, local);
+                    stack.push(XmlElementFrame {
+                        namespace,
+                        local_name: local.to_vec(),
+                        is_word: namespace == StoryNamespace::Word,
+                        full_start: before,
+                        owner_kind: None,
+                        item_kind: None,
+                        direct_owner_child: false,
+                        sdt_context,
+                        word_prefixes,
+                        opaque: !modeled,
+                        typed_sdt_content_seen: false,
+                    });
+                    paths.push(path);
+                    children.push(0);
+                }
+            }
+            Event::End(_) => {
+                if paths.pop().flatten().is_some() {
+                    signature.push("-".into());
+                }
+                children.pop();
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if after == range.end {
+            return Ok(PairedTextBoxProjection { signature, slots });
+        }
+        buffer.clear();
+    }
+    Err(Error::Other("paired text-box source is incomplete".into()))
+}
+
+struct PairedReplacement<'a> {
+    span: &'a Range<usize>,
+    paragraph: Option<usize>,
+    placeholder: &'a str,
+    replacement: &'a str,
+    count: usize,
+}
+
+fn paired_scoped_edits(
+    xml: &[u8],
+    owner: &StoryOwnerSpan,
+    replacement: &PairedReplacement<'_>,
+) -> Result<Option<Vec<PairedTextEdit>>> {
+    let PairedReplacement {
+        span,
+        paragraph,
+        placeholder,
+        replacement,
+        count,
+    } = *replacement;
+    let copies = scoped_alternate_text_box_copies(xml)?;
+    let selected = copies
+        .iter()
+        .filter(|copy| copy.range.start <= owner.full.start && owner.full.end <= copy.range.end)
+        .max_by_key(|copy| copy.alternate);
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let mut branches = BTreeMap::<usize, Vec<&PairedTextBoxCopy>>::new();
+    for copy in &copies {
+        if copy.alternate == selected.alternate {
+            branches.entry(copy.branch).or_default().push(copy);
+        }
+    }
+    if branches.len() < 2 {
+        return Ok(None);
+    }
+    let selected_branch = &branches[&selected.branch];
+    let selected_slot = selected_branch
+        .iter()
+        .position(|copy| copy.range == selected.range)
+        .ok_or_else(|| Error::Other("paired selected box disappeared".into()))?;
+    let baseline = selected_branch
+        .iter()
+        .map(|copy| paired_text_box_projection(xml, copy.range.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let selected_signature = &baseline[selected_slot].signature;
+    if selected_branch.len() > 1
+        && baseline
+            .iter()
+            .filter(|projection| &projection.signature == selected_signature)
+            .count()
+            != 1
+    {
+        return Err(Error::Other(
+            "indistinguishable sibling text boxes cannot be paired".into(),
+        ));
+    }
+    let path = baseline[selected_slot]
+        .slots
+        .iter()
+        .find(|(_, range)| range == span)
+        .map(|(path, _)| path.clone())
+        .ok_or_else(|| Error::Other("selected paired content has no structural slot".into()))?;
+    let mut edits = Vec::new();
+    for branch in branches.values() {
+        if branch.len() != baseline.len() {
+            return Err(Error::Other(
+                "paired text-box branches have unequal cardinality".into(),
+            ));
+        }
+        let projections = branch
+            .iter()
+            .map(|copy| paired_text_box_projection(xml, copy.range.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        if projections
+            .iter()
+            .zip(&baseline)
+            .any(|(actual, expected)| actual.signature != expected.signature)
+            || (branch.len() > 1
+                && projections
+                    .iter()
+                    .filter(|p| &p.signature == selected_signature)
+                    .count()
+                    != 1)
+        {
+            return Err(Error::Other(
+                "paired alternate text-box topology or accepted text is asymmetric".into(),
+            ));
+        }
+        let range = projections[selected_slot]
+            .slots
+            .iter()
+            .find(|(actual_path, _)| actual_path == &path)
+            .map(|(_, range)| range.clone())
+            .ok_or_else(|| Error::Other("paired content structural slot is absent".into()))?;
+        let scope = story_namespace_scope_at(xml, range.start)?;
+        let mut raw = close_content_fragment_namespaces(&xml[range.clone()], &scope)?;
+        let actual_count = rdocx_oxml::placeholder::try_replace_in_block(
+            &mut raw,
+            paragraph,
+            placeholder,
+            replacement,
+        )?;
+        if actual_count != count {
+            return Err(Error::Other(
+                "paired replacement physical counts are unequal".into(),
+            ));
+        }
+        edits.push(PairedTextEdit { range, raw });
+    }
+    edits.sort_by_key(|edit| edit.range.start);
+    if edits
+        .windows(2)
+        .any(|pair| pair[0].range.end > pair[1].range.start)
+    {
+        return Err(Error::Other("paired replacement sources overlap".into()));
+    }
+    Ok(Some(edits))
+}
+
 fn opaque_story_event(
-    stack: &[XmlElementFrame],
+    stack: &mut [XmlElementFrame],
     namespace: StoryNamespace,
     local_name: &[u8],
     element: &BytesStart<'_>,
@@ -7510,8 +10713,126 @@ fn update_complex_field_results(results: &mut Vec<bool>, marker: Option<ComplexF
     }
 }
 
+/// Return whether text at this point is visible: no open complex field is
+/// still in its instruction part, and a field item is inside its own field.
 fn complex_field_text_visible(item: &StoryItemSpan, results: &[bool]) -> bool {
-    !item.complex_field || (!results.is_empty() && results.iter().all(|result| *result))
+    (!item.complex_field || !results.is_empty()) && results.iter().all(|result| *result)
+}
+
+/// The fields open where a piece of story text was read, by index into
+/// [`StoryFieldTracker`], each with whether it had reached its result.
+type StoryFieldContext = Vec<(usize, bool)>;
+
+/// The complex fields an item other than a field item opens, in source order.
+///
+/// The typed model reads a field as its cached result only when the field
+/// closes within the paragraph. An open field, such as the first paragraph of
+/// a table of contents, reads as plain runs. Whether a field hides text is
+/// only known at its end marker, so text records the [`Self::context`] it was
+/// read in, and [`Self::hides`] decides once the item is scanned.
+#[derive(Default)]
+struct StoryFieldTracker {
+    /// The fields open now, by index, each with whether it has separated.
+    open: StoryFieldContext,
+    closed: Vec<bool>,
+}
+
+impl StoryFieldTracker {
+    fn mark(&mut self, marker: Option<ComplexFieldMarker>) {
+        match marker {
+            Some(ComplexFieldMarker::Begin) => {
+                self.open.push((self.closed.len(), false));
+                self.closed.push(false);
+            }
+            Some(ComplexFieldMarker::Separate) => {
+                if let Some((_, separated)) = self.open.last_mut() {
+                    *separated = true;
+                }
+            }
+            Some(ComplexFieldMarker::End) => {
+                if let Some((field, _)) = self.open.pop() {
+                    self.closed[field] = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The open fields, each with whether it has reached its result.
+    fn context(&self) -> StoryFieldContext {
+        self.open.clone()
+    }
+
+    /// Whether a closed field was still in its instruction part.
+    fn hides(&self, context: &[(usize, bool)]) -> bool {
+        context
+            .iter()
+            .any(|(field, separated)| self.closed[*field] && !separated)
+    }
+
+    /// Whether the text lies in the result of a closed field.
+    fn in_result(&self, context: &[(usize, bool)]) -> bool {
+        context.iter().any(|(field, _)| self.closed[*field])
+    }
+}
+
+/// Return whether a field character at `position` opens, separates or closes
+/// a field that hides text of this item. A field item tracks the markers of
+/// its own field. Any other item tracks every accepted marker of its own
+/// story, so a field's instruction part stays out of its text as in
+/// `Paragraph::text`.
+fn story_field_marker_tracked(
+    item: &StoryItemSpan,
+    position: usize,
+    nested_owner_depth: usize,
+    stack: &[XmlElementFrame],
+) -> bool {
+    if item.complex_field {
+        item.full.start <= position && position < item.full.end
+    } else {
+        nested_owner_depth == 0 && accepted_story_text_visible(stack)
+    }
+}
+
+/// One piece of story text, kept with the fields open where it was read.
+enum StoryTextPiece {
+    Text(String),
+    /// A tab or break, as read outside and inside a field result.
+    Character(Option<char>, Option<char>),
+}
+
+/// The text a visible run `w:br` or `w:cr` adds, as the typed model reads it.
+/// Direct runs and flattened simple fields read breaks as line feeds.
+/// Inside a closed complex field's cached result, page and column breaks
+/// read as form feeds and vertical tabs. CR remains a line feed in both views.
+fn story_break_text(
+    reader: &NsReader<&[u8]>,
+    element: &BytesStart<'_>,
+    in_field_result: bool,
+) -> Result<Option<char>> {
+    if element.local_name().as_ref() == b"cr" {
+        return Ok(Some('\n'));
+    }
+    if !in_field_result {
+        return Ok(Some('\n'));
+    }
+    for attribute in element.attributes() {
+        let attribute = attribute
+            .map_err(|error| Error::Other(format!("break attribute scan failed: {error}")))?;
+        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
+        if !word_element(&namespace) || local_name.as_ref() != b"type" {
+            continue;
+        }
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .map_err(|error| Error::Other(format!("break type decode failed: {error}")))?;
+        return Ok(Some(match value.as_ref() {
+            "page" => '\u{000c}',
+            "column" => '\u{000b}',
+            _ => '\n',
+        }));
+    }
+    Ok(Some('\n'))
 }
 
 fn accepted_story_text_visible(stack: &[XmlElementFrame]) -> bool {
@@ -7523,6 +10844,16 @@ fn accepted_story_text_visible(stack: &[XmlElementFrame]) -> bool {
 }
 
 fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerSpan>> {
+    scan_story_owners_with_special(xml, root_kind, false)
+}
+
+fn scan_story_owners_with_special(
+    xml: &[u8],
+    root_kind: StoryKind,
+    include_special: bool,
+) -> Result<Vec<StoryOwnerSpan>> {
+    #[cfg(test)]
+    STORY_OWNER_SCANS.set(STORY_OWNER_SCANS.get() + 1);
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut stack: Vec<XmlElementFrame> = Vec::new();
@@ -7545,7 +10876,7 @@ fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerS
                 let direct_owner_child =
                     stack.last().is_some_and(|frame| frame.owner_kind.is_some());
                 let mut opaque = opaque_story_event(
-                    &stack,
+                    &mut stack,
                     namespace_kind,
                     &local_name,
                     &element,
@@ -7560,6 +10891,7 @@ fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerS
                     .then(|| owner_kind(&local_name))
                     .flatten();
                 if matches!(candidate, Some(StoryKind::Footnote | StoryKind::Endnote))
+                    && !include_special
                     && !editable_note_owner(&reader, &element)?
                 {
                     candidate = None;
@@ -7583,6 +10915,7 @@ fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerS
                     sdt_context,
                     word_prefixes,
                     opaque,
+                    typed_sdt_content_seen: false,
                 });
             }
             Event::Empty(element) => {
@@ -7590,7 +10923,7 @@ fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerS
                     stack.last().is_some_and(|frame| frame.owner_kind.is_some());
                 let local_name = element.local_name();
                 let opaque = opaque_story_event(
-                    &stack,
+                    &mut stack,
                     namespace_kind,
                     local_name.as_ref(),
                     &element,
@@ -7608,6 +10941,7 @@ fn scan_story_owners(xml: &[u8], root_kind: StoryKind) -> Result<Vec<StoryOwnerS
                             || matches!(kind, StoryKind::TableCell | StoryKind::TextBox)
                     })
                     && (!matches!(kind, StoryKind::Footnote | StoryKind::Endnote)
+                        || include_special
                         || editable_note_owner(&reader, &element)?)
                 {
                     owners.push(StoryOwnerSpan {
@@ -7708,6 +11042,419 @@ fn paired_story_owners(
             Some((scanned.full.clone(), story(unpaired.remove(position))))
         })
         .collect())
+}
+
+// Anchor capture uses trim_text(true). Apply precisely that parser projection
+// to the original span, while retaining element names, attributes and order.
+fn drawing_capture_key(xml: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    let mut buffer = Vec::new();
+    loop {
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("drawing capture scan failed: {error}")))?;
+        if matches!(event, Event::Eof) {
+            break;
+        }
+        writer
+            .write_event(event)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        buffer.clear();
+    }
+    Ok(writer.into_inner())
+}
+
+/// Bind modeled selected anchors to actual physical story owners before shaping.
+fn bind_text_box_source_owners(
+    body: &mut rdocx_oxml::document::CT_Body,
+    xml: &[u8],
+    root_kind: StoryKind,
+    scope: Range<usize>,
+) -> Result<()> {
+    let owners = scan_story_owners(xml, root_kind)?;
+    let mut anchors = Vec::new();
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("text-box owner scan failed: {error}")))?;
+        if let Event::Start(element) = event {
+            if story_namespace(&namespace) == StoryNamespace::WordDrawing
+                && element.local_name().as_ref() == b"anchor"
+                && scope.contains(&before)
+            {
+                let end = story_element_end(xml, before)?;
+                let contained = owners
+                    .iter()
+                    .filter(|owner| {
+                        owner.kind == StoryKind::TextBox
+                            && before <= owner.full.start
+                            && owner.full.end <= end
+                    })
+                    .collect::<Vec<_>>();
+                // Nested anchors own their own boxes. This anchor's direct box
+                // is the first selected owner in its captured source span.
+                anchors.push((
+                    drawing_capture_key(&xml[before..end])?,
+                    contained.first().map(|owner| owner.owner_index),
+                    false,
+                ));
+            }
+        } else if matches!(event, Event::Eof) {
+            break;
+        }
+        buffer.clear();
+    }
+    prepare_physical_story_projection(body, &mut anchors)
+}
+
+pub(crate) fn prepare_physical_story_projection(
+    body: &mut rdocx_oxml::document::CT_Body,
+    anchors: &mut [(Vec<u8>, Option<usize>, bool)],
+) -> Result<()> {
+    fn consume_raw(raw: &[u8], anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        let captured = drawing_capture_key(raw)?;
+        let mut reader = quick_xml::Reader::from_reader(captured.as_slice());
+        let mut buffer = Vec::new();
+        loop {
+            let before = reader.buffer_position() as usize;
+            let event = reader
+                .read_event_into(&mut buffer)
+                .map_err(|error| Error::Other(error.to_string()))?;
+            if let Event::Start(element) = &event
+                && element.local_name().as_ref() == b"anchor"
+            {
+                let end = story_element_end(&captured, before)?;
+                let key = &captured[before..end];
+                if let Some((_, _, used)) = anchors
+                    .iter_mut()
+                    .find(|(source, _, used)| !*used && source == key)
+                {
+                    *used = true;
+                }
+            }
+            if matches!(event, Event::Eof) {
+                break;
+            }
+            buffer.clear();
+        }
+        Ok(())
+    }
+    fn drawing(
+        value: &mut rdocx_oxml::drawing::CT_Drawing,
+        anchors: &mut [(Vec<u8>, Option<usize>, bool)],
+    ) -> Result<()> {
+        let Some(anchor) = value.anchor.as_mut() else {
+            return Ok(());
+        };
+        let Some(shape) = anchor.shape.as_mut() else {
+            return Ok(());
+        };
+        shape.source_text_box_owner = if let Some(raw) = &anchor.raw_xml {
+            let key = drawing_capture_key(raw)?;
+            anchors
+                .iter_mut()
+                .find(|(source, _, used)| !*used && *source == key)
+                .and_then(|(_, owner, used)| {
+                    *used = true;
+                    *owner
+                })
+        } else {
+            None
+        };
+        shape_content(shape, anchors)
+    }
+    fn shape_content(
+        shape: &mut rdocx_oxml::drawing::CT_Shape,
+        anchors: &mut [(Vec<u8>, Option<usize>, bool)],
+    ) -> Result<()> {
+        if let Some(body) = &mut shape.text_body {
+            body_content(&mut body.content, anchors)?;
+        } else {
+            for p in &mut shape.text {
+                paragraph(p, anchors)?;
+            }
+        }
+        Ok(())
+    }
+    fn selected_raw(
+        raw: &[u8],
+        selected: &mut rdocx_oxml::drawing::CT_Drawing,
+        anchors: &mut [(Vec<u8>, Option<usize>, bool)],
+    ) -> Result<()> {
+        let selected_key = selected
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.raw_xml.as_deref())
+            .map(drawing_capture_key)
+            .transpose()?;
+        let captured = drawing_capture_key(raw)?;
+        let mut reader = quick_xml::Reader::from_reader(captured.as_slice());
+        let mut buffer = Vec::new();
+        let mut bound = false;
+        loop {
+            let before = reader.buffer_position() as usize;
+            let event = reader
+                .read_event_into(&mut buffer)
+                .map_err(|error| Error::Other(error.to_string()))?;
+            if let Event::Start(element) = &event
+                && element.local_name().as_ref() == b"anchor"
+            {
+                let end = story_element_end(&captured, before)?;
+                let key = &captured[before..end];
+                let owner = anchors
+                    .iter_mut()
+                    .find(|(source, _, used)| !*used && source == key)
+                    .and_then(|(_, owner, used)| {
+                        *used = true;
+                        *owner
+                    });
+                if !bound && owner.is_some() && selected_key.as_deref() == Some(key) {
+                    if let Some(shape) = selected
+                        .anchor
+                        .as_mut()
+                        .and_then(|anchor| anchor.shape.as_mut())
+                    {
+                        shape.source_text_box_owner = owner;
+                        shape_content(shape, anchors)?;
+                    }
+                    bound = true;
+                    let name = element.name().as_ref().to_vec();
+                    reader
+                        .read_to_end_into(quick_xml::name::QName(&name), &mut Vec::new())
+                        .map_err(|error| Error::Other(error.to_string()))?;
+                }
+            }
+            if matches!(event, Event::Eof) {
+                break;
+            }
+            buffer.clear();
+        }
+        if !bound
+            && let Some(shape) = selected
+                .anchor
+                .as_mut()
+                .and_then(|anchor| anchor.shape.as_mut())
+        {
+            shape.source_text_box_owner = None;
+        }
+        Ok(())
+    }
+    fn run(value: &mut CT_R, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        let properties = usize::from(value.properties.is_some());
+        let mut selected_index = 0;
+        let mut children = value
+            .extra_xml
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let encoded = value.extra_xml_positions.get(index).copied();
+                if encoded.is_some_and(CT_R::raw_child_is_root_attributes) {
+                    return None;
+                }
+                let selected = if encoded.is_some_and(CT_R::raw_child_has_alternate_content_drawing)
+                {
+                    let index = selected_index;
+                    selected_index += 1;
+                    Some(index)
+                } else {
+                    None
+                };
+                Some((
+                    encoded.map_or(properties + value.content.len(), CT_R::raw_child_position),
+                    0u8,
+                    index,
+                    selected,
+                ))
+            })
+            .chain(
+                value
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, content)| {
+                        matches!(content, RunContent::Drawing(_)).then_some((
+                            properties + index,
+                            1u8,
+                            index,
+                            None,
+                        ))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        children.sort_unstable();
+        for (_, kind, index, selected) in children {
+            if kind == 1 {
+                if let RunContent::Drawing(value) = &mut value.content[index] {
+                    drawing(value, anchors)?;
+                }
+            } else if let Some(selected) =
+                selected.and_then(|index| value.alt_drawings.get_mut(index))
+            {
+                selected_raw(&value.extra_xml[index], selected, anchors)?;
+            } else {
+                consume_raw(&value.extra_xml[index], anchors)?;
+            }
+        }
+        Ok(())
+    }
+    fn paragraph(value: &mut CT_P, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        // Consume every physical revision owner before selecting accepted runs.
+        // Projection metadata is installed in place, never serialized/reparsed.
+        for boundary in 0..=value.runs.len() {
+            let mut owners = value
+                .content_controls
+                .iter()
+                .enumerate()
+                .filter(|(_, (at, _, _, _))| *at == boundary)
+                .map(|(index, (_, slot, _, _))| (1u8, *slot, 0u8, index))
+                .chain(
+                    value
+                        .revisions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (at, _, _))| *at == boundary)
+                        .map(|(index, (_, slot, _))| {
+                            let (order, slot) = if let Some(link_index) =
+                                rdocx_oxml::text::hyperlink_revision_index(*slot)
+                            {
+                                match value.hyperlinks.get(link_index) {
+                                    Some(link) if link.preserved_raw_before.is_some() => {
+                                        (1, link.preserved_raw_before.unwrap())
+                                    }
+                                    Some(link) if boundary == link.run_end => (0, 0),
+                                    _ => (2, 0),
+                                }
+                            } else {
+                                (1, *slot)
+                            };
+                            (order, slot, 1u8, index)
+                        }),
+                )
+                .collect::<Vec<_>>();
+            for (raw_slot, (index, (at, _))) in value
+                .extra_xml
+                .iter()
+                .enumerate()
+                .filter(|(_, (at, _))| *at == boundary)
+                .enumerate()
+            {
+                let projected = value
+                    .revisions
+                    .iter()
+                    .any(|(position, slot, _)| position == at && *slot == raw_slot)
+                    || value.hyperlinks.iter().any(|link| {
+                        link.run_start == boundary && link.preserved_raw_before == Some(raw_slot)
+                    });
+                if !projected {
+                    owners.push((1, raw_slot, 2, index));
+                }
+            }
+            owners.sort_unstable();
+            for (_, _, kind, index) in owners {
+                if kind == 1 {
+                    if let Some(p) = value.revisions[index].2.physical_content_paragraph_mut()? {
+                        paragraph(p, anchors)?;
+                    }
+                } else if kind == 0 {
+                    control(&mut value.content_controls[index].3, anchors)?;
+                } else {
+                    consume_raw(&value.extra_xml[index].1, anchors)?;
+                }
+            }
+            if let Some(value) = value.runs.get_mut(boundary) {
+                run(value, anchors)?;
+            }
+        }
+        Ok(())
+    }
+    fn control(value: &mut CT_Sdt, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        for boundary in 0..=value.content.len() {
+            for (_, revision) in value
+                .physical_revisions_mut()
+                .iter_mut()
+                .filter(|(at, _)| *at == boundary)
+            {
+                if let Some(p) = revision.physical_content_paragraph_mut()? {
+                    paragraph(p, anchors)?;
+                }
+            }
+            if let Some(content) = value.content.get_mut(boundary) {
+                match content {
+                    SdtContent::Paragraph(p) => paragraph(p, anchors)?,
+                    SdtContent::Run(value) => run(value, anchors)?,
+                    SdtContent::Table(value) => table(value, anchors)?,
+                    SdtContent::Row(value) => row(value, anchors)?,
+                    SdtContent::Cell(value) => cell(value, anchors)?,
+                    SdtContent::ContentControl(value) => control(value, anchors)?,
+                    SdtContent::RawXml(raw) => consume_raw(raw, anchors)?,
+                }
+            }
+        }
+        Ok(())
+    }
+    fn table(value: &mut CT_Tbl, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        for boundary in 0..=value.rows.len() {
+            for (_, _, value) in value
+                .content_controls
+                .iter_mut()
+                .filter(|(at, _, _)| *at == boundary)
+            {
+                control(value, anchors)?;
+            }
+            if let Some(value) = value.rows.get_mut(boundary) {
+                row(value, anchors)?;
+            }
+        }
+        Ok(())
+    }
+    fn row(value: &mut CT_Row, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        for boundary in 0..=value.cells.len() {
+            for (_, _, value) in value
+                .content_controls
+                .iter_mut()
+                .filter(|(at, _, _)| *at == boundary)
+            {
+                control(value, anchors)?;
+            }
+            if let Some(value) = value.cells.get_mut(boundary) {
+                cell(value, anchors)?;
+            }
+        }
+        Ok(())
+    }
+    fn cell(value: &mut CT_Tc, anchors: &mut [(Vec<u8>, Option<usize>, bool)]) -> Result<()> {
+        for content in &mut value.content {
+            match content {
+                CellContent::Paragraph(value) => paragraph(value, anchors)?,
+                CellContent::Table(value) => table(value, anchors)?,
+                CellContent::ContentControl(value) => control(value, anchors)?,
+            }
+        }
+        Ok(())
+    }
+    fn body_content(
+        values: &mut [BodyContent],
+        anchors: &mut [(Vec<u8>, Option<usize>, bool)],
+    ) -> Result<()> {
+        for value in values {
+            match value {
+                BodyContent::Paragraph(value) => paragraph(value, anchors)?,
+                BodyContent::Table(value) => table(value, anchors)?,
+                BodyContent::ContentControl(value) => control(value, anchors)?,
+                BodyContent::RawXml(raw) => consume_raw(raw, anchors)?,
+            }
+        }
+        Ok(())
+    }
+    let mut candidate = body.clone();
+    body_content(&mut candidate.content, anchors)?;
+    *body = candidate;
+    Ok(())
 }
 
 fn structural_fingerprint(xml: &[u8]) -> Result<u64> {
@@ -7830,7 +11577,146 @@ fn typed_complex_field_candidate_is_admitted(
     Ok(sources.iter().any(|source| source == &isolated))
 }
 
+fn scan_story_control_paragraphs(xml: &[u8], control: &StoryItemSpan) -> Result<Vec<Range<usize>>> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::<XmlElementFrame>::new();
+    let mut paragraphs = Vec::new();
+    let mut active = false;
+    let mut buffer = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("control paragraph scan failed: {error}")))?;
+        let namespace = story_namespace(&namespace);
+        let after = reader.buffer_position() as usize;
+        if !active {
+            if before != control.full.start {
+                if matches!(event, Event::Eof) {
+                    break;
+                }
+                buffer.clear();
+                continue;
+            }
+            active = true;
+        }
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let local = element.local_name().as_ref().to_vec();
+                let empty = matches!(event, Event::Empty(_));
+                let is_word = namespace == StoryNamespace::Word;
+                let root = stack.is_empty();
+                if root && (!is_word || local != b"sdt") {
+                    return Err(Error::Other(
+                        "control paragraph source has no qualified selected control".into(),
+                    ));
+                }
+                // Only this control's direct paragraphs belong to this inventory.
+                // Descendants of another control cannot contribute, typed or raw.
+                let opaque = !root
+                    && ((is_word && local == b"sdt")
+                        || opaque_story_event(
+                            &mut stack, namespace, &local, element, empty, xml, before, after,
+                        )?);
+                let direct_content = stack.last().is_some_and(|parent| {
+                    !parent.opaque
+                        && parent.namespace == StoryNamespace::Word
+                        && parent.local_name == b"sdtContent"
+                });
+                if !opaque && is_word && local == b"p" && direct_content {
+                    paragraphs.push(
+                        before..if empty {
+                            after
+                        } else {
+                            story_element_end(xml, before)?
+                        },
+                    );
+                }
+                if !empty {
+                    let inherited = if root {
+                        story_namespace_scope_at(xml, before)?
+                            .into_iter()
+                            .filter_map(|(prefix, uri)| (uri == WORD_NAMESPACE).then_some(prefix))
+                            .collect::<Vec<_>>()
+                    } else {
+                        stack
+                            .last()
+                            .map_or_else(Vec::new, |parent| parent.word_prefixes.clone())
+                    };
+                    let word_prefixes = story_word_prefixes_at(element, &inherited, is_word)?;
+                    let sdt_context = if root {
+                        control.sdt_context
+                    } else {
+                        story_element_sdt_context(&stack, namespace, &local)
+                    };
+                    stack.push(XmlElementFrame {
+                        namespace,
+                        local_name: local,
+                        is_word,
+                        full_start: before,
+                        owner_kind: None,
+                        item_kind: None,
+                        direct_owner_child: false,
+                        sdt_context,
+                        word_prefixes,
+                        opaque,
+                        typed_sdt_content_seen: false,
+                    });
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if after >= control.full.end {
+            break;
+        }
+        buffer.clear();
+    }
+    Ok(paragraphs)
+}
+
+fn scan_story_control_paragraphs_with_scope(
+    xml: &[u8],
+    control: &StoryItemSpan,
+    scope: &BTreeMap<String, String>,
+) -> Result<Vec<Range<usize>>> {
+    let (closed, added) = scoped_story_fragment(xml, control.full.clone(), scope)?;
+    let mut local_control = control.clone();
+    local_control.full = 0..closed.len();
+    let map = |position: usize| -> Result<usize> {
+        let mapped = if position == 0 {
+            Some(control.full.start)
+        } else {
+            position
+                .checked_sub(added)
+                .and_then(|offset| control.full.start.checked_add(offset))
+        };
+        mapped
+            .filter(|offset| *offset <= control.full.end)
+            .ok_or_else(|| {
+                Error::Other("control paragraph excerpt has an invalid source offset".to_owned())
+            })
+    };
+    scan_story_control_paragraphs(&closed, &local_control)?
+        .into_iter()
+        .map(|paragraph| Ok(map(paragraph.start)?..map(paragraph.end)?))
+        .collect()
+}
+
 fn scan_story_items(xml: &[u8], owner: &StoryOwnerSpan) -> Result<Vec<StoryItemSpan>> {
+    #[cfg(test)]
+    FX237_ITEM_SCANS.set(FX237_ITEM_SCANS.get() + 1);
+    #[cfg(test)]
+    {
+        let mut counts = FX211_PROFILE.get();
+        counts[0] += 1;
+        counts[1] += xml.len();
+        FX211_PROFILE.set(counts);
+    }
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut stack: Vec<XmlElementFrame> = Vec::new();
@@ -7862,21 +11748,30 @@ fn scan_story_items(xml: &[u8], owner: &StoryOwnerSpan) -> Result<Vec<StoryItemS
             Event::Start(element) => {
                 let is_word = is_word_namespace;
                 let local_name = element.local_name().as_ref().to_vec();
-                let sdt_context = story_element_sdt_context(&stack, namespace_kind, &local_name);
+                let sdt_context = if stack.is_empty() && is_word && local_name == b"sdtContent" {
+                    Some(StorySdtContext::Block)
+                } else {
+                    story_element_sdt_context(&stack, namespace_kind, &local_name)
+                };
                 let depth = stack.len();
                 let in_nested_owner = stack.iter().skip(1).any(|frame| {
                     frame.is_word && matches!(frame.local_name.as_slice(), b"tc" | b"txbxContent")
                 });
-                let child_opaque = opaque_story_event(
-                    &stack,
-                    namespace_kind,
-                    &local_name,
-                    &element,
-                    false,
-                    xml,
-                    before,
-                    after,
-                )?;
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(if in_nested_owner { 1 } else { 2 });
+                let child_opaque = in_nested_owner
+                    || opaque_story_event(
+                        &mut stack,
+                        namespace_kind,
+                        &local_name,
+                        &element,
+                        false,
+                        xml,
+                        before,
+                        after,
+                    )?;
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(0);
                 let item_kind = if depth == 1 && !in_nested_owner {
                     Some(if child_opaque {
                         StoryItemKind::PreservedNode
@@ -7935,6 +11830,7 @@ fn scan_story_items(xml: &[u8], owner: &StoryOwnerSpan) -> Result<Vec<StoryItemS
                     sdt_context,
                     word_prefixes,
                     opaque,
+                    typed_sdt_content_seen: false,
                 });
             }
             Event::Empty(element) => {
@@ -7943,19 +11839,24 @@ fn scan_story_items(xml: &[u8], owner: &StoryOwnerSpan) -> Result<Vec<StoryItemS
                 let sdt_context =
                     story_element_sdt_context(&stack, namespace_kind, local_name.as_ref());
                 let depth = stack.len();
-                let opaque = opaque_story_event(
-                    &stack,
-                    namespace_kind,
-                    local_name.as_ref(),
-                    &element,
-                    true,
-                    xml,
-                    before,
-                    after,
-                )?;
                 let in_nested_owner = stack.iter().skip(1).any(|frame| {
                     frame.is_word && matches!(frame.local_name.as_slice(), b"tc" | b"txbxContent")
                 });
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(if in_nested_owner { 1 } else { 2 });
+                let opaque = in_nested_owner
+                    || opaque_story_event(
+                        &mut stack,
+                        namespace_kind,
+                        local_name.as_ref(),
+                        &element,
+                        true,
+                        xml,
+                        before,
+                        after,
+                    )?;
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(0);
                 let kind = if depth == 1 && !in_nested_owner {
                     Some(if opaque {
                         StoryItemKind::PreservedNode
@@ -8124,7 +12025,7 @@ fn scan_story_item_links(xml: &[u8], item: &StoryItemSpan) -> Result<Vec<StoryLi
                     false
                 } else {
                     opaque_story_event(
-                        &stack,
+                        &mut stack,
                         namespace_kind,
                         &local_name,
                         &element,
@@ -8172,12 +12073,13 @@ fn scan_story_item_links(xml: &[u8], item: &StoryItemSpan) -> Result<Vec<StoryLi
                     },
                     word_prefixes,
                     opaque,
+                    typed_sdt_content_seen: false,
                 });
             }
             Event::Empty(element) => {
                 let local_name = element.local_name();
                 let opaque = opaque_story_event(
-                    &stack,
+                    &mut stack,
                     namespace_kind,
                     local_name.as_ref(),
                     &element,
@@ -8534,6 +12436,120 @@ fn unwrap_story_hyperlink(
     Ok(updated)
 }
 
+/// One admitted bookmark marker and its physical source range.
+struct BookmarkMarkerSpan {
+    start: bool,
+    id: String,
+    span: Range<usize>,
+}
+
+fn bookmark_marker_spans(xml: &[u8]) -> Result<Vec<BookmarkMarkerSpan>> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut stack = Vec::<XmlElementFrame>::new();
+    let mut markers = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|error| Error::Other(format!("bookmark scan failed: {error}")))?;
+        let namespace = story_namespace(&namespace);
+        let after = reader.buffer_position() as usize;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let local = element.local_name().as_ref().to_vec();
+                let empty = matches!(event, Event::Empty(_));
+                let modeled = stack.last().is_none_or(|parent| !parent.opaque)
+                    && modeled_story_event(
+                        &mut stack, namespace, &local, element, empty, xml, before, after,
+                    )?;
+                if modeled
+                    && accepted_story_text_visible(&stack)
+                    && namespace == StoryNamespace::Word
+                    && matches!(local.as_slice(), b"bookmarkStart" | b"bookmarkEnd")
+                {
+                    let mut id = None;
+                    for attribute in element.attributes() {
+                        let attribute =
+                            attribute.map_err(|error| Error::Other(error.to_string()))?;
+                        let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+                        if word_element(&namespace) && local.as_ref() == b"id" {
+                            let value = attribute
+                                .decoded_and_normalized_value(
+                                    XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| Error::Other(error.to_string()))?;
+                            if id.replace(value.into_owned()).is_some() {
+                                return Err(Error::Other(
+                                    "bookmark marker has duplicate owned id".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(id) = id {
+                        let end = if empty {
+                            after
+                        } else {
+                            story_element_end(xml, before)?
+                        };
+                        if !empty {
+                            let mut child = quick_xml::Reader::from_reader(&xml[after..end]);
+                            if !matches!(
+                                child
+                                    .read_event()
+                                    .map_err(|error| Error::Other(error.to_string()))?,
+                                Event::End(_)
+                            ) {
+                                return Err(Error::Other(
+                                    "a bookmark marker with child content cannot be removed"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                        markers.push(BookmarkMarkerSpan {
+                            start: local == b"bookmarkStart",
+                            id,
+                            span: before..end,
+                        });
+                    }
+                }
+                if !empty {
+                    let sdt_context = story_element_sdt_context(&stack, namespace, &local);
+                    let inherited = stack
+                        .last()
+                        .map_or(&[][..], |frame| frame.word_prefixes.as_slice());
+                    let word_prefixes = story_word_prefixes_at(
+                        element,
+                        inherited,
+                        namespace == StoryNamespace::Word,
+                    )?;
+                    stack.push(XmlElementFrame {
+                        namespace,
+                        local_name: local,
+                        is_word: namespace == StoryNamespace::Word,
+                        full_start: before,
+                        owner_kind: None,
+                        item_kind: None,
+                        direct_owner_child: false,
+                        sdt_context,
+                        word_prefixes,
+                        opaque: !modeled,
+                        typed_sdt_content_seen: false,
+                    });
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(markers)
+}
+
 /// Resize every `pic:pic` drawing in `xml` whose blip names `relationship_id`,
 /// returning the edited XML and the number of drawings resized.
 ///
@@ -8714,12 +12730,25 @@ fn resize_story_pictures(
     Ok((updated, resized))
 }
 
-fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
+fn story_item_text(
+    xml: &[u8],
+    item: &StoryItemSpan,
+    qualified_items: &[StoryItemSpan],
+    source_scan: Range<usize>,
+    added: usize,
+) -> Result<Option<String>> {
+    #[cfg(test)]
+    {
+        let mut counts = FX211_PROFILE.get();
+        counts[6] += 1;
+        counts[7] += xml.len();
+        FX211_PROFILE.set(counts);
+    }
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut in_text = 0usize;
-    let mut text = String::new();
-    let mut found = false;
+    let mut pieces: Vec<(StoryFieldContext, StoryTextPiece)> = Vec::new();
+    let mut fields = StoryFieldTracker::default();
     let mut active = false;
     let mut element_stack: Vec<XmlElementFrame> = Vec::new();
     let mut nested_owner_depth = 0usize;
@@ -8750,12 +12779,49 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
             Event::Start(element) => {
                 let depth = element_stack.len();
                 let local_name = element.local_name().as_ref().to_vec();
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(if nested_owner_depth > 0 { 4 } else { 3 });
+                // Reuse only controls independently admitted in this operation's
+                // owner inventory. A typed parent can still retain untyped raw
+                // descendants, which must follow ordinary qualification.
+                let qualified_control = namespace_kind == StoryNamespace::Word
+                    && local_name == b"sdt"
+                    && !element_stack.last().is_some_and(|frame| frame.opaque)
+                    && modeled_story_child(&element_stack, namespace_kind, &local_name)
+                    && (if !item.complex_field && before == 0 {
+                        Some(source_scan.start)
+                    } else {
+                        before
+                            .checked_sub(added)
+                            .and_then(|offset| source_scan.start.checked_add(offset))
+                    })
+                    .and_then(|start| {
+                        qualified_items
+                            .binary_search_by_key(&start, |item| item.full.start)
+                            .ok()
+                    })
+                    .is_some_and(|index| {
+                        let control = &qualified_items[index];
+                        control.kind == StoryItemKind::ContentControl
+                            && !control.complex_field
+                            && control.full == control.scan
+                            && source_scan.start <= control.full.start
+                            && control.full.end <= source_scan.end
+                            && control.sdt_context == story_sdt_context(&element_stack)
+                    });
                 let opaque =
                     if element_stack.is_empty() && item.kind == StoryItemKind::ContentControl {
                         false
+                    } else if nested_owner_depth > 0 {
+                        // The qualified nested owner excludes this content from
+                        // the selected item. Keep inherited opacity and balanced
+                        // owner depth while traversing its source and scopes.
+                        element_stack.last().is_some_and(|frame| frame.opaque)
+                    } else if qualified_control {
+                        false
                     } else {
                         opaque_story_event(
-                            &element_stack,
+                            &mut element_stack,
                             namespace_kind,
                             &local_name,
                             &element,
@@ -8765,18 +12831,22 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
                             after,
                         )?
                     };
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(0);
                 if !opaque
-                    && item.complex_field
-                    && item.full.start <= before
-                    && before < item.full.end
+                    && story_field_marker_tracked(item, before, nested_owner_depth, &element_stack)
                     && is_word_namespace
                     && local_name == b"fldChar"
                 {
-                    update_complex_field_results(
-                        &mut complex_results,
-                        complex_field_marker(&reader, &element)?,
-                    );
+                    let marker = complex_field_marker(&reader, &element)?;
+                    if item.complex_field {
+                        update_complex_field_results(&mut complex_results, marker);
+                    } else {
+                        fields.mark(marker);
+                    }
                 }
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(0);
                 if !opaque
                     && depth > 0
                     && is_word_namespace
@@ -8789,10 +12859,15 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
                     && accepted_story_text_visible(&element_stack)
                     && nested_owner_depth == 0
                     && is_word_namespace
-                    && local_name == b"t"
                 {
-                    in_text += 1;
-                    found = true;
+                    if local_name == b"t" {
+                        in_text += 1;
+                        pieces.push((fields.context(), StoryTextPiece::Text(String::new())));
+                    } else if let Some(piece) =
+                        story_run_character(&reader, &element, &element_stack, item)?
+                    {
+                        pieces.push((fields.context(), piece));
+                    }
                 }
                 let inherited = element_stack
                     .last()
@@ -8817,39 +12892,53 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
                     },
                     word_prefixes,
                     opaque,
+                    typed_sdt_content_seen: false,
                 });
             }
             Event::Empty(element) => {
                 let local_name = element.local_name();
-                let opaque = opaque_story_event(
-                    &element_stack,
-                    namespace_kind,
-                    local_name.as_ref(),
-                    &element,
-                    true,
-                    xml,
-                    before,
-                    after,
-                )?;
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(if nested_owner_depth > 0 { 4 } else { 3 });
+                let opaque = if nested_owner_depth > 0 {
+                    element_stack.last().is_some_and(|frame| frame.opaque)
+                } else {
+                    opaque_story_event(
+                        &mut element_stack,
+                        namespace_kind,
+                        local_name.as_ref(),
+                        &element,
+                        true,
+                        xml,
+                        before,
+                        after,
+                    )?
+                };
+                #[cfg(test)]
+                FX211_PROFILE_CONTEXT.set(0);
                 if !opaque
-                    && item.complex_field
-                    && item.full.start <= before
-                    && before < item.full.end
+                    && story_field_marker_tracked(item, before, nested_owner_depth, &element_stack)
                     && is_word_namespace
                     && local_name.as_ref() == b"fldChar"
                 {
-                    update_complex_field_results(
-                        &mut complex_results,
-                        complex_field_marker(&reader, &element)?,
-                    );
+                    let marker = complex_field_marker(&reader, &element)?;
+                    if item.complex_field {
+                        update_complex_field_results(&mut complex_results, marker);
+                    } else {
+                        fields.mark(marker);
+                    }
                 } else if !opaque
                     && complex_field_text_visible(item, &complex_results)
                     && accepted_story_text_visible(&element_stack)
                     && nested_owner_depth == 0
                     && is_word_namespace
-                    && local_name.as_ref() == b"t"
                 {
-                    found = true;
+                    if local_name.as_ref() == b"t" {
+                        pieces.push((fields.context(), StoryTextPiece::Text(String::new())));
+                    } else if let Some(piece) =
+                        story_run_character(&reader, &element, &element_stack, item)?
+                    {
+                        pieces.push((fields.context(), piece));
+                    }
                 }
             }
             Event::End(element) => {
@@ -8875,7 +12964,8 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
             Event::Text(value)
                 if complex_field_text_visible(item, &complex_results) && in_text > 0 =>
             {
-                text.push_str(
+                push_story_text(
+                    &mut pieces,
                     &quick_xml::escape::unescape(&value.decode().map_err(|error| {
                         Error::Other(format!("story text decode failed: {error}"))
                     })?)
@@ -8887,7 +12977,8 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
             Event::CData(value)
                 if complex_field_text_visible(item, &complex_results) && in_text > 0 =>
             {
-                text.push_str(
+                push_story_text(
+                    &mut pieces,
                     &value.decode().map_err(|error| {
                         Error::Other(format!("story CDATA decode failed: {error}"))
                     })?,
@@ -8896,7 +12987,7 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
             Event::GeneralRef(value)
                 if complex_field_text_visible(item, &complex_results) && in_text > 0 =>
             {
-                text.push_str(&oxml_core::xml_text::resolve_entity(&value));
+                push_story_text(&mut pieces, &oxml_core::xml_text::resolve_entity(&value));
             }
             Event::Eof => break,
             _ => {}
@@ -8908,7 +12999,70 @@ fn story_item_text(xml: &[u8], item: &StoryItemSpan) -> Result<Option<String>> {
         }
         buffer.clear();
     }
+    let mut text = String::new();
+    let mut found = false;
+    for (context, piece) in pieces {
+        if fields.hides(&context) {
+            continue;
+        }
+        match piece {
+            StoryTextPiece::Text(value) => {
+                text.push_str(&value);
+                found = true;
+            }
+            StoryTextPiece::Character(plain, in_result) => {
+                let character = if fields.in_result(&context) {
+                    in_result
+                } else {
+                    plain
+                };
+                if let Some(character) = character {
+                    text.push(character);
+                    found = true;
+                }
+            }
+        }
+    }
     Ok((found || item.complex_field).then_some(text))
+}
+
+/// Append decoded text to the `w:t` piece it belongs to.
+fn push_story_text(pieces: &mut [(StoryFieldContext, StoryTextPiece)], value: &str) {
+    if let Some((_, StoryTextPiece::Text(text))) = pieces.last_mut() {
+        text.push_str(value);
+    }
+}
+
+/// Return whether an element opened at this stack is run content, so a run's
+/// `w:tab` counts as text and a tab stop under `w:tabs` does not.
+fn story_run_child(stack: &[XmlElementFrame]) -> bool {
+    stack
+        .last()
+        .is_some_and(|frame| !frame.opaque && frame.is_word && frame.local_name == b"r")
+}
+
+/// The text a visible Word element adds when it is run content other than
+/// `w:t`: a tab for `w:tab`, and a break for `w:br` or `w:cr`, as read
+/// outside and inside a field result. A field item reads inside its field.
+fn story_run_character(
+    reader: &NsReader<&[u8]>,
+    element: &BytesStart<'_>,
+    stack: &[XmlElementFrame],
+    item: &StoryItemSpan,
+) -> Result<Option<StoryTextPiece>> {
+    if !story_run_child(stack) {
+        return Ok(None);
+    }
+    let (plain, in_result) = match element.local_name().as_ref() {
+        b"tab" => (Some('\t'), Some('\t')),
+        b"br" | b"cr" => (
+            story_break_text(reader, element, false)?,
+            story_break_text(reader, element, true)?,
+        ),
+        _ => return Ok(None),
+    };
+    let plain = if item.complex_field { in_result } else { plain };
+    Ok(Some(StoryTextPiece::Character(plain, in_result)))
 }
 
 fn story_text_start(element: &BytesStart<'_>, preserve_space: bool) -> Result<Vec<u8>> {
@@ -8992,19 +13146,18 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
     let mut reader = NsReader::from_reader(source);
     reader.config_mut().trim_text(false);
     let mut text_depth = 0usize;
-    let mut text_ranges = Vec::new();
     let mut root_prefix = None;
     let mut root_end = None;
     let mut root_is_empty = false;
-    let mut first_text_start = None;
-    let mut first_empty_text = None;
-    let mut found_text = false;
+    let mut texts: Vec<StoryTextElement> = Vec::new();
+    // Visible run tabs and breaks, which the new text replaces as well.
+    let mut removed: Vec<(StoryFieldContext, Range<usize>)> = Vec::new();
+    let mut removed_start = None;
+    let mut fields = StoryFieldTracker::default();
     let mut element_stack: Vec<XmlElementFrame> = Vec::new();
     let mut nested_owner_depth = 0usize;
     let mut complex_results = Vec::new();
-    let mut outer_complex_separator_found = false;
-    let mut complex_end_marker_start = None;
-    let mut complex_insertion_word_prefixes = Vec::new();
+    let mut complex_field_edit = ComplexFieldEdit::default();
     let mut active = false;
     let mut buffer = Vec::new();
     loop {
@@ -9046,7 +13199,7 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                         false
                     } else {
                         opaque_story_event(
-                            &element_stack,
+                            &mut element_stack,
                             namespace_kind,
                             &local_name,
                             &element,
@@ -9057,23 +13210,20 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                         )?
                     };
                 if !opaque
-                    && item.complex_field
-                    && item.full.start <= before
-                    && before < item.full.end
+                    && story_field_marker_tracked(item, before, nested_owner_depth, &element_stack)
                     && is_word_namespace
                     && local_name == b"fldChar"
                 {
                     let marker = complex_field_marker(&reader, &element)?;
-                    if marker == Some(ComplexFieldMarker::Separate) && complex_results.len() == 1 {
-                        outer_complex_separator_found = true;
-                    } else if marker == Some(ComplexFieldMarker::End) && complex_results.len() == 1
-                    {
-                        complex_end_marker_start = Some(before);
-                        complex_insertion_word_prefixes = element_stack
-                            .last()
-                            .map_or_else(Vec::new, |frame| frame.word_prefixes.clone());
-                    }
-                    update_complex_field_results(&mut complex_results, marker);
+                    track_story_field_marker(
+                        item,
+                        marker,
+                        &mut fields,
+                        &mut complex_results,
+                        &mut complex_field_edit,
+                        before,
+                        &element_stack,
+                    );
                 }
                 if !opaque
                     && depth > 0
@@ -9088,18 +13238,26 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                     && is_word_namespace
                     && local_name == b"t"
                 {
-                    found_text = true;
-                    if first_text_start.is_none() && first_empty_text.is_none() {
-                        first_text_start = Some((
-                            before..after,
-                            story_text_start(
-                                &element,
-                                value.starts_with(' ') || value.ends_with(' '),
-                            )?,
-                        ));
-                    }
-                    text_ranges.push(after..after);
+                    texts.push(StoryTextElement {
+                        context: fields.context(),
+                        tag: before..after,
+                        markup: story_text_markup_tags(
+                            &element,
+                            story_text_preserves_space(value),
+                        )?,
+                        empty: false,
+                        content: Vec::new(),
+                    });
                     text_depth += 1;
+                } else if !opaque
+                    && complex_field_text_visible(item, &complex_results)
+                    && accepted_story_text_visible(&element_stack)
+                    && nested_owner_depth == 0
+                    && is_word_namespace
+                    && story_run_child(&element_stack)
+                    && matches!(local_name.as_slice(), b"tab" | b"br" | b"cr")
+                {
+                    removed_start = Some((element_stack.len(), before, fields.context()));
                 }
                 let inherited = element_stack
                     .last()
@@ -9124,6 +13282,7 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                     },
                     word_prefixes,
                     opaque,
+                    typed_sdt_content_seen: false,
                 });
             }
             Event::Empty(element) => {
@@ -9141,7 +13300,7 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                 }
                 let local_name = element.local_name();
                 let opaque = opaque_story_event(
-                    &element_stack,
+                    &mut element_stack,
                     namespace_kind,
                     local_name.as_ref(),
                     &element,
@@ -9151,44 +13310,57 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                     after,
                 )?;
                 if !opaque
-                    && item.complex_field
-                    && item.full.start <= before
-                    && before < item.full.end
+                    && story_field_marker_tracked(item, before, nested_owner_depth, &element_stack)
                     && is_word_namespace
                     && local_name.as_ref() == b"fldChar"
                 {
                     let marker = complex_field_marker(&reader, &element)?;
-                    if marker == Some(ComplexFieldMarker::Separate) && complex_results.len() == 1 {
-                        outer_complex_separator_found = true;
-                    } else if marker == Some(ComplexFieldMarker::End) && complex_results.len() == 1
-                    {
-                        complex_end_marker_start = Some(before);
-                        complex_insertion_word_prefixes = element_stack
-                            .last()
-                            .map_or_else(Vec::new, |frame| frame.word_prefixes.clone());
-                    }
-                    update_complex_field_results(&mut complex_results, marker);
+                    track_story_field_marker(
+                        item,
+                        marker,
+                        &mut fields,
+                        &mut complex_results,
+                        &mut complex_field_edit,
+                        before,
+                        &element_stack,
+                    );
                 } else if !opaque
                     && complex_field_text_visible(item, &complex_results)
                     && nested_owner_depth == 0
                     && is_word_namespace
                     && local_name.as_ref() == b"t"
                 {
-                    found_text = true;
-                    if first_text_start.is_none() && first_empty_text.is_none() {
-                        let preserve_space = value.starts_with(' ') || value.ends_with(' ');
-                        let mut replacement = story_text_start(&element, preserve_space)?;
-                        replacement.extend_from_slice(quick_xml::escape::escape(value).as_bytes());
-                        replacement.extend_from_slice(b"</");
-                        replacement.extend_from_slice(element.name().as_ref());
-                        replacement.push(b'>');
-                        first_empty_text = Some((before..after, replacement));
-                    }
+                    texts.push(StoryTextElement {
+                        context: fields.context(),
+                        tag: before..after,
+                        markup: story_text_markup_tags(
+                            &element,
+                            story_text_preserves_space(value),
+                        )?,
+                        empty: true,
+                        content: Vec::new(),
+                    });
+                } else if !opaque
+                    && complex_field_text_visible(item, &complex_results)
+                    && accepted_story_text_visible(&element_stack)
+                    && nested_owner_depth == 0
+                    && is_word_namespace
+                    && story_run_child(&element_stack)
+                    && matches!(local_name.as_ref(), b"tab" | b"br" | b"cr")
+                {
+                    removed.push((fields.context(), before..after));
                 }
             }
             Event::End(element) => {
                 let opaque = element_stack.pop().is_some_and(|frame| frame.opaque);
                 let depth = element_stack.len();
+                if removed_start
+                    .as_ref()
+                    .is_some_and(|(start_depth, _, _)| *start_depth == depth)
+                    && let Some((_, start, context)) = removed_start.take()
+                {
+                    removed.push((context, start..after));
+                }
                 if !opaque
                     && complex_field_text_visible(item, &complex_results)
                     && nested_owner_depth == 0
@@ -9211,7 +13383,9 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
             Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)
                 if complex_field_text_visible(item, &complex_results) && text_depth > 0 =>
             {
-                text_ranges.push(before..after);
+                if let Some(text) = texts.last_mut() {
+                    text.content.push(before..after);
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -9224,9 +13398,30 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
         buffer.clear();
     }
 
-    let escaped = quick_xml::escape::escape(value).into_owned();
+    // Only a field closed within the item hides its instruction part.
+    let texts = texts
+        .into_iter()
+        .filter(|text| !fields.hides(&text.context))
+        .collect::<Vec<_>>();
+    let removed_ranges = removed
+        .into_iter()
+        .filter(|(context, _)| !fields.hides(context))
+        .map(|(_, range)| range)
+        .collect::<Vec<_>>();
+    let ComplexFieldEdit {
+        separator_found: outer_complex_separator_found,
+        end_marker_start: complex_end_marker_start,
+        word_prefixes: complex_insertion_word_prefixes,
+    } = complex_field_edit;
     let mut updated = source.to_vec();
-    if !found_text {
+    let space = if story_text_preserves_space(value) {
+        " xml:space=\"preserve\""
+    } else {
+        ""
+    };
+    if texts.is_empty() {
+        // Each insertion lies after every removed tab or break, so removing
+        // them afterwards from the end keeps the insertion in place.
         if item.complex_field {
             let insert_at = complex_end_marker_start.ok_or_else(|| {
                 Error::Other("complex story field has no closing marker".to_owned())
@@ -9258,11 +13453,6 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                         "",
                     )
                 };
-            let space = if value.starts_with(' ') || value.ends_with(' ') {
-                " xml:space=\"preserve\""
-            } else {
-                ""
-            };
             let separator = if outer_complex_separator_found {
                 String::new()
             } else {
@@ -9271,61 +13461,205 @@ fn replace_story_item_text(source: &[u8], item: &StoryItemSpan, value: &str) -> 
                      {attribute_prefix}:fldCharType=\"separate\"/>"
                 )
             };
-            let replacement =
-                format!("{separator}<{prefix}t{declaration}{space}>{escaped}</{prefix}t>");
-            updated.splice(insert_at..insert_at, replacement.bytes());
-            return Ok(updated);
-        }
-        if item.kind != StoryItemKind::Paragraph {
-            return Err(StoryError::NotTextBearing { kind: item.kind }.into());
-        }
-        let prefix = root_prefix.unwrap_or_else(|| "w".to_owned());
-        let prefix = if prefix.is_empty() {
-            String::new()
+            let markup = StoryTextMarkup::new(&prefix, &declaration, space);
+            let mut replacement = separator.into_bytes();
+            replacement.extend_from_slice(&markup.open);
+            replacement.extend_from_slice(&story_text_content(value, &markup));
+            replacement.extend_from_slice(&markup.close);
+            updated.splice(insert_at..insert_at, replacement);
         } else {
-            format!("{prefix}:")
-        };
-        let space = if value.starts_with(' ') || value.ends_with(' ') {
-            " xml:space=\"preserve\""
-        } else {
-            ""
-        };
-        let run = format!("<{prefix}r><{prefix}t{space}>{escaped}</{prefix}t></{prefix}r>");
-        if let Some(end) = root_end {
-            updated.splice(end..end, run.bytes());
-        } else if root_is_empty {
-            let slash = item.full.end.checked_sub(2).ok_or_else(|| {
-                Error::Other("self-closing paragraph story item is truncated".to_owned())
-            })?;
-            if source.get(slash..item.full.end) != Some(b"/>".as_slice()) {
+            if item.kind != StoryItemKind::Paragraph {
+                return Err(StoryError::NotTextBearing { kind: item.kind }.into());
+            }
+            let prefix = root_prefix.unwrap_or_else(|| "w".to_owned());
+            let prefix = if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}:")
+            };
+            let markup = StoryTextMarkup::new(&prefix, "", space);
+            let mut run = format!("<{prefix}r>").into_bytes();
+            run.extend_from_slice(&markup.open);
+            run.extend_from_slice(&story_text_content(value, &markup));
+            run.extend_from_slice(&markup.close);
+            run.extend_from_slice(format!("</{prefix}r>").as_bytes());
+            if let Some(end) = root_end {
+                updated.splice(end..end, run);
+            } else if root_is_empty {
+                let slash = item.full.end.checked_sub(2).ok_or_else(|| {
+                    Error::Other("self-closing paragraph story item is truncated".to_owned())
+                })?;
+                if source.get(slash..item.full.end) != Some(b"/>".as_slice()) {
+                    return Err(Error::Other(
+                        "self-closing paragraph story item has no closing slash".to_owned(),
+                    ));
+                }
+                let mut replacement = b">".to_vec();
+                replacement.extend_from_slice(&run);
+                replacement.extend_from_slice(format!("</{prefix}p>").as_bytes());
+                updated.splice(slash..item.full.end, replacement);
+            } else {
                 return Err(Error::Other(
-                    "self-closing paragraph story item has no closing slash".to_owned(),
+                    "paragraph story item has no closing element".to_owned(),
                 ));
             }
-            let replacement = format!(">{run}</{prefix}p>");
-            updated.splice(slash..item.full.end, replacement.bytes());
-        } else {
-            return Err(Error::Other(
-                "paragraph story item has no closing element".to_owned(),
-            ));
+        }
+        for range in removed_ranges.into_iter().rev() {
+            updated.splice(range, []);
         }
     } else {
-        for (ordinal, range) in text_ranges.iter().enumerate().rev() {
-            let replacement = if ordinal == 0 && first_empty_text.is_none() {
-                escaped.as_bytes()
-            } else {
-                b""
-            };
-            updated.splice(range.clone(), replacement.iter().copied());
+        let mut edits: Vec<(Range<usize>, Vec<u8>)> = removed_ranges
+            .into_iter()
+            .map(|range| (range, Vec::new()))
+            .collect();
+        for (ordinal, text) in texts.into_iter().enumerate() {
+            if ordinal == 0 {
+                // The first text element takes the whole new text.
+                let content = story_text_content(value, &text.markup);
+                if text.empty {
+                    let mut replacement = text.markup.open;
+                    replacement.extend_from_slice(&content);
+                    replacement.extend_from_slice(&text.markup.close);
+                    edits.push((text.tag, replacement));
+                } else {
+                    edits.push((text.tag.end..text.tag.end, content));
+                    edits.push((text.tag, text.markup.open));
+                }
+            }
+            edits.extend(text.content.into_iter().map(|range| (range, Vec::new())));
         }
-        if let Some((range, replacement)) = first_text_start {
-            updated.splice(range, replacement);
-        }
-        if let Some((range, replacement)) = first_empty_text {
+        // A start tag ends where the new text is inserted, so equal starts
+        // sort the start tag first and apply it last.
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        for (range, replacement) in edits.into_iter().rev() {
             updated.splice(range, replacement);
         }
     }
     Ok(updated)
+}
+
+/// One accepted text element an item's new text may replace, with the
+/// fields open where it was read.
+struct StoryTextElement {
+    context: StoryFieldContext,
+    tag: Range<usize>,
+    markup: StoryTextMarkup,
+    empty: bool,
+    content: Vec<Range<usize>>,
+}
+
+/// Where new text goes in a field item that has no text yet.
+#[derive(Default)]
+struct ComplexFieldEdit {
+    separator_found: bool,
+    end_marker_start: Option<usize>,
+    word_prefixes: Vec<String>,
+}
+
+/// Track one field character for text replacement. A field item records
+/// where its own field separates and ends. Any other item tracks the fields
+/// of its story to learn which close within it.
+fn track_story_field_marker(
+    item: &StoryItemSpan,
+    marker: Option<ComplexFieldMarker>,
+    fields: &mut StoryFieldTracker,
+    complex_results: &mut Vec<bool>,
+    edit: &mut ComplexFieldEdit,
+    position: usize,
+    stack: &[XmlElementFrame],
+) {
+    if !item.complex_field {
+        fields.mark(marker);
+        return;
+    }
+    if complex_results.len() == 1 && marker == Some(ComplexFieldMarker::Separate) {
+        edit.separator_found = true;
+    } else if complex_results.len() == 1 && marker == Some(ComplexFieldMarker::End) {
+        edit.end_marker_start = Some(position);
+        edit.word_prefixes = stack
+            .last()
+            .map_or_else(Vec::new, |frame| frame.word_prefixes.clone());
+    }
+    update_complex_field_results(complex_results, marker);
+}
+
+/// The tags that write new story text into a run: the text element's start
+/// and end tags, and the tab and break elements a tab or line feed becomes.
+struct StoryTextMarkup {
+    open: Vec<u8>,
+    close: Vec<u8>,
+    tab: Vec<u8>,
+    br: Vec<u8>,
+}
+
+impl StoryTextMarkup {
+    fn new(prefix: &str, declaration: &str, space: &str) -> Self {
+        Self {
+            open: format!("<{prefix}t{declaration}{space}>").into_bytes(),
+            close: format!("</{prefix}t>").into_bytes(),
+            tab: format!("<{prefix}tab{declaration}/>").into_bytes(),
+            br: format!("<{prefix}br{declaration}/>").into_bytes(),
+        }
+    }
+}
+
+/// Build the markup for new text written into an existing `w:t`, keeping its
+/// attributes and namespace declarations for any further text element.
+fn story_text_markup_tags(
+    element: &BytesStart<'_>,
+    preserve_space: bool,
+) -> Result<StoryTextMarkup> {
+    let name = element.name();
+    let name = std::str::from_utf8(name.as_ref())
+        .map_err(|error| Error::Other(format!("story text name is not UTF-8: {error}")))?;
+    let prefix = name.strip_suffix('t').unwrap_or_default();
+    let mut declarations = String::new();
+    for attribute in element.attributes() {
+        let attribute = attribute
+            .map_err(|error| Error::Other(format!("story text attribute scan failed: {error}")))?;
+        let key = attribute.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            declarations.push(' ');
+            declarations.push_str(&String::from_utf8_lossy(key));
+            declarations.push_str("=\"");
+            declarations.push_str(&String::from_utf8_lossy(&attribute.value));
+            declarations.push('"');
+        }
+    }
+    let mut markup = StoryTextMarkup::new(prefix, &declarations, "");
+    markup.open = story_text_start(element, preserve_space)?;
+    markup.close = format!("</{name}>").into_bytes();
+    Ok(markup)
+}
+
+/// Escape new story text, writing a tab as `w:tab` and a line feed or a
+/// carriage return as `w:br` between text elements, as `Paragraph::set_text`
+/// does.
+fn story_text_content(value: &str, markup: &StoryTextMarkup) -> Vec<u8> {
+    let mut content = Vec::with_capacity(value.len());
+    let mut separators = value
+        .chars()
+        .filter(|character| matches!(character, '\t' | '\n' | '\r'));
+    for (index, segment) in value.split(['\t', '\n', '\r']).enumerate() {
+        if index > 0 {
+            content.extend_from_slice(&markup.close);
+            if separators.next() == Some('\t') {
+                content.extend_from_slice(&markup.tab);
+            } else {
+                content.extend_from_slice(&markup.br);
+            }
+            content.extend_from_slice(&markup.open);
+        }
+        content.extend_from_slice(quick_xml::escape::escape(segment).as_bytes());
+    }
+    content
+}
+
+/// Return whether any text element of new story text must keep its spaces.
+fn story_text_preserves_space(value: &str) -> bool {
+    value
+        .split(['\t', '\n', '\r'])
+        .any(|segment| segment.starts_with(' ') || segment.ends_with(' '))
 }
 
 fn hyperlink_has_visible_content(source: &[u8], range: Range<usize>) -> Result<bool> {
@@ -9996,6 +14330,8 @@ fn nth_cell_in_row<'a>(row: &'a mut CT_Row, index: &mut usize) -> Option<&'a mut
 }
 
 fn take_cell<'a>(cell: &'a mut CT_Tc, index: &mut usize) -> Option<&'a mut CT_Tc> {
+    #[cfg(test)]
+    FX237_LEGACY_CELL_STEPS.set(FX237_LEGACY_CELL_STEPS.get() + 1);
     if *index == 0 {
         Some(cell)
     } else {
@@ -10012,6 +14348,97 @@ fn take_cell<'a>(cell: &'a mut CT_Tc, index: &mut usize) -> Option<&'a mut CT_Tc
         }
         None
     }
+}
+
+// Traverse the parsed physical tree once. Coordinates name direct physical
+// rows/cells only, while controls still participate in source correspondence.
+enum PhysicalCellNode<'a> {
+    Table(&'a CT_Tbl),
+    Row(&'a CT_Row, usize, Option<usize>),
+    Cell(&'a CT_Tc, usize, Option<(usize, usize)>),
+    Control(&'a CT_Sdt, usize),
+}
+
+#[allow(clippy::type_complexity)]
+fn physical_table_cells(table: &CT_Tbl) -> (usize, Vec<(usize, Option<(usize, usize)>)>) {
+    let mut stack = vec![PhysicalCellNode::Table(table)];
+    let mut tables = 0;
+    let mut cells = Vec::new();
+    while let Some(node) = stack.pop() {
+        let mut children = Vec::new();
+        match node {
+            PhysicalCellNode::Table(table) => {
+                let index = tables;
+                tables += 1;
+                let mut controls = table.content_controls.iter().peekable();
+                for boundary in 0..=table.rows.len() {
+                    while controls.peek().is_some_and(|(at, _, _)| *at == boundary) {
+                        children.push(PhysicalCellNode::Control(
+                            &controls.next().unwrap().2,
+                            index,
+                        ));
+                    }
+                    if let Some(row) = table.rows.get(boundary) {
+                        children.push(PhysicalCellNode::Row(row, index, Some(boundary)));
+                    }
+                }
+            }
+            PhysicalCellNode::Row(row, table, ordinal) => {
+                let mut controls = row.content_controls.iter().peekable();
+                for boundary in 0..=row.cells.len() {
+                    while controls.peek().is_some_and(|(at, _, _)| *at == boundary) {
+                        children.push(PhysicalCellNode::Control(
+                            &controls.next().unwrap().2,
+                            table,
+                        ));
+                    }
+                    if let Some(cell) = row.cells.get(boundary) {
+                        children.push(PhysicalCellNode::Cell(
+                            cell,
+                            table,
+                            ordinal.map(|row| (row, boundary)),
+                        ));
+                    }
+                }
+            }
+            PhysicalCellNode::Cell(cell, table, coordinate) => {
+                cells.push((table, coordinate));
+                for child in &cell.content {
+                    match child {
+                        CellContent::Table(table) => children.push(PhysicalCellNode::Table(table)),
+                        CellContent::ContentControl(control) => {
+                            children.push(PhysicalCellNode::Control(control, table))
+                        }
+                        CellContent::Paragraph(_) => {}
+                    }
+                }
+            }
+            PhysicalCellNode::Control(control, table) => {
+                for child in &control.content {
+                    match child {
+                        SdtContent::Table(table) => children.push(PhysicalCellNode::Table(table)),
+                        SdtContent::Row(row) => {
+                            children.push(PhysicalCellNode::Row(row, table, None))
+                        }
+                        SdtContent::Cell(cell) => {
+                            children.push(PhysicalCellNode::Cell(cell, table, None))
+                        }
+                        SdtContent::ContentControl(control) => {
+                            children.push(PhysicalCellNode::Control(control, table))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    #[cfg(test)]
+    {
+        FX237_TABLE_VISITS.set(FX237_TABLE_VISITS.get() + tables);
+        FX237_CELL_VISITS.set(FX237_CELL_VISITS.get() + cells.len());
+    }
+    (tables, cells)
 }
 
 fn cell_count_in_control(control: &CT_Sdt) -> usize {
@@ -10050,6 +14477,8 @@ fn cell_count_in_row(row: &CT_Row) -> usize {
 }
 
 fn cell_count_in_cell(cell: &CT_Tc) -> usize {
+    #[cfg(test)]
+    FX237_LEGACY_CELL_STEPS.set(FX237_LEGACY_CELL_STEPS.get() + 1);
     cell.content
         .iter()
         .map(|child| match child {
@@ -10125,73 +14554,83 @@ fn insert_html_content_into_cell(
     Ok(())
 }
 
-pub(crate) fn visit_body_paragraphs(content: &[BodyContent], visitor: &mut impl FnMut(&CT_P)) {
+pub(crate) fn visit_body_paragraphs(
+    content: &[BodyContent],
+    accepted: bool,
+    visitor: &mut impl FnMut(&CT_P),
+) {
     for item in content {
         match item {
-            BodyContent::Paragraph(paragraph) => visit_paragraph(paragraph, visitor),
-            BodyContent::Table(table) => visit_table(table, visitor),
-            BodyContent::ContentControl(control) => visit_sdt(control, visitor),
+            BodyContent::Paragraph(paragraph) => visit_paragraph(paragraph, accepted, visitor),
+            BodyContent::Table(table) => visit_table(table, accepted, visitor),
+            BodyContent::ContentControl(control) => visit_sdt(control, accepted, visitor),
             BodyContent::RawXml(_) => {}
         }
     }
 }
 
-fn visit_paragraph(paragraph: &CT_P, visitor: &mut impl FnMut(&CT_P)) {
+// With `accepted`, the visitors leave out the rows that accepting every
+// tracked change removes, as `CT_Row::accepted_view_removes` reports them.
+// `visit_row` itself visits the row it is given.
+fn visit_paragraph(paragraph: &CT_P, accepted: bool, visitor: &mut impl FnMut(&CT_P)) {
     visitor(paragraph);
     for (_, _, _, control) in &paragraph.content_controls {
-        visit_sdt(control, visitor);
+        visit_sdt(control, accepted, visitor);
     }
 }
 
-fn visit_table(table: &CT_Tbl, visitor: &mut impl FnMut(&CT_P)) {
+fn visit_table(table: &CT_Tbl, accepted: bool, visitor: &mut impl FnMut(&CT_P)) {
     for index in 0..=table.rows.len() {
         for (_, _, control) in table
             .content_controls
             .iter()
             .filter(|(at, _, _)| *at == index)
         {
-            visit_sdt(control, visitor);
+            visit_sdt(control, accepted, visitor);
         }
-        if let Some(row) = table.rows.get(index) {
-            visit_row(row, visitor);
+        if let Some(row) = table.rows.get(index)
+            && !(accepted && row.accepted_view_removes())
+        {
+            visit_row(row, accepted, visitor);
         }
     }
 }
 
-fn visit_row(row: &CT_Row, visitor: &mut impl FnMut(&CT_P)) {
+fn visit_row(row: &CT_Row, accepted: bool, visitor: &mut impl FnMut(&CT_P)) {
     for index in 0..=row.cells.len() {
         for (_, _, control) in row
             .content_controls
             .iter()
             .filter(|(at, _, _)| *at == index)
         {
-            visit_sdt(control, visitor);
+            visit_sdt(control, accepted, visitor);
         }
         if let Some(cell) = row.cells.get(index) {
-            visit_cell(cell, visitor);
+            visit_cell(cell, accepted, visitor);
         }
     }
 }
 
-fn visit_cell(cell: &CT_Tc, visitor: &mut impl FnMut(&CT_P)) {
+fn visit_cell(cell: &CT_Tc, accepted: bool, visitor: &mut impl FnMut(&CT_P)) {
     for item in &cell.content {
         match item {
-            CellContent::Paragraph(paragraph) => visit_paragraph(paragraph, visitor),
-            CellContent::Table(table) => visit_table(table, visitor),
-            CellContent::ContentControl(control) => visit_sdt(control, visitor),
+            CellContent::Paragraph(paragraph) => visit_paragraph(paragraph, accepted, visitor),
+            CellContent::Table(table) => visit_table(table, accepted, visitor),
+            CellContent::ContentControl(control) => visit_sdt(control, accepted, visitor),
         }
     }
 }
 
-fn visit_sdt(control: &CT_Sdt, visitor: &mut impl FnMut(&CT_P)) {
+fn visit_sdt(control: &CT_Sdt, accepted: bool, visitor: &mut impl FnMut(&CT_P)) {
     for item in &control.content {
         match item {
-            SdtContent::Paragraph(paragraph) => visit_paragraph(paragraph, visitor),
-            SdtContent::Table(table) => visit_table(table, visitor),
-            SdtContent::Row(row) => visit_row(row, visitor),
-            SdtContent::Cell(cell) => visit_cell(cell, visitor),
+            SdtContent::Paragraph(paragraph) => visit_paragraph(paragraph, accepted, visitor),
+            SdtContent::Table(table) => visit_table(table, accepted, visitor),
+            SdtContent::Row(row) if accepted && row.accepted_view_removes() => {}
+            SdtContent::Row(row) => visit_row(row, accepted, visitor),
+            SdtContent::Cell(cell) => visit_cell(cell, accepted, visitor),
             SdtContent::Run(_) | SdtContent::RawXml(_) => {}
-            SdtContent::ContentControl(nested) => visit_sdt(nested, visitor),
+            SdtContent::ContentControl(nested) => visit_sdt(nested, accepted, visitor),
         }
     }
 }
@@ -10256,7 +14695,12 @@ fn push_table_text(table: &CT_Tbl, text: &mut String) {
 /// Append a row to [`Document::text`] as one line in which every paragraph of
 /// its cells ends with a tab, cell controls and nested tables included.
 fn push_row_text(row: &CT_Row, text: &mut String) {
-    visit_row(row, &mut |paragraph| push_cell_paragraph(paragraph, text));
+    if row.accepted_view_removes() {
+        return;
+    }
+    visit_row(row, true, &mut |paragraph| {
+        push_cell_paragraph(paragraph, text)
+    });
     text.push('\n');
 }
 
@@ -10273,7 +14717,9 @@ fn push_control_text(control: &CT_Sdt, text: &mut String) {
             SdtContent::Table(table) => push_table_text(table, text),
             SdtContent::Row(row) => push_row_text(row, text),
             SdtContent::Cell(cell) => {
-                visit_cell(cell, &mut |paragraph| push_cell_paragraph(paragraph, text));
+                visit_cell(cell, true, &mut |paragraph| {
+                    push_cell_paragraph(paragraph, text)
+                });
             }
             SdtContent::Run(_) | SdtContent::RawXml(_) => {}
             SdtContent::ContentControl(nested) => push_control_text(nested, text),
@@ -10382,7 +14828,7 @@ fn update_reciprocal_style_link(
 fn merge_style_update(
     existing: &rdocx_oxml::styles::CT_Style,
     authored: &mut rdocx_oxml::styles::CT_Style,
-    cleared: u16,
+    cleared: u32,
     removed_regions: &[rdocx_oxml::styles::TableStyleRegion],
 ) {
     authored.is_default = existing.is_default;
@@ -10417,15 +14863,28 @@ fn merge_style_update(
         authored.locked = existing.locked;
     }
     if let Some(properties) = &authored.ppr {
-        let mut updated = existing.ppr.clone().unwrap_or_default();
-        updated.merge_from(properties);
-        authored.ppr = Some(updated);
+        if cleared & style::REPLACE_PARAGRAPH_PROPERTIES == 0 {
+            let mut updated = existing.ppr.clone().unwrap_or_default();
+            updated.merge_from(properties);
+            authored.ppr = Some(updated);
+        }
     } else if cleared & style::CLEAR_PARAGRAPH_PROPERTIES == 0 {
         authored.ppr = existing.ppr.clone();
     }
     if let Some(properties) = &authored.rpr {
         let mut updated = existing.rpr.clone().unwrap_or_default();
         updated.merge_from(properties);
+        if cleared & style::CLEAR_FONT_THEME != 0 {
+            updated.font_ascii_theme = None;
+            updated.font_hansi_theme = None;
+            updated.font_east_asia_theme = None;
+            updated.font_cs_theme = None;
+        }
+        if cleared & style::CLEAR_COLOR_THEME != 0 {
+            updated.color_theme = None;
+            updated.color_theme_tint = None;
+            updated.color_theme_shade = None;
+        }
         authored.rpr = Some(updated);
     } else if cleared & style::CLEAR_RUN_PROPERTIES == 0 {
         authored.rpr = existing.rpr.clone();
@@ -11106,7 +15565,7 @@ pub(crate) fn visit_accepted_drawings(
     content: &[BodyContent],
     visitor: &mut impl FnMut(&CT_Drawing),
 ) {
-    visit_body_paragraphs(content, &mut |paragraph| {
+    visit_body_paragraphs(content, true, &mut |paragraph| {
         for run in &paragraph.accepted_view().runs {
             visit_run_drawings(run, visitor);
         }
@@ -11382,7 +15841,20 @@ impl Document {
         if compatible {
             styles.styles.extend(style::common_styles());
         }
-        let settings = compatible.then(CT_Settings::new);
+        // Word writes compatibility mode 15 into every document it creates.
+        // A document that names no mode opens in Compatibility Mode and lays
+        // out under the legacy rules (see `build_layout_input`).
+        let settings = compatible.then(|| {
+            let mut settings = CT_Settings::new();
+            settings
+                .set_compatibility_setting(CompatibilitySetting {
+                    name: "compatibilityMode".to_owned(),
+                    uri: "http://schemas.microsoft.com/office/word".to_owned(),
+                    value: "15".to_owned(),
+                })
+                .expect("fresh Word settings accept a compatibility setting");
+            settings
+        });
         let core_properties = compatible.then(Box::<CoreProperties>::default);
         let application_properties = compatible.then(default_application_properties);
         let mut package = if compatible {
@@ -11474,8 +15946,32 @@ impl Document {
         }
     }
 
+    /// Admit each loaded recursive owner before staging clones it.
+    fn validate_model_resource_limits(&self) -> Result<()> {
+        self.document.validate_resource_limits()?;
+        for note in &self.footnotes.footnotes {
+            for paragraph in &note.paragraphs {
+                paragraph.validate_resource_limits()?;
+            }
+        }
+        if let Some(comments) = &self.comments {
+            for comment in &comments.comments {
+                for paragraph in &comment.paragraphs {
+                    paragraph.validate_resource_limits()?;
+                }
+            }
+        }
+        if let Some(glossary) = &self.glossary {
+            glossary.validate_resource_limits()?;
+        }
+        // Header/footer and endnote parts are source-owned OPC bytes here,
+        // not recursive cached models. Their independent parsers and writers
+        // admit owners when those parts are projected or edited.
+        Ok(())
+    }
+
     /// Clone all package and typed state while discarding derived layout caches.
-    pub(crate) fn clone_for_staging(&self) -> Self {
+    pub fn clone_for_staging(&self) -> Self {
         Self {
             package: self.package.clone(),
             document: self.document.clone(),
@@ -11540,7 +16036,7 @@ impl Document {
 
     fn canonicalize_bookmark_ids(&mut self) -> Result<()> {
         let mut semantic = Vec::new();
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |paragraph| {
             for marker in &paragraph.bookmark_markers {
                 if marker.is_start()
                     && let Some(id) = marker.id()
@@ -11560,10 +16056,12 @@ impl Document {
             visit_body_paragraphs_mut(&mut self.document.body.content, &mut |paragraph| {
                 let _ = paragraph.remap_authored_bookmark_ids(&remap);
             });
-            for (old, new) in remap {
-                self.identifiers.authored_bookmark_ids.remove(&old);
-                self.identifiers.authored_bookmark_ids.insert(new);
+            for old in remap.keys() {
+                self.identifiers.authored_bookmark_ids.remove(old);
             }
+            self.identifiers
+                .authored_bookmark_ids
+                .extend(remap.values());
         }
         self.canonicalize_toc_bookmark_ids()?;
         Ok(())
@@ -11571,7 +16069,7 @@ impl Document {
 
     fn canonicalize_toc_bookmark_ids(&mut self) -> Result<()> {
         let mut semantic = Vec::new();
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |paragraph| {
             for marker in &paragraph.bookmark_markers {
                 if marker.is_start()
                     && let Some(id) = marker.id()
@@ -11625,7 +16123,7 @@ impl Document {
             return Ok(());
         };
         let mut semantic_nums = Vec::new();
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |paragraph| {
             if let Some(id) = paragraph
                 .properties
                 .as_ref()
@@ -11728,6 +16226,23 @@ impl Document {
         &self,
         modeled_relationships: &[String],
     ) -> Result<Vec<String>> {
+        // Without modeled candidates there is nothing to mask. An unchanged
+        // typed story can inventory its exact retained source, including opaque
+        // property-root attributes that canonical serialization cannot replay.
+        // Dirty stories and modeled relationships still need the checked mask.
+        if modeled_relationships.is_empty()
+            && let Some(source) = self.package.get_part(&self.doc_part_name)
+            && {
+                #[cfg(test)]
+                eprintln!("FX211_DRAWING_STAGE opaque-reparse-before");
+                let matches = CT_Document::from_xml(source).ok().as_ref() == Some(&self.document);
+                #[cfg(test)]
+                eprintln!("FX211_DRAWING_STAGE opaque-reparse-after");
+                matches
+            }
+        {
+            return xml_relationship_ids_in_order(source);
+        }
         let nested_namespace_owners = self
             .package
             .get_part(&self.doc_part_name)
@@ -11853,10 +16368,14 @@ impl Document {
             .cloned()
             .unwrap_or_default();
         let mut modeled_story_relationships = Vec::new();
+        #[cfg(test)]
+        eprintln!("FX211_DRAWING_STAGE collect-before");
         collect_relationship_ids(
             &self.document.body.content,
             &mut modeled_story_relationships,
         );
+        #[cfg(test)]
+        eprintln!("FX211_DRAWING_STAGE collect-after");
         if let Some(section) = &self.document.body.sect_pr {
             for reference in section.header_refs.iter().chain(&section.footer_refs) {
                 if !modeled_story_relationships.contains(&reference.rel_id) {
@@ -11870,8 +16389,12 @@ impl Document {
             .get(&owner_identity)
             .cloned()
             .unwrap_or_default();
+        #[cfg(test)]
+        eprintln!("FX211_DRAWING_STAGE opaque-before");
         let mut opaque_relationships =
             self.opaque_relationship_ids_from_serialized_story(&modeled_story_relationships)?;
+        #[cfg(test)]
+        eprintln!("FX211_DRAWING_STAGE opaque-after");
         opaque_relationships.retain(|id| !nested_relationships.contains(id));
         let mut story_relationships = self.main_story_relationship_ids();
         let relationships = self
@@ -12687,6 +17210,7 @@ impl Document {
     /// This changes only the main part's content-type override. Macro projects
     /// and all other package payloads remain present.
     pub fn to_bytes_as(&self, class: WordPackageClass) -> Result<Vec<u8>> {
+        self.validate_model_resource_limits()?;
         let mut candidate = self.clone_for_staging();
         candidate.prepare_staged_output()?;
         candidate
@@ -12736,8 +17260,8 @@ impl Document {
 
     /// Sign the current typed document with the strict RSA-SHA256 profile.
     ///
-    /// The private key must be PKCS#8 DER and the certificate must be X.509
-    /// DER. Typed state is flushed and signed on a staged clone, so any
+    /// The private key must be PKCS#8 DER or one unencrypted PRIVATE KEY PEM
+    /// block. The certificate must be X.509 DER or one CERTIFICATE PEM block. Typed state is flushed and signed on a staged clone, so any
     /// serialization, key, certificate, or signature failure leaves this
     /// document unchanged. Certificate-chain trust remains caller policy.
     #[cfg(all(feature = "digital-signatures", not(target_arch = "wasm32")))]
@@ -12857,7 +17381,8 @@ impl Document {
         let application_properties = application_properties_part_name
             .as_deref()
             .and_then(|part| package.get_part(part))
-            .and_then(|xml| AppProperties::from_xml(xml).ok());
+            .and_then(|xml| AppProperties::from_xml(xml).ok())
+            .map(repair_application_version);
 
         let custom_properties_part_name = package
             .package_rels
@@ -13018,7 +17543,7 @@ impl Document {
             return Ok(Arc::clone(layout));
         }
 
-        let input = self.build_layout_input();
+        let input = self.build_layout_input()?;
         #[cfg(test)]
         record_layout_invocation();
         let mut engine = self
@@ -13043,7 +17568,7 @@ impl Document {
             return Ok(Arc::clone(layout));
         }
 
-        let input = self.build_layout_input();
+        let input = self.build_layout_input()?;
         #[cfg(test)]
         record_layout_invocation();
         let layout = Arc::new(rdocx_layout::layout_document_deterministic_with_provenance(
@@ -13058,6 +17583,13 @@ impl Document {
         options: RenderOptions,
         deterministic: bool,
     ) -> Result<Arc<rdocx_layout::WordLayoutResult>> {
+        if options.revision_style != rdocx_layout::RevisionStyle::Plain
+            && options.revision_view != rdocx_layout::RevisionView::Tracked
+        {
+            return Err(Error::Other(
+                "revision style applies only with tracked view".to_owned(),
+            ));
+        }
         if options.revision_view == rdocx_layout::RevisionView::Accepted {
             return if deterministic {
                 self.cached_deterministic_layout()
@@ -13066,8 +17598,9 @@ impl Document {
             };
         }
 
-        let mut input = self.build_layout_input();
+        let mut input = self.build_layout_input()?;
         input.revision_view = options.revision_view;
+        input.revision_style = options.revision_style;
         #[cfg(test)]
         record_layout_invocation();
         let layout = if deterministic {
@@ -13100,6 +17633,7 @@ impl Document {
     /// that conversion explicitly and keeps the VBA part.
     ///
     pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        self.validate_model_resource_limits()?;
         let path = path.as_ref();
         if let Some(class) = self.package_class_for_path(path)? {
             return self.save_as_package_class(path, class);
@@ -13116,8 +17650,21 @@ impl Document {
 
     /// Save the document to a byte vector.
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE resource-before");
+        self.validate_model_resource_limits()?;
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE resource-after");
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE clone-before");
         let mut candidate = self.clone_for_staging();
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE clone-after");
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE prepare-before");
         candidate.prepare_staged_output()?;
+        #[cfg(test)]
+        eprintln!("FX211_SAVE_STAGE prepare-after");
         crate::embedded::persist_invalidated_package_signature(
             &mut candidate.package,
             candidate.package_signatures_invalidated,
@@ -13182,6 +17729,7 @@ impl Document {
     /// Save a password-protected document to a byte vector.
     #[cfg(all(feature = "agile-encryption", not(target_arch = "wasm32")))]
     pub fn to_encrypted_bytes(&self, password: &str) -> Result<Vec<u8>> {
+        self.validate_model_resource_limits()?;
         let mut candidate = self.clone_for_staging();
         candidate.prepare_staged_output()?;
         crate::embedded::persist_invalidated_package_signature(
@@ -13196,15 +17744,44 @@ impl Document {
     }
 
     pub(crate) fn prepare_staged_package(&mut self) -> Result<()> {
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE preflight-before");
         self.preflight_flush_required_bundles()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE preflight-after");
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE typed-identifiers-before");
         self.canonicalize_typed_identifiers()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE typed-identifiers-after");
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE signature-before");
         let retained_signature_invalidated =
             self.retained_package_signature_would_be_invalidated()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE signature-after");
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE related-flush-before");
         self.flush_dirty_related_story_models()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE related-flush-after");
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE drawing-identifiers-before");
         self.canonicalize_drawing_ids()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE drawing-identifiers-after");
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE refresh-before");
         self.refresh_related_story_caches()?;
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE refresh-after");
         self.package_signatures_invalidated |= retained_signature_invalidated;
-        self.flush_to_package()
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE flush-before");
+        let result = self.flush_to_package();
+        #[cfg(test)]
+        eprintln!("FX211_PREPARE_STAGE flush-after");
+        result
     }
 
     /// Stage every public output. A comments model that no longer matches its
@@ -13274,6 +17851,13 @@ impl Document {
 
     pub(crate) fn prepare_and_reopen_staged(mut self) -> Result<Self> {
         self.prepare_staged_package()?;
+        #[cfg(test)]
+        if FAIL_NEXT_STAGED_REOPEN.replace(false) {
+            return self.reopen_prepared_staged_with_limits(PackageReadLimits {
+                max_entries: 0,
+                ..PackageReadLimits::UNBOUNDED
+            });
+        }
         self.reopen_prepared_staged()
     }
 
@@ -13298,6 +17882,9 @@ impl Document {
         let mut output = std::io::Cursor::new(Vec::new());
         self.package.write_to(&mut output)?;
         let mut reopened = Self::from_bytes_with_limits(output.get_ref(), limits)?;
+        reopened
+            .identifiers
+            .reject_new_repeated_drawing_ids(&provenance)?;
         reopened.identifiers.reconcile_provenance(&provenance);
         reopened.custom_properties_owned = custom_properties_owned;
         reopened.settings_owned = settings_owned;
@@ -13662,14 +18249,32 @@ impl Document {
         // byte. A modified document fails closed when canonical serialization
         // could change the meaning or bytes of retained content.
         let existing_document_xml = self.package.get_part(&self.doc_part_name);
+        #[cfg(test)]
+        let typed_document_is_unchanged = {
+            eprintln!("FX211_FLUSH_STAGE reparse-before");
+            let parsed = existing_document_xml.and_then(|xml| CT_Document::from_xml(xml).ok());
+            eprintln!("FX211_FLUSH_STAGE reparse-after");
+            eprintln!("FX211_FLUSH_STAGE equality-before");
+            let unchanged = parsed.as_ref() == Some(&self.document);
+            eprintln!("FX211_FLUSH_STAGE equality-after");
+            eprintln!("FX211_FLUSH_STAGE temporary-drop-before");
+            drop(parsed);
+            eprintln!("FX211_FLUSH_STAGE temporary-drop-after");
+            unchanged
+        };
+        #[cfg(not(test))]
         let typed_document_is_unchanged = existing_document_xml
             .and_then(|xml| CT_Document::from_xml(xml).ok())
             .as_ref()
             == Some(&self.document);
+        #[cfg(test)]
+        eprintln!("FX211_FLUSH_STAGE nested-scopes-before");
         let nested_namespace_owners = existing_document_xml
             .map(nested_modeled_namespace_owners)
             .transpose()?
             .unwrap_or_default();
+        #[cfg(test)]
+        eprintln!("FX211_FLUSH_STAGE nested-scopes-after");
         let unsafe_prefix = unsafe_serializer_namespace_prefix(
             &self.root_namespace_declarations,
             &self.body_namespace_declarations,
@@ -13686,7 +18291,11 @@ impl Document {
                     "cannot serialize a modified document with a shadowed `{prefix}` namespace"
                 )));
             }
+            #[cfg(test)]
+            eprintln!("FX211_FLUSH_STAGE serialize-before");
             let serialized = self.document.to_xml()?;
+            #[cfg(test)]
+            eprintln!("FX211_FLUSH_STAGE serialize-after");
             replay_nested_namespace_declarations(&serialized, &nested_namespace_owners)?
         };
         let namespace_scopes = document_namespace_scopes(&doc_xml)?;
@@ -13762,7 +18371,7 @@ impl Document {
         Ok(())
     }
 
-    fn reserve_document_part_bundle(
+    pub(crate) fn reserve_document_part_bundle(
         &mut self,
         existing: Option<&str>,
         preferred: &str,
@@ -13888,7 +18497,7 @@ impl Document {
         Ok(id)
     }
 
-    fn add_relative_internal_relationship_checked(
+    pub(crate) fn add_relative_internal_relationship_checked(
         &mut self,
         owner: &str,
         rel_type: &str,
@@ -13939,7 +18548,7 @@ impl Document {
         self.add_relative_internal_relationship_checked(owner, rel_types::IMAGE, &part_name)
     }
 
-    fn add_external_relationship_checked(
+    pub(crate) fn add_external_relationship_checked(
         &mut self,
         owner: &str,
         rel_type: &str,
@@ -14187,6 +18796,96 @@ impl Document {
         Ok(())
     }
 
+    pub(crate) fn generated_table_paragraph_positions(
+        &self,
+    ) -> Result<Vec<(ContentLocation, std::ops::Range<usize>)>> {
+        let mut result = Vec::new();
+        for story in self.stories()? {
+            if story.kind == StoryKind::Comment {
+                continue;
+            }
+            let (source, _) = self.story_source_and_owner(&story)?;
+            let xml = self
+                .package
+                .get_part(&source.part_name)
+                .unwrap_or(source.xml.as_ref());
+            let owner = scan_story_owners(xml, source.root_kind)?
+                .into_iter()
+                .find(|owner| owner.kind == story.kind && owner.owner_index == story.owner_index)
+                .ok_or_else(|| {
+                    Error::Other(
+                        "generated paragraph owner disappeared from retained source".into(),
+                    )
+                })?;
+            for (index, item) in scan_story_items(xml, &owner)?.iter().enumerate() {
+                let spans = match item.kind {
+                    StoryItemKind::Paragraph => vec![(vec![index], item.full.clone())],
+                    StoryItemKind::ContentControl => scan_story_control_paragraphs(xml, item)?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(paragraph, span)| (vec![index, paragraph], span))
+                        .collect(),
+                    _ => continue,
+                };
+                for (path, range) in spans {
+                    let location =
+                        ContentLocation::new(story.clone(), StoryItemKind::Paragraph, path);
+                    self.story_range_paragraph_source(&location)?;
+                    result.push((location, range));
+                }
+            }
+        }
+        result.sort_by_key(|(location, range)| {
+            (location.story().part_name().to_owned(), range.start)
+        });
+        Ok(result)
+    }
+
+    /// Exact physical story-owner content, from the existing checked inventory.
+    pub(crate) fn generated_table_story_sources(&self) -> Result<Vec<GeneratedStoryOwner>> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for source in self.story_sources()? {
+            let xml = if source.part_name == self.doc_part_name {
+                self.package
+                    .get_part(&source.part_name)
+                    .unwrap_or(source.xml.as_ref())
+            } else {
+                source.xml.as_ref()
+            };
+            for owner in scan_story_owners(xml, source.root_kind)? {
+                if matches!(owner.kind, StoryKind::Comment | StoryKind::TableCell)
+                    || !seen.insert((owner.kind, source.part_name.clone(), owner.owner_index))
+                {
+                    continue;
+                }
+                let mut reader = quick_xml::Reader::from_reader(&xml[owner.full.clone()]);
+                let mut buffer = Vec::new();
+                let start = match reader.read_event_into(&mut buffer).map_err(|error| {
+                    Error::Other(format!("story owner start scan failed: {error}"))
+                })? {
+                    Event::Start(_) => owner.full.start + reader.buffer_position() as usize,
+                    Event::Empty(_) => continue,
+                    _ => return Err(Error::Other("story owner has no start element".into())),
+                };
+                let end = story_owner_content_end(xml, &owner)?;
+                let scope = story_namespace_scope_at(xml, start)?;
+                result.push(GeneratedStoryOwner {
+                    story: StoryId {
+                        kind: owner.kind,
+                        part_name: source.part_name.clone(),
+                        owner_index: owner.owner_index,
+                        fingerprint: owner.fingerprint,
+                    },
+                    range: start..end,
+                    xml: xml.to_vec(),
+                    namespaces: scope,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     fn story_sources(&self) -> Result<Vec<StorySource<'_>>> {
         #[cfg(test)]
         STORY_SOURCE_BUILDS.set(STORY_SOURCE_BUILDS.get() + 1);
@@ -14325,6 +19024,141 @@ impl Document {
         Ok((source, owner))
     }
 
+    /// Bind an existing control to a snapshot-checked placeholder entry.
+    pub fn bind_building_block_placeholder(
+        &mut self,
+        control: &ContentLocation,
+        entry: &crate::BuildingBlockInfo,
+    ) -> Result<()> {
+        self.checked_building_block(entry)?;
+        if entry.block.gallery.as_deref() != Some("placeholder") {
+            return Err(Error::Other(
+                "placeholder binding requires the placeholder gallery".to_owned(),
+            ));
+        }
+        if control.item_kind != StoryItemKind::ContentControl
+            || control.index_path.len() != 1
+            || control.is_end
+        {
+            return Err(Error::Other(
+                "placeholder binding requires an existing content control location".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.prepare_staged_package()?;
+        let (source, owner) = candidate.fragment_story_source_and_owner(&control.story)?;
+        let part = source.part_name.clone();
+        let mut xml = source.xml.into_owned();
+        let item = scan_story_items(&xml, &owner)?
+            .get(control.index_path[0])
+            .cloned()
+            .ok_or_else(|| Error::Other("stale content control index".to_owned()))?;
+        if item.kind != StoryItemKind::ContentControl {
+            return Err(Error::Other(
+                "content control location changed kind".to_owned(),
+            ));
+        }
+        let scope = story_namespace_scope_at(&xml, item.full.start)?;
+        let raw = close_content_fragment_namespaces(&xml[item.full.clone()], &scope)?;
+        let updated = crate::building_block::bind_placeholder_xml(&raw, entry)?;
+        xml.splice(item.full, updated);
+        set_story_source_xml(&mut candidate, &part, xml)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    pub(crate) fn preserve_glossary_drawing_ids_staged(&mut self) -> Result<()> {
+        if let Some(glossary) = &self.glossary {
+            let ids = drawing_ids_in_xml(&glossary.to_xml()?)?;
+            self.identifiers.drawing_ids.extend(ids.iter().copied());
+            self.identifiers.preserved_drawing_ids.extend(ids);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn project_fragment_part_content(
+        &mut self,
+        source_part: &str,
+        mut selected: Vec<u8>,
+    ) -> Result<()> {
+        if source_part != self.doc_part_name {
+            let source_rels = self
+                .package
+                .get_part_rels(source_part)
+                .cloned()
+                .unwrap_or_default();
+            let mut relationship_map = BTreeMap::new();
+            for relationship_id in crate::field::relationship_ids_in_xml(&selected)? {
+                let relationship = source_rels.get_by_id(&relationship_id).ok_or_else(|| {
+                        Error::Other(format!(
+                            "fragment source relationship {relationship_id} is missing from {source_part}"
+                        ))
+                    })?;
+                let destination_part = self.doc_part_name.clone();
+                let new_id = if relationship_is_internal(relationship) {
+                    let target_part =
+                        OpcPackage::resolve_rel_target(source_part, &relationship.target);
+                    self.add_internal_relationship_checked(
+                        &destination_part,
+                        &relationship.rel_type,
+                        &relative_target(&destination_part, &target_part),
+                    )?
+                } else {
+                    self.add_external_relationship_checked(
+                        &destination_part,
+                        &relationship.rel_type,
+                        &relationship.target,
+                    )?
+                };
+                relationship_map.insert(relationship_id, new_id);
+            }
+            selected = crate::field::patch_relationship_ids(&selected, &relationship_map)?;
+        }
+        let main_xml = self
+            .package
+            .get_part(&self.doc_part_name)
+            .ok_or_else(|| Error::Other("document fragment main part is missing".to_owned()))?
+            .to_vec();
+        let main_owner = scan_story_owners(&main_xml, StoryKind::Body)?
+            .into_iter()
+            .find(|owner| owner.kind == StoryKind::Body)
+            .ok_or_else(|| Error::Other("document fragment main body is missing".to_owned()))?;
+        let main_items = direct_story_content_items(&main_xml, &main_owner)?;
+        let main_end = story_owner_content_end(&main_xml, &main_owner)?;
+        let main_start = main_items.first().map_or(main_end, |item| item.full.start);
+        let mut updated = main_xml;
+        updated.splice(main_start..main_end, selected);
+        self.package.set_part(&self.doc_part_name, updated);
+        Ok(())
+    }
+
+    fn fragment_story_source_and_owner<'a>(
+        &'a self,
+        story: &StoryId,
+    ) -> Result<(StorySource<'a>, StoryOwnerSpan)> {
+        let (canonical, _) = self.story_source_and_owner(story)?;
+        let xml = self.package.get_part(&canonical.part_name).ok_or_else(|| {
+            Error::Other(format!(
+                "document fragment story part {} is missing",
+                canonical.part_name
+            ))
+        })?;
+        let owner = scan_story_owners(xml, canonical.root_kind)?
+            .into_iter()
+            .find(|owner| owner.kind == story.kind && owner.owner_index == story.owner_index)
+            .ok_or_else(|| StoryError::OwnerNotFound {
+                story: story.clone(),
+            })?;
+        Ok((
+            StorySource {
+                xml: Cow::Borrowed(xml),
+                ..canonical
+            },
+            owner,
+        ))
+    }
+
     pub(crate) fn story_paragraph_mut(&mut self, location: &ContentLocation) -> Result<&mut CT_P> {
         let (part_name, paragraph_slot, ordinal, cell_route) = {
             let (source, owner) = self.story_source_and_owner(&location.story)?;
@@ -14399,14 +19233,19 @@ impl Document {
             StoryKind::Body => {
                 match (self.document.body.content.get_mut(paragraph_slot), ordinal) {
                     (Some(BodyContent::Paragraph(paragraph)), None) => Ok(paragraph),
-                    (Some(BodyContent::ContentControl(control)), Some(mut remaining)) => {
-                        nth_paragraph_in_control(control, &mut remaining).ok_or_else(|| {
-                            Error::Other(format!(
-                                "comment content control has no paragraph {}",
-                                ordinal.unwrap_or_default()
-                            ))
+                    (Some(BodyContent::ContentControl(control)), Some(ordinal)) => control
+                        .content
+                        .iter_mut()
+                        .filter_map(|child| match child {
+                            SdtContent::Paragraph(paragraph) => Some(paragraph),
+                            _ => None,
                         })
-                    }
+                        .nth(ordinal)
+                        .ok_or_else(|| {
+                            Error::Other(format!(
+                                "comment content control has no paragraph {ordinal}"
+                            ))
+                        }),
                     _ => Err(Error::Other("comment body paragraph is missing".to_owned())),
                 }
             }
@@ -14443,6 +19282,668 @@ impl Document {
         }
     }
 
+    /// Insert a checked run through its physical story paragraph owner.
+    pub(crate) fn insert_story_run_staged(
+        &mut self,
+        position: &crate::StoryRunPosition,
+        run: CT_R,
+    ) -> Result<()> {
+        let (source, item) = self.story_range_paragraph_source(&position.location)?;
+        if item.kind != StoryItemKind::Paragraph {
+            return Err(Error::Other(
+                "field insertion needs a paragraph location".into(),
+            ));
+        }
+        let part_name = source.part_name.clone();
+        let mut xml = source.xml.into_owned();
+        let scope = story_namespace_scope_at(&xml, item.full.start)?;
+        let closed = close_content_fragment_namespaces(&xml[item.full.clone()], &scope)?;
+        let mut paragraph = CT_P::from_xml_fragment(&closed)?;
+        paragraph
+            .insert_accepted_run(position.run_index, run)
+            .map_err(|error| Error::Other(format!("field insertion boundary: {error}")))?;
+        let replacement = serialize_content_fragment(BodyContent::Paragraph(paragraph))?;
+        let replacement = close_content_fragment_namespaces(&replacement, &scope)?;
+        xml.splice(item.full, replacement);
+        set_story_source_xml(self, &part_name, xml)
+    }
+
+    pub(crate) fn anchor_story_range(
+        &mut self,
+        range: &crate::comments::StoryRunRange,
+        anchor: RangeAnchor<'_>,
+        label: &str,
+        endpoint_probe: bool,
+    ) -> Result<()> {
+        let start = &range.start.location;
+        let end = &range.end.location;
+        let start_run = range.start.run_index;
+        let end_run = range.end.run_index;
+        if start.story != end.story {
+            return Err(Error::Other(format!(
+                "{label} range endpoints must be ordered in one story owner"
+            )));
+        }
+        let nested_body_control = [start, end].iter().any(|location| {
+            location.index_path.len() == 2
+                && self
+                    .story_item_source(&ContentLocation::new(
+                        location.story.clone(),
+                        StoryItemKind::ContentControl,
+                        vec![location.index_path[0]],
+                    ))
+                    .is_ok_and(|(_, control)| !control.direct_owner_child)
+        });
+        // Multiple paragraphs must be qualified before either endpoint changes
+        // the owner's fingerprint. The raw path below publishes both spans once.
+        if start == end
+            && start.story.kind() == StoryKind::Body
+            && (start.index_path.len() == 2 || end.index_path.len() == 2)
+            && !nested_body_control
+        {
+            if start.index_path > end.index_path {
+                return Err(Error::Other(format!(
+                    "{label} range endpoints must be ordered in one story owner"
+                )));
+            }
+            let mut first = self.story_paragraph_mut(start)?.clone();
+            let mut last = if start == end {
+                first.clone()
+            } else {
+                self.story_paragraph_mut(end)?.clone()
+            };
+            if start == end {
+                first
+                    .anchor_accepted_range(Some(start_run), Some(end_run), anchor)
+                    .map_err(|error| {
+                        Error::Other(format!("{label} range cannot be anchored: {error}"))
+                    })?;
+            } else {
+                first
+                    .anchor_accepted_range(Some(start_run), None, anchor)
+                    .map_err(|error| {
+                        Error::Other(format!("{label} range cannot be anchored: {error}"))
+                    })?;
+                last.anchor_accepted_range(None, Some(end_run), anchor)
+                    .map_err(|error| {
+                        Error::Other(format!("{label} range cannot be anchored: {error}"))
+                    })?;
+            }
+            *self.story_paragraph_mut(start)? = first;
+            if start != end {
+                *self.story_paragraph_mut(end)? = last;
+            }
+            return Ok(());
+        }
+        let (source, start_item) = self.story_range_paragraph_source(start)?;
+        let part_name = source.part_name.clone();
+        let source_xml = source.xml.into_owned();
+        let (_, end_item) = self.story_range_paragraph_source(end)?;
+        if start_item.full.start > end_item.full.start {
+            return Err(Error::Other(format!(
+                "{label} range endpoints must be ordered in one story owner"
+            )));
+        }
+        let read_paragraph = |item: &StoryItemSpan| -> Result<CT_P> {
+            if item.kind != StoryItemKind::Paragraph {
+                return Err(Error::Other(
+                    "comment positions must identify paragraphs".to_owned(),
+                ));
+            }
+            let scope = story_namespace_scope_at(&source_xml, item.full.start)?;
+            let closed = close_content_fragment_namespaces(&source_xml[item.full.clone()], &scope)?;
+            Ok(CT_P::from_xml_fragment(&closed)?)
+        };
+        let mut first = read_paragraph(&start_item)?;
+        let mut last = if start_item.full == end_item.full {
+            first.clone()
+        } else {
+            read_paragraph(&end_item)?
+        };
+        for (boundary, index, paragraph) in [("start", start_run, &first), ("end", end_run, &last)]
+        {
+            let count = paragraph.accepted_run_paths().len();
+            if index > count {
+                return Err(Error::Other(format!(
+                    "{label} range {boundary} run index {index} exceeds paragraph run count {count}"
+                )));
+            }
+        }
+        if start_item.full == end_item.full {
+            if start_run > end_run {
+                return Err(Error::Other(format!(
+                    "{label} range start must not follow its end"
+                )));
+            }
+            first
+                .anchor_accepted_range(Some(start_run), Some(end_run), anchor)
+                .map_err(|error| {
+                    Error::Other(format!("{label} range cannot be anchored: {error}"))
+                })?;
+        } else {
+            first
+                .anchor_accepted_range(Some(start_run), None, anchor)
+                .map_err(|error| {
+                    Error::Other(format!("{label} range cannot be anchored: {error}"))
+                })?;
+            last.anchor_accepted_range(None, Some(end_run), anchor)
+                .map_err(|error| {
+                    Error::Other(format!("{label} range cannot be anchored: {error}"))
+                })?;
+        }
+        let same_paragraph = start_item.full == end_item.full;
+        let mut edits = vec![(start_item.full, first)];
+        if !same_paragraph {
+            edits.push((end_item.full, last));
+        }
+        edits.sort_by_key(|item| std::cmp::Reverse(item.0.start));
+        let mut updated = source_xml;
+        for (span, paragraph) in edits {
+            let scope = story_namespace_scope_at(&updated, span.start)?;
+            let xml = serialize_content_fragment(BodyContent::Paragraph(paragraph))?;
+            let xml = close_content_fragment_namespaces(&xml, &scope)?;
+            updated.splice(span, xml);
+        }
+        let updated = match anchor {
+            RangeAnchor::Comment(id) if !endpoint_probe => {
+                self.comment_move_source_with_namespaces(&part_name, updated, id, false)?
+            }
+            _ => updated,
+        };
+        set_story_source_xml(self, &part_name, updated)
+    }
+
+    /// Stage a comment move using physical source edits, then bind the surviving
+    /// destination paragraphs and accepted run boundaries to their new owners.
+    pub(crate) fn move_comment_story_range(
+        &mut self,
+        entry: &crate::comments::StoryRangeRef,
+        target: &StoryRunRange,
+        id: i32,
+    ) -> Result<()> {
+        // Validate both endpoints before any source is removed. The probe never
+        // publishes its synthesized reference or changes the requested axis.
+        let mut probe = self.clone_for_staging();
+        probe.anchor_story_range(target, RangeAnchor::Comment(id), "comment", true)?;
+        let endpoints = [&target.start, &target.end]
+            .map(|position| {
+                let (source, paragraph) = self.story_range_paragraph_source(&position.location)?;
+                Ok((source.part_name.clone(), paragraph.full.start))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let (part_name, xml, selected) = self.story_range_marker_spans(entry, true)?;
+        let (edits, reference, reference_span) = comment_move_source_edits(&xml, &selected)?;
+        let mut reference_axis = None;
+        for (location, _) in self.story_range_paragraphs()? {
+            if location.story != entry.range().start.location.story {
+                continue;
+            }
+            let (source, paragraph) = self.story_range_paragraph_source(&location)?;
+            if !paragraph.full.contains(&reference_span.start) {
+                continue;
+            }
+            let scope = story_namespace_scope_at(source.xml.as_ref(), paragraph.full.start)?;
+            let raw =
+                close_content_fragment_namespaces(&source.xml[paragraph.full.clone()], &scope)?;
+            let paragraph_model = CT_P::from_xml_fragment(&raw)?;
+            let indices = paragraph_model
+                .accepted_run_paths()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    paragraph_model
+                        .accepted_run(path)
+                        .filter(|run| {
+                            run.content.iter().any(|content| {
+                                matches!(content,
+                        RunContent::CommentReference { id: found, .. } if *found == id)
+                            })
+                        })
+                        .map(|_| index)
+                })
+                .collect::<Vec<_>>();
+            if indices.len() != 1 || reference_axis.is_some() {
+                return Err(Error::Other(
+                    "comment reference has no unique accepted run boundary".into(),
+                ));
+            }
+            reference_axis = Some((paragraph.full.start, indices[0]));
+        }
+        let (reference_paragraph, reference_index) = reference_axis.ok_or_else(|| {
+            Error::Other("comment reference is outside the supported accepted run axis".into())
+        })?;
+        let map_offset = |offset: usize| -> Result<usize> {
+            if edits.iter().any(|span| span.contains(&offset)) {
+                return Err(Error::Other(
+                    "comment move destination is inside a removed marker-only owner".into(),
+                ));
+            }
+            Ok(offset
+                - edits
+                    .iter()
+                    .filter(|span| span.end <= offset)
+                    .map(|span| span.len())
+                    .sum::<usize>())
+        };
+        let mut updated = xml;
+        for span in edits.iter().rev() {
+            updated.drain(span.clone());
+        }
+        let updated = self.comment_move_source_with_namespaces(&part_name, updated, id, true)?;
+        set_story_source_xml(self, &part_name, updated)?;
+        let stories = self.stories()?;
+        let rebase = |position: &StoryRunPosition,
+                      endpoint: &(String, usize)|
+         -> Result<StoryRunPosition> {
+            let original = position.location.story();
+            let story = stories
+                .iter()
+                .find(|story| {
+                    story.kind == original.kind
+                        && story.part_name == original.part_name
+                        && story.owner_index == original.owner_index
+                })
+                .ok_or_else(|| Error::Other("comment move destination story disappeared".into()))?;
+            let expected = if endpoint.0 == part_name {
+                map_offset(endpoint.1)?
+            } else {
+                endpoint.1
+            };
+            let (source, owner) = self.story_source_and_owner(story)?;
+            let mut found = None;
+            for (index, item) in scan_story_items(source.xml.as_ref(), &owner)?
+                .iter()
+                .enumerate()
+            {
+                let paths = match item.kind {
+                    StoryItemKind::Paragraph => vec![(vec![index], item.full.start)],
+                    StoryItemKind::ContentControl => {
+                        scan_story_control_paragraphs(source.xml.as_ref(), item)?
+                            .iter()
+                            .enumerate()
+                            .map(|(child, span)| (vec![index, child], span.start))
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for (path, offset) in paths {
+                    if offset == expected {
+                        if found.is_some() {
+                            return Err(Error::Other("ambiguous comment move destination".into()));
+                        }
+                        found = Some(path);
+                    }
+                }
+            }
+            let path = found.ok_or_else(|| {
+                Error::Other("comment move destination paragraph disappeared".into())
+            })?;
+            let removed_before_boundary = endpoint.0 == part_name
+                && endpoint.1 == reference_paragraph
+                && position.run_index > reference_index
+                && edits.iter().any(|span| {
+                    span.start <= reference_span.start && reference_span.end <= span.end
+                });
+            Ok(StoryRunPosition {
+                location: ContentLocation::new(story.clone(), StoryItemKind::Paragraph, path),
+                run_index: position.run_index - usize::from(removed_before_boundary),
+            })
+        };
+        let rebound = StoryRunRange {
+            start: rebase(&target.start, &endpoints[0])?,
+            end: rebase(&target.end, &endpoints[1])?,
+        };
+        self.anchor_story_range(&rebound, RangeAnchor::Comment(id), "comment", false)?;
+        // Replace only the uniquely synthesized selected reference run. The
+        // original run carries its namespace closure, formatting and raw attrs.
+        self.restore_comment_reference_run(id, reference)
+    }
+
+    pub(crate) fn remove_comment_source_for_move(
+        &mut self,
+        entry: &crate::comments::StoryRangeRef,
+    ) -> Result<Vec<u8>> {
+        let (part, xml, selected) = self.story_range_marker_spans(entry, true)?;
+        let (edits, reference, _) = comment_move_source_edits(&xml, &selected)?;
+        let mut updated = xml;
+        for span in edits.iter().rev() {
+            updated.drain(span.clone());
+        }
+        let updated = self.comment_move_source_with_namespaces(
+            &part,
+            updated,
+            match entry.kind() {
+                crate::comments::StoryRangeKind::Comment { id } => *id,
+                _ => return Err(Error::Other("expected comment move source".into())),
+            },
+            true,
+        )?;
+        set_story_source_xml(self, &part, updated)?;
+        Ok(reference)
+    }
+
+    pub(crate) fn restore_comment_reference_run(
+        &mut self,
+        id: i32,
+        reference: Vec<u8>,
+    ) -> Result<()> {
+        let ranges = self.story_ranges()?;
+        let matching = ranges
+            .iter()
+            .filter(|entry| {
+                matches!(entry.kind(),
+            crate::comments::StoryRangeKind::Comment { id: found } if *found == id)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(Error::Other(
+                "moved comment has no unique destination range".into(),
+            ));
+        }
+        let (source, owner) =
+            self.story_source_and_owner(matching[0].range().end.location.story())?;
+        let part = source.part_name.clone();
+        let span = comment_reference_run_span(source.xml.as_ref(), &owner.full, id)?;
+        let mut xml = source.xml.into_owned();
+        xml.splice(span, reference);
+        let xml = self.comment_move_source_with_namespaces(&part, xml, id, false)?;
+        set_story_source_xml(self, &part, xml)
+    }
+
+    // Source discovery retains the established canonical fingerprint axis.
+    // Before a move replaces that source, replay its original qualified nested
+    // declarations so the replacement does not erase preserved raw aliases.
+    fn comment_move_source_with_namespaces(
+        &self,
+        part: &str,
+        xml: Vec<u8>,
+        id: i32,
+        source_removal: bool,
+    ) -> Result<Vec<u8>> {
+        if part != self.doc_part_name {
+            return Ok(xml);
+        }
+        let original = self
+            .package
+            .get_part(part)
+            .ok_or_else(|| Error::Other("comment move main source is missing".into()))?;
+        // Apply the same proved source edits to the original namespace authority.
+        // Whole transported runs disappear, while mixed source runs keep their
+        // declarations and every non-reference child in their original order.
+        let mut remaining_source = original.to_vec();
+        if source_removal {
+            let selected = crate::comments::comment_source_markers(original)?
+                .into_iter()
+                .filter(|marker| marker.id == id)
+                .map(|marker| marker.span)
+                .collect::<Vec<_>>();
+            if selected.len() != 3 {
+                return Err(Error::Other(
+                    "comment move original source lacks one qualified pair and reference".into(),
+                ));
+            }
+            let (edits, _, _) = comment_move_source_edits(original, &selected)?;
+            for span in edits.into_iter().rev() {
+                remaining_source.drain(span);
+            }
+        }
+        let original = remaining_source.as_slice();
+        let mut owners = nested_modeled_namespace_owners(original)?;
+        let original_spans = modeled_owner_spans(original)?;
+        let spans = modeled_owner_spans(&xml)?;
+        for owner in &mut owners {
+            let has_pair = |source: &[u8], span: &ModeledOwnerSpan| -> Result<bool> {
+                let mut scope = span
+                    .bindings
+                    .iter()
+                    .map(|(name, uri)| (namespace_prefix(name), uri.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                for (name, uri) in &owner.declarations {
+                    let prefix = namespace_prefix(name);
+                    scope.insert(prefix, uri.clone());
+                }
+                let closed =
+                    close_content_fragment_namespaces(&source[span.start..span.end], &scope)?;
+                Ok(CT_P::comment_range_text_from_source(&closed, id)?.is_some())
+            };
+            let mut original_selected = false;
+            for span in original_spans
+                .iter()
+                .filter(|span| span.local_name == owner.local_name)
+            {
+                let markers = candidate_namespace_owner_markers(
+                    &original[span.start..span.end],
+                    &owner.declarations,
+                    &span.bindings,
+                    &owner.markers,
+                )?;
+                if marker_multiset_matches(&owner.markers, &markers, true)
+                    && has_pair(original, span)?
+                {
+                    original_selected = true;
+                }
+            }
+            let mut matching = Vec::new();
+            for span in spans
+                .iter()
+                .filter(|span| span.local_name == owner.local_name)
+            {
+                let markers = candidate_namespace_owner_markers(
+                    &xml[span.start..span.end],
+                    &owner.declarations,
+                    &span.bindings,
+                    &owner.markers,
+                )?;
+                if marker_multiset_matches(&owner.markers, &markers, true) {
+                    matching.push(span);
+                }
+            }
+            let selected = matching
+                .iter()
+                .map(|span| has_pair(&xml, span))
+                .collect::<Result<Vec<_>>>()?;
+            if original_selected || selected.iter().any(|selected| *selected) {
+                let [span] = matching.as_slice() else {
+                    return Err(Error::Other(
+                        "comment move has ambiguous retained namespace owner".into(),
+                    ));
+                };
+                owner.snapshot = logical_owner_snapshot(
+                    &xml[span.start..span.end],
+                    &span.bindings,
+                    &owner.declarations,
+                )?;
+            }
+        }
+        replay_nested_namespace_declarations(&xml, &owners)
+    }
+
+    fn story_range_marker_spans(
+        &self,
+        entry: &crate::comments::StoryRangeRef,
+        move_comment_reference: bool,
+    ) -> Result<(String, Vec<u8>, Vec<Range<usize>>)> {
+        use crate::comments::StoryRangeKind;
+        let (source, owner) = self.story_source_and_owner(entry.range().start.location.story())?;
+        let part_name = source.part_name.clone();
+        let xml = source.xml.as_ref();
+        let mut paragraphs = Vec::new();
+        for item in scan_story_items(xml, &owner)? {
+            match item.kind {
+                StoryItemKind::Paragraph => paragraphs.push(item.full),
+                StoryItemKind::ContentControl => {
+                    paragraphs.extend(scan_story_control_paragraphs(xml, &item)?);
+                }
+                _ => {}
+            }
+        }
+        let (start_tag, end_tag, identity) = match entry.kind() {
+            StoryRangeKind::Bookmark { id, .. } => (
+                b"bookmarkStart".as_slice(),
+                b"bookmarkEnd".as_slice(),
+                id.to_string(),
+            ),
+            StoryRangeKind::Comment { id } => (
+                b"commentRangeStart".as_slice(),
+                b"commentRangeEnd".as_slice(),
+                id.to_string(),
+            ),
+            StoryRangeKind::Permission { id, .. } => (
+                b"permStart".as_slice(),
+                b"permEnd".as_slice(),
+                id.to_string(),
+            ),
+            StoryRangeKind::Proofing { kind } => {
+                (b"proofErr".as_slice(), b"proofErr".as_slice(), kind.clone())
+            }
+        };
+        let mut reader = NsReader::from_reader(xml);
+        reader.config_mut().trim_text(false);
+        let mut ranges = Vec::new();
+        let mut ordinal = 0usize;
+        let mut stack = Vec::<(bool, Vec<u8>, usize)>::new();
+        let mut buffer = Vec::new();
+        loop {
+            let before = reader.buffer_position() as usize;
+            let (namespace, event) = reader
+                .read_resolved_event_into(&mut buffer)
+                .map_err(|error| Error::Other(format!("range removal scan failed: {error}")))?;
+            let is_word = word_element(&namespace);
+            drop(namespace);
+            let after = reader.buffer_position() as usize;
+            let hidden = stack.iter().any(|(word, name, start)| {
+                *word
+                    && matches!(
+                        name.as_slice(),
+                        b"del" | b"moveFrom" | b"smartTag" | b"customXml" | b"fldSimple"
+                    )
+                    || *word && name == b"txbxContent" && *start > owner.full.start
+            });
+            if let Event::End(_) = &event {
+                stack.pop();
+            }
+            if let Event::Start(element) = &event {
+                stack.push((is_word, element.local_name().as_ref().to_vec(), before));
+            }
+            let element = match &event {
+                Event::Start(element) | Event::Empty(element)
+                    if paragraphs
+                        .iter()
+                        .any(|paragraph| paragraph.contains(&before))
+                        && !hidden
+                        && is_word
+                        && matches!(
+                            element.local_name().as_ref(),
+                            b"bookmarkStart"
+                                | b"bookmarkEnd"
+                                | b"commentRangeStart"
+                                | b"commentRangeEnd"
+                                | b"permStart"
+                                | b"permEnd"
+                                | b"proofErr"
+                                | b"commentReference"
+                        ) =>
+                {
+                    element
+                }
+                Event::Eof => break,
+                _ => {
+                    buffer.clear();
+                    continue;
+                }
+            };
+            let mut id_value = None;
+            let mut type_value = None;
+            for attribute in element.attributes() {
+                let attribute = attribute.map_err(|error| Error::Other(error.to_string()))?;
+                let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+                if word_element(&namespace) && matches!(local.as_ref(), b"id" | b"type") {
+                    let value = attribute
+                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                        .map_err(|error| Error::Other(error.to_string()))?;
+                    if local.as_ref() == b"id" {
+                        id_value = Some(value.into_owned());
+                    } else {
+                        type_value = Some(value.into_owned());
+                    }
+                }
+            }
+            let name = element.local_name();
+            let name = name.as_ref();
+            let paired = matches!(
+                name,
+                b"bookmarkStart"
+                    | b"bookmarkEnd"
+                    | b"commentRangeStart"
+                    | b"commentRangeEnd"
+                    | b"permStart"
+                    | b"permEnd"
+            ) || name == b"proofErr"
+                && matches!(
+                    type_value.as_deref(),
+                    Some("spellStart" | "spellEnd" | "gramStart" | "gramEnd")
+                );
+            let this_ordinal = paired.then(|| {
+                let current = ordinal;
+                ordinal += 1;
+                current
+            });
+            let matched = if name == b"commentReference" {
+                move_comment_reference
+                    && matches!(entry.kind(), StoryRangeKind::Comment { .. })
+                    && id_value.as_deref() == Some(identity.as_str())
+            } else {
+                (name == start_tag || name == end_tag)
+                    && this_ordinal.is_some_and(|index| {
+                        index == entry.start_ordinal || index == entry.end_ordinal
+                    })
+                    && if matches!(entry.kind(), StoryRangeKind::Proofing { .. }) {
+                        type_value.as_deref() == Some(format!("{identity}Start").as_str())
+                            || type_value.as_deref() == Some(format!("{identity}End").as_str())
+                    } else {
+                        id_value.as_deref() == Some(identity.as_str())
+                    }
+            };
+            if matched {
+                let end = if matches!(event, Event::Empty(_)) {
+                    after
+                } else {
+                    story_element_end(xml, before)?
+                };
+                ranges.push(before..end);
+            }
+            buffer.clear();
+        }
+        let expected =
+            if move_comment_reference && matches!(entry.kind(), StoryRangeKind::Comment { .. }) {
+                3
+            } else {
+                2
+            };
+        if ranges.len() != expected {
+            return Err(Error::Other(format!(
+                "range marker identity {} has {} selected elements, expected {expected}",
+                identity,
+                ranges.len()
+            )));
+        }
+        Ok((part_name, xml.to_vec(), ranges))
+    }
+
+    pub(crate) fn remove_story_range_markers(
+        &mut self,
+        entry: &crate::comments::StoryRangeRef,
+        move_comment_reference: bool,
+    ) -> Result<()> {
+        let (part_name, mut updated, ranges) =
+            self.story_range_marker_spans(entry, move_comment_reference)?;
+        for range in ranges.into_iter().rev() {
+            updated.splice(range, []);
+        }
+        set_story_source_xml(self, &part_name, updated)
+    }
+
     fn story_item_source<'a>(
         &'a self,
         location: &ContentLocation,
@@ -14470,6 +19971,56 @@ impl Document {
         Ok((source, item))
     }
 
+    fn story_range_paragraph_source<'a>(
+        &'a self,
+        location: &ContentLocation,
+    ) -> Result<(StorySource<'a>, StoryItemSpan)> {
+        if location.index_path.len() == 1 {
+            return self.story_item_source(location);
+        }
+        if location.index_path.len() != 2 || location.item_kind != StoryItemKind::Paragraph {
+            return Err(StoryError::InvalidPath {
+                path: location.index_path.clone(),
+            }
+            .into());
+        }
+        let (source, owner) = self.story_source_and_owner(&location.story)?;
+        let items = scan_story_items(source.xml.as_ref(), &owner)?;
+        let control_index = location.index_path[0];
+        let control = items.get(control_index).ok_or(StoryError::OutOfBounds {
+            index: control_index,
+            len: items.len(),
+        })?;
+        if control.kind != StoryItemKind::ContentControl {
+            return Err(StoryError::KindMismatch {
+                expected: StoryItemKind::ContentControl,
+                actual: control.kind,
+            }
+            .into());
+        }
+        let paragraphs = scan_story_control_paragraphs(source.xml.as_ref(), control)?;
+        let paragraph_index = location.index_path[1];
+        let full = paragraphs
+            .get(paragraph_index)
+            .cloned()
+            .ok_or(StoryError::OutOfBounds {
+                index: paragraph_index,
+                len: paragraphs.len(),
+            })?;
+        Ok((
+            source,
+            StoryItemSpan {
+                kind: StoryItemKind::Paragraph,
+                scan: full.clone(),
+                full,
+                direct_owner_child: false,
+                complex_field: false,
+                complex_ancestors: Vec::new(),
+                sdt_context: None,
+            },
+        ))
+    }
+
     /// Traverse one story's supported content without constructing a second
     /// document tree.
     pub fn story_items<'a>(&'a self, story: &StoryId) -> Result<Vec<StoryItemRef<'a>>> {
@@ -14488,6 +20039,377 @@ impl Document {
                 },
             })
             .collect())
+    }
+
+    pub(crate) fn patch_story_paragraph_field_sources(
+        &mut self,
+        location: &ContentLocation,
+        replacements: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        // Earlier writes may have changed the owning story's fingerprint.
+        // Refresh only that fingerprint, keeping its physical part and ordinal.
+        let mut location = location.clone();
+        location.story = self
+            .stories()?
+            .into_iter()
+            .find(|story| {
+                story.kind == location.story.kind
+                    && story.part_name == location.story.part_name
+                    && story.owner_index == location.story.owner_index
+            })
+            .ok_or_else(|| {
+                Error::Other("field cache owner disappeared during staging".to_owned())
+            })?;
+        let (source, paragraph) = self.story_range_paragraph_source(&location)?;
+        let part_name = source.part_name.clone();
+        let mut xml = source.xml.into_owned();
+        let mut edits = Vec::new();
+        let mut cursor = 0;
+        for (original, replacement) in replacements {
+            if original.is_empty() {
+                return Err(Error::Other("empty field source identity".to_owned()));
+            }
+            let offset = crate::field::find_typed_field_source(
+                &xml,
+                paragraph.full.start,
+                paragraph.full.end,
+                original,
+                cursor,
+            )?
+            .ok_or_else(|| {
+                Error::Other("field source no longer belongs to its checked paragraph".to_owned())
+            })?;
+            let start = paragraph.full.start + offset;
+            cursor = offset + original.len();
+            edits.push((start..(start + original.len()), replacement));
+        }
+        for (range, replacement) in edits.into_iter().rev() {
+            xml.splice(range, replacement.iter().copied());
+        }
+        set_story_source_xml(self, &part_name, xml)?;
+        self.invalidate_layout();
+        Ok(())
+    }
+
+    pub(crate) fn text_box_cache_paragraphs(&self) -> Result<Vec<TextBoxCacheParagraph>> {
+        let (sources, paragraphs) = self.story_range_paragraph_sources()?;
+        let text_boxes = sources
+            .iter()
+            .map(|source| {
+                Ok(scan_story_owners(source.xml.as_ref(), source.root_kind)?
+                    .into_iter()
+                    .filter(|owner| owner.kind == StoryKind::TextBox)
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for (source_index, paragraph, location, xml) in paragraphs {
+            if !matches!(
+                location.story.kind,
+                StoryKind::TextBox | StoryKind::TableCell
+            ) {
+                continue;
+            }
+            let source = &sources[source_index];
+            let text_box = text_boxes[source_index]
+                .iter()
+                .filter(|owner| {
+                    owner.full.start <= paragraph.start && owner.full.end >= paragraph.end
+                })
+                .min_by_key(|owner| owner.full.len());
+            if let Some(text_box) = text_box
+                && seen.insert((source.part_name.clone(), paragraph.start, paragraph.end))
+            {
+                result.push(TextBoxCacheParagraph {
+                    location,
+                    xml,
+                    owner_index: text_box.owner_index,
+                    paragraph_index: paragraph.start,
+                });
+            }
+        }
+        result.sort_by(|left, right| {
+            (
+                left.location.story.part_name.as_str(),
+                left.owner_index,
+                left.paragraph_index,
+            )
+                .cmp(&(
+                    right.location.story.part_name.as_str(),
+                    right.owner_index,
+                    right.paragraph_index,
+                ))
+        });
+        let mut ordinals = HashMap::<(String, usize), usize>::new();
+        for paragraph in &mut result {
+            let ordinal = ordinals
+                .entry((
+                    paragraph.location.story.part_name.clone(),
+                    paragraph.owner_index,
+                ))
+                .or_default();
+            paragraph.paragraph_index = *ordinal;
+            *ordinal += 1;
+        }
+        Ok(result)
+    }
+
+    /// Snapshot one checked range paragraph, including a paragraph within a block control.
+    /// This does not expand the ordinary story-item inventory.
+    #[doc(hidden)]
+    pub fn story_range_paragraph_snapshot(
+        &self,
+        location: &ContentLocation,
+    ) -> Result<StoryItemSnapshot> {
+        let (source, item) = self.story_range_paragraph_source(location)?;
+        let scope = story_namespace_scope_at(source.xml.as_ref(), item.full.start)?;
+        let xml = close_content_fragment_namespaces(&source.xml.as_ref()[item.full], &scope)?;
+        let text = CT_P::from_xml_fragment(&xml)?.accepted_text();
+        let containing = if let [control, _] = location.index_path() {
+            ContentLocation::new(
+                location.story().clone(),
+                StoryItemKind::ContentControl,
+                vec![*control],
+            )
+        } else {
+            location.clone()
+        };
+        let direct_body_index = StoryItemRef {
+            document: self,
+            location: containing,
+        }
+        .direct_body_index()?;
+        Ok(StoryItemSnapshot {
+            location: location.clone(),
+            direct_body_index,
+            direct_child: location.index_path().len() == 1,
+            text: Some(text),
+            xml,
+        })
+    }
+
+    // Guard the unique newly placed pair against the actual main source after
+    // existing namespace replay. Only this unpublished candidate's document part
+    // is flushed, leaving pending comment models and identifier state untouched.
+    pub(crate) fn comment_literal_range_text(&mut self, id: i32) -> Result<Option<String>> {
+        let xml = self.comment_move_source_with_namespaces(
+            &self.doc_part_name,
+            self.document.to_xml()?,
+            id,
+            false,
+        )?;
+        let part = self.doc_part_name.clone();
+        set_story_source_xml(self, &part, xml)?;
+        self.flush_document_to_package()?;
+        let source = self.package.get_part(&self.doc_part_name).ok_or_else(|| {
+            Error::Other("comment literal guard has no main document source".into())
+        })?;
+        Ok(CT_P::comment_range_text_from_source(source, id)?)
+    }
+
+    // Keep canonical locations and fingerprints while restoring only the proved
+    // namespace context used by rich comment projection. Physical event offsets
+    // qualify every owner before a restored declaration can reinterpret a name.
+    fn namespace_restored_main_source(&self) -> Result<Vec<u8>> {
+        let canonical = self.document.to_xml()?;
+        let original = self
+            .package
+            .get_part(&self.doc_part_name)
+            .ok_or_else(|| Error::Other("rich comment projection has no main source".into()))?;
+        let mut namespace_owners = nested_modeled_namespace_owners(original)?;
+        if namespace_owners.is_empty() {
+            return Ok(canonical);
+        }
+        let canonical_spans = modeled_owner_spans(&canonical)?;
+        let mut needed = Vec::new();
+        for owner in namespace_owners.drain(..) {
+            let original_scope = story_namespace_scope_at(original, owner.source.start)?;
+            let original_owner = close_content_fragment_namespaces(
+                &original[owner.source.clone()],
+                &original_scope,
+            )?;
+            let mut redundant = 0;
+            for target in canonical_spans.iter().filter(|span| {
+                span.local_name == owner.local_name
+                    && owner
+                        .declarations
+                        .iter()
+                        .all(|declaration| span.declarations.contains(declaration))
+            }) {
+                let scope = story_namespace_scope_at(&canonical, target.start)?;
+                let target_owner = close_content_fragment_namespaces(
+                    &canonical[target.start..target.end],
+                    &scope,
+                )?;
+                // Full owner payload, names and attributes prove the unique
+                // source counterpart. Only redundant namespace declarations may
+                // differ, with every resolved namespace fact still identical.
+                if let Some((_, changed)) =
+                    comment_namespace_source_boundaries(&original_owner, &target_owner)?
+                    && changed.is_empty()
+                {
+                    redundant += 1;
+                }
+            }
+            if redundant != 1 {
+                needed.push(owner);
+            }
+        }
+        let restored = replay_nested_namespace_declarations(&canonical, &needed)?;
+        if restored == canonical {
+            return Ok(canonical);
+        }
+        let (boundaries, _) = comment_namespace_source_boundaries(&canonical, &restored)?
+            .ok_or_else(|| {
+                Error::Other("rich comment namespace replay changed physical source".into())
+            })?;
+        let owners = scan_story_owners(&canonical, StoryKind::Body)?;
+        let restored_owners = scan_story_owners(&restored, StoryKind::Body)?;
+        if owners.len() != restored_owners.len()
+            || owners.iter().any(|owner| {
+                !restored_owners.iter().any(|other| {
+                    other.kind == owner.kind
+                        && other.owner_index == owner.owner_index
+                        && boundaries.get(&owner.full.start) == Some(&other.full.start)
+                        && boundaries.get(&owner.full.end) == Some(&other.full.end)
+                })
+            })
+        {
+            return Err(Error::Other(
+                "rich comment namespace replay changes story ownership".into(),
+            ));
+        }
+        Ok(restored)
+    }
+
+    pub(crate) fn comment_story_range_paragraphs(&self) -> Result<Vec<(ContentLocation, Vec<u8>)>> {
+        let mut paragraphs = self.story_range_paragraphs()?;
+        let canonical = self.document.to_xml()?;
+        let restored = self.namespace_restored_main_source()?;
+        if restored == canonical {
+            return Ok(paragraphs);
+        }
+        let (boundaries, _) = comment_namespace_source_boundaries(&canonical, &restored)?
+            .ok_or_else(|| {
+                Error::Other("rich comment namespace replay changed physical source".into())
+            })?;
+        let owners = scan_story_owners(&canonical, StoryKind::Body)?
+            .into_iter()
+            .map(|owner| {
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: self.doc_part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                (story, owner)
+            })
+            .collect::<Vec<_>>();
+        let mut paragraph_spans = HashMap::new();
+        for (location, span) in story_range_paragraph_spans(&canonical, &owners)?
+            .into_iter()
+            .flatten()
+        {
+            if paragraph_spans.insert(location, span).is_some() {
+                return Err(Error::Other(
+                    "rich comment has duplicate physical paragraph path".into(),
+                ));
+            }
+        }
+        let scopes = story_namespace_scopes_at(
+            &restored,
+            paragraph_spans
+                .values()
+                .filter_map(|span| boundaries.get(&span.start).copied()),
+        )?;
+        for (location, xml) in &mut paragraphs {
+            if location.story.part_name != self.doc_part_name {
+                continue;
+            }
+            let span = paragraph_spans.get(location).ok_or_else(|| {
+                Error::Other("rich comment paragraph has no checked physical path".into())
+            })?;
+            let start = *boundaries.get(&span.start).ok_or_else(|| {
+                Error::Other("rich comment paragraph has no physical namespace boundary".into())
+            })?;
+            let end = *boundaries.get(&span.end).ok_or_else(|| {
+                Error::Other("rich comment paragraph has no physical namespace boundary".into())
+            })?;
+            let scope = scopes.get(&start).ok_or_else(|| {
+                Error::Other("rich comment paragraph namespace scope was not inventoried".into())
+            })?;
+            *xml = close_content_fragment_namespaces(&restored[start..end], scope)?;
+        }
+        Ok(paragraphs)
+    }
+
+    #[doc(hidden)]
+    pub fn story_range_paragraphs(&self) -> Result<Vec<(ContentLocation, Vec<u8>)>> {
+        let (_, paragraphs) = self.story_range_paragraph_sources()?;
+        Ok(paragraphs
+            .into_iter()
+            .map(|(_, _, location, xml)| (location, xml))
+            .collect())
+    }
+
+    /// List every checked range paragraph in story order, with the index of
+    /// its source and its span there, after building each package source once.
+    ///
+    /// Stories keep the identities and order of [`Self::stories`]. Each source
+    /// is scanned for its owners once and its paragraph scopes are inventoried
+    /// in one pass.
+    #[allow(clippy::type_complexity)] // Sources and their located paragraph spans form one inventory.
+    fn story_range_paragraph_sources(
+        &self,
+    ) -> Result<(
+        Vec<StorySource<'_>>,
+        Vec<(usize, Range<usize>, ContentLocation, Vec<u8>)>,
+    )> {
+        let sources = self.story_sources()?;
+        let mut paragraphs = Vec::new();
+        let mut seen = HashSet::new();
+        let mut story_index = 0usize;
+        for (source_index, source) in sources.iter().enumerate() {
+            let source_xml = source.xml.as_ref();
+            let mut owners = Vec::new();
+            for owner in scan_story_owners(source_xml, source.root_kind)? {
+                let identity = (owner.kind, source.part_name.clone(), owner.owner_index);
+                if !seen.insert(identity) {
+                    continue;
+                }
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: source.part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                owners.push((story, owner));
+            }
+            let spans = story_range_paragraph_spans(source_xml, &owners)?;
+            let scopes = story_namespace_scopes_at(
+                source_xml,
+                spans.iter().flatten().map(|(_, span)| span.start),
+            )?;
+            for story_spans in spans {
+                for (location, span) in story_spans {
+                    let scope = scopes.get(&span.start).ok_or_else(|| {
+                        Error::Other("story paragraph namespace scope was not inventoried".into())
+                    })?;
+                    let xml = close_content_fragment_namespaces(&source_xml[span.clone()], scope)?;
+                    paragraphs.push((story_index, source_index, span, location, xml));
+                }
+                story_index += 1;
+            }
+        }
+        paragraphs.sort_by_key(|(story_index, _, span, _, _)| (*story_index, span.start));
+        Ok((
+            sources,
+            paragraphs
+                .into_iter()
+                .map(|(_, source_index, span, location, xml)| (source_index, span, location, xml))
+                .collect(),
+        ))
     }
 
     /// Materialize every story item after building each package source once.
@@ -14546,7 +20468,7 @@ impl Document {
             )?;
             for (story, items, direct_items) in inventories {
                 let mut direct_cursor = 0usize;
-                for (index, item) in items.into_iter().enumerate() {
+                for (index, item) in items.iter().enumerate() {
                     while direct_items
                         .get(direct_cursor)
                         .is_some_and(|direct| direct.full.end <= item.full.start)
@@ -14560,9 +20482,10 @@ impl Document {
                     let scope = item_scopes.get(&item.scan.start).ok_or_else(|| {
                         Error::Other("story item namespace scope was not inventoried".to_owned())
                     })?;
-                    let text = story_item_text_with_scope(source.xml.as_ref(), &item, scope)?;
+                    let text =
+                        story_item_text_with_scope(source.xml.as_ref(), item, scope, &items)?;
                     let xml = if item.complex_field {
-                        complex_story_field_xml(source.xml.as_ref(), &item)?
+                        complex_story_field_xml(source.xml.as_ref(), item)?
                     } else {
                         source.xml[item.full.clone()].to_vec()
                     };
@@ -14600,7 +20523,7 @@ impl Document {
             complex_ancestors: Vec::new(),
             sdt_context: None,
         };
-        let text = story_item_text_with_scope(xml, &text_item, scope)?.unwrap_or_default();
+        let text = story_item_text_with_scope(xml, &text_item, scope, &[])?.unwrap_or_default();
         let url = link
             .rel_id
             .as_deref()
@@ -14735,6 +20658,151 @@ impl Document {
         Ok(())
     }
 
+    /// Insert an inline picture at one checked physical run boundary.
+    /// The media, owning relationship and drawing are published together.
+    pub fn insert_picture_at(
+        &mut self,
+        position: &StoryRunPosition,
+        image_data: &[u8],
+        image_filename: &str,
+        width: Option<Length>,
+        height: Option<Length>,
+    ) -> Result<()> {
+        self.insert_picture_with_options_at(
+            position,
+            image_data,
+            image_filename,
+            width,
+            height,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Import picture metadata and placement through the same checked owner transaction.
+    pub fn insert_picture_with_options_at(
+        &mut self,
+        position: &StoryRunPosition,
+        image_data: &[u8],
+        image_filename: &str,
+        width: Option<Length>,
+        height: Option<Length>,
+        options: Option<PictureOptions>,
+    ) -> Result<PictureOccurrence> {
+        let format = oxml_media::ImageFormat::sniff(image_data)
+            .ok_or_else(|| Error::Other("picture image bytes are unsupported".to_owned()))?;
+        if matches!(
+            format,
+            oxml_media::ImageFormat::Png
+                | oxml_media::ImageFormat::Jpeg
+                | oxml_media::ImageFormat::Gif
+                | oxml_media::ImageFormat::Bmp
+                | oxml_media::ImageFormat::Webp
+        ) && oxml_media::probe(image_data).is_none()
+        {
+            return Err(Error::Other(
+                "picture image bytes are unsupported".to_owned(),
+            ));
+        }
+        let (width, height) = match (width, height) {
+            (Some(width), Some(height)) if width.to_emu() > 0 && height.to_emu() > 0 => {
+                (width, height)
+            }
+            (None, None) => {
+                let size = oxml_media::probe(image_data)
+                    .and_then(|info| info.native_size(72.0))
+                    .ok_or_else(|| Error::UnavailableImageDimensions {
+                        filename: image_filename.to_owned(),
+                    })?;
+                (Length::emu(size.width_emu), Length::emu(size.height_emu))
+            }
+            _ => {
+                return Err(Error::Other(
+                    "picture dimensions require two positive lengths or neither".to_owned(),
+                ));
+            }
+        };
+        let mut options = options.unwrap_or(PictureOptions {
+            width,
+            height,
+            crop: None,
+            anchor: None,
+            name: None,
+            description: None,
+            title: None,
+            decorative: false,
+        });
+        options.width = width;
+        options.height = height;
+        validate_picture_options(&options)?;
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let snapshot = candidate.story_range_paragraph_snapshot(&position.location)?;
+        let original_paragraph = CT_P::from_xml_fragment(snapshot.xml())?;
+        let original = original_paragraph.accepted_view();
+        if position.run_index > original.runs.len() {
+            return Err(Error::Other("picture run boundary is out of range".into()));
+        }
+        let ordinal = original
+            .runs
+            .iter()
+            .take(position.run_index)
+            .flat_map(|run| {
+                run.content
+                    .iter()
+                    .filter_map(|content| match content {
+                        RunContent::Drawing(drawing) => Some(drawing),
+                        _ => None,
+                    })
+                    .chain(run.alt_drawings.iter())
+            })
+            .filter(|drawing| {
+                drawing
+                    .inline
+                    .as_ref()
+                    .is_some_and(|i| !i.embed_id.is_empty())
+                    || drawing
+                        .anchor
+                        .as_ref()
+                        .is_some_and(|a| !a.embed_id.is_empty())
+            })
+            .count();
+        let relationship = candidate.add_image_relationship_checked(
+            position.location.story.part_name(),
+            image_data,
+            image_filename,
+        )?;
+        let drawing = picture_drawing(
+            &relationship,
+            candidate.identifiers.reserve_drawing_id()?,
+            &options,
+        );
+        let mut paragraph = CT_P::new();
+        paragraph.runs.push(CT_R {
+            alt_drawings: Vec::new(),
+            properties: None,
+            content: vec![RunContent::Drawing(drawing)],
+            extra_xml: Vec::new(),
+            extra_xml_positions: Vec::new(),
+        });
+        close_typed_story_drawing_namespaces(&mut paragraph)?;
+        candidate.insert_story_run_staged(position, paragraph.runs.remove(0))?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        let picture = reopened
+            .pictures()?
+            .into_iter()
+            .find(|picture| {
+                picture.location.story.kind == position.location.story.kind
+                    && picture.location.story.part_name == position.location.story.part_name
+                    && picture.location.story.owner_index == position.location.story.owner_index
+                    && picture.location.index_path == position.location.index_path
+                    && picture.ordinal == ordinal
+            })
+            .ok_or_else(|| Error::Other("inserted picture occurrence was not projected".into()))?;
+        self.commit_staged_mutation(reopened);
+        Ok(picture)
+    }
+
     /// Insert an inline picture paragraph after checked story content.
     ///
     /// Omitting `after` appends to the story. Width and height must either both
@@ -14749,6 +20817,43 @@ impl Document {
         width: Option<Length>,
         height: Option<Length>,
     ) -> Result<ContentLocation> {
+        self.insert_picture_to_story_with_options(
+            story,
+            after,
+            image_data,
+            image_filename,
+            width,
+            height,
+            None,
+        )
+    }
+
+    /// Import picture metadata and placement through the same checked owner transaction.
+    pub fn insert_picture_to_story_with_options(
+        &mut self,
+        story: &StoryId,
+        after: Option<&ContentLocation>,
+        image_data: &[u8],
+        image_filename: &str,
+        width: Option<Length>,
+        height: Option<Length>,
+        options: Option<PictureOptions>,
+    ) -> Result<ContentLocation> {
+        let format = oxml_media::ImageFormat::sniff(image_data)
+            .ok_or_else(|| Error::Other("picture image bytes are unsupported".to_owned()))?;
+        if matches!(
+            format,
+            oxml_media::ImageFormat::Png
+                | oxml_media::ImageFormat::Jpeg
+                | oxml_media::ImageFormat::Gif
+                | oxml_media::ImageFormat::Bmp
+                | oxml_media::ImageFormat::Webp
+        ) && oxml_media::probe(image_data).is_none()
+        {
+            return Err(Error::Other(
+                "picture image bytes are unsupported".to_owned(),
+            ));
+        }
         let (width, height) = match (width, height) {
             (Some(width), Some(height)) => (width, height),
             (None, None) => {
@@ -14768,6 +20873,19 @@ impl Document {
                 ));
             }
         };
+        let mut options = options.unwrap_or(PictureOptions {
+            width,
+            height,
+            crop: None,
+            anchor: None,
+            name: None,
+            description: None,
+            title: None,
+            decorative: false,
+        });
+        options.width = width;
+        options.height = height;
+        validate_picture_options(&options)?;
         let mut candidate = self.clone_for_staging();
         candidate.flush_to_package()?;
         let (source, mut story_owner) = candidate.story_source_and_owner(story)?;
@@ -14810,17 +20928,15 @@ impl Document {
             candidate.add_image_relationship_checked(&part_name, image_data, image_filename)?;
         let drawing_id = candidate.identifiers.reserve_drawing_id()?;
 
-        let mut inline = CT_Inline::new(&relationship_id, width.to_emu(), height.to_emu());
-        inline.doc_pr_id = drawing_id;
-        let run = CT_R {
+        let drawing = picture_drawing(&relationship_id, drawing_id, &options);
+        let mut paragraph = CT_P::new();
+        paragraph.runs.push(CT_R {
             alt_drawings: Vec::new(),
             properties: None,
-            content: vec![RunContent::Drawing(CT_Drawing::inline(inline))],
+            content: vec![RunContent::Drawing(drawing)],
             extra_xml: Vec::new(),
             extra_xml_positions: Vec::new(),
-        };
-        let mut paragraph = CT_P::new();
-        paragraph.runs.push(run);
+        });
         close_typed_story_drawing_namespaces(&mut paragraph)?;
         let mut fragment = ContentFragment::paragraph(paragraph)?;
         fragment.source_part_name = Some(part_name.clone());
@@ -14889,39 +21005,7 @@ impl Document {
         let relationship_id =
             candidate.add_image_relationship_checked(&owner, image_data, image_filename)?;
         let drawing_id = candidate.identifiers.reserve_drawing_id()?;
-        let source_rect = options.crop.map(|crop| SourceRect {
-            left: crop.left,
-            top: crop.top,
-            right: crop.right,
-            bottom: crop.bottom,
-        });
-        let drawing = match options.anchor {
-            Some(anchor_options) => {
-                let mut anchor = CT_Anchor::background(
-                    &relationship_id,
-                    options.width.to_emu(),
-                    options.height.to_emu(),
-                );
-                apply_picture_anchor(&mut anchor, anchor_options);
-                anchor.doc_pr_id = drawing_id;
-                anchor.name = options.name;
-                anchor.description = options.description;
-                anchor.source_rect = source_rect;
-                CT_Drawing::anchor(anchor)
-            }
-            None => {
-                let mut inline = CT_Inline::new(
-                    &relationship_id,
-                    options.width.to_emu(),
-                    options.height.to_emu(),
-                );
-                inline.doc_pr_id = drawing_id;
-                inline.name = options.name;
-                inline.description = options.description;
-                inline.source_rect = source_rect;
-                CT_Drawing::inline(inline)
-            }
-        };
+        let drawing = picture_drawing(&relationship_id, drawing_id, &options);
         let mut paragraph = CT_P::new();
         paragraph.runs.push(CT_R {
             alt_drawings: Vec::new(),
@@ -14942,6 +21026,196 @@ impl Document {
         let reopened = candidate.prepare_and_reopen_staged()?;
         self.commit_staged_mutation(reopened);
         Ok(())
+    }
+
+    fn append_internal_hyperlink_staged(
+        &mut self,
+        location: &ContentLocation,
+        text: &str,
+        bookmark: &str,
+        tooltip: Option<&str>,
+    ) -> Result<StoryRunPosition> {
+        for value in [Some(text), Some(bookmark), tooltip].into_iter().flatten() {
+            oxml_core::xml::reject_non_xml_characters("internal hyperlink", value)?;
+        }
+        crate::comments::validate_bookmark_name(bookmark)?;
+        let matching = self.story_ranges()?.into_iter().filter(|entry| {
+            matches!(entry.kind(), crate::StoryRangeKind::Bookmark { name, .. } if name == bookmark)
+        }).count();
+        if matching != 1 {
+            return Err(Error::Other(
+                "internal hyperlink bookmark is missing or ambiguous".into(),
+            ));
+        }
+        let story = self
+            .stories()?
+            .into_iter()
+            .find(|story| {
+                story.kind == location.story.kind
+                    && story.part_name == location.story.part_name
+                    && story.owner_index == location.story.owner_index
+            })
+            .ok_or_else(|| Error::Other("hyperlink story disappeared".into()))?;
+        let refreshed =
+            ContentLocation::new(story, location.item_kind, location.index_path.clone());
+        let run_index = self.edit_story_paragraph(&refreshed, |paragraph| {
+            let index = paragraph.run_count();
+            paragraph.add_internal_hyperlink(text, bookmark, tooltip);
+            Ok(index)
+        })?;
+        let story = self
+            .stories()?
+            .into_iter()
+            .find(|story| {
+                story.kind == location.story.kind
+                    && story.part_name == location.story.part_name
+                    && story.owner_index == location.story.owner_index
+            })
+            .ok_or_else(|| Error::Other("hyperlink story disappeared".into()))?;
+        Ok(StoryRunPosition {
+            location: ContentLocation::new(story, location.item_kind, location.index_path.clone()),
+            run_index,
+        })
+    }
+
+    /// Add a checked internal link without allocating an external relationship.
+    pub fn add_internal_hyperlink_at(
+        &mut self,
+        location: &ContentLocation,
+        text: &str,
+        bookmark: &str,
+        tooltip: Option<&str>,
+    ) -> Result<StoryRunPosition> {
+        self.story_range_paragraph_snapshot(location)?;
+        let mut candidate = self.clone_for_staging();
+        let result =
+            candidate.append_internal_hyperlink_staged(location, text, bookmark, tooltip)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        let story = reopened
+            .stories()?
+            .into_iter()
+            .find(|s| {
+                s.kind == result.location.story.kind
+                    && s.part_name == result.location.story.part_name
+                    && s.owner_index == result.location.story.owner_index
+            })
+            .ok_or_else(|| Error::Other("hyperlink story disappeared".into()))?;
+        self.commit_staged_mutation(reopened);
+        Ok(StoryRunPosition {
+            location: ContentLocation::new(
+                story,
+                result.location.item_kind,
+                result.location.index_path,
+            ),
+            run_index: result.run_index,
+        })
+    }
+
+    /// Stage a heading bookmark and source link together, with unique IDs and
+    /// one caller publication. Existing complete heading bookmarks are reused.
+    pub fn add_heading_hyperlink_at(
+        &mut self,
+        source: &ContentLocation,
+        heading: &ContentLocation,
+        text: &str,
+        tooltip: Option<&str>,
+    ) -> Result<StoryRunPosition> {
+        self.story_range_paragraph_snapshot(source)?;
+        let item = self.story_range_paragraph_snapshot(heading)?;
+        let paragraph = CT_P::from_xml_fragment(&item.xml)?;
+        let mut level = paragraph.properties.as_ref().and_then(|p| p.outline_lvl);
+        let mut style = paragraph
+            .properties
+            .as_ref()
+            .and_then(|p| p.style_id.as_deref());
+        let mut seen = HashSet::new();
+        while level.is_none() {
+            let Some(id) = style else {
+                break;
+            };
+            if !seen.insert(id) {
+                return Err(Error::Other("heading style ancestry is cyclic".into()));
+            }
+            let Some(value) = self.styles.get_by_id(id) else {
+                break;
+            };
+            level = value.ppr.as_ref().and_then(|p| p.outline_lvl);
+            style = value.based_on.as_deref();
+        }
+        if !level.is_some_and(|level| level < 9)
+            && Self::detect_heading_level_for_toc(&paragraph).is_none()
+        {
+            return Err(Error::Other(
+                "heading target is not an outline heading".into(),
+            ));
+        }
+        let run_count = paragraph.accepted_run_paths().len();
+        let ranges = self.story_ranges()?;
+        let existing = ranges.iter().find_map(|entry| {
+            let crate::StoryRangeKind::Bookmark { name, .. } = entry.kind() else {
+                return None;
+            };
+            let range = entry.range();
+            (crate::comments::validate_bookmark_name(name).is_ok()
+                && range.start.location == *heading
+                && range.end.location == *heading
+                && range.start.run_index == 0
+                && range.end.run_index == run_count)
+                .then(|| name.clone())
+        });
+        let mut candidate = self.clone_for_staging();
+        let name = match existing {
+            Some(name) => name,
+            None => {
+                let names = ranges
+                    .iter()
+                    .filter_map(|entry| match entry.kind() {
+                        crate::StoryRangeKind::Bookmark { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                let mut suffix = 1u32;
+                let name = loop {
+                    let name = format!("Heading_{suffix}");
+                    if !names.contains(name.as_str()) {
+                        break name;
+                    }
+                    suffix = suffix
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Other("heading bookmark names exhausted".into()))?;
+                };
+                candidate.add_story_bookmark(
+                    &name,
+                    crate::StoryRunRange {
+                        start: crate::StoryRunPosition {
+                            location: heading.clone(),
+                            run_index: 0,
+                        },
+                        end: crate::StoryRunPosition {
+                            location: heading.clone(),
+                            run_index: run_count,
+                        },
+                    },
+                )?;
+                name
+            }
+        };
+        let result = candidate.append_internal_hyperlink_staged(source, text, &name, tooltip)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        let story = reopened
+            .stories()?
+            .into_iter()
+            .find(|s| {
+                s.kind == source.story.kind
+                    && s.part_name == source.story.part_name
+                    && s.owner_index == source.story.owner_index
+            })
+            .ok_or_else(|| Error::Other("heading hyperlink source disappeared".into()))?;
+        self.commit_staged_mutation(reopened);
+        Ok(StoryRunPosition {
+            location: ContentLocation::new(story, source.item_kind, source.index_path.clone()),
+            run_index: result.run_index,
+        })
     }
 
     /// Append one modeled DrawingML text box with a VML compatibility fallback.
@@ -15120,6 +21394,384 @@ impl Document {
             )));
         }
         Ok(target)
+    }
+
+    /// Inventory supported pictures once per package source, in story and
+    /// physical source order. Only the existing accepted paragraph projection
+    /// admits a drawing. Unknown XML and unselected alternatives stay opaque.
+    pub fn pictures(&self) -> Result<Vec<PictureOccurrence>> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for source in self.story_sources()? {
+            let owners = scan_story_owners(&source.xml, source.root_kind)?;
+            for owner in owners {
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: source.part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                for (location, span) in
+                    story_range_paragraph_spans(&source.xml, &[(story.clone(), owner.clone())])?
+                        .into_iter()
+                        .flatten()
+                {
+                    let scope = story_namespace_scope_at(&source.xml, span.start)?;
+                    let closed =
+                        close_content_fragment_namespaces(&source.xml[span.clone()], &scope)?;
+                    let paragraph = CT_P::from_xml_fragment(&closed)?;
+                    let accepted = paragraph.accepted_view();
+                    let drawings = accepted.runs.iter().flat_map(|run| {
+                        run.content
+                            .iter()
+                            .filter_map(|content| match content {
+                                RunContent::Drawing(drawing) => Some(drawing),
+                                _ => None,
+                            })
+                            .chain(run.alt_drawings.iter())
+                    });
+                    let mut occurrences = Vec::new();
+                    let mut claimed = HashSet::new();
+                    for drawing in drawings {
+                        let (
+                            raw,
+                            embed,
+                            link,
+                            chart,
+                            _projected_width,
+                            _projected_height,
+                            name,
+                            description,
+                            title,
+                            decorative,
+                            anchored,
+                        ) = if let Some(inline) = &drawing.inline {
+                            (
+                                &inline.raw_xml,
+                                &inline.embed_id,
+                                &inline.link_id,
+                                &inline.chart_rel_id,
+                                inline.extent_cx.0,
+                                inline.extent_cy.0,
+                                &inline.name,
+                                &inline.description,
+                                &inline.title,
+                                inline.decorative,
+                                false,
+                            )
+                        } else if let Some(anchor) = &drawing.anchor {
+                            (
+                                &anchor.raw_xml,
+                                &anchor.embed_id,
+                                &anchor.link_id,
+                                &anchor.chart_rel_id,
+                                anchor.extent_cx.0,
+                                anchor.extent_cy.0,
+                                &anchor.name,
+                                &anchor.description,
+                                &anchor.title,
+                                anchor.decorative,
+                                true,
+                            )
+                        } else {
+                            continue;
+                        };
+                        if chart.is_some() || (embed.is_empty() && link.is_none()) {
+                            continue;
+                        }
+                        let raw = raw.as_ref().ok_or_else(|| {
+                            Error::Other("picture has no physical source identity".into())
+                        })?;
+                        if raw.is_empty() {
+                            return Err(Error::Other("picture source is empty".into()));
+                        }
+                        let Some((width, height)) = picture_source_extent(raw, &scope, anchored)?
+                        else {
+                            continue;
+                        };
+                        let matches = source.xml[span.clone()]
+                            .windows(raw.len())
+                            .enumerate()
+                            .filter(|(_, bytes)| *bytes == raw.as_slice())
+                            .map(|(offset, _)| span.start + offset)
+                            .collect::<Vec<_>>();
+                        // Physical copies that cannot be distinguished by the
+                        // admitted projection are not silently reinterpreted.
+                        let count = accepted
+                            .runs
+                            .iter()
+                            .flat_map(|run| {
+                                run.content
+                                    .iter()
+                                    .filter_map(|c| match c {
+                                        RunContent::Drawing(d) => Some(d),
+                                        _ => None,
+                                    })
+                                    .chain(run.alt_drawings.iter())
+                            })
+                            .filter(|d| {
+                                d.inline.as_ref().and_then(|i| i.raw_xml.as_ref()) == Some(raw)
+                                    || d.anchor.as_ref().and_then(|a| a.raw_xml.as_ref())
+                                        == Some(raw)
+                            })
+                            .count();
+                        if matches.len() != count {
+                            return Err(Error::Other(
+                                "picture has ambiguous alternate physical copies".into(),
+                            ));
+                        }
+                        let start = matches
+                            .into_iter()
+                            .find(|start| !claimed.contains(start))
+                            .ok_or_else(|| {
+                                Error::Other("picture source correspondence is missing".into())
+                            })?;
+                        claimed.insert(start);
+                        if width <= 0 || height <= 0 {
+                            return Err(Error::Other("picture extent must be positive".into()));
+                        }
+                        let relationship_id = link.as_deref().unwrap_or(embed);
+                        let (media_part_name, external_url, bytes, content_type) = if link.is_some()
+                        {
+                            let relationship = self
+                                .package
+                                .get_part_rels(&story.part_name)
+                                .and_then(|rels| rels.get_by_id(relationship_id))
+                                .ok_or_else(|| {
+                                    Error::Other("linked picture relationship is missing".into())
+                                })?;
+                            if relationship.rel_type != rel_types::IMAGE
+                                || relationship_is_internal(relationship)
+                            {
+                                return Err(Error::Other(
+                                    "linked picture must have an external image relationship"
+                                        .into(),
+                                ));
+                            }
+                            (
+                                None,
+                                Some(relationship.target.clone()),
+                                Vec::new(),
+                                String::new(),
+                            )
+                        } else {
+                            let target = self.validate_internal_relationship_for_story(
+                                &story,
+                                embed,
+                                rel_types::IMAGE,
+                            )?;
+                            let target = self
+                                .package
+                                .parts
+                                .keys()
+                                .filter(|name| {
+                                    OpcPackage::resolve_rel_target("/", name)
+                                        .eq_ignore_ascii_case(&target)
+                                })
+                                .min()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    Error::Other("picture media identity is missing".into())
+                                })?;
+                            let bytes = self
+                                .package
+                                .get_part(&target)
+                                .ok_or_else(|| Error::Other("picture media is missing".into()))?
+                                .to_vec();
+                            let content_type = self
+                                .package
+                                .content_types
+                                .content_type_for(&target)
+                                .filter(|kind| kind.starts_with("image/"))
+                                .ok_or_else(|| {
+                                    Error::Other("picture media content type is unsupported".into())
+                                })?
+                                .to_owned();
+                            (Some(target), None, bytes, content_type)
+                        };
+                        occurrences.push((
+                            start,
+                            PictureOccurrence {
+                                location: location.clone(),
+                                ordinal: 0,
+                                relationship_id: relationship_id.to_owned(),
+                                media_part_name,
+                                external_url,
+                                width,
+                                height,
+                                name: name.clone(),
+                                description: description.clone(),
+                                title: title.clone(),
+                                decorative,
+                                anchored,
+                                content_type,
+                                bytes,
+                                source: raw.clone(),
+                            },
+                        ));
+                    }
+                    occurrences.sort_by_key(|(start, _)| *start);
+                    for (ordinal, (start, mut picture)) in occurrences.into_iter().enumerate() {
+                        picture.ordinal = ordinal;
+                        if seen.insert((source.part_name.clone(), start)) {
+                            result.push(picture);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Resize one frozen occurrence, preserving shared media and every other
+    /// physical drawing. Changed source or unsupported copies refuse atomically.
+    pub fn set_picture_size_at(
+        &mut self,
+        picture: &PictureOccurrence,
+        width: Length,
+        height: Length,
+    ) -> Result<()> {
+        if picture.external_url.is_some() {
+            return Err(Error::Other(
+                "linked picture resizing is unsupported".into(),
+            ));
+        }
+        let (width, height) = (width.to_emu(), height.to_emu());
+        if width <= 0 || height <= 0 {
+            return Err(Error::Other("picture dimensions must be positive".into()));
+        }
+        let current = self
+            .pictures()?
+            .into_iter()
+            .find(|current| {
+                current.location == picture.location && current.ordinal == picture.ordinal
+            })
+            .ok_or_else(|| Error::Other("picture occurrence is stale or foreign".into()))?;
+        if current != *picture {
+            return Err(Error::Other("picture occurrence source changed".into()));
+        }
+        if (width, height) == (picture.width, picture.height) {
+            return Ok(());
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let (source, owner) = candidate.story_source_and_owner(&picture.location.story)?;
+        let part_name = source.part_name.clone();
+        let spans = story_range_paragraph_spans(
+            &source.xml,
+            &[(picture.location.story.clone(), owner.clone())],
+        )?
+        .into_iter()
+        .flatten();
+        let span = spans
+            .into_iter()
+            .find(|(location, _)| location == &picture.location)
+            .map(|(_, span)| span)
+            .ok_or_else(|| Error::Other("picture paragraph disappeared".into()))?;
+        let scope = story_namespace_scope_at(&source.xml, span.start)?;
+        let paragraph = &source.xml[span.clone()];
+        let matches = paragraph
+            .windows(picture.source.len())
+            .enumerate()
+            .filter(|(_, bytes)| *bytes == picture.source.as_slice())
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        let equal_before = candidate
+            .pictures()?
+            .into_iter()
+            .filter(|other| {
+                other.location == picture.location
+                    && other.ordinal < picture.ordinal
+                    && other.source == picture.source
+            })
+            .count();
+        let offset = *matches
+            .get(equal_before)
+            .ok_or_else(|| Error::Other("picture physical source disappeared".into()))?;
+        let closed = close_content_fragment_namespaces(&picture.source, &scope)?;
+        let (resized, count) =
+            resize_story_pictures(&closed, &picture.relationship_id, width, height)?;
+        if count != 1 {
+            return Err(Error::Other(
+                "picture occurrence has unsupported nested representation".into(),
+            ));
+        }
+        // Namespace closure is projection-only. Numeric edits are transported
+        // back onto the exact physical owner without rewriting its bindings.
+        let (boundaries, _) = comment_namespace_source_boundaries(&picture.source, &closed)?
+            .ok_or_else(|| Error::Other("picture namespace closure changed source".into()))?;
+        let mut edits = Vec::new();
+        let mut before_reader = NsReader::from_reader(closed.as_slice());
+        let mut after_reader = NsReader::from_reader(resized.as_slice());
+        loop {
+            let start = before_reader.buffer_position() as usize;
+            let before = before_reader
+                .read_event()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let after = after_reader
+                .read_event()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            if before != after {
+                let physical_start = boundaries
+                    .iter()
+                    .find_map(|(raw, closed)| (*closed == start).then_some(*raw))
+                    .ok_or_else(|| Error::Other("picture edit has no physical boundary".into()))?;
+                let end = before_reader.buffer_position() as usize;
+                let physical_end = boundaries
+                    .iter()
+                    .find_map(|(raw, closed)| (*closed == end).then_some(*raw))
+                    .ok_or_else(|| Error::Other("picture edit has no physical boundary".into()))?;
+                // Only numeric values change, the original element spelling
+                // and all other attributes remain byte-exact.
+                let Event::Empty(ref before_tag) = before else {
+                    return Err(Error::Other("picture extent source is unsupported".into()));
+                };
+                let Event::Empty(ref after_tag) = after else {
+                    return Err(Error::Other("picture extent source is unsupported".into()));
+                };
+                let mut tag = picture.source[physical_start..physical_end].to_vec();
+                let mut values = Vec::new();
+                for (a, b) in before_tag.attributes().zip(after_tag.attributes()) {
+                    let (a, b) = (
+                        a.map_err(|e| Error::Other(e.to_string()))?,
+                        b.map_err(|e| Error::Other(e.to_string()))?,
+                    );
+                    if a.key != b.key {
+                        return Err(Error::Other(
+                            "picture resize changed attribute ownership".into(),
+                        ));
+                    }
+                    if a.value != b.value {
+                        let (a_start, a_end) = story_attribute_value_span(&tag, a.key.as_ref())
+                            .ok_or_else(|| {
+                                Error::Other("picture extent attribute missing".into())
+                            })?;
+                        values.push((a_start..a_end, b.value.to_vec()));
+                    }
+                }
+                values.sort_by_key(|(range, _)| range.start);
+                for (range, value) in values.into_iter().rev() {
+                    tag.splice(range, value);
+                }
+                edits.push((physical_start..physical_end, tag));
+            }
+            if matches!(before, Event::Eof) {
+                break;
+            }
+        }
+        let mut raw = picture.source.clone();
+        for (range, value) in edits.into_iter().rev() {
+            raw.splice(range, value);
+        }
+        let mut updated = source.xml.into_owned();
+        updated.splice(
+            span.start + offset..span.start + offset + picture.source.len(),
+            raw,
+        );
+        set_story_source_xml(&mut candidate, &part_name, updated)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
     }
 
     /// Fetch image bytes through a checked story-local relationship.
@@ -15317,6 +21969,1221 @@ impl Document {
     }
 
     /// Replace the visible text of one checked story item atomically.
+    /// Replace one checked story item in its actual package owner.
+    ///
+    /// The item kind, physical story and surrounding bytes remain unchanged.
+    /// Relationship-bearing content must already belong to this story part.
+    pub fn replace_story_content(
+        &mut self,
+        location: &ContentLocation,
+        fragment: ContentFragment,
+    ) -> Result<()> {
+        if location.is_end
+            || location.item_kind != fragment.kind
+            || location.item_kind == StoryItemKind::PreservedNode
+        {
+            return Err(Error::Other(
+                "story replacement requires the same modeled item kind".to_owned(),
+            ));
+        }
+        reject_section_owning_content_fragment(&fragment)?;
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let (source, item) = if location.item_kind == StoryItemKind::Paragraph {
+            candidate.story_range_paragraph_source(location)?
+        } else {
+            candidate.story_item_source(location)?
+        };
+        if item.kind != location.item_kind {
+            return Err(StoryError::KindMismatch {
+                expected: location.item_kind,
+                actual: item.kind,
+            }
+            .into());
+        }
+        let part_name = source.part_name.clone();
+        let scope = story_namespace_scope_at(&source.xml, item.full.start)?;
+        let mut xml = source.xml.into_owned();
+        let replacement = content_fragment_for_insertion(&candidate, &location.story, &fragment)?;
+        let replacement = close_content_fragment_namespaces(&replacement, &scope)?;
+        xml.splice(item.full, replacement);
+        set_story_source_xml(&mut candidate, &part_name, xml)?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Apply checked element content only when paragraph-owned section profiles
+    /// match the selected original. Generic content insertion keeps its stricter
+    /// section-owner refusal contract.
+    fn replace_checked_element_content(
+        &mut self,
+        location: &ContentLocation,
+        fragment: ContentFragment,
+    ) -> Result<()> {
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE clone-before");
+        let mut candidate = self.clone_for_staging();
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE clone-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE flush-before");
+        candidate.flush_to_package()?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE flush-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE candidate-source-before");
+        let (source, item) = if location.item_kind == StoryItemKind::Paragraph {
+            candidate.story_range_paragraph_source(location)?
+        } else {
+            candidate.story_item_source(location)?
+        };
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE candidate-source-after");
+        if location.is_end || item.kind != fragment.kind || item.kind != location.item_kind {
+            return Err(Error::Other(
+                "element XML requires the same existing physical owner".into(),
+            ));
+        }
+        let part_name = source.part_name.clone();
+        let scope = story_namespace_scope_at(&source.xml, item.full.start)?;
+        let original = close_content_fragment_namespaces(&source.xml[item.full.clone()], &scope)?;
+        let incoming = close_content_fragment_namespaces(&fragment.xml, &fragment.namespace_scope)?;
+        let profiles = |xml: &[u8]| -> Result<Vec<CT_SectPr>> {
+            let mut wrapped =
+                format!(r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>"#).into_bytes();
+            wrapped.extend_from_slice(xml);
+            wrapped.extend_from_slice(b"</w:body></w:document>");
+            let document = CT_Document::from_xml(&wrapped)?;
+            let mut profiles = Vec::new();
+            visit_body_paragraphs(&document.body.content, false, &mut |paragraph| {
+                if let Some(section) = paragraph
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.sect_pr.as_ref())
+                {
+                    profiles.push(section.clone());
+                }
+            });
+            Ok(profiles)
+        };
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE profiles-before");
+        if profiles(&original)? != profiles(&incoming)? {
+            return Err(Error::Other("element XML changed or introduced paragraph-owned section properties are unsupported, use the checked section owner".into()));
+        }
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE profiles-after");
+        let mut xml = source.xml.into_owned();
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE insertion-before");
+        let replacement = content_fragment_for_insertion(&candidate, &location.story, &fragment)?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE insertion-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE insertion-close-before");
+        let replacement = close_content_fragment_namespaces(&replacement, &scope)?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE insertion-close-after");
+
+        xml.splice(item.full, replacement);
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE setsource-before");
+        set_story_source_xml(&mut candidate, &part_name, xml)?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE setsource-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE comments-before");
+        candidate.reconcile_comment_removal(self)?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE comments-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE reopen-before");
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE reopen-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE commit-before");
+        self.commit_staged_mutation(reopened);
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE commit-after");
+
+        Ok(())
+    }
+
+    /// Namespace-complete XML for the held physical paragraph owner.
+    #[doc(hidden)]
+    pub fn paragraph_element_xml(&self, location: &ContentLocation) -> Result<Vec<u8>> {
+        Ok(self
+            .story_range_paragraph_snapshot(location)?
+            .xml()
+            .to_vec())
+    }
+
+    /// Namespace-complete XML for an accepted run in a held paragraph owner.
+    #[doc(hidden)]
+    pub fn run_element_xml(
+        &self,
+        location: &ContentLocation,
+        path: &rdocx_oxml::text::AcceptedRunPath,
+    ) -> Result<Vec<u8>> {
+        let snapshot = self.story_range_paragraph_snapshot(location)?;
+        let paragraph = CT_P::from_xml_fragment(snapshot.xml())?;
+        let run = paragraph
+            .accepted_run(path)
+            .ok_or_else(|| Error::Other("element XML run owner is absent".into()))?;
+        let mut bytes = Vec::new();
+        run.to_xml(&mut Writer::new(&mut bytes))?;
+        let scope = BTreeMap::from([
+            ("w".to_owned(), WORD_NAMESPACE.to_owned()),
+            ("r".to_owned(), rdocx_oxml::namespace::R_NS.to_owned()),
+        ]);
+        close_content_fragment_namespaces(&bytes, &scope)
+    }
+
+    /// Namespace-complete XML for an existing physical table owner.
+    #[doc(hidden)]
+    pub fn table_element_xml(&self, location: &ContentLocation) -> Result<Vec<u8>> {
+        let (source, item) = self.story_item_source(location)?;
+        if item.kind != StoryItemKind::Table || location.is_end {
+            return Err(Error::Other(
+                "element XML needs an existing physical table owner".into(),
+            ));
+        }
+        let scope = story_namespace_scope_at(&source.xml, item.full.start)?;
+        close_content_fragment_namespaces(&source.xml[item.full], &scope)
+    }
+
+    /// Namespace-complete XML for a physical cell, including an empty cell.
+    #[doc(hidden)]
+    pub fn cell_element_xml(
+        &self,
+        table: &ContentLocation,
+        row: usize,
+        cell: usize,
+    ) -> Result<Vec<u8>> {
+        let owner = self.story_table_cell(table, row, cell)?;
+        let (source, span) = self.story_source_and_owner(&owner)?;
+        let scope = story_namespace_scope_at(&source.xml, span.full.start)?;
+        close_content_fragment_namespaces(&source.xml[span.full], &scope)
+    }
+
+    /// Namespace-complete XML for an existing section properties owner.
+    #[doc(hidden)]
+    pub fn section_properties_xml(&self, index: usize) -> Result<Vec<u8>> {
+        let section = self
+            .section(index)
+            .ok_or_else(|| Error::Other("element XML section owner is absent".into()))?;
+        let mut bytes = Vec::new();
+        section.properties().to_xml(&mut Writer::new(&mut bytes))?;
+        let scope = BTreeMap::from([
+            ("w".to_owned(), WORD_NAMESPACE.to_owned()),
+            ("r".to_owned(), rdocx_oxml::namespace::R_NS.to_owned()),
+        ]);
+        close_content_fragment_namespaces(&bytes, &scope)
+    }
+
+    /// Replace the checked existing paragraph owner atomically.
+    #[doc(hidden)]
+    pub fn replace_paragraph_xml(&mut self, location: &ContentLocation, xml: &str) -> Result<()> {
+        self.validate_model_resource_limits()?;
+        let selected = self.story_range_paragraph_snapshot(location)?;
+        if selected.xml() == xml.as_bytes() {
+            return Ok(());
+        }
+        let paragraph = CT_P::from_xml_fragment_checked(xml.as_bytes())?;
+        validate_element_owner_relationships(
+            self,
+            &location.story,
+            WordXmlOwner::Paragraph(&paragraph),
+        )?;
+        validate_element_xml_identity_change(
+            self,
+            &location.story,
+            selected.xml(),
+            xml.as_bytes(),
+        )?;
+        let mut replacement = Vec::new();
+        paragraph.to_xml(&mut Writer::new(&mut replacement))?;
+        let fragment = ContentFragment {
+            kind: StoryItemKind::Paragraph,
+            xml: replacement,
+            namespace_scope: BTreeMap::new(),
+            source_part_name: Some(location.story.part_name.clone()),
+            source_story_kind: Some(location.story.kind),
+            source_owner_index: Some(location.story.owner_index),
+        };
+        self.replace_checked_element_content(location, fragment)
+    }
+
+    #[doc(hidden)]
+    /// Replace one existing accepted regular run through its physical
+    /// paragraph owner, never by inserting a run at an old numeric slot.
+    pub fn replace_run_xml(&mut self, position: &StoryRunPosition, xml: &str) -> Result<()> {
+        self.validate_model_resource_limits()?;
+        let snapshot = self.story_range_paragraph_snapshot(&position.location)?;
+        let mut paragraph = CT_P::from_xml_fragment(snapshot.xml())?;
+        let path = paragraph
+            .accepted_run_paths()
+            .get(position.run_index)
+            .cloned()
+            .ok_or_else(|| Error::Other("element XML run index is out of range".into()))?;
+        let current = paragraph
+            .accepted_run(&path)
+            .ok_or_else(|| Error::Other("element XML run owner is absent".into()))?;
+        if current
+            .content
+            .iter()
+            .any(|content| matches!(content, RunContent::Field(_)))
+        {
+            return Err(Error::Other(
+                "element XML regular run replacement cannot replace a field owner".into(),
+            ));
+        }
+        let mut current_xml = Vec::new();
+        current.to_xml(&mut Writer::new(&mut current_xml))?;
+        let bindings = BTreeMap::from([
+            ("w".to_owned(), WORD_NAMESPACE.to_owned()),
+            ("r".to_owned(), rdocx_oxml::namespace::R_NS.to_owned()),
+        ]);
+        let current_xml = close_content_fragment_namespaces(&current_xml, &bindings)?;
+        if current_xml == xml.as_bytes() {
+            return Ok(());
+        }
+        let replacement = CT_R::from_xml_fragment_checked(xml.as_bytes())?;
+        validate_element_owner_relationships(
+            self,
+            &position.location.story,
+            WordXmlOwner::Run(&replacement),
+        )?;
+        validate_element_xml_identity_change(
+            self,
+            &position.location.story,
+            &current_xml,
+            xml.as_bytes(),
+        )?;
+        if !paragraph.replace_accepted_run(&path, replacement)? {
+            return Err(Error::Other("element XML run owner disappeared".into()));
+        }
+        let mut fragment = ContentFragment::paragraph(paragraph)?;
+        fragment.source_part_name = Some(position.location.story.part_name.clone());
+        fragment.source_story_kind = Some(position.location.story.kind);
+        fragment.source_owner_index = Some(position.location.story.owner_index);
+        self.replace_checked_element_content(&position.location, fragment)
+    }
+
+    /// Replace one checked physical table atomically.
+    #[doc(hidden)]
+    pub fn replace_table_xml(&mut self, location: &ContentLocation, xml: &str) -> Result<()> {
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE resource-before");
+        self.validate_model_resource_limits()?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE resource-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE source-before");
+        let (source, item) = self.story_item_source(location)?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE source-after");
+
+        if item.kind != StoryItemKind::Table || location.is_end {
+            return Err(Error::Other(
+                "element XML needs an existing physical table owner".into(),
+            ));
+        }
+        let scope = story_namespace_scope_at(&source.xml, item.full.start)?;
+        let current = close_content_fragment_namespaces(&source.xml[item.full], &scope)?;
+        if current == xml.as_bytes() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE checkedparse-before");
+        let table = CT_Tbl::from_xml_fragment_checked(xml.as_bytes())?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE checkedparse-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE relationships-before");
+        validate_element_owner_relationships(self, &location.story, WordXmlOwner::Table(&table))?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE relationships-after");
+
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE identity-before");
+        validate_element_xml_identity_change(self, &location.story, &current, xml.as_bytes())?;
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE identity-after");
+
+        let fragment = ContentFragment {
+            kind: StoryItemKind::Table,
+            xml: xml.as_bytes().to_vec(),
+            namespace_scope: BTreeMap::new(),
+            source_part_name: Some(location.story.part_name.clone()),
+            source_story_kind: Some(location.story.kind),
+            source_owner_index: Some(location.story.owner_index),
+        };
+        #[cfg(test)]
+        eprintln!("FX211_REPLACE_STAGE element-helper-before");
+        #[cfg(test)]
+        {
+            let result = self.replace_checked_element_content(location, fragment);
+            eprintln!("FX211_REPLACE_STAGE element-helper-after");
+            result
+        }
+        #[cfg(not(test))]
+        self.replace_checked_element_content(location, fragment)
+    }
+
+    /// Replace exactly the source-qualified cell resolved by the held table.
+    #[doc(hidden)]
+    pub fn replace_cell_xml(
+        &mut self,
+        table: &ContentLocation,
+        row: usize,
+        cell: usize,
+        xml: &str,
+    ) -> Result<()> {
+        self.validate_model_resource_limits()?;
+        let owner = self.story_table_cell(table, row, cell)?;
+        let (source, span) = self.story_source_and_owner(&owner)?;
+        let scope = story_namespace_scope_at(&source.xml, span.full.start)?;
+        let current = close_content_fragment_namespaces(&source.xml[span.full.clone()], &scope)?;
+        if current == xml.as_bytes() {
+            return Ok(());
+        }
+        let replacement = CT_Tc::from_xml_fragment_checked(xml.as_bytes())?;
+        if replacement.content.is_empty() {
+            return Err(Error::Other(
+                "element XML cell requires modeled block content".into(),
+            ));
+        }
+        validate_element_owner_relationships(self, &owner, WordXmlOwner::Cell(&replacement))?;
+        validate_element_xml_identity_change(self, &owner, &current, xml.as_bytes())?;
+        let original_table = self.story_table_model(table)?;
+        let original_cell = original_table
+            .rows
+            .get(row)
+            .and_then(|row| row.cells.get(cell))
+            .ok_or_else(|| Error::Other("element XML original physical cell disappeared".into()))?;
+        let profiles = |cell: &CT_Tc| {
+            let mut profiles = Vec::new();
+            visit_cell(cell, false, &mut |paragraph| {
+                if let Some(section) = paragraph
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.sect_pr.as_ref())
+                {
+                    profiles.push(section.clone());
+                }
+            });
+            profiles
+        };
+        if profiles(original_cell) != profiles(&replacement) {
+            return Err(Error::Other("element XML changed or introduced paragraph-owned section properties are unsupported, use the checked section owner".into()));
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let (source, span) = candidate.story_source_and_owner(&owner)?;
+        let scope = story_namespace_scope_at(&source.xml, span.full.start)?;
+        let part = source.part_name.clone();
+        let mut bytes = source.xml.into_owned();
+        bytes.splice(
+            span.full,
+            close_content_fragment_namespaces(xml.as_bytes(), &scope)?,
+        );
+        set_story_source_xml(&mut candidate, &part, bytes)?;
+        // Only the closed candidate changed: replacing the qualified cell
+        // cannot move its enclosing table or preceding owner boundary.
+        // Rebind that candidate's story fingerprint before its topology check.
+        let mut enclosing = table.clone();
+        enclosing.story = candidate
+            .stories()?
+            .into_iter()
+            .find(|story| {
+                story.kind == table.story.kind
+                    && story.part_name == table.story.part_name
+                    && story.owner_index == table.story.owner_index
+            })
+            .ok_or_else(|| Error::Other("element XML enclosing table story disappeared".into()))?;
+        validate_table_topology(&candidate.story_table_model(&enclosing)?)?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Replace an existing physical section owner through a closed candidate.
+    #[doc(hidden)]
+    pub fn replace_section_properties_xml(&mut self, index: usize, xml: &str) -> Result<()> {
+        self.validate_model_resource_limits()?;
+        let current = self
+            .section(index)
+            .ok_or_else(|| Error::Other("element XML section owner is absent".into()))?;
+        let replacement = CT_SectPr::from_xml_fragment_checked(xml.as_bytes())?;
+        for (references, kind) in [
+            (&replacement.header_refs, HeaderFooterKind::Header),
+            (&replacement.footer_refs, HeaderFooterKind::Footer),
+        ] {
+            let mut types = Vec::new();
+            for reference in references {
+                if types.contains(&reference.hdr_ftr_type) {
+                    return Err(Error::Other(
+                        "element XML section has duplicate header/footer types".into(),
+                    ));
+                }
+                types.push(reference.hdr_ftr_type);
+                let part = self
+                    .header_footer_part_name(&reference.rel_id, kind == HeaderFooterKind::Header)
+                    .ok_or_else(|| {
+                        Error::Other(
+                            "element XML section relationship kind or mode is invalid".into(),
+                        )
+                    })?;
+                if self.package.content_types.content_type_for(&part) != Some(kind.content_type())
+                    || self
+                        .load_header_footer(&reference.rel_id, kind == HeaderFooterKind::Header)
+                        .is_none()
+                {
+                    return Err(Error::Other(
+                        "element XML section relationship target is invalid".into(),
+                    ));
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        current.properties().to_xml(&mut Writer::new(&mut bytes))?;
+        let scope = BTreeMap::from([
+            ("w".to_owned(), WORD_NAMESPACE.to_owned()),
+            ("r".to_owned(), rdocx_oxml::namespace::R_NS.to_owned()),
+        ]);
+        if close_content_fragment_namespaces(&bytes, &scope)? == xml.as_bytes() {
+            return Ok(());
+        }
+        let mut candidate = self.clone_for_staging();
+        *candidate
+            .section_mut(index)
+            .ok_or_else(|| Error::Other("element XML section owner disappeared".into()))?
+            .inner = replacement;
+        if candidate
+            .validate_sections()
+            .findings
+            .iter()
+            .any(|finding| {
+                finding.severity == ValidationSeverity::Error
+                    && finding.message == format!("section {index} has nonpositive page size")
+            })
+        {
+            return Err(Error::Other(
+                "element XML section geometry has nonpositive page size".into(),
+            ));
+        }
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    fn story_table_model(&self, location: &ContentLocation) -> Result<CT_Tbl> {
+        if location.item_kind != StoryItemKind::Table || location.is_end {
+            return Err(Error::Other(
+                "rich table needs an existing table location".to_owned(),
+            ));
+        }
+        let (source, item) = self.story_item_source(location)?;
+        Self::story_table_from_source(&source.xml, &item)
+    }
+
+    fn story_table_from_source(xml: &[u8], item: &StoryItemSpan) -> Result<CT_Tbl> {
+        let scope = story_namespace_scope_at(xml, item.full.start)?;
+        let closed = close_content_fragment_namespaces(&xml[item.full.clone()], &scope)?;
+        let mut wrapped =
+            format!(r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>"#).into_bytes();
+        wrapped.extend_from_slice(&closed);
+        wrapped.extend_from_slice(b"</w:body></w:document>");
+        let mut parsed = CT_Document::from_xml(&wrapped)?;
+        if parsed.body.content.len() != 1 {
+            return Err(Error::Other(
+                "rich table has ambiguous physical content".to_owned(),
+            ));
+        }
+        match parsed.body.content.remove(0) {
+            BodyContent::Table(table) => Ok(table),
+            _ => Err(Error::Other(
+                "rich table source is not a qualified table".to_owned(),
+            )),
+        }
+    }
+
+    /// Read owned facts from one source-qualified table.
+    #[doc(hidden)]
+    pub fn read_story_table<T>(
+        &self,
+        location: &ContentLocation,
+        read: impl FnOnce(TableRef<'_>) -> T,
+    ) -> Result<T> {
+        let table = self.story_table_model(location)?;
+        Ok(read(TableRef { inner: &table }))
+    }
+
+    /// Edit one source-qualified table and publish it atomically.
+    #[doc(hidden)]
+    pub fn edit_story_table<T>(
+        &mut self,
+        location: &ContentLocation,
+        edit: impl FnOnce(&mut Table<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut table = self.story_table_model(location)?;
+        let result = edit(&mut Table { inner: &mut table })?;
+        self.replace_story_content(location, ContentFragment::table(table)?)?;
+        Ok(result)
+    }
+
+    /// Snapshot all checked Word owners within one immutable source inventory.
+    ///
+    /// The four families have the same order, payload and admission as story
+    /// items, physical table cells, range paragraphs and hyperlinks respectively.
+    /// Source qualification is shared only within this call, never across edits.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)] // One cross-crate projection carries four existing owned families.
+    pub fn story_owner_snapshots(
+        &self,
+    ) -> Result<(
+        Vec<StoryItemSnapshot>,
+        Vec<(ContentLocation, usize, usize, StoryId)>,
+        Vec<(ContentLocation, Vec<u8>)>,
+        Vec<(ContentLocation, LinkInfo)>,
+    )> {
+        let mut snapshots = Vec::new();
+        let mut cells = Vec::new();
+        let mut paragraphs = Vec::new();
+        let mut links = Vec::new();
+        let mut seen = HashSet::new();
+        let mut emitted_cells = HashSet::new();
+        for source in self.story_sources()? {
+            let physical_owners = scan_story_owners(&source.xml, source.root_kind)?;
+            let owner_scopes = story_namespace_scopes_at(
+                &source.xml,
+                physical_owners.iter().map(|owner| owner.full.start),
+            )?;
+            let mut owners = Vec::with_capacity(physical_owners.len());
+            let mut inventories = Vec::with_capacity(physical_owners.len());
+            let mut admitted = Vec::with_capacity(physical_owners.len());
+            for owner in &physical_owners {
+                let scope = owner_scopes.get(&owner.full.start).ok_or_else(|| {
+                    Error::Other("story owner namespace scope was not inventoried".into())
+                })?;
+                inventories.push(scan_story_items_with_scope(&source.xml, owner, scope)?);
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: source.part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                admitted.push(seen.insert((
+                    owner.kind,
+                    source.part_name.clone(),
+                    owner.owner_index,
+                )));
+                owners.push((story, owner.clone()));
+            }
+            let scopes = story_namespace_scopes_at(
+                &source.xml,
+                inventories
+                    .iter()
+                    .flatten()
+                    .flat_map(|item| [item.scan.start, item.full.start]),
+            )?;
+            cells.extend(Self::story_table_cells_from_inventory(
+                &source,
+                &physical_owners,
+                &inventories,
+                &scopes,
+                &mut emitted_cells,
+            )?);
+            let paragraph_spans = story_range_paragraph_spans_from_inventory(
+                &source.xml,
+                &owners,
+                &inventories,
+                &scopes,
+            )?;
+            let mut link_spans = Vec::with_capacity(owners.len());
+            for ((story, _), items) in owners.iter().zip(&inventories) {
+                link_spans.push(ordered_story_link_spans(
+                    &source.xml,
+                    story,
+                    items.clone(),
+                    &scopes,
+                )?);
+            }
+            let leaf_scopes = story_namespace_scopes_at(
+                &source.xml,
+                paragraph_spans
+                    .iter()
+                    .flatten()
+                    .map(|(_, span)| span.start)
+                    .chain(link_spans.iter().flatten().map(|(_, link)| link.full.start)),
+            )?;
+            for (owner_index, ((story, _), items)) in owners.iter().zip(&inventories).enumerate() {
+                if !admitted[owner_index] {
+                    continue;
+                }
+                let mut direct_items = Vec::new();
+                if story.kind == StoryKind::Body {
+                    for item in items.iter().filter(|item| item.direct_owner_child) {
+                        if item.kind != StoryItemKind::PreservedNode
+                            || !content_fragment_root_is_section_properties(&source.xml, item)?
+                        {
+                            direct_items.push(item);
+                        }
+                    }
+                }
+                let mut direct_cursor = 0;
+                for (index, item) in items.iter().enumerate() {
+                    while direct_items
+                        .get(direct_cursor)
+                        .is_some_and(|direct| direct.full.end <= item.full.start)
+                    {
+                        direct_cursor += 1;
+                    }
+                    let direct_body_index = direct_items.get(direct_cursor).and_then(|direct| {
+                        (direct.full.start <= item.full.start && item.full.end <= direct.full.end)
+                            .then_some(direct_cursor)
+                    });
+                    let scope = scopes.get(&item.scan.start).ok_or_else(|| {
+                        Error::Other("story item namespace scope was not inventoried".into())
+                    })?;
+                    let text = story_item_text_with_scope(&source.xml, item, scope, items)?;
+                    let xml = if item.complex_field {
+                        complex_story_field_xml(&source.xml, item)?
+                    } else {
+                        source.xml[item.full.clone()].to_vec()
+                    };
+                    snapshots.push(StoryItemSnapshot {
+                        location: ContentLocation::new(story.clone(), item.kind, vec![index]),
+                        direct_body_index,
+                        direct_child: item.direct_owner_child,
+                        text,
+                        xml,
+                    });
+                }
+            }
+            for (index, mut spans) in paragraph_spans.into_iter().enumerate() {
+                if !admitted[index] {
+                    continue;
+                }
+                spans.sort_by_key(|(_, span)| span.start);
+                for (location, span) in spans {
+                    let scope = leaf_scopes.get(&span.start).ok_or_else(|| {
+                        Error::Other("story paragraph namespace scope was not inventoried".into())
+                    })?;
+                    paragraphs.push((
+                        location,
+                        close_content_fragment_namespaces(&source.xml[span], scope)?,
+                    ));
+                }
+            }
+            for (index, spans) in link_spans.into_iter().enumerate() {
+                if !admitted[index] {
+                    continue;
+                }
+                for (location, span) in spans {
+                    let scope = leaf_scopes.get(&span.full.start).ok_or_else(|| {
+                        Error::Other("story hyperlink namespace scope was not inventoried".into())
+                    })?;
+                    let info = self.story_link_info(location.story(), &source.xml, span, scope)?;
+                    links.push((location, info));
+                }
+            }
+        }
+        Ok((snapshots, cells, paragraphs, links))
+    }
+
+    /// Snapshot direct physical cell coordinates and their checked source owners.
+    ///
+    /// Each source is materialized once. Outer tables are parsed once and their
+    /// nested models participate in the same physical correspondence traversal.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    #[cfg(test)]
+    fn story_table_cell_snapshots(&self) -> Result<Vec<(ContentLocation, usize, usize, StoryId)>> {
+        let mut result = Vec::new();
+        let mut emitted = HashSet::new();
+        for source in self.story_sources()? {
+            let owners = scan_story_owners(&source.xml, source.root_kind)?;
+            let scopes = story_namespace_scopes_at(
+                &source.xml,
+                owners.iter().map(|owner| owner.full.start),
+            )?;
+            let mut tables = Vec::new();
+            for owner in &owners {
+                let scope = scopes
+                    .get(&owner.full.start)
+                    .ok_or_else(|| Error::Other("table owner scope missing".into()))?;
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: source.part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                for (index, item) in scan_story_items_with_scope(&source.xml, owner, scope)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if item.kind == StoryItemKind::Table {
+                        tables.push((
+                            item.full,
+                            ContentLocation::new(story.clone(), item.kind, vec![index]),
+                        ));
+                    }
+                }
+            }
+            // Recover physical order with one lexical pass instead of sorting
+            // a growing table inventory. Qualification came from the owner scan.
+            let mut by_start = tables
+                .into_iter()
+                .map(|item| (item.0.start, item))
+                .collect::<HashMap<_, _>>();
+            let mut tables = Vec::with_capacity(by_start.len());
+            let mut reader = quick_xml::Reader::from_reader(source.xml.as_ref());
+            let mut buffer = Vec::new();
+            loop {
+                let before = reader.buffer_position() as usize;
+                match reader.read_event_into(&mut buffer).map_err(|error| {
+                    Error::Other(format!("table source order scan failed: {error}"))
+                })? {
+                    Event::Start(_) | Event::Empty(_) => {
+                        if let Some(item) = by_start.remove(&before) {
+                            tables.push(item);
+                        }
+                    }
+                    Event::Eof => break,
+                    _ => {}
+                }
+                buffer.clear();
+            }
+            if !by_start.is_empty() {
+                return Err(Error::Other(
+                    "table physical source order is incomplete".into(),
+                ));
+            }
+            let scopes =
+                story_namespace_scopes_at(&source.xml, tables.iter().map(|(span, _)| span.start))?;
+            let cells = owners
+                .iter()
+                .filter(|owner| owner.kind == StoryKind::TableCell)
+                .collect::<Vec<_>>();
+            let mut next = 0;
+            let mut cell_cursor = 0;
+            while next < tables.len() {
+                let root = next;
+                let span = tables[root].0.clone();
+                next += 1;
+                while next < tables.len() && tables[next].0.end < span.end {
+                    next += 1;
+                }
+                let scope = scopes
+                    .get(&span.start)
+                    .ok_or_else(|| Error::Other("table item scope missing".into()))?;
+                let closed = close_content_fragment_namespaces(&source.xml[span.clone()], scope)?;
+                let mut wrapped =
+                    format!(r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>"#).into_bytes();
+                wrapped.extend(closed);
+                wrapped.extend_from_slice(b"</w:body></w:document>");
+                let parsed = CT_Document::from_xml(&wrapped)?;
+                let [BodyContent::Table(table)] = parsed.body.content.as_slice() else {
+                    return Err(Error::Other(
+                        "rich table has ambiguous physical content".into(),
+                    ));
+                };
+                let (count, modeled) = physical_table_cells(table);
+                while cells
+                    .get(cell_cursor)
+                    .is_some_and(|owner| owner.full.start < span.start)
+                {
+                    cell_cursor += 1;
+                }
+                let first = cell_cursor;
+                while cells
+                    .get(cell_cursor)
+                    .is_some_and(|owner| owner.full.start < span.end)
+                {
+                    cell_cursor += 1;
+                }
+                let physical = &cells[first..cell_cursor];
+                if modeled.len() != physical.len() {
+                    return Err(Error::Other(
+                        "rich table cell source correspondence is incomplete".into(),
+                    ));
+                }
+                let mut table_routes = vec![None; count];
+                let mut containing = Vec::<usize>::new();
+                let mut cursor = root;
+                for ((table, coordinate), owner) in modeled.into_iter().zip(physical) {
+                    while cursor < next && tables[cursor].0.start < owner.full.start {
+                        while containing
+                            .last()
+                            .is_some_and(|&index| tables[index].0.end < tables[cursor].0.end)
+                        {
+                            containing.pop();
+                        }
+                        containing.push(cursor);
+                        cursor += 1;
+                    }
+                    while containing
+                        .last()
+                        .is_some_and(|&index| tables[index].0.end <= owner.full.start)
+                    {
+                        containing.pop();
+                    }
+                    let index = *containing
+                        .last()
+                        .ok_or_else(|| Error::Other("cell has no physical table".into()))?;
+                    if owner.full.end >= tables[index].0.end
+                        || table_routes[table].is_some_and(|before| before != index)
+                    {
+                        return Err(Error::Other(
+                            "rich table cell has ambiguous physical owner".into(),
+                        ));
+                    }
+                    table_routes[table] = Some(index);
+                    if let Some((row, cell)) = coordinate
+                        && emitted.insert((tables[index].1.clone(), row, cell))
+                    {
+                        result.push((
+                            tables[index].1.clone(),
+                            row,
+                            cell,
+                            StoryId {
+                                kind: owner.kind,
+                                part_name: source.part_name.clone(),
+                                owner_index: owner.owner_index,
+                                fingerprint: owner.fingerprint,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn story_table_cells_from_inventory(
+        source: &StorySource<'_>,
+        owners: &[StoryOwnerSpan],
+        inventories: &[Vec<StoryItemSpan>],
+        scopes: &HashMap<usize, BTreeMap<String, String>>,
+        emitted: &mut HashSet<(ContentLocation, usize, usize)>,
+    ) -> Result<Vec<(ContentLocation, usize, usize, StoryId)>> {
+        let mut result = Vec::new();
+        let mut tables = Vec::new();
+        for (owner, items) in owners.iter().zip(inventories) {
+            let story = StoryId {
+                kind: owner.kind,
+                part_name: source.part_name.clone(),
+                owner_index: owner.owner_index,
+                fingerprint: owner.fingerprint,
+            };
+            for (index, item) in items.iter().enumerate() {
+                if item.kind == StoryItemKind::Table {
+                    tables.push((
+                        item.full.clone(),
+                        ContentLocation::new(story.clone(), item.kind, vec![index]),
+                    ));
+                }
+            }
+        }
+        // Recover physical order with one lexical pass instead of sorting
+        // a growing table inventory. Qualification came from the owner scan.
+        let mut by_start = tables
+            .into_iter()
+            .map(|item| (item.0.start, item))
+            .collect::<HashMap<_, _>>();
+        let mut tables = Vec::with_capacity(by_start.len());
+        let mut reader = quick_xml::Reader::from_reader(source.xml.as_ref());
+        let mut buffer = Vec::new();
+        loop {
+            let before = reader.buffer_position() as usize;
+            match reader
+                .read_event_into(&mut buffer)
+                .map_err(|error| Error::Other(format!("table source order scan failed: {error}")))?
+            {
+                Event::Start(_) | Event::Empty(_) => {
+                    if let Some(item) = by_start.remove(&before) {
+                        tables.push(item);
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buffer.clear();
+        }
+        if !by_start.is_empty() {
+            return Err(Error::Other(
+                "table physical source order is incomplete".into(),
+            ));
+        }
+        let cells = owners
+            .iter()
+            .filter(|owner| owner.kind == StoryKind::TableCell)
+            .collect::<Vec<_>>();
+        let mut next = 0;
+        let mut cell_cursor = 0;
+        while next < tables.len() {
+            let root = next;
+            let span = tables[root].0.clone();
+            next += 1;
+            while next < tables.len() && tables[next].0.end < span.end {
+                next += 1;
+            }
+            let scope = scopes
+                .get(&span.start)
+                .ok_or_else(|| Error::Other("table item scope missing".into()))?;
+            let closed = close_content_fragment_namespaces(&source.xml[span.clone()], scope)?;
+            let mut wrapped =
+                format!(r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>"#).into_bytes();
+            wrapped.extend(closed);
+            wrapped.extend_from_slice(b"</w:body></w:document>");
+            let parsed = CT_Document::from_xml(&wrapped)?;
+            let [BodyContent::Table(table)] = parsed.body.content.as_slice() else {
+                return Err(Error::Other(
+                    "rich table has ambiguous physical content".into(),
+                ));
+            };
+            let (count, modeled) = physical_table_cells(table);
+            while cells
+                .get(cell_cursor)
+                .is_some_and(|owner| owner.full.start < span.start)
+            {
+                cell_cursor += 1;
+            }
+            let first = cell_cursor;
+            while cells
+                .get(cell_cursor)
+                .is_some_and(|owner| owner.full.start < span.end)
+            {
+                cell_cursor += 1;
+            }
+            let physical = &cells[first..cell_cursor];
+            if modeled.len() != physical.len() {
+                return Err(Error::Other(
+                    "rich table cell source correspondence is incomplete".into(),
+                ));
+            }
+            let mut table_routes = vec![None; count];
+            let mut containing = Vec::<usize>::new();
+            let mut cursor = root;
+            for ((table, coordinate), owner) in modeled.into_iter().zip(physical) {
+                while cursor < next && tables[cursor].0.start < owner.full.start {
+                    while containing
+                        .last()
+                        .is_some_and(|&index| tables[index].0.end < tables[cursor].0.end)
+                    {
+                        containing.pop();
+                    }
+                    containing.push(cursor);
+                    cursor += 1;
+                }
+                while containing
+                    .last()
+                    .is_some_and(|&index| tables[index].0.end <= owner.full.start)
+                {
+                    containing.pop();
+                }
+                let index = *containing
+                    .last()
+                    .ok_or_else(|| Error::Other("cell has no physical table".into()))?;
+                if owner.full.end >= tables[index].0.end
+                    || table_routes[table].is_some_and(|before| before != index)
+                {
+                    return Err(Error::Other(
+                        "rich table cell has ambiguous physical owner".into(),
+                    ));
+                }
+                table_routes[table] = Some(index);
+                if let Some((row, cell)) = coordinate
+                    && emitted.insert((tables[index].1.clone(), row, cell))
+                {
+                    result.push((
+                        tables[index].1.clone(),
+                        row,
+                        cell,
+                        StoryId {
+                            kind: owner.kind,
+                            part_name: source.part_name.clone(),
+                            owner_index: owner.owner_index,
+                            fingerprint: owner.fingerprint,
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Resolve one related table cell through its actual enclosing physical table.
+    #[doc(hidden)]
+    pub fn story_table_cell(
+        &self,
+        location: &ContentLocation,
+        row: usize,
+        cell: usize,
+    ) -> Result<StoryId> {
+        if location.item_kind != StoryItemKind::Table || location.is_end {
+            return Err(Error::Other(
+                "rich table needs an existing table location".to_owned(),
+            ));
+        }
+        let (source, item) = self.story_item_source(location)?;
+        let table = Self::story_table_from_source(&source.xml, &item)?;
+        TableRef { inner: &table }
+            .cell(row, cell)
+            .ok_or_else(|| Error::Other("rich table cell index is out of range".to_owned()))?;
+        let owners = scan_story_owners(&source.xml, source.root_kind)?
+            .into_iter()
+            .filter(|owner| {
+                owner.kind == StoryKind::TableCell
+                    && item.full.start < owner.full.start
+                    && owner.full.end < item.full.end
+            })
+            .collect::<Vec<_>>();
+        let (_, modeled) = physical_table_cells(&table);
+        if modeled.len() < owners.len() {
+            return Err(Error::Other(
+                "rich table cell source correspondence is incomplete".into(),
+            ));
+        }
+        if modeled.len() > owners.len() {
+            return Err(Error::Other(
+                "rich table has unqualified modeled cells".into(),
+            ));
+        }
+        let ordinal = modeled
+            .iter()
+            .position(|(table, coordinate)| *table == 0 && *coordinate == Some((row, cell)))
+            .ok_or_else(|| Error::Other("rich table cell has no unique physical owner".into()))?;
+        let owner = &owners[ordinal];
+        let story = StoryId {
+            kind: owner.kind,
+            part_name: source.part_name.clone(),
+            owner_index: owner.owner_index,
+            fingerprint: owner.fingerprint,
+        };
+        Ok(story)
+    }
+
+    #[cfg(test)]
+    fn fx237_legacy_story_table_cell(
+        &self,
+        location: &ContentLocation,
+        row: usize,
+        cell: usize,
+    ) -> Result<StoryId> {
+        let mut table = self.story_table_model(location)?;
+        let selected = TableRef { inner: &table }
+            .cell(row, cell)
+            .map(|cell| cell.inner as *const CT_Tc)
+            .ok_or_else(|| Error::Other("rich table cell index is out of range".to_owned()))?;
+        let (source, item) = self.story_item_source(location)?;
+        let owners = scan_story_owners(&source.xml, source.root_kind)?
+            .into_iter()
+            .filter(|owner| {
+                owner.kind == StoryKind::TableCell
+                    && item.full.start < owner.full.start
+                    && owner.full.end < item.full.end
+            })
+            .collect::<Vec<_>>();
+        let mut found = None;
+        for (index, owner) in owners.iter().enumerate() {
+            let mut ordinal = index;
+            let modeled = nth_cell_in_table(&mut table, &mut ordinal).ok_or_else(|| {
+                Error::Other("rich table cell source correspondence is incomplete".to_owned())
+            })?;
+            if std::ptr::eq(selected, modeled) {
+                found = Some(owner);
+            }
+        }
+        let mut beyond = owners.len();
+        if nth_cell_in_table(&mut table, &mut beyond).is_some() {
+            return Err(Error::Other(
+                "rich table has unqualified modeled cells".to_owned(),
+            ));
+        }
+        let owner = found.ok_or_else(|| {
+            Error::Other("rich table cell has no unique physical owner".to_owned())
+        })?;
+        let story = StoryId {
+            kind: owner.kind,
+            part_name: source.part_name.clone(),
+            owner_index: owner.owner_index,
+            fingerprint: owner.fingerprint,
+        };
+        Ok(story)
+    }
+
+    /// Resolve one paragraph through its actual checked related table cell owner.
+    #[doc(hidden)]
+    pub fn story_table_cell_paragraph_location(
+        &self,
+        location: &ContentLocation,
+        row: usize,
+        cell: usize,
+        paragraph: usize,
+    ) -> Result<ContentLocation> {
+        let story = self.story_table_cell(location, row, cell)?;
+        let (source, owner) = self.story_source_and_owner(&story)?;
+        let spans = story_range_paragraph_spans(&source.xml, &[(story.clone(), owner.clone())])?
+            .into_iter()
+            .flatten();
+        let (location, _) = spans.into_iter().nth(paragraph).ok_or_else(|| {
+            Error::Other("rich table cell paragraph index is out of range".to_owned())
+        })?;
+        self.story_range_paragraph_snapshot(&location)?;
+        Ok(location)
+    }
+
+    /// Read owned facts from one source-qualified rich paragraph.
+    #[doc(hidden)]
+    pub fn read_story_paragraph<T>(
+        &self,
+        location: &ContentLocation,
+        read: impl FnOnce(ParagraphRef<'_>) -> T,
+    ) -> Result<T> {
+        let snapshot = self.story_range_paragraph_snapshot(location)?;
+        let paragraph = CT_P::from_xml_fragment(snapshot.xml())?;
+        Ok(read(ParagraphRef { inner: &paragraph }))
+    }
+
+    /// Edit one source-qualified rich paragraph and publish it atomically.
+    #[doc(hidden)]
+    pub fn edit_story_paragraph<T>(
+        &mut self,
+        location: &ContentLocation,
+        edit: impl FnOnce(&mut Paragraph<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let snapshot = self.story_range_paragraph_snapshot(location)?;
+        let mut paragraph = CT_P::from_xml_fragment(snapshot.xml())?;
+        let result = edit(&mut Paragraph {
+            inner: &mut paragraph,
+        })?;
+        let mut fragment = ContentFragment::paragraph(paragraph)?;
+        // This fragment is rebuilt from the checked paragraph of this same owner.
+        // Keep relationship admission scoped to that owner, including newly
+        // allocated relationships already validated in its package scope.
+        fragment.source_part_name = Some(location.story.part_name.clone());
+        fragment.source_story_kind = Some(location.story.kind);
+        fragment.source_owner_index = Some(location.story.owner_index);
+        self.replace_story_content(location, fragment)?;
+        Ok(result)
+    }
+
     pub fn set_story_text(&mut self, location: &ContentLocation, value: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.flush_to_package()?;
@@ -15650,11 +23517,11 @@ impl Document {
         })
     }
 
-    /// Import an owned cross-document main-body fragment at a checked boundary.
+    /// Import an owned cross-document fragment at a checked story boundary.
     ///
     /// The complete supported dependency closure is allocated on a staged
-    /// candidate. Unsupported or external relationships return an error before
-    /// the destination changes.
+    /// candidate. Unreconcilable dependencies return an error before the
+    /// destination changes.
     pub fn import_fragment(
         &mut self,
         destination: &ContentLocation,
@@ -15663,31 +23530,37 @@ impl Document {
     ) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.flush_to_package()?;
-        if destination.story.kind != StoryKind::Body
-            || destination.story.part_name != candidate.doc_part_name
-        {
-            return Err(Error::Other(
-                "document fragments can be imported only into the main body".to_owned(),
-            ));
-        }
-        let (source, owner) = candidate.story_source_and_owner(&destination.story)?;
+        let (source, owner) = candidate.fragment_story_source_and_owner(&destination.story)?;
         let part_name = source.part_name.clone();
         let mut source_xml = source.xml.into_owned();
-        let (boundary, _, _) = validated_content_boundary(&source_xml, &owner, destination)?;
-        let imported_document_xml = crate::field::import_document_fragment_content(
-            &mut candidate,
-            &fragment.package,
-            fragment.include_final_section_properties,
-            policy,
-        )?;
-        let destination_scope = story_namespace_scope_at(&source_xml, owner.full.start)?;
-        let imported_xml = package_authoritative_body_fragment(
-            &imported_document_xml,
-            fragment.include_final_section_properties,
-            &destination_scope,
-        )?;
-        insert_story_fragment(&mut source_xml, &owner, boundary, imported_xml)?;
+        let (mut owner, mut boundary, _, _) =
+            fragment_content_boundary(&source_xml, &owner, destination)?;
+        if fragment.include_final_section_properties
+            && (destination.story.kind != StoryKind::Body
+                || (!destination.is_end && destination.index_path.len() != 1))
+        {
+            return Err(Error::Other(
+                "section-inclusive fragments require the main body destination".to_owned(),
+            ));
+        }
+        let imported_xml = fragment.import_content_staged(&mut candidate, &part_name, policy)?;
+        // Companion closure may append notes or comment threads to the same
+        // physical part that owns the destination. Refresh that part before
+        // inserting, so publishing the selected owner cannot discard them.
         candidate.prepare_staged_package()?;
+        let companion_owner = candidate.comments_part_name.as_deref() == Some(&part_name)
+            || candidate.note_part_name(StoryKind::Footnote)?.as_deref() == Some(&part_name)
+            || candidate.note_part_name(StoryKind::Endnote)?.as_deref() == Some(&part_name);
+        if companion_owner {
+            let (updated_source, updated_owner) =
+                candidate.fragment_story_source_and_owner(&destination.story)?;
+            source_xml = updated_source.xml.into_owned();
+            let (updated_owner, updated_boundary, _, _) =
+                fragment_content_boundary(&source_xml, &updated_owner, destination)?;
+            owner = updated_owner;
+            boundary = updated_boundary;
+        }
+        insert_story_fragment(&mut source_xml, &owner, boundary, imported_xml)?;
         set_story_source_xml(&mut candidate, &part_name, source_xml)?;
         let reopened = candidate.reopen_prepared_staged()?;
         self.commit_staged_mutation(reopened);
@@ -15702,6 +23575,10 @@ impl Document {
         let part_name = source.part_name.clone();
         let source_xml = source.xml.into_owned();
         let item = validated_direct_content_item(&source_xml, &owner, location)?;
+        let namespace_scope = story_namespace_scope_at(&source_xml, item.full.start)?;
+        let closed =
+            close_content_fragment_namespaces(&source_xml[item.full.clone()], &namespace_scope)?;
+        Self::refuse_commented_fragment(&closed)?;
         if owner.kind == StoryKind::TableCell
             && item.kind == StoryItemKind::Paragraph
             && direct_story_content_items(&source_xml, &owner)?
@@ -15720,7 +23597,7 @@ impl Document {
             source_part_name: Some(part_name.clone()),
             source_story_kind: Some(location.story.kind),
             source_owner_index: Some(location.story.owner_index),
-            namespace_scope: story_namespace_scope_at(&source_xml, item.full.start)?,
+            namespace_scope,
         };
         reject_section_owning_content_fragment(&fragment)?;
         validate_fragment_relationships(&candidate, &location.story, &fragment)?;
@@ -15883,6 +23760,37 @@ impl Document {
         self.document.background_xml.is_some()
     }
 
+    /// Publish page color and the relationship-resolved display setting together.
+    pub fn set_page_color(&mut self, color: &str) -> Result<()> {
+        if !is_rgb_hex(color) {
+            return Err(Error::Other(
+                "page color must be six hexadecimal digits".to_owned(),
+            ));
+        }
+        let mut candidate = self.settings_mutation_candidate()?;
+        if let Some(background) = candidate.document.background_xml.as_ref() {
+            let source = candidate
+                .package
+                .get_part(&candidate.doc_part_name)
+                .ok_or_else(|| Error::Other("main document part is missing".to_owned()))?;
+            let scope = document_namespace_scopes(source)?
+                .root_declarations
+                .into_iter()
+                .collect();
+            candidate.document.background_xml =
+                Some(close_content_fragment_namespaces(background, &scope)?);
+        }
+        candidate.document.set_background_color(color)?;
+        candidate
+            .settings
+            .get_or_insert_with(CT_Settings::new)
+            .set_display_background_shape(true)?;
+        candidate.invalidate_layout();
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
     /// Whether any document section carries layout formatting.
     ///
     /// This includes the final body section and sections attached to paragraph
@@ -15897,6 +23805,23 @@ impl Document {
     pub fn has_unmodeled_section_properties(&self) -> bool {
         self.section_properties_in_order()
             .any(|properties| !properties.extra_xml.is_empty() || properties.change.is_some())
+    }
+
+    /// Return whether each facade paragraph contains displayed content.
+    ///
+    /// Uses an unpublished source snapshot and preserves the live document.
+    pub fn paragraph_visibility(&self) -> Result<Vec<bool>> {
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_document_to_package()?;
+        let source = candidate
+            .package
+            .get_part(&candidate.doc_part_name)
+            .ok_or(Error::NoDocumentPart)?;
+        paragraph_visibility_from_main_source(
+            &candidate,
+            source,
+            ParagraphVisibilityScope::FacadeRecursive,
+        )
     }
 
     /// Get immutable references to all paragraphs.
@@ -15975,6 +23900,871 @@ impl Document {
             .expect("an in-memory document can refresh a typed footnote");
         self.commit_staged_mutation(candidate);
         id
+    }
+
+    /// Create a normal footnote and append its reference to a direct body paragraph.
+    /// The note and reference are published together only after the staged package reopens.
+    pub fn create_footnote(&mut self, reference: &ContentLocation, text: &str) -> Result<i32> {
+        if reference.story.kind != StoryKind::Body || reference.index_path.len() != 1 {
+            return Err(Error::Other(
+                "footnote reference must identify a direct body paragraph".to_owned(),
+            ));
+        }
+        let run_index = self.read_story_paragraph(reference, |paragraph| paragraph.run_count())?;
+        self.create_footnote_at(
+            &StoryRunPosition {
+                location: reference.clone(),
+                run_index,
+            },
+            text,
+        )
+    }
+
+    /// Create a note and reference together at a checked body or table-cell run boundary.
+    pub fn create_footnote_at(&mut self, position: &StoryRunPosition, text: &str) -> Result<i32> {
+        if !matches!(
+            position.location.story.kind(),
+            StoryKind::Body | StoryKind::TableCell
+        ) || position.location.story.part_name() != self.doc_part_name
+        {
+            return Err(Error::Other(
+                "note references require body or body-table content".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate
+            .read_story_paragraph(&position.location, |paragraph| paragraph.run_count())?
+            .checked_sub(position.run_index)
+            .ok_or_else(|| {
+                Error::Other("note reference run boundary is out of range".to_owned())
+            })?;
+        let occupied = candidate
+            .footnotes
+            .footnotes
+            .iter()
+            .map(|note| note.id)
+            .collect::<HashSet<_>>();
+        let mut id = 2_i32;
+        while occupied.contains(&id) {
+            id = id
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("footnote ID range is exhausted".to_owned()))?;
+        }
+        candidate.reserve_footnotes_bundle()?;
+        let mut paragraph = CT_P::new();
+        let mut note_marker = CT_R::new("");
+        note_marker.content.clear();
+        note_marker.extra_xml.push(b"<w:footnoteRef/>".to_vec());
+        note_marker.extra_xml_positions.push(0);
+        paragraph.runs.push(note_marker);
+        paragraph.add_run(text);
+        candidate
+            .footnotes
+            .footnotes
+            .push(rdocx_oxml::footnotes::CT_Footnote {
+                id,
+                note_type: rdocx_oxml::footnotes::NoteType::Normal,
+                paragraphs: vec![paragraph],
+            });
+        candidate.footnotes_dirty = true;
+        candidate.flush_dirty_related_story_models()?;
+        candidate.refresh_related_story_caches()?;
+        candidate.invalidate_layout();
+        let mut run = CT_R::new("");
+        run.content = vec![RunContent::FootnoteRef {
+            id,
+            custom_mark: None,
+        }];
+        candidate.insert_story_run_staged(position, run)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(id)
+    }
+
+    /// Create a normal endnote and append its reference to a direct body paragraph.
+    /// The note and reference are published together only after the staged package reopens.
+    pub fn create_endnote(&mut self, reference: &ContentLocation, text: &str) -> Result<i32> {
+        if reference.story.kind != StoryKind::Body || reference.index_path.len() != 1 {
+            return Err(Error::Other(
+                "endnote reference must identify a direct body paragraph".to_owned(),
+            ));
+        }
+        let run_index = self.read_story_paragraph(reference, |paragraph| paragraph.run_count())?;
+        self.create_endnote_at(
+            &StoryRunPosition {
+                location: reference.clone(),
+                run_index,
+            },
+            text,
+        )
+    }
+
+    /// Create a note and reference together at a checked body or table-cell run boundary.
+    pub fn create_endnote_at(&mut self, position: &StoryRunPosition, text: &str) -> Result<i32> {
+        if !matches!(
+            position.location.story.kind(),
+            StoryKind::Body | StoryKind::TableCell
+        ) || position.location.story.part_name() != self.doc_part_name
+        {
+            return Err(Error::Other(
+                "note references require body or body-table content".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate
+            .read_story_paragraph(&position.location, |paragraph| paragraph.run_count())?
+            .checked_sub(position.run_index)
+            .ok_or_else(|| {
+                Error::Other("note reference run boundary is out of range".to_owned())
+            })?;
+        candidate.flush_to_package()?;
+        let existing_part = candidate.note_part_name(StoryKind::Endnote)?;
+        let part_name = candidate.reserve_document_part_bundle(
+            existing_part.as_deref(),
+            "/word/endnotes.xml",
+            rel_types::ENDNOTES,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+        )?;
+        let source = match candidate.package.get_part(&part_name) {
+            Some(xml) => xml.to_vec(),
+            None => rdocx_oxml::footnotes::CT_Footnotes::new().to_xml_endnotes()?,
+        };
+        let existing = rdocx_oxml::footnotes::CT_Footnotes::from_xml(&source)?;
+        let occupied = existing
+            .footnotes
+            .iter()
+            .map(|note| note.id)
+            .collect::<HashSet<_>>();
+        let mut id = 2_i32;
+        while occupied.contains(&id) {
+            id = id
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("endnote ID range is exhausted".to_owned()))?;
+        }
+        let mut paragraph = CT_P::new();
+        let mut note_marker = CT_R::new("");
+        note_marker.content.clear();
+        note_marker.extra_xml.push(b"<w:endnoteRef/>".to_vec());
+        note_marker.extra_xml_positions.push(0);
+        paragraph.runs.push(note_marker);
+        paragraph.add_run(text);
+        let note = rdocx_oxml::footnotes::CT_Footnote {
+            id,
+            note_type: rdocx_oxml::footnotes::NoteType::Normal,
+            paragraphs: vec![paragraph],
+        };
+        let fragment = serialized_note_fragment(&note, StoryKind::Endnote)?;
+        let updated =
+            append_story_fragments_to_root(&source, b"endnotes", b"endnote", &[fragment])?;
+        set_story_source_xml(&mut candidate, &part_name, updated)?;
+        candidate.invalidate_layout();
+        let mut run = CT_R::new("");
+        run.content = vec![RunContent::EndnoteRef {
+            id,
+            custom_mark: None,
+        }];
+        candidate.insert_story_run_staged(position, run)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(id)
+    }
+
+    /// Create a footnote whose visible reference is an authored mark.
+    pub fn create_footnote_with_mark(
+        &mut self,
+        reference: &ContentLocation,
+        text: &str,
+        mark: &str,
+    ) -> Result<i32> {
+        self.create_note_with_mark(NoteFamily::Footnote, reference, text, mark)
+    }
+
+    /// Create an endnote whose visible reference is an authored mark.
+    pub fn create_endnote_with_mark(
+        &mut self,
+        reference: &ContentLocation,
+        text: &str,
+        mark: &str,
+    ) -> Result<i32> {
+        self.create_note_with_mark(NoteFamily::Endnote, reference, text, mark)
+    }
+
+    fn create_note_with_mark(
+        &mut self,
+        family: NoteFamily,
+        reference: &ContentLocation,
+        text: &str,
+        mark: &str,
+    ) -> Result<i32> {
+        if mark.is_empty() {
+            return Err(Error::Other(
+                "custom note mark must not be empty".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        let (kind, id) = match family {
+            NoteFamily::Footnote => (
+                StoryKind::Footnote,
+                candidate.create_footnote(reference, text)?,
+            ),
+            NoteFamily::Endnote => (
+                StoryKind::Endnote,
+                candidate.create_endnote(reference, text)?,
+            ),
+        };
+        let paragraph_index = reference.index_path.first().copied().ok_or_else(|| {
+            Error::Other("note reference must identify a direct body paragraph".to_owned())
+        })?;
+        let refreshed = candidate
+            .paragraph_story_location(paragraph_index)?
+            .ok_or_else(|| Error::Other("new note reference paragraph is missing".to_owned()))?;
+        let paragraph = candidate.story_paragraph_mut(&refreshed)?;
+        let marker = paragraph
+            .runs
+            .last_mut()
+            .and_then(|run| run.content.first_mut())
+            .ok_or_else(|| Error::Other("new note reference is missing".to_owned()))?;
+        match marker {
+            RunContent::FootnoteRef { custom_mark, .. }
+            | RunContent::EndnoteRef { custom_mark, .. } => {
+                *custom_mark = Some(mark.to_owned());
+            }
+            _ => return Err(Error::Other("new note reference is malformed".to_owned())),
+        }
+        candidate.invalidate_layout();
+        candidate.flush_to_package()?;
+        let story = candidate
+            .note_story(kind, id)?
+            .ok_or_else(|| Error::Other("new note story is missing".to_owned()))?;
+        let part_name = story.part_name.clone();
+        let mut xml = candidate
+            .package
+            .get_part(&part_name)
+            .ok_or_else(|| Error::Other("new note part is missing".to_owned()))?
+            .to_vec();
+        let owner = scan_story_owners(&xml, kind)?
+            .into_iter()
+            .find(|owner| owner.kind == kind && owner.owner_index == story.owner_index)
+            .ok_or_else(|| Error::Other("new note owner is missing".to_owned()))?;
+        let mut paragraph = CT_P::new();
+        let marker_run = CT_R::new(mark);
+        paragraph.runs.push(marker_run);
+        paragraph.add_run(text);
+        let note = rdocx_oxml::footnotes::CT_Footnote {
+            id,
+            note_type: rdocx_oxml::footnotes::NoteType::Normal,
+            paragraphs: vec![paragraph],
+        };
+        let fragment = serialized_note_fragment(&note, kind)?;
+        xml.splice(owner.full, fragment);
+        set_story_source_xml(&mut candidate, &part_name, xml)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(id)
+    }
+
+    /// Create or replace an authored note separator or continuation record.
+    /// The supplied paragraphs are written into the special note owner without
+    /// changing other note owners or unmodelled XML in the part.
+    pub fn set_note_special_record(
+        &mut self,
+        family: NoteFamily,
+        record: NoteSpecialRecord,
+        paragraphs: Vec<CT_P>,
+    ) -> Result<i32> {
+        if paragraphs.is_empty() {
+            return Err(Error::Other(
+                "special note record needs a paragraph".to_owned(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let (kind, part_name, root, item) = match family {
+            NoteFamily::Footnote => {
+                candidate.reserve_footnotes_bundle()?;
+                (
+                    StoryKind::Footnote,
+                    candidate
+                        .footnotes_part_name
+                        .clone()
+                        .ok_or_else(|| Error::Other("footnotes part is missing".to_owned()))?,
+                    b"footnotes".as_slice(),
+                    b"footnote".as_slice(),
+                )
+            }
+            NoteFamily::Endnote => {
+                let existing = candidate.note_part_name(StoryKind::Endnote)?;
+                let part = candidate.reserve_document_part_bundle(
+                    existing.as_deref(),
+                    "/word/endnotes.xml",
+                    rel_types::ENDNOTES,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+                )?;
+                (
+                    StoryKind::Endnote,
+                    part,
+                    b"endnotes".as_slice(),
+                    b"endnote".as_slice(),
+                )
+            }
+        };
+        let source = match candidate.package.get_part(&part_name) {
+            Some(xml) => xml.to_vec(),
+            None if family == NoteFamily::Footnote => {
+                rdocx_oxml::footnotes::CT_Footnotes::new().to_xml_footnotes()?
+            }
+            None => rdocx_oxml::footnotes::CT_Footnotes::new().to_xml_endnotes()?,
+        };
+        let parsed = rdocx_oxml::footnotes::CT_Footnotes::from_xml(&source)?;
+        let matches = parsed
+            .footnotes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| note.note_type == record.note_type())
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(Error::Other("duplicate special note records".to_owned()));
+        }
+        let used = parsed
+            .footnotes
+            .iter()
+            .map(|note| note.id)
+            .collect::<HashSet<_>>();
+        let id = if let Some((_, note)) = matches.first() {
+            note.id
+        } else {
+            let preferred = match record {
+                NoteSpecialRecord::Separator => -1,
+                NoteSpecialRecord::ContinuationSeparator => 0,
+                NoteSpecialRecord::ContinuationNotice => -2,
+            };
+            if !used.contains(&preferred) {
+                preferred
+            } else {
+                let mut next = -2_i32;
+                while used.contains(&next) {
+                    next = next.checked_sub(1).ok_or_else(|| {
+                        Error::Other("special note ID range is exhausted".to_owned())
+                    })?;
+                }
+                next
+            }
+        };
+        let note = rdocx_oxml::footnotes::CT_Footnote {
+            id,
+            note_type: record.note_type(),
+            paragraphs,
+        };
+        let fragment = serialized_note_fragment(&note, kind)?;
+        let updated = if let Some((index, _)) = matches.first() {
+            let spans = scan_story_owners_with_special(&source, kind, true)?
+                .into_iter()
+                .filter(|owner| owner.kind == kind)
+                .collect::<Vec<_>>();
+            let span = spans
+                .get(*index)
+                .ok_or_else(|| Error::Other("special note owner cannot be located".to_owned()))?;
+            let mut xml = source;
+            xml.splice(span.full.clone(), fragment);
+            xml
+        } else {
+            append_story_fragments_to_root(&source, root, item, &[fragment])?
+        };
+        set_story_source_xml(&mut candidate, &part_name, updated)?;
+        let mut properties = candidate
+            .note_properties(family)
+            .cloned()
+            .unwrap_or_default();
+        if !properties.special_references.contains(&id) {
+            properties.special_references.push(id);
+        }
+        candidate.stage_settings_mutation(|settings| match family {
+            NoteFamily::Footnote => settings.set_footnote_properties(properties),
+            NoteFamily::Endnote => settings.set_endnote_properties(properties),
+        })?;
+        candidate.invalidate_layout();
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(id)
+    }
+
+    /// Find the current story identity for a normal footnote ID.
+    pub fn footnote_story(&self, id: i32) -> Result<Option<StoryId>> {
+        self.note_story(StoryKind::Footnote, id)
+    }
+
+    /// Find the current story identity for a normal endnote ID.
+    pub fn endnote_story(&self, id: i32) -> Result<Option<StoryId>> {
+        self.note_story(StoryKind::Endnote, id)
+    }
+
+    /// Omit review state only within transferred body content and its selected notes.
+    pub(crate) fn omit_glossary_selected_body_comments(
+        &mut self,
+        include_final_section_properties: bool,
+    ) -> Result<Vec<u8>> {
+        let part = self.doc_part_name.clone();
+        let mut xml = self
+            .package
+            .get_part(&part)
+            .ok_or_else(|| Error::Other("fragment main source disappeared".into()))?
+            .to_vec();
+        let owner = scan_story_owners(&xml, StoryKind::Body)?
+            .into_iter()
+            .find(|owner| owner.kind == StoryKind::Body)
+            .ok_or_else(|| Error::Other("document fragment has no main body".into()))?;
+        let start = direct_story_content_items(&xml, &owner)?
+            .first()
+            .map(|item| item.full.start)
+            .ok_or_else(|| Error::Other("document fragment main body is empty".into()))?;
+        let end = story_owner_content_end(&xml, &owner)?;
+        let selected = package_authoritative_body_fragment(&xml, false, &BTreeMap::new())?;
+        self.omit_glossary_fragment_note_comments(&part, &selected)?;
+        let omitted = Self::omit_comment_markers(&selected)?;
+        if include_final_section_properties {
+            for item in scan_story_items(&xml, &owner)? {
+                if item.direct_owner_child
+                    && item.kind == StoryItemKind::PreservedNode
+                    && content_fragment_root_is_section_properties(&xml, &item)?
+                {
+                    let scope = story_namespace_scope_at(&xml, item.full.start)?;
+                    let section =
+                        close_content_fragment_namespaces(&xml[item.full.clone()], &scope)?;
+                    self.omit_glossary_fragment_note_comments(&part, &section)?;
+                    xml.splice(item.full, Self::omit_comment_markers(&section)?);
+                    break;
+                }
+            }
+        }
+        xml.splice(start..end, omitted);
+        set_story_source_xml(self, &part, xml.clone())?;
+        Ok(xml)
+    }
+
+    /// Omit only selected note review markers before glossary dependency capture.
+    pub(crate) fn omit_glossary_fragment_note_comments(
+        &mut self,
+        source_part: &str,
+        selected: &[u8],
+    ) -> Result<()> {
+        let mut pending = crate::field::fragment_note_references(selected)?;
+        let mut seen = HashSet::new();
+        while let Some((kind, id)) = pending.pop() {
+            if !seen.insert((kind, id)) {
+                continue;
+            }
+            let relationship_type = match kind {
+                StoryKind::Footnote => rel_types::FOOTNOTES,
+                StoryKind::Endnote => rel_types::ENDNOTES,
+                _ => return Err(Error::Other("invalid glossary note dependency kind".into())),
+            };
+            if part_name_identity(source_part) != part_name_identity(&self.doc_part_name)
+                && self
+                    .package
+                    .get_part_rels(source_part)
+                    .iter()
+                    .flat_map(|rels| &rels.items)
+                    .any(|relationship| relationship.rel_type == relationship_type)
+            {
+                return Err(Error::Other(format!(
+                    "cannot project glossary-local {kind:?} {id} through main numeric note ownership"
+                )));
+            }
+            let story = self.note_story(kind, id)?.ok_or_else(|| {
+                Error::Other(format!(
+                    "glossary fragment {kind:?} {id} has no proved main note owner"
+                ))
+            })?;
+            let (source, owner) = self.story_source_and_owner(&story)?;
+            let part = source.part_name;
+            let mut xml = source.xml.into_owned();
+            let scope = story_namespace_scope_at(&xml, owner.full.start)?;
+            let note = close_content_fragment_namespaces(&xml[owner.full.clone()], &scope)?;
+            pending.extend(crate::field::fragment_note_references(&note)?);
+            let omitted = Self::omit_comment_markers(&note)?;
+            xml.splice(owner.full, omitted);
+            set_story_source_xml(self, &part, xml)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fragment_note_dependency(
+        &self,
+        kind: StoryKind,
+        id: i32,
+    ) -> Result<(String, Vec<u8>)> {
+        let story = self.note_story(kind, id)?.ok_or_else(|| {
+            Error::Other(format!(
+                "document fragment {kind:?} reference {id} has no note owner"
+            ))
+        })?;
+        let (source, owner) = self.story_source_and_owner(&story)?;
+        let xml = source.xml.as_ref();
+        let scope = story_namespace_scope_at(xml, owner.full.start)?;
+        Ok((
+            source.part_name,
+            close_content_fragment_namespaces(&xml[owner.full], &scope)?,
+        ))
+    }
+
+    pub(crate) fn fragment_comment_dependency(&self, id: i32) -> Result<(String, Vec<u8>)> {
+        let part = self.comments_part_name.as_ref().ok_or_else(|| {
+            Error::Other("REF f annotation has no relationship-owned comments part".into())
+        })?;
+        let comments = self
+            .comments
+            .as_ref()
+            .ok_or_else(|| Error::Other("REF f annotation has no source definitions".into()))?;
+        let matching = comments
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, comment)| comment.id == id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(Error::Other(
+                "REF f annotation source ID is missing or ambiguous".into(),
+            ));
+        }
+        let owners = self
+            .stories()?
+            .into_iter()
+            .filter(|story| story.kind == StoryKind::Comment && story.part_name == *part)
+            .collect::<Vec<_>>();
+        if owners.len() != comments.comments.len() {
+            return Err(Error::Other(
+                "REF f annotation owner inventory differs from its definitions".into(),
+            ));
+        }
+        let (source, owner) = self.story_source_and_owner(&owners[matching[0].0])?;
+        let scope = story_namespace_scope_at(source.xml.as_ref(), owner.full.start)?;
+        Ok((
+            source.part_name,
+            close_content_fragment_namespaces(&source.xml.as_ref()[owner.full], &scope)?,
+        ))
+    }
+
+    pub(crate) fn publish_fragment_comment_staged(
+        &mut self,
+        part: &str,
+        xml: Vec<u8>,
+        replace_id: Option<i32>,
+    ) -> Result<()> {
+        if self.comments_part_name.as_deref() != Some(part) {
+            return Err(Error::Other(
+                "REF f annotation copy has a different relationship owner".into(),
+            ));
+        }
+        let source = self
+            .package
+            .get_part(part)
+            .ok_or_else(|| Error::Other("REF f destination comments part is missing".into()))?;
+        let updated = if let Some(id) = replace_id {
+            let matching = self
+                .comments
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Other("REF f cached annotation definitions are absent".into())
+                })?
+                .comments
+                .iter()
+                .enumerate()
+                .filter(|(_, comment)| comment.id == id)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(Error::Other(
+                    "REF f cached annotation owner is missing or ambiguous".into(),
+                ));
+            }
+            let owners = self
+                .stories()?
+                .into_iter()
+                .filter(|story| story.kind == StoryKind::Comment && story.part_name == part)
+                .collect::<Vec<_>>();
+            if owners.len() != self.comments.as_ref().unwrap().comments.len() {
+                return Err(Error::Other(
+                    "REF f cached annotation physical owners differ from their definitions".into(),
+                ));
+            }
+            let (owner_source, owner) = self.story_source_and_owner(&owners[matching[0]])?;
+            if owner_source.part_name != part {
+                return Err(Error::Other(
+                    "REF f cached annotation has a different relationship owner".into(),
+                ));
+            }
+            let mut updated = source.to_vec();
+            updated.splice(owner.full, xml);
+            updated
+        } else {
+            append_story_fragments_to_root(source, b"comments", b"comment", &[xml])?
+        };
+        self.comments = Some(rdocx_oxml::comments::CT_Comments::from_xml(&updated)?);
+        self.package.set_part(part, updated);
+        self.comments_dirty = false;
+        Ok(())
+    }
+
+    pub(crate) fn ensure_fragment_note_part_staged(&mut self, kind: StoryKind) -> Result<String> {
+        let (preferred, relationship_type, content_type) = match kind {
+            StoryKind::Footnote => (
+                "/word/footnotes.xml",
+                rel_types::FOOTNOTES,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+            ),
+            StoryKind::Endnote => (
+                "/word/endnotes.xml",
+                rel_types::ENDNOTES,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+            ),
+            _ => return Err(Error::Other("invalid fragment note story kind".to_owned())),
+        };
+        let existing = self.note_part_name(kind)?;
+        let part = self.reserve_document_part_bundle(
+            existing.as_deref(),
+            preferred,
+            relationship_type,
+            content_type,
+        )?;
+        if kind == StoryKind::Footnote {
+            self.footnotes_part_name = Some(part.clone());
+        }
+        if self.package.get_part(&part).is_none() {
+            let notes = rdocx_oxml::footnotes::CT_Footnotes::new();
+            let xml = if kind == StoryKind::Footnote {
+                notes.to_xml_footnotes()?
+            } else {
+                notes.to_xml_endnotes()?
+            };
+            self.package.set_part(&part, xml);
+        }
+        Ok(part)
+    }
+
+    pub(crate) fn publish_fragment_note_staged(
+        &mut self,
+        kind: StoryKind,
+        part_name: &str,
+        note_xml: Vec<u8>,
+        replace_id: Option<i32>,
+    ) -> Result<()> {
+        let source = self.package.get_part(part_name).ok_or_else(|| {
+            Error::Other(format!(
+                "document fragment destination note part {part_name} is missing"
+            ))
+        })?;
+        let (root, item) = match kind {
+            StoryKind::Footnote => (b"footnotes".as_slice(), b"footnote".as_slice()),
+            StoryKind::Endnote => (b"endnotes".as_slice(), b"endnote".as_slice()),
+            _ => return Err(Error::Other("invalid fragment note story kind".to_owned())),
+        };
+        let updated = if let Some(id) = replace_id {
+            let story = self.note_story(kind, id)?.ok_or_else(|| {
+                Error::Other("REF f cached note replacement owner is absent".into())
+            })?;
+            let (owner_source, owner) = self.story_source_and_owner(&story)?;
+            if owner_source.part_name != part_name {
+                return Err(Error::Other(
+                    "REF f cached note replacement has a different relationship owner".into(),
+                ));
+            }
+            let mut updated = source.to_vec();
+            updated.splice(owner.full, note_xml);
+            rdocx_oxml::footnotes::CT_Footnotes::from_xml(&updated)?;
+            updated
+        } else {
+            append_story_fragments_to_root(source, root, item, &[note_xml])?
+        };
+        self.package.set_part(part_name, updated);
+        Ok(())
+    }
+
+    fn note_part_name(&self, kind: StoryKind) -> Result<Option<String>> {
+        if kind == StoryKind::Footnote {
+            return Ok(self.footnotes_part_name.clone());
+        }
+        if kind != StoryKind::Endnote {
+            return Err(Error::Other("invalid note story kind".to_owned()));
+        }
+        let mut targets = self
+            .package
+            .get_part_rels(&self.doc_part_name)
+            .map(|relationships| relationships.items.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|relationship| {
+                relationship.rel_type == rel_types::ENDNOTES
+                    && relationship_is_internal(relationship)
+            })
+            .map(|relationship| {
+                OpcPackage::resolve_rel_target(&self.doc_part_name, &relationship.target)
+            });
+        let first = targets.next();
+        if targets.next().is_some() {
+            return Err(Error::Other(
+                "endnotes part has multiple internal relationships".to_owned(),
+            ));
+        }
+        Ok(first)
+    }
+
+    fn note_story(&self, kind: StoryKind, id: i32) -> Result<Option<StoryId>> {
+        let Some(part_name) = self.note_part_name(kind)? else {
+            if kind == StoryKind::Footnote
+                && self.footnotes.footnotes.iter().any(|note| {
+                    note.id == id && note.note_type == rdocx_oxml::footnotes::NoteType::Normal
+                })
+            {
+                return Err(Error::Other(
+                    "normal footnote has no relationship-resolved part".to_owned(),
+                ));
+            }
+            return Ok(None);
+        };
+        let endnotes;
+        let notes = if kind == StoryKind::Footnote {
+            &self.footnotes
+        } else {
+            let xml = self
+                .package
+                .get_part(&part_name)
+                .ok_or_else(|| Error::Other(format!("endnotes part {part_name} is missing")))?;
+            endnotes = rdocx_oxml::footnotes::CT_Footnotes::from_xml(xml)?;
+            &endnotes
+        };
+        let normal = notes
+            .footnotes
+            .iter()
+            .filter(|note| note.note_type == rdocx_oxml::footnotes::NoteType::Normal)
+            .collect::<Vec<_>>();
+        let mut matches = normal.iter().enumerate().filter(|(_, note)| note.id == id);
+        let Some((index, _)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(Error::Other(format!("{kind:?} ID {id} is ambiguous")));
+        }
+        let stories = self
+            .stories()?
+            .into_iter()
+            .filter(|story| story.kind == kind && story.part_name == part_name)
+            .collect::<Vec<_>>();
+        if stories.len() != normal.len() {
+            return Err(Error::Other(
+                "note story count differs from the normal note stream".to_owned(),
+            ));
+        }
+        Ok(stories.into_iter().nth(index))
+    }
+
+    /// Move a normal footnote before another normal footnote without changing IDs.
+    pub fn move_footnote_before(&mut self, id: i32, before_id: i32) -> Result<()> {
+        self.move_note_before(StoryKind::Footnote, id, before_id)
+    }
+
+    /// Move a normal endnote before another normal endnote without changing IDs.
+    pub fn move_endnote_before(&mut self, id: i32, before_id: i32) -> Result<()> {
+        self.move_note_before(StoryKind::Endnote, id, before_id)
+    }
+
+    fn move_note_before(&mut self, kind: StoryKind, id: i32, before_id: i32) -> Result<()> {
+        let label = if kind == StoryKind::Footnote {
+            "footnote"
+        } else {
+            "endnote"
+        };
+        let source_story = self
+            .note_story(kind, id)?
+            .ok_or_else(|| Error::Other(format!("{label} ID {id} does not exist")))?;
+        let target_story = self
+            .note_story(kind, before_id)?
+            .ok_or_else(|| Error::Other(format!("{label} ID {before_id} does not exist")))?;
+        if id == before_id {
+            return Ok(());
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let part_name = source_story.part_name.clone();
+        let mut xml = candidate
+            .package
+            .get_part(&part_name)
+            .ok_or_else(|| Error::Other(format!("{label}s part {part_name} is missing")))?
+            .to_vec();
+        let owners = scan_story_owners(&xml, kind)?;
+        let source = owners
+            .iter()
+            .find(|owner| owner.kind == kind && owner.owner_index == source_story.owner_index)
+            .ok_or_else(|| StoryError::OwnerNotFound {
+                story: source_story.clone(),
+            })?;
+        let target = owners
+            .iter()
+            .find(|owner| owner.kind == kind && owner.owner_index == target_story.owner_index)
+            .ok_or_else(|| StoryError::OwnerNotFound {
+                story: target_story.clone(),
+            })?;
+        let fragment = xml[source.full.clone()].to_vec();
+        let source_range = source.full.clone();
+        let target_start = target.full.start;
+        xml.drain(source_range.clone());
+        let insertion = if source_range.start < target_start {
+            target_start - source_range.len()
+        } else {
+            target_start
+        };
+        xml.splice(insertion..insertion, fragment);
+        set_story_source_xml(&mut candidate, &part_name, xml)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Remove a normal footnote and every matching reference in the main body.
+    pub fn remove_footnote(&mut self, id: i32) -> Result<()> {
+        self.remove_note(StoryKind::Footnote, id)
+    }
+
+    /// Remove a normal endnote and every matching reference in the main body.
+    pub fn remove_endnote(&mut self, id: i32) -> Result<()> {
+        self.remove_note(StoryKind::Endnote, id)
+    }
+
+    fn remove_note(&mut self, kind: StoryKind, id: i32) -> Result<()> {
+        let label = if kind == StoryKind::Footnote {
+            "footnote"
+        } else {
+            "endnote"
+        };
+        let story = self
+            .note_story(kind, id)?
+            .ok_or_else(|| Error::Other(format!("{label} ID {id} does not exist")))?;
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let part_name = story.part_name.clone();
+        let mut notes_xml = candidate
+            .package
+            .get_part(&part_name)
+            .ok_or_else(|| Error::Other(format!("{label}s part {part_name} is missing")))?
+            .to_vec();
+        let owner = scan_story_owners(&notes_xml, kind)?
+            .into_iter()
+            .find(|owner| owner.kind == kind && owner.owner_index == story.owner_index)
+            .ok_or_else(|| StoryError::OwnerNotFound {
+                story: story.clone(),
+            })?;
+        notes_xml.drain(owner.full);
+        let document_xml = candidate
+            .package
+            .get_part(&candidate.doc_part_name)
+            .ok_or_else(|| Error::Other("main document part is missing".to_owned()))?;
+        let without_references = remove_note_references(document_xml, id, kind)?;
+        let document_part = candidate.doc_part_name.clone();
+        set_story_source_xml(&mut candidate, &document_part, without_references)?;
+        set_story_source_xml(&mut candidate, &part_name, notes_xml)?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
     }
 
     /// Add a paragraph with the given text and return a mutable reference.
@@ -16079,17 +24869,28 @@ impl Document {
 
     /// Get the plain text of body paragraphs and table cells in document order.
     ///
-    /// A body paragraph ends with a newline. A table row is one line in which
+    /// A body paragraph normally ends with a newline. A table row is one line in which
     /// every cell paragraph ends with a tab, paragraphs of nested tables
     /// included. Content controls at every level contribute the paragraphs,
     /// rows and cells they wrap at the position they occupy.
     /// Each paragraph contributes its accepted-view text, the same text as
     /// [`ParagraphRef::text`]: tracked insertions are included and tracked
-    /// deletions are left out.
+    /// deletions are left out. A body paragraph whose mark is deleted or moved
+    /// away joins the next body paragraph without a newline when
+    /// `CT_Body::accepted_paragraph_joins_next` says so, as accepting it does,
+    /// so one with no accepted text leaves no line at all. A table row that
+    /// accepting removes, as
+    /// `CT_Row::accepted_view_removes` reports it, contributes no line, so a
+    /// table whose rows are all deleted contributes nothing.
     pub fn text(&self) -> String {
         let mut result = String::new();
-        for content in &self.document.body.content {
+        for (index, content) in self.document.body.content.iter().enumerate() {
             match content {
+                BodyContent::Paragraph(paragraph)
+                    if self.document.body.accepted_paragraph_joins_next(index) =>
+                {
+                    result.push_str(&ParagraphRef { inner: paragraph }.text());
+                }
                 BodyContent::Paragraph(paragraph) => push_paragraph_line(paragraph, &mut result),
                 BodyContent::Table(table) => push_table_text(table, &mut result),
                 BodyContent::ContentControl(control) => push_control_text(control, &mut result),
@@ -16195,6 +24996,141 @@ impl Document {
             .map(|inner| Table { inner })
     }
 
+    /// Append a formatted empty row through one checked package transaction.
+    pub fn add_empty_table_row(&mut self, table_index: usize) -> Result<usize> {
+        let mut candidate = self.clone_for_staging();
+        let index = {
+            let mut table = candidate.table_mut(table_index).ok_or_else(|| {
+                Error::Other(format!("table index {table_index} is out of range"))
+            })?;
+            let index = table.row_count();
+            table.add_row()?;
+            index
+        };
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(index)
+    }
+
+    /// Insert a logical grid column before or after an existing grid column.
+    pub fn insert_table_column(
+        &mut self,
+        table_index: usize,
+        index: usize,
+        before: bool,
+    ) -> Result<()> {
+        let mut candidate = self.clone_for_staging();
+        let mut table = candidate
+            .table_mut(table_index)
+            .ok_or_else(|| Error::Other(format!("table index {table_index} is out of range")))?;
+        let columns = table
+            .inner
+            .grid
+            .as_ref()
+            .map_or(0, |grid| grid.columns.len());
+        if index >= columns {
+            return Err(Error::Other(
+                "column insertion index is out of range".into(),
+            ));
+        }
+        table.insert_column(index, before, None)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    fn reconcile_cut_table_bookmarks(&mut self, original: &Self, part_name: &str) -> Result<()> {
+        let source_xml = |document: &Self| -> Result<Vec<u8>> {
+            document
+                .story_sources()?
+                .into_iter()
+                .find(|source| source.part_name == part_name)
+                .map(|source| source.xml.into_owned())
+                .ok_or_else(|| Error::Other("table bookmark source part disappeared".to_owned()))
+        };
+        let paired = |markers: &[BookmarkMarkerSpan]| {
+            let starts = markers
+                .iter()
+                .filter(|marker| marker.start)
+                .map(|marker| marker.id.clone())
+                .collect::<HashSet<_>>();
+            markers
+                .iter()
+                .filter(|marker| !marker.start && starts.contains(&marker.id))
+                .map(|marker| marker.id.clone())
+                .collect::<HashSet<_>>()
+        };
+        let paired_before = paired(&bookmark_marker_spans(&source_xml(original)?)?);
+        let mut xml = source_xml(self)?;
+        let markers = bookmark_marker_spans(&xml)?;
+        let paired_after = paired(&markers);
+        let mut orphans = markers
+            .into_iter()
+            .filter(|marker| {
+                paired_before.contains(&marker.id) && !paired_after.contains(&marker.id)
+            })
+            .collect::<Vec<_>>();
+        orphans.sort_by_key(|marker| marker.span.start);
+        if !orphans.is_empty() {
+            for marker in orphans.into_iter().rev() {
+                xml.splice(marker.span, std::iter::empty());
+            }
+            set_story_source_xml(self, part_name, xml)?;
+        }
+        Ok(())
+    }
+
+    /// Delete one logical grid column without publishing partial topology.
+    pub fn delete_table_column(&mut self, table_index: usize, index: usize) -> Result<()> {
+        let mut candidate = self.clone_for_staging();
+        let table = candidate
+            .table_mut(table_index)
+            .ok_or_else(|| Error::Other(format!("table index {table_index} is out of range")))?
+            .inner;
+        crate::table::remove_grid_column(table, index)?;
+        let part_name = candidate.doc_part_name.clone();
+        candidate.reconcile_cut_table_bookmarks(self, &part_name)?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Split the complete merge containing a logical column, or preserve an unmerged cell.
+    pub fn split_table_cell(
+        &mut self,
+        table_index: usize,
+        row: usize,
+        logical_column: usize,
+    ) -> Result<bool> {
+        let mut candidate = self.clone_for_staging();
+        let mut table = candidate
+            .table_mut(table_index)
+            .ok_or_else(|| Error::Other(format!("table index {table_index} is out of range")))?;
+        let columns = table
+            .inner
+            .grid
+            .as_ref()
+            .map_or(0, |grid| grid.columns.len());
+        let source_row = table
+            .inner
+            .rows
+            .get(row)
+            .ok_or_else(|| Error::Other("table row index is out of range".to_owned()))?;
+        let cell = crate::table::row_cell_ranges(source_row, columns)?
+            .iter()
+            .position(|(start, end)| (*start..*end).contains(&logical_column))
+            .ok_or_else(|| Error::Other("logical column has no physical cell".to_owned()))?;
+        let before = table.inner.clone();
+        table.split_cell(row, cell)?;
+        if table.inner == &before {
+            return Ok(false);
+        }
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(true)
+    }
+
     /// Insert a copy of one table row before row `insert_at` in the same table.
     ///
     /// `table_index` counts every table in document order, including nested
@@ -16294,9 +25230,128 @@ impl Document {
         }
         table.rows.remove(row_index);
         validate_table_topology(table)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         self.commit_staged_mutation(reopened);
         Ok(true)
+    }
+
+    /// Delete a logical column in one checked related table and publish once.
+    #[doc(hidden)]
+    pub fn delete_story_table_column(
+        &mut self,
+        location: &ContentLocation,
+        column: usize,
+    ) -> Result<()> {
+        let mut candidate = self.clone_for_staging();
+        let mut table = candidate.story_table_model(location)?;
+        crate::table::remove_grid_column(&mut table, column)?;
+        candidate.replace_story_content(location, ContentFragment::table(table)?)?;
+        candidate.reconcile_cut_table_bookmarks(self, location.story().part_name())?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Copy one row within a checked related table, freshening its identities once.
+    #[doc(hidden)]
+    pub fn clone_story_table_row(
+        &mut self,
+        location: &ContentLocation,
+        source: usize,
+        insert_at: usize,
+    ) -> Result<usize> {
+        let mut candidate = self.clone_for_staging();
+        let mut table = candidate.story_table_model(location)?;
+        if source >= table.rows.len() || insert_at > table.rows.len() {
+            return Err(Error::Other(
+                "rich table row copy index is out of range".to_owned(),
+            ));
+        }
+        let copied = candidate.fresh_table_row_copy(table.rows[source].clone())?;
+        for (position, _) in &mut table.extra_xml {
+            if *position >= insert_at {
+                *position += 1;
+            }
+        }
+        for (position, _, _) in &mut table.content_controls {
+            if *position >= insert_at {
+                *position += 1;
+            }
+        }
+        table.rows.insert(insert_at, copied);
+        validate_table_topology(&table)?;
+        candidate.replace_story_content(location, ContentFragment::table(table)?)?;
+        self.commit_staged_mutation(candidate);
+        Ok(insert_at)
+    }
+
+    /// Remove one row from a checked related table while preserving owned boundaries.
+    #[doc(hidden)]
+    pub fn remove_story_table_row(
+        &mut self,
+        location: &ContentLocation,
+        row_index: usize,
+    ) -> Result<bool> {
+        let mut candidate = self.clone_for_staging();
+        let mut table = candidate.story_table_model(location)?;
+        if row_index >= table.rows.len() {
+            return Err(Error::Other(
+                "rich table row index is out of range".to_owned(),
+            ));
+        }
+        if table.rows.len() == 1 {
+            return Err(Error::Other(
+                "a table keeps at least one row, so its only row cannot be removed".to_owned(),
+            ));
+        }
+        restart_merges_continued_below(&mut table, row_index)?;
+        let raw_before = table
+            .extra_xml
+            .iter()
+            .filter(|(position, _)| *position == row_index)
+            .count();
+        for (position, _) in &mut table.extra_xml {
+            if *position > row_index {
+                *position -= 1;
+            }
+        }
+        for (position, raw, _) in &mut table.content_controls {
+            if *position > row_index {
+                if *position == row_index + 1 {
+                    *raw += raw_before;
+                }
+                *position -= 1;
+            }
+        }
+        table.rows.remove(row_index);
+        validate_table_topology(&table)?;
+        candidate.replace_story_content(location, ContentFragment::table(table)?)?;
+        self.commit_staged_mutation(candidate);
+        Ok(true)
+    }
+
+    /// Set one body's table cell text through a checked package transaction.
+    #[doc(hidden)]
+    pub fn try_set_cell_text(
+        &mut self,
+        table: usize,
+        row: usize,
+        cell: usize,
+        text: &str,
+    ) -> Result<()> {
+        let mut candidate = self.clone_for_staging();
+        candidate
+            .table_mut(table)
+            .ok_or_else(|| Error::Other(format!("table index {table} is out of range")))?
+            .cell(row, cell)
+            .ok_or_else(|| Error::Other(format!("cell {row}:{cell} is out of range")))?
+            .try_set_text(text)?;
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
     }
 
     /// Freshen the document-wide identities carried by a copied table row.
@@ -16505,28 +25560,101 @@ impl Document {
     /// A direct body paragraph has its one-segment story item path. A
     /// paragraph inside a block content control, which has no story item of
     /// its own, has a two-segment path: the control's story item index, then
-    /// the paragraph's position among the control's paragraphs. Only
-    /// [`Self::add_story_comment`] accepts the two-segment form. Returns
-    /// `None` when the index is out of range.
+    /// the paragraph's position among the control's paragraphs. Comment
+    /// operations and scoped literal replacement accept this form. Returns
+    /// `None` when the index is out of range or the paragraph belongs to a
+    /// Resolve a modeled body cell paragraph to its checked physical story owner.
+    #[doc(hidden)]
+    pub fn cell_paragraph_story_location(
+        &self,
+        table: usize,
+        row: usize,
+        cell: usize,
+        paragraph: usize,
+    ) -> Result<ContentLocation> {
+        let mut candidate = self.clone_for_staging();
+        let selected = candidate
+            .table(table)
+            .and_then(|table| table.cell(row, cell).map(|cell| cell.inner as *const CT_Tc))
+            .ok_or_else(|| Error::Other("cell index is out of range".to_owned()))?;
+        let xml = candidate.document.to_xml()?;
+        for owner in scan_story_owners(&xml, StoryKind::Body)?
+            .into_iter()
+            .filter(|owner| owner.kind == StoryKind::TableCell)
+        {
+            let (content, mut ordinal) = modeled_main_cell_route(&xml, &owner)?;
+            let modeled = match candidate.document.body.content.get_mut(content) {
+                Some(BodyContent::Table(table)) => nth_cell_in_table(table, &mut ordinal),
+                Some(BodyContent::ContentControl(control)) => {
+                    nth_cell_in_control(control, &mut ordinal)
+                }
+                _ => None,
+            };
+            if let Some(modeled) = modeled.filter(|cell| std::ptr::eq(selected, *cell)) {
+                let count = modeled.paragraphs().len();
+                let story = StoryId {
+                    kind: owner.kind,
+                    part_name: candidate.doc_part_name.clone(),
+                    owner_index: owner.owner_index,
+                    fingerprint: owner.fingerprint,
+                };
+                let mut paragraphs = story_range_paragraph_spans(&xml, &[(story, owner)])?
+                    .into_iter()
+                    .next()
+                    .expect("one checked cell inventory");
+                // Controls contribute their direct paragraphs separately. Restore
+                // physical source order before applying the facade paragraph axis.
+                paragraphs.sort_by_key(|(_, span)| span.start);
+                if paragraphs.len() != count {
+                    return Err(Error::Other(
+                        "cell paragraph modeled/source correspondence is unsupported".into(),
+                    ));
+                }
+                let (location, _) = paragraphs
+                    .into_iter()
+                    .nth(paragraph)
+                    .ok_or_else(|| Error::Other("cell paragraph index is out of range".into()))?;
+                candidate.story_range_paragraph_snapshot(&location)?;
+                return Ok(location);
+            }
+        }
+        Err(Error::Other(
+            "cell has no checked physical story owner".to_owned(),
+        ))
+    }
+
+    /// nested control or table beyond this two-segment path.
     pub fn paragraph_story_location(
         &self,
         paragraph_index: usize,
     ) -> Result<Option<ContentLocation>> {
-        let mut remaining = paragraph_index;
-        let mut target = None;
-        for (slot, child) in self.document.body.content.iter().enumerate() {
-            let count = match child {
-                BodyContent::Paragraph(_) => 1,
-                BodyContent::ContentControl(control) => paragraph_count_in_control(control),
-                BodyContent::Table(_) | BodyContent::RawXml(_) => 0,
-            };
-            if remaining < count {
-                let ordinal = matches!(child, BodyContent::ContentControl(_)).then_some(remaining);
-                target = Some((slot, ordinal));
-                break;
-            }
-            remaining -= count;
-        }
+        let Some(paragraph) = self.paragraph(paragraph_index) else {
+            return Ok(None);
+        };
+        let selected = paragraph.inner;
+        // A facade handle counts recursively. The checked two-segment path
+        // counts only paragraphs directly owned by the outer block control.
+        let target = self
+            .document
+            .body
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(slot, child)| match child {
+                BodyContent::Paragraph(paragraph) if std::ptr::eq(paragraph, selected) => {
+                    Some((slot, None))
+                }
+                BodyContent::ContentControl(control) => control
+                    .content
+                    .iter()
+                    .filter_map(|child| match child {
+                        SdtContent::Paragraph(paragraph) => Some(paragraph),
+                        _ => None,
+                    })
+                    .position(|paragraph| std::ptr::eq(paragraph, selected))
+                    .map(|ordinal| (slot, Some(ordinal))),
+                _ => None,
+            });
         let Some((slot, ordinal)) = target else {
             return Ok(None);
         };
@@ -16538,13 +25666,21 @@ impl Document {
         let (source, owner) = self.story_source_and_owner(&story)?;
         // The body section properties come last, so the n-th direct item is
         // the direct body child at slot n.
-        let item_index = scan_story_items(source.xml.as_ref(), &owner)?
+        let items = scan_story_items(source.xml.as_ref(), &owner)?;
+        let (item_index, item) = items
             .iter()
             .enumerate()
             .filter(|(_, item)| item.direct_owner_child)
             .nth(slot)
-            .map(|(index, _)| index)
             .ok_or_else(|| Error::Other("body paragraph has no story item".to_owned()))?;
+        let expected_kind = if ordinal.is_some() {
+            StoryItemKind::ContentControl
+        } else {
+            StoryItemKind::Paragraph
+        };
+        if item.kind != expected_kind {
+            return Ok(None);
+        }
         Ok(Some(ContentLocation::new(
             story,
             StoryItemKind::Paragraph,
@@ -16562,10 +25698,24 @@ impl Document {
 
     /// Remove the content at the given body index.
     ///
-    /// Returns `true` if an element was removed, `false` if the index was out of bounds.
+    /// Returns false when the index is absent or safe removal is refused.
+    /// Use [`Self::try_remove_content`] to distinguish a refusal from an absent index.
     pub fn remove_content(&mut self, index: usize) -> bool {
-        self.invalidate_layout();
-        self.document.body.remove(index).is_some()
+        self.try_remove_content(index).unwrap_or(false)
+    }
+
+    /// Remove a direct body child and its wholly owned comment threads.
+    /// Partial comment cuts and unprovable companion ownership fail atomically.
+    pub fn try_remove_content(&mut self, index: usize) -> Result<bool> {
+        if index >= self.document.body.content.len() {
+            return Ok(false);
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.document.body.remove(index);
+        candidate.reconcile_comment_removal(self)?;
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(true)
     }
 
     // ---- Image support ----
@@ -16629,6 +25779,167 @@ impl Document {
         Ok(())
     }
 
+    fn chart_legend_owner(
+        &self,
+        paragraph: usize,
+    ) -> Result<(ContentLocation, Vec<u8>, WordChartReference, String)> {
+        if self.content_index_of_paragraph(paragraph).is_none() {
+            return Err(Error::Other(
+                "chart legend requires a direct body paragraph".into(),
+            ));
+        }
+        let location = self
+            .paragraph_story_location(paragraph)?
+            .ok_or_else(|| Error::Other("chart paragraph is absent".into()))?;
+        let xml = self.paragraph_element_xml(&location)?;
+        let references = word_chart_references(&xml)?
+            .into_iter()
+            .filter(|reference| reference.owned)
+            .collect::<Vec<_>>();
+        let [reference] = references.as_slice() else {
+            return Err(Error::Other(
+                "chart paragraph requires exactly one owned chart".into(),
+            ));
+        };
+        let id = &reference.relationship_id;
+        if self
+            .package
+            .get_part_rels(&self.doc_part_name)
+            .map_or(0, |rels| rels.items.iter().filter(|r| r.id == *id).count())
+            != 1
+        {
+            return Err(Error::Other(
+                "chart relationship is missing or ambiguous".into(),
+            ));
+        }
+        let relationship = self
+            .package
+            .get_part_rels(&self.doc_part_name)
+            .and_then(|r| r.get_by_id(id))
+            .filter(|r| r.rel_type == rel_types::CHART && relationship_is_internal(r))
+            .ok_or_else(|| {
+                Error::Other("chart relationship is missing, external or invalid".into())
+            })?;
+        let part = OpcPackage::resolve_rel_target(&self.doc_part_name, &relationship.target);
+        if self.package.content_types.content_type_for(&part) != Some(content_types::CHART)
+            || self.package.get_part(&part).is_none()
+        {
+            return Err(Error::Other(
+                "chart target is missing or has invalid content type".into(),
+            ));
+        }
+        if let Some(rels) = self.package.get_part_rels(&part) {
+            for rel in &rels.items {
+                if relationship_is_internal(rel)
+                    && self
+                        .package
+                        .get_part(&OpcPackage::resolve_rel_target(&part, &rel.target))
+                        .is_none()
+                {
+                    return Err(Error::Other("chart related part is missing".into()));
+                }
+            }
+        }
+        Ok((location, xml, reference.clone(), part))
+    }
+
+    /// Read effective legend settings from exactly one owned direct-body chart.
+    pub fn chart_legend(&self, paragraph: usize) -> Result<oxml_chart::LegendSettings> {
+        let (_, _, _, part) = self.chart_legend_owner(paragraph)?;
+        oxml_chart::chart_legend_settings(
+            self.package
+                .get_part(&part)
+                .ok_or_else(|| Error::Other("chart part disappeared".into()))?,
+        )
+        .map_err(|e| Error::Other(format!("invalid chart legend: {e}")))
+    }
+
+    /// Atomically edit one chart legend, isolating any shared ChartML part.
+    pub fn set_chart_legend(
+        &mut self,
+        paragraph: usize,
+        visible: Option<bool>,
+        position: Option<oxml_chart::LegendPosition>,
+        overlay: Option<bool>,
+    ) -> Result<()> {
+        let (location, xml, reference, part) = self.chart_legend_owner(paragraph)?;
+        let id = &reference.relationship_id;
+        let source = self
+            .package
+            .get_part(&part)
+            .ok_or_else(|| Error::Other("chart part disappeared".into()))?;
+        let updated = oxml_chart::set_chart_legend(source, visible, position, overlay)
+            .map_err(|e| Error::Other(format!("invalid chart legend: {e}")))?;
+        if updated == source {
+            return Ok(());
+        }
+        let references = word_chart_references(&self.document.to_xml()?)?;
+        let shared = references
+            .iter()
+            .filter(|r| &r.relationship_id == id)
+            .count()
+            > 1
+            || self
+                .package
+                .part_rels
+                .iter()
+                .flat_map(|(owner, rels)| rels.items.iter().map(move |r| (owner, r)))
+                .filter(|(owner, r)| {
+                    relationship_is_internal(r)
+                        && OpcPackage::resolve_rel_target(owner, &r.target)
+                            .eq_ignore_ascii_case(&part)
+                })
+                .count()
+                > 1;
+        let mut candidate = self.clone_for_staging();
+        candidate
+            .identifiers
+            .observe_package_graph(&candidate.package)?;
+        let target = if shared {
+            candidate
+                .identifiers
+                .reserve_part_name("/word/charts", "chart", "xml")?
+        } else {
+            part.clone()
+        };
+        if shared {
+            if let Some(mut rels) = candidate.package.get_part_rels(&part).cloned() {
+                for rel in &mut rels.items {
+                    if relationship_is_internal(rel) {
+                        let dest = OpcPackage::resolve_rel_target(&part, &rel.target);
+                        if candidate.package.get_part(&dest).is_none() {
+                            return Err(Error::Other("chart related part is missing".into()));
+                        }
+                        rel.target = relative_target(&target, &dest);
+                    }
+                }
+                candidate.package.set_part_rels(&target, rels);
+            }
+            let owner = candidate.doc_part_name.clone();
+            let isolated = candidate.add_relative_internal_relationship_checked(
+                &owner,
+                rel_types::CHART,
+                &target,
+            )?;
+            let mut rewritten = xml;
+            rewritten.splice(reference.value_span, isolated.bytes());
+            let rewritten =
+                std::str::from_utf8(&rewritten).map_err(|e| Error::Other(e.to_string()))?;
+            candidate.package.set_part(&target, updated);
+            candidate
+                .package
+                .content_types
+                .add_override(&target, content_types::CHART);
+            candidate.replace_paragraph_xml(&location, rewritten)?;
+        } else {
+            candidate.package.set_part(&target, updated);
+        }
+        candidate.invalidate_layout();
+        let candidate = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
     /// Add an editable inline chart to the document.
     ///
     /// The ChartML cache and embedded workbook are authored from the same
@@ -16643,6 +25954,34 @@ impl Document {
         self.add_chart_package(ChartPackageSource::Authored { kind, data }, width, height)?;
         let Some(BodyContent::Paragraph(paragraph)) = self.document.body.content.last_mut() else {
             unreachable!("chart package assembly appends one paragraph");
+        };
+        Ok(Paragraph { inner: paragraph })
+    }
+
+    /// Insert an editable chart immediately after a direct body paragraph.
+    /// Validation and package assembly complete on a candidate before publication.
+    pub fn add_chart_after(
+        &mut self,
+        after: usize,
+        kind: ChartKind,
+        width: Length,
+        height: Length,
+        data: &ChartData,
+    ) -> Result<Paragraph<'_>> {
+        let index = self.content_index_of_paragraph(after).ok_or_else(|| {
+            Error::Other("chart insertion requires a direct body paragraph".to_owned())
+        })? + 1;
+        let mut candidate = self.clone_for_staging();
+        candidate.add_chart(kind, width, height, data)?;
+        let paragraph =
+            candidate.document.body.content.pop().ok_or_else(|| {
+                Error::Other("chart assembly did not create a paragraph".to_owned())
+            })?;
+        candidate.document.body.content.insert(index, paragraph);
+        candidate.document.to_xml()?;
+        self.commit_staged_mutation(candidate);
+        let BodyContent::Paragraph(paragraph) = &mut self.document.body.content[index] else {
+            unreachable!("chart assembly creates a paragraph");
         };
         Ok(Paragraph { inner: paragraph })
     }
@@ -16863,8 +26202,9 @@ impl Document {
     /// Resolve the public reader projection for one numbering level.
     ///
     /// `has_unmodeled_properties` reports extra XML or attributes attached to
-    /// this numbering instance, definition, or level. Modeled producer metadata
-    /// and raw preservation overlays for level properties are not reported.
+    /// this numbering instance, definition, or level, excluding retained XML
+    /// namespace declarations. Modeled producer metadata and raw preservation
+    /// overlays for level properties are not reported.
     pub fn numbering_level(&self, num_id: u32, level: u32) -> Option<NumberingLevel<'_>> {
         if num_id == 0 {
             return None;
@@ -16910,11 +26250,14 @@ impl Document {
             template_code: level.template_code.as_deref(),
             tentative: level.tentative,
             has_unmodeled_properties: !instance.extra_xml.is_empty()
-                || !instance.extra_attributes.is_empty()
                 || !definition.extra_xml.is_empty()
-                || !definition.extra_attributes.is_empty()
                 || !level.extra_xml.is_empty()
-                || !level.extra_attributes.is_empty(),
+                || instance
+                    .extra_attributes
+                    .iter()
+                    .chain(&definition.extra_attributes)
+                    .chain(&level.extra_attributes)
+                    .any(|(name, _)| name != "xmlns" && !name.starts_with("xmlns:")),
             has_paragraph_presentation: level.ppr.as_ref().is_some_and(|properties| {
                 Self::has_list_paragraph_presentation(level.ilvl, properties)
             }),
@@ -17090,44 +26433,72 @@ impl Document {
     /// Creates a header part with the given text and references it from
     /// the section properties.
     pub fn set_header(&mut self, text: &str) {
+        self.try_set_header(text)
+            .expect("an in-memory document can install a header");
+    }
+
+    /// Replace the header atomically, refusing unsafe comment removal.
+    pub fn try_set_header(&mut self, text: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.invalidate_layout();
-        candidate
-            .set_header_footer_part(text, true, HdrFtrType::Default)
-            .expect("an in-memory document can install a header");
+        candidate.set_header_footer_part(text, true, HdrFtrType::Default)?;
+        candidate.reconcile_comment_removal(self)?;
+        candidate.clone_for_staging().prepare_and_reopen_staged()?;
         self.commit_staged_mutation(candidate);
+        Ok(())
     }
 
     /// Set the default footer text.
     pub fn set_footer(&mut self, text: &str) {
+        self.try_set_footer(text)
+            .expect("an in-memory document can install a footer");
+    }
+
+    /// Replace the footer atomically, refusing unsafe comment removal.
+    pub fn try_set_footer(&mut self, text: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.invalidate_layout();
-        candidate
-            .set_header_footer_part(text, false, HdrFtrType::Default)
-            .expect("an in-memory document can install a footer");
+        candidate.set_header_footer_part(text, false, HdrFtrType::Default)?;
+        candidate.reconcile_comment_removal(self)?;
+        candidate.clone_for_staging().prepare_and_reopen_staged()?;
         self.commit_staged_mutation(candidate);
+        Ok(())
     }
 
     /// Set the first-page header text.
     pub fn set_first_page_header(&mut self, text: &str) {
+        self.try_set_first_page_header(text)
+            .expect("an in-memory document can install a first page header");
+    }
+
+    /// Replace the first page header atomically, refusing unsafe comment removal.
+    pub fn try_set_first_page_header(&mut self, text: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.invalidate_layout();
         candidate.set_different_first_page(true);
-        candidate
-            .set_header_footer_part(text, true, HdrFtrType::First)
-            .expect("an in-memory document can install a first-page header");
+        candidate.set_header_footer_part(text, true, HdrFtrType::First)?;
+        candidate.reconcile_comment_removal(self)?;
+        candidate.clone_for_staging().prepare_and_reopen_staged()?;
         self.commit_staged_mutation(candidate);
+        Ok(())
     }
 
     /// Set the first-page footer text.
     pub fn set_first_page_footer(&mut self, text: &str) {
+        self.try_set_first_page_footer(text)
+            .expect("an in-memory document can install a first page footer");
+    }
+
+    /// Replace the first page footer atomically, refusing unsafe comment removal.
+    pub fn try_set_first_page_footer(&mut self, text: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.invalidate_layout();
         candidate.set_different_first_page(true);
-        candidate
-            .set_header_footer_part(text, false, HdrFtrType::First)
-            .expect("an in-memory document can install a first-page footer");
+        candidate.set_header_footer_part(text, false, HdrFtrType::First)?;
+        candidate.reconcile_comment_removal(self)?;
+        candidate.clone_for_staging().prepare_and_reopen_staged()?;
         self.commit_staged_mutation(candidate);
+        Ok(())
     }
 
     /// Get the default header text, if set.
@@ -17172,6 +26543,13 @@ impl Document {
                 HdrFtrType::Default,
             )
             .expect("an in-memory document can install a header image");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -17230,6 +26608,416 @@ impl Document {
         candidate.invalidate_layout();
         let reopened = candidate.prepare_and_reopen_staged()?;
         self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Set real DrawingML watermark text in one explicit header variant.
+    /// Only unchanged API-owned DrawingML is replaced. Opaque edits refuse atomically.
+    pub fn set_drawingml_text_watermark_for(
+        &mut self,
+        section_index: usize,
+        hdr_type: HdrFtrType,
+        text: &str,
+        options: TextWatermarkOptions,
+        font_size: Length,
+    ) -> Result<()> {
+        validate_text_watermark_options(&options)?;
+        if options.opacity != 0.5 {
+            return Err(Error::Other(
+                "DrawingML text watermark opacity other than 0.5 is unsupported by the qualified native text-fill representation".into(),
+            ));
+        }
+        let font_emu = font_size.to_emu();
+        if font_emu <= 0 || font_emu % 6350 != 0 || font_emu / 6350 > 3276 {
+            return Err(Error::Other(
+                "watermark font size requires positive half-points up to 1638 points".into(),
+            ));
+        }
+        let mut candidate = self.clone_for_staging();
+        let story =
+            match candidate.section_story(section_index, HeaderFooterKind::Header, hdr_type)? {
+                Some(story) => story.story,
+                None => candidate.create_section_story(
+                    section_index,
+                    HeaderFooterKind::Header,
+                    hdr_type,
+                )?,
+            };
+        candidate.flush_to_package()?;
+        let original = candidate
+            .package
+            .get_part(&story.part_name)
+            .ok_or_else(|| Error::Other("watermark header source is missing".into()))?
+            .to_vec();
+        let owned = drawingml_watermark_span(&original)?;
+        let drawing_id = match &owned {
+            Some((_, id)) => *id,
+            None => candidate.identifiers.reserve_drawing_id()?,
+        };
+        let box_options = TextBoxOptions {
+            width: options.width,
+            height: options.height,
+            anchor: PictureAnchor {
+                horizontal_relative_from: DrawingHorizontalRelativeFrom::Page,
+                horizontal_offset: Length::emu(0),
+                horizontal_alignment: Some(DrawingHorizontalAlignment::Center),
+                vertical_relative_from: DrawingVerticalRelativeFrom::Page,
+                vertical_offset: Length::emu(0),
+                vertical_alignment: Some(DrawingVerticalAlignment::Center),
+                wrap: DrawingWrap::None,
+                distance_top: Length::emu(0),
+                distance_bottom: Length::emu(0),
+                distance_left: Length::emu(0),
+                distance_right: Length::emu(0),
+                relative_height: 0,
+                behind_text: true,
+            },
+            rotation_degrees: options.rotation_degrees,
+            text_direction: TextBoxDirection::Horizontal,
+            fill_color: None,
+        };
+        let mut alternate = String::from_utf8(authored_text_box_alternate_content(
+            drawing_id,
+            text,
+            &box_options,
+        )?)
+        .map_err(|error| Error::Other(error.to_string()))?;
+        // Plain text warp keeps the watermark as real DrawingML shape text.
+        // It also lets importers preserve the shape rotation instead of
+        // projecting this owner as an unrotated Writer text frame.
+        alternate = alternate.replace(
+            "<wps:bodyPr vert=\"horz\"/>",
+            "<wps:bodyPr vert=\"horz\"><a:prstTxWarp prst=\"textPlain\"><a:avLst/></a:prstTxWarp></wps:bodyPr>",
+        );
+        let family = options.font_family.as_deref().unwrap_or("Calibri");
+        let family = quick_xml::escape::escape(family);
+        let color = &options.color;
+        let alpha = (options.opacity * 100_000.0).round() as u32;
+        let size = font_emu / 6350;
+        let properties = format!(
+            "<w:rPr><w:rFonts w:ascii=\"{family}\" w:hAnsi=\"{family}\" w:eastAsia=\"{family}\" w:cs=\"{family}\"/><w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/><w14:textFill xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"><w14:solidFill><w14:srgbClr w14:val=\"{color}\"><w14:alpha w14:val=\"{alpha}\"/></w14:srgbClr></w14:solidFill></w14:textFill></w:rPr>"
+        );
+        if alternate.matches("<w:r>").count() != 2 {
+            return Err(Error::Other(
+                "watermark requires both real text representations".into(),
+            ));
+        }
+        alternate = alternate.replace("<w:r>", &format!("<w:r>{properties}"));
+        alternate = alternate.replace(
+            &format!("name=\"Text Box {drawing_id}\""),
+            "name=\"RDOCX DrawingML Watermark\"",
+        );
+        // Word preserves solid text-fill opacity, while the supported WPS
+        // importer preserves the equivalent constant-gradient opacity. Keep
+        // both real text owners under their actual declared capability choices.
+        let choice_start = alternate
+            .find("<mc:Choice Requires=\"wps\">")
+            .ok_or_else(|| Error::Other("watermark capability choice is missing".into()))?;
+        let choice_end = alternate[choice_start..]
+            .find("</mc:Choice>")
+            .map(|offset| choice_start + offset + "</mc:Choice>".len())
+            .ok_or_else(|| Error::Other("watermark capability choice is incomplete".into()))?;
+        let original_choice = &alternate[choice_start..choice_end];
+        let word_choice = original_choice.replacen("Requires=\"wps\"", "Requires=\"wps w16\" xmlns:w16=\"http://schemas.microsoft.com/office/word/2018/wordml\"", 1);
+        alternate.replace_range(choice_start..choice_end, &word_choice);
+        let mut fallback = String::from_utf8(
+            VmlWatermark::Text {
+                text: text.to_owned(),
+                width_pt: options.width.to_pt(),
+                height_pt: options.height.to_pt(),
+                rotation_degrees: options.rotation_degrees,
+                color: options.color.clone(),
+                font_family: options.font_family.clone(),
+                opacity: options.opacity,
+            }
+            .to_pict_xml(),
+        )
+        .map_err(|_| Error::Other("watermark textpath source is not UTF-8".into()))?;
+        // Word's authored type 136 uses this formula-driven straight text path.
+        // Keep the legacy VML authoring writer unchanged and adapt only this fallback.
+        let shape_type_start = fallback
+            .find("<v:shapetype ")
+            .ok_or_else(|| Error::Other("watermark textpath shape type is missing".into()))?;
+        let shape_type_end = fallback[shape_type_start..]
+            .find("</v:shapetype>")
+            .map(|offset| shape_type_start + offset + "</v:shapetype>".len())
+            .ok_or_else(|| Error::Other("watermark textpath shape type is incomplete".into()))?;
+        let shape_type = concat!(
+            "<v:shapetype id=\"rdocx-watermark-type-text\" coordsize=\"21600,21600\" o:spt=\"136\" adj=\"10800\" path=\"m@7,l@8,m@5,21600l@6,21600e\">",
+            "<v:formulas><v:f eqn=\"sum #0 0 10800\"/><v:f eqn=\"prod #0 2 1\"/><v:f eqn=\"sum 21600 0 @1\"/><v:f eqn=\"sum 0 0 @2\"/><v:f eqn=\"sum 21600 0 @3\"/><v:f eqn=\"if @0 @3 0\"/><v:f eqn=\"if @0 21600 @1\"/><v:f eqn=\"if @0 0 @2\"/><v:f eqn=\"if @0 @4 21600\"/><v:f eqn=\"mid @5 @6\"/><v:f eqn=\"mid @8 @5\"/><v:f eqn=\"mid @7 @8\"/><v:f eqn=\"mid @6 @7\"/><v:f eqn=\"sum @6 0 @5\"/></v:formulas>",
+            "<v:path textpathok=\"t\" o:connecttype=\"custom\" o:connectlocs=\"@9,0;@10,10800;@11,21600;@12,10800\" o:connectangles=\"270,180,90,0\"/><v:textpath on=\"t\" fitshape=\"t\"/><v:handles><v:h position=\"#0,bottomRight\" xrange=\"6629,14971\"/></v:handles><o:lock v:ext=\"edit\" text=\"t\" shapetype=\"t\"/></v:shapetype>"
+        );
+        fallback.replace_range(shape_type_start..shape_type_end, shape_type);
+        fallback = fallback
+            .replace(
+                "font-size:1pt",
+                &format!("font-size:{}pt", font_size.to_pt()),
+            )
+            .replace("relative:margin", "relative:page")
+            .replace(
+                &format!("fillcolor=\"{color}\""),
+                &format!("fillcolor=\"#{color}\""),
+            )
+            .replace(
+                "id=\"rdocx-watermark\"",
+                &format!("id=\"rdocx-watermark-{drawing_id}\""),
+            )
+            .replace(
+                "rdocx-watermark-type-text",
+                &format!("rdocx-watermark-type-text-{drawing_id}"),
+            );
+        let fallback_start = alternate
+            .find("<mc:Fallback>")
+            .ok_or_else(|| Error::Other("watermark fallback source is missing".into()))?;
+        let fallback_end = alternate[fallback_start..]
+            .find("</mc:Fallback>")
+            .map(|offset| fallback_start + offset + "</mc:Fallback>".len())
+            .ok_or_else(|| Error::Other("watermark fallback source is incomplete".into()))?;
+        alternate.replace_range(
+            fallback_start..fallback_end,
+            &format!("<mc:Fallback>{fallback}</mc:Fallback>"),
+        );
+        let checksum = structural_fingerprint(alternate.as_bytes())?;
+        alternate = alternate.replace(
+            "name=\"RDOCX DrawingML Watermark\"",
+            &format!(
+                "name=\"RDOCX DrawingML Watermark\" descr=\"rdocx-watermark-text-v1:{checksum}\""
+            ),
+        );
+        let alternate = alternate.into_bytes();
+        // Validate the actual style projection before publishing either representation.
+        let drawing =
+            rdocx_oxml::drawing::parse_alternate_content(&alternate, &[]).ok_or_else(|| {
+                Error::Other("watermark DrawingML representation did not reopen".into())
+            })?;
+        if let Some((span, _)) = owned {
+            let mut updated = original.clone();
+            updated.splice(span.clone(), alternate);
+            candidate
+                .package
+                .set_part(&story.part_name, updated.clone());
+            candidate.prune_replaced_watermark_media(
+                &story.part_name,
+                &original[span],
+                &updated,
+            )?;
+        } else {
+            let mut paragraph = CT_P::new();
+            paragraph.runs.push(CT_R {
+                properties: None,
+                content: Vec::new(),
+                extra_xml: vec![alternate],
+                extra_xml_positions: vec![0],
+                alt_drawings: vec![drawing],
+            });
+            candidate.append_authored_paragraph_to_story(&story, paragraph)?;
+        }
+        candidate.invalidate_layout();
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Set a page-centered DrawingML image in the selected actual header owner.
+    pub fn set_drawingml_image_watermark_for(
+        &mut self,
+        section_index: usize,
+        hdr_type: HdrFtrType,
+        image_data: &[u8],
+        image_filename: &str,
+        options: ImageWatermarkOptions,
+    ) -> Result<()> {
+        if options.width.to_emu() <= 0
+            || options.height.to_emu() <= 0
+            || !options.rotation_degrees.is_finite()
+            || !options.opacity.is_finite()
+            || !(0.0..=1.0).contains(&options.opacity)
+        {
+            return Err(Error::Other(
+                "watermark image geometry or opacity is invalid".into(),
+            ));
+        }
+        if oxml_media::probe(image_data).is_none() {
+            return Err(Error::Other("watermark image bytes are unsupported".into()));
+        }
+        let mut candidate = self.clone_for_staging();
+        let story =
+            match candidate.section_story(section_index, HeaderFooterKind::Header, hdr_type)? {
+                Some(story) => story.story,
+                None => candidate.create_section_story(
+                    section_index,
+                    HeaderFooterKind::Header,
+                    hdr_type,
+                )?,
+            };
+        candidate.flush_to_package()?;
+        let original = candidate
+            .package
+            .get_part(&story.part_name)
+            .ok_or_else(|| Error::Other("watermark header source is missing".into()))?
+            .to_vec();
+        let owned = drawingml_watermark_span(&original)?;
+        let id = match &owned {
+            Some((_, id)) => *id,
+            None => candidate.identifiers.reserve_drawing_id()?,
+        };
+        // Retire only the already qualified API owner before allocating its
+        // replacement. Otherwise final relationship canonicalization can reuse
+        // the retired ID after the new owner's fingerprint has been written.
+        if let Some((span, _)) = &owned {
+            let mut without_owner = original.clone();
+            without_owner.drain(span.clone());
+            candidate
+                .package
+                .set_part(&story.part_name, without_owner.clone());
+            candidate.prune_replaced_watermark_media(
+                &story.part_name,
+                &original[span.clone()],
+                &without_owner,
+            )?;
+        }
+        let relationship = candidate.add_image_relationship_checked(
+            &story.part_name,
+            image_data,
+            image_filename,
+        )?;
+        let mut anchor = CT_Anchor::background(
+            &relationship,
+            options.width.to_emu(),
+            options.height.to_emu(),
+        );
+        anchor.doc_pr_id = id;
+        anchor.name = Some("RDOCX DrawingML Watermark".into());
+        anchor.description = None;
+        anchor.pos_h_align = Some(rdocx_oxml::drawing::AnchorAlignH::Center);
+        anchor.pos_v_align = Some(rdocx_oxml::drawing::AnchorAlignV::Center);
+        let mut writer = Writer::new(Vec::new());
+        CT_Drawing::anchor(anchor).to_xml(&mut writer)?;
+        let mut drawing =
+            String::from_utf8(writer.into_inner()).map_err(|e| Error::Other(e.to_string()))?;
+        drawing = drawing.replacen("<w:drawing>", "<w:drawing xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">", 1);
+        let blip = format!("<a:blip r:embed=\"{relationship}\"/>");
+        let alpha = (options.opacity * 100_000.0).round() as u32;
+        if !drawing.contains(&blip) || !drawing.contains("<a:xfrm>") {
+            return Err(Error::Other(
+                "watermark image writer shape is unsupported".into(),
+            ));
+        }
+        drawing = drawing.replacen(
+            &blip,
+            &format!(
+                "<a:blip r:embed=\"{relationship}\"><a:alphaModFix amt=\"{alpha}\"/></a:blip>"
+            ),
+            1,
+        );
+        let rotation = (options.rotation_degrees.rem_euclid(360.0) * 60_000.0).round() as i32;
+        drawing = drawing.replacen("<a:xfrm>", &format!("<a:xfrm rot=\"{rotation}\">"), 1);
+        let checksum = structural_fingerprint(drawing.as_bytes())?;
+        drawing = drawing.replacen(
+            "name=\"RDOCX DrawingML Watermark\"",
+            &format!(
+                "name=\"RDOCX DrawingML Watermark\" descr=\"rdocx-watermark-image-v1:{checksum}\""
+            ),
+            1,
+        );
+        if let Some((span, _)) = owned {
+            let mut updated = original.clone();
+            updated.splice(span.clone(), drawing.into_bytes());
+            candidate
+                .package
+                .set_part(&story.part_name, updated.clone());
+        } else {
+            let mut paragraph = CT_P::new();
+            paragraph.runs.push(CT_R {
+                properties: None,
+                content: Vec::new(),
+                extra_xml: vec![drawing.into_bytes()],
+                extra_xml_positions: vec![0],
+                alt_drawings: Vec::new(),
+            });
+            candidate.append_authored_paragraph_to_story(&story, paragraph)?;
+        }
+        candidate.invalidate_layout();
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    /// Remove only a source-qualified API watermark, keeping its surrounding content.
+    pub fn remove_drawingml_watermark_for(
+        &mut self,
+        section_index: usize,
+        hdr_type: HdrFtrType,
+    ) -> Result<()> {
+        let Some(story) = self.section_story(section_index, HeaderFooterKind::Header, hdr_type)?
+        else {
+            return Ok(());
+        };
+        let mut candidate = self.clone_for_staging();
+        candidate.flush_to_package()?;
+        let original = candidate
+            .package
+            .get_part(&story.story.part_name)
+            .ok_or_else(|| Error::Other("watermark header source is missing".into()))?
+            .to_vec();
+        let Some((span, _)) = drawingml_watermark_span(&original)? else {
+            return Ok(());
+        };
+        let mut updated = original.clone();
+        updated.drain(span.clone());
+        candidate
+            .package
+            .set_part(&story.story.part_name, updated.clone());
+        candidate.prune_replaced_watermark_media(
+            &story.story.part_name,
+            &original[span],
+            &updated,
+        )?;
+        candidate.invalidate_layout();
+        let reopened = candidate.prepare_and_reopen_staged()?;
+        self.commit_staged_mutation(reopened);
+        Ok(())
+    }
+
+    fn prune_replaced_watermark_media(
+        &mut self,
+        part: &str,
+        removed: &[u8],
+        updated: &[u8],
+    ) -> Result<()> {
+        let removed_ids = xml_relationship_ids_in_order(removed)?;
+        let referenced = xml_relationship_ids_in_order(updated)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for id in removed_ids {
+            if referenced.contains(&id) {
+                continue;
+            }
+            let image_part = self
+                .package
+                .get_part_rels(part)
+                .and_then(|rels| {
+                    rels.items.iter().find(|rel| {
+                        rel.id == id
+                            && rel.rel_type == rel_types::IMAGE
+                            && relationship_is_internal(rel)
+                    })
+                })
+                .map(|rel| OpcPackage::resolve_rel_target(part, &rel.target));
+            if let Some(preserved) = self
+                .identifiers
+                .preserved_relationship_ids
+                .get_mut(&relationship_owner_identity(part))
+            {
+                preserved.remove(&id);
+            }
+            if let Some(image_part) = image_part {
+                self.identifiers
+                    .preserved_part_names
+                    .remove(&part_name_identity(&image_part));
+            }
+        }
+        self.prune_authored_story_relationships(part, &referenced);
         Ok(())
     }
 
@@ -17505,6 +27293,13 @@ impl Document {
                 HdrFtrType::Default,
             )
             .expect("an in-memory document can install a footer image");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -17529,6 +27324,13 @@ impl Document {
         candidate
             .set_raw_hdr_ftr_with_images(header_xml, images, true, hdr_type)
             .expect("raw header package preflight failed");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -17544,6 +27346,13 @@ impl Document {
         candidate
             .set_raw_hdr_ftr_with_images(footer_xml, images, false, hdr_type)
             .expect("raw footer package preflight failed");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -17573,6 +27382,13 @@ impl Document {
                 HdrFtrType::Default,
             )
             .expect("an in-memory document can install a header background image");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -17597,6 +27413,13 @@ impl Document {
                 HdrFtrType::First,
             )
             .expect("an in-memory document can install a first-page header image");
+        candidate
+            .reconcile_comment_removal(self)
+            .expect("whole-story replacement cannot remove partial or malformed comment ownership");
+        candidate
+            .clone_for_staging()
+            .prepare_and_reopen_staged()
+            .expect("whole-story replacement package preflight failed");
         self.commit_staged_mutation(candidate);
     }
 
@@ -18091,15 +27914,129 @@ impl Document {
         Ok(())
     }
 
+    /// The direct ASCII document default font, without changing Normal.
+    pub fn default_font_name(&self) -> Option<&str> {
+        self.styles
+            .doc_defaults
+            .as_ref()?
+            .rpr
+            .as_ref()?
+            .font_ascii
+            .as_deref()
+    }
+
+    /// Stage a general four-slot default-font update, preserving unrelated defaults.
+    pub fn set_default_font_name_value(&mut self, name: Option<&str>) -> Result<()> {
+        if name.is_none()
+            && self
+                .styles
+                .doc_defaults
+                .as_ref()
+                .and_then(|value| value.rpr.as_ref())
+                .is_none()
+        {
+            return Ok(());
+        }
+        if let Some(name) = name {
+            oxml_core::xml::reject_non_xml_characters("default_font_name", name)?;
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.reserve_styles_bundle()?;
+        let defaults = candidate
+            .styles
+            .doc_defaults
+            .get_or_insert_with(Default::default);
+        let properties = defaults.rpr.get_or_insert_with(Default::default);
+        properties.font_ascii = name.map(str::to_owned);
+        properties.font_hansi = name.map(str::to_owned);
+        properties.font_east_asia = name.map(str::to_owned);
+        properties.font_cs = name.map(str::to_owned);
+        properties.font_ascii_theme = None;
+        properties.font_hansi_theme = None;
+        properties.font_east_asia_theme = None;
+        properties.font_cs_theme = None;
+        if candidate.styles == self.styles {
+            return Ok(());
+        }
+        candidate.invalidate_layout();
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
+    /// The normal-script direct default font size.
+    pub fn default_font_size(&self) -> Option<Length> {
+        self.styles
+            .doc_defaults
+            .as_ref()?
+            .rpr
+            .as_ref()?
+            .sz
+            .map(|size| Length::pt(size.to_pt()))
+    }
+
+    /// Set both normal and complex-script half-point defaults after preflight.
+    pub fn set_default_font_size_value(&mut self, size: Option<Length>) -> Result<()> {
+        let half_points = size
+            .map(|size| {
+                if size.to_emu() < 0 {
+                    return Err(Error::Other(
+                        "default_font_size cannot be negative".to_owned(),
+                    ));
+                }
+                u32::try_from(size.to_emu() / 6350)
+                    .map(rdocx_oxml::units::HalfPoint)
+                    .map_err(|_| {
+                        Error::Other("default_font_size exceeds half-point range".to_owned())
+                    })
+            })
+            .transpose()?;
+        if size.is_none()
+            && self
+                .styles
+                .doc_defaults
+                .as_ref()
+                .and_then(|value| value.rpr.as_ref())
+                .is_none()
+        {
+            return Ok(());
+        }
+        let mut candidate = self.clone_for_staging();
+        candidate.reserve_styles_bundle()?;
+        let defaults = candidate
+            .styles
+            .doc_defaults
+            .get_or_insert_with(Default::default);
+        let properties = defaults.rpr.get_or_insert_with(Default::default);
+        properties.sz = half_points;
+        properties.sz_cs = half_points;
+        if candidate.styles == self.styles {
+            return Ok(());
+        }
+        candidate.invalidate_layout();
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
     /// Add a bullet list item at the given indentation level (0-based).
     ///
     /// If no bullet list definition exists yet, one is created automatically.
     /// Returns a mutable `Paragraph` for further configuration.
     pub fn add_bullet_list_item(&mut self, text: &str, level: u32) -> Paragraph<'_> {
+        self.try_add_bullet_list_item(text, level)
+            .expect("the historical infallible list helper requires a valid document and level")
+    }
+
+    /// Checked counterpart. Invalid text, levels and package graphs leave the document unchanged.
+    pub fn try_add_bullet_list_item(&mut self, text: &str, level: u32) -> Result<Paragraph<'_>> {
+        if level > 8 {
+            return Err(Error::Other(
+                "list level must be between 0 and 8".to_owned(),
+            ));
+        }
+        oxml_core::xml::reject_non_xml_characters("text", text)?;
+        self.validate_numbering_graph()?;
         let mut candidate = self.clone_for_staging();
-        candidate
-            .reserve_numbering_bundle()
-            .expect("an in-memory document can allocate a numbering part");
+        candidate.reserve_numbering_bundle()?;
         candidate.invalidate_layout();
         // Find or create a bullet list numId
         let existing = candidate.numbering.as_ref().and_then(|numbering| {
@@ -18116,10 +28053,7 @@ impl Document {
         let num_id = if let Some(existing) = existing {
             existing.num_id
         } else {
-            let (abstract_id, num_id) = candidate
-                .identifiers
-                .reserve_numbering_ids()
-                .expect("an in-memory document cannot exhaust numbering identifiers");
+            let (abstract_id, num_id) = candidate.identifiers.reserve_numbering_ids()?;
             candidate.ensure_numbering().add_list_with_ids(
                 &[(rdocx_oxml::numbering::ST_NumberFormat::Bullet, Some(1))],
                 abstract_id,
@@ -18143,9 +28077,10 @@ impl Document {
             .body
             .content
             .push(BodyContent::Paragraph(p));
+        candidate.validate_numbering_graph()?;
         self.commit_staged_mutation(candidate);
         match self.document.body.content.last_mut().unwrap() {
-            BodyContent::Paragraph(p) => Paragraph { inner: p },
+            BodyContent::Paragraph(p) => Ok(Paragraph { inner: p }),
             _ => unreachable!(),
         }
     }
@@ -18155,10 +28090,21 @@ impl Document {
     /// If no numbered list definition exists yet, one is created automatically.
     /// Returns a mutable `Paragraph` for further configuration.
     pub fn add_numbered_list_item(&mut self, text: &str, level: u32) -> Paragraph<'_> {
+        self.try_add_numbered_list_item(text, level)
+            .expect("the historical infallible list helper requires a valid document and level")
+    }
+
+    /// Checked counterpart. Invalid text, levels and package graphs leave the document unchanged.
+    pub fn try_add_numbered_list_item(&mut self, text: &str, level: u32) -> Result<Paragraph<'_>> {
+        if level > 8 {
+            return Err(Error::Other(
+                "list level must be between 0 and 8".to_owned(),
+            ));
+        }
+        oxml_core::xml::reject_non_xml_characters("text", text)?;
+        self.validate_numbering_graph()?;
         let mut candidate = self.clone_for_staging();
-        candidate
-            .reserve_numbering_bundle()
-            .expect("an in-memory document can allocate a numbering part");
+        candidate.reserve_numbering_bundle()?;
         candidate.invalidate_layout();
         // Find or create a numbered list numId
         let existing = candidate.numbering.as_ref().and_then(|numbering| {
@@ -18175,10 +28121,7 @@ impl Document {
         let num_id = if let Some(existing) = existing {
             existing.num_id
         } else {
-            let (abstract_id, num_id) = candidate
-                .identifiers
-                .reserve_numbering_ids()
-                .expect("an in-memory document cannot exhaust numbering identifiers");
+            let (abstract_id, num_id) = candidate.identifiers.reserve_numbering_ids()?;
             candidate.ensure_numbering().add_list_with_ids(
                 &[(rdocx_oxml::numbering::ST_NumberFormat::Decimal, Some(1))],
                 abstract_id,
@@ -18202,9 +28145,10 @@ impl Document {
             .body
             .content
             .push(BodyContent::Paragraph(p));
+        candidate.validate_numbering_graph()?;
         self.commit_staged_mutation(candidate);
         match self.document.body.content.last_mut().unwrap() {
-            BodyContent::Paragraph(p) => Paragraph { inner: p },
+            BodyContent::Paragraph(p) => Ok(Paragraph { inner: p }),
             _ => unreachable!(),
         }
     }
@@ -18713,14 +28657,21 @@ impl Document {
             let Some(properties) = style.ppr.as_ref() else {
                 continue;
             };
-            let Some(num_id) = properties.num_id else {
-                if properties.num_ilvl.is_some() {
-                    return Err(Error::Other(format!(
-                        "style '{}' has a numbering level without an instance",
-                        style.style_id
-                    )));
+            // A `w:ilvl` without a `w:numId` is schema-valid. The style takes
+            // the instance of its `basedOn` chain, as layout and Word resolve
+            // it, and is not numbered when the chain has none. It owns no link
+            // of its own, so only a level that names it back records one.
+            let (num_id, inherited) = match properties.num_id {
+                Some(num_id) => (num_id, false),
+                None if properties.num_ilvl.is_some() => {
+                    match style::resolve_paragraph_properties(Some(&style.style_id), &self.styles)
+                        .num_id
+                    {
+                        Some(num_id) => (num_id, true),
+                        None => continue,
+                    }
                 }
-                continue;
+                None => continue,
             };
             if num_id == 0 {
                 continue;
@@ -18758,6 +28709,9 @@ impl Document {
                 .and_then(|value| value.level.as_ref())
                 .unwrap_or(base);
             if effective.p_style.as_deref() != Some(style.style_id.as_str()) {
+                if inherited {
+                    continue;
+                }
                 return Err(Error::Other(format!(
                     "style '{}' and numbering instance {num_id} level {level} are not reciprocally linked",
                     style.style_id
@@ -18865,7 +28819,7 @@ impl Document {
         Ok(references)
     }
 
-    fn word_story_part_names(&self) -> Vec<String> {
+    pub(crate) fn word_story_part_names(&self) -> Vec<String> {
         let mut story_parts = vec![self.doc_part_name.clone()];
         if let Some(relationships) = self.package.get_part_rels(&self.doc_part_name) {
             story_parts.extend(
@@ -18966,7 +28920,10 @@ impl Document {
     /// Both the style's paragraph properties and the numbering level's
     /// paragraph-style link are published together. Existing links must either
     /// match this exact tuple or the operation fails without changing the
-    /// document.
+    /// document. A style `w:numPr` holding a `w:ilvl` and no `w:numId` is not
+    /// a link, and the new link replaces its level. A repeated style ID
+    /// resolves to its first definition, and the style graph is validated as
+    /// in [`Document::add_style`].
     pub fn link_style_to_numbering(
         &mut self,
         style_id: &str,
@@ -18974,7 +28931,6 @@ impl Document {
         level: u32,
     ) -> Result<()> {
         let mut candidate = self.clone_for_staging();
-        style::validate_style_graph(&candidate.styles)?;
         candidate.validate_numbering_graph()?;
         candidate.reserve_styles_bundle()?;
         candidate.reserve_numbering_bundle()?;
@@ -19023,7 +28979,8 @@ impl Document {
             .as_ref()
             .map(|properties| (properties.num_id, properties.num_ilvl))
             .unwrap_or((None, None));
-        if style_numbering != (None, None) && style_numbering != (Some(num_id), Some(level)) {
+        // A `w:ilvl` without a `w:numId` owns no link, so the link replaces it.
+        if style_numbering.0.is_some() && style_numbering != (Some(num_id), Some(level)) {
             return Err(Error::Other(format!(
                 "style '{style_id}' already references a different numbering level"
             )));
@@ -19093,7 +29050,7 @@ impl Document {
                 Some(style_id.to_owned());
         }
 
-        style::validate_style_graph(&candidate.styles)?;
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.validate_numbering_graph()?;
         candidate.flush_to_package()?;
         candidate.invalidate_layout();
@@ -19102,6 +29059,15 @@ impl Document {
     }
 
     /// Atomically remove one exact paragraph-style numbering association.
+    ///
+    /// Unlinking removes the style's `w:numId` and `w:ilvl` together, so a
+    /// style that held only a `w:ilvl` before it was linked does not get it
+    /// back. A style that holds only a `w:ilvl`, takes its instance from its
+    /// `basedOn` chain and is named back by the level loses only that name
+    /// and keeps its level. A style holding only a `w:ilvl` that no level
+    /// names is not linked, and unlinking it changes nothing. A repeated
+    /// style ID resolves to its first definition, and the style graph is
+    /// validated as in [`Document::add_style`].
     pub fn unlink_style_from_numbering(
         &mut self,
         style_id: &str,
@@ -19109,7 +29075,6 @@ impl Document {
         level: u32,
     ) -> Result<()> {
         let mut candidate = self.clone_for_staging();
-        style::validate_style_graph(&candidate.styles)?;
         candidate.validate_numbering_graph()?;
 
         let style_index = candidate
@@ -19164,10 +29129,17 @@ impl Document {
             .unwrap_or(&numbering.abstract_nums[definition_index].levels[definition_level_index])
             .p_style
             .as_deref();
-        if style_numbering == (None, None) && target_style.is_none() {
+        if style_numbering.0.is_none() && target_style.is_none() {
             return Ok(());
         }
-        if style_numbering != (Some(num_id), Some(level)) || target_style != Some(style_id) {
+        // A level may name back a style that takes its instance from its
+        // `basedOn` chain, which is the link recorded for it.
+        let inherited = style_numbering == (None, Some(level))
+            && style::resolve_paragraph_properties(Some(style_id), &candidate.styles).num_id
+                == Some(num_id);
+        if (style_numbering != (Some(num_id), Some(level)) && !inherited)
+            || target_style != Some(style_id)
+        {
             return Err(Error::Other(format!(
                 "style '{style_id}' and numbering instance {num_id} level {level} are not linked"
             )));
@@ -19179,8 +29151,10 @@ impl Document {
             .ppr
             .as_mut()
             .expect("the exact style link was validated above");
-        properties.num_id = None;
-        properties.num_ilvl = None;
+        if !inherited {
+            properties.num_id = None;
+            properties.num_ilvl = None;
+        }
         let numbering = candidate
             .numbering
             .as_mut()
@@ -19195,7 +29169,7 @@ impl Document {
             numbering.abstract_nums[definition_index].levels[definition_level_index].p_style = None;
         }
 
-        style::validate_style_graph(&candidate.styles)?;
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.validate_numbering_graph()?;
         candidate.flush_to_package()?;
         candidate.invalidate_layout();
@@ -19221,7 +29195,13 @@ impl Document {
 
     // ---- Style manipulation ----
 
-    /// Add a custom style after validating the complete style graph.
+    /// Add a custom style after validating the change to the style graph.
+    ///
+    /// A defect the styles part already has, such as a style ID a producer
+    /// repeated, is retained, and [`Document::validate_style_graph`] still
+    /// reports it. Only a defect the change introduces rejects it, and an ID
+    /// that already exists is refused. The style mutations resolve a repeated
+    /// ID to its first definition, as layout and TOC rebuilding do.
     pub fn add_style(&mut self, builder: StyleBuilder) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.reserve_styles_bundle()?;
@@ -19251,13 +29231,16 @@ impl Document {
             None,
             linked_style.as_deref(),
         );
-        style::validate_style_graph(&candidate.styles)?;
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
         Ok(())
     }
 
-    /// Replace an existing style after validating the complete style graph.
+    /// Replace an existing style after validating the change to the style graph.
+    ///
+    /// A repeated style ID updates its first definition. Validation retains
+    /// existing defects as in [`Document::add_style`].
     pub fn set_style(&mut self, builder: StyleBuilder) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.reserve_styles_bundle()?;
@@ -19304,20 +29287,26 @@ impl Document {
             old_link.as_deref(),
             new_link.as_deref(),
         );
-        style::validate_style_graph(&candidate.styles)?;
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
         Ok(())
     }
 
     /// Select the sole default style for one style type.
+    ///
+    /// A repeated style ID makes its first definition the default. Validation
+    /// retains existing defects as in [`Document::add_style`].
     pub fn set_default_style(&mut self, style_type: StyleType, style_id: &str) -> Result<()> {
         let mut candidate = self.clone_for_staging();
         candidate.reserve_styles_bundle()?;
-        let target = candidate
+        let index = candidate
             .styles
-            .get_by_id(style_id)
+            .styles
+            .iter()
+            .position(|style| style.style_id == style_id)
             .ok_or_else(|| Error::Other(format!("style '{style_id}' does not exist")))?;
+        let target = &candidate.styles.styles[index];
         if target.style_type != style_type {
             return Err(Error::Other(format!(
                 "style '{style_id}' has type '{}', not '{}'",
@@ -19325,27 +29314,26 @@ impl Document {
                 style_type.to_str()
             )));
         }
-        for style in &mut candidate.styles.styles {
+        for (position, style) in candidate.styles.styles.iter_mut().enumerate() {
             if style.style_type == style_type {
-                style.is_default = style.style_id == style_id;
+                style.is_default = position == index;
             }
         }
-        style::validate_style_graph(&candidate.styles)?;
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
         Ok(())
     }
 
     /// Remove an unreferenced style, returning whether it existed.
+    ///
+    /// Every definition of a repeated style ID is removed, so no later one takes
+    /// over the ID. Validation retains existing defects as in
+    /// [`Document::add_style`].
     pub fn remove_style(&mut self, style_id: &str) -> Result<bool> {
-        let Some(index) = self
-            .styles
-            .styles
-            .iter()
-            .position(|style| style.style_id == style_id)
-        else {
+        if self.styles.get_by_id(style_id).is_none() {
             return Ok(false);
-        };
+        }
         if let Some(owner) = self.styles.styles.iter().find(|style| {
             style.style_id != style_id
                 && (style.based_on.as_deref() == Some(style_id)
@@ -19384,8 +29372,11 @@ impl Document {
 
         let mut candidate = self.clone_for_staging();
         candidate.reserve_styles_bundle()?;
-        candidate.styles.styles.remove(index);
-        style::validate_style_graph(&candidate.styles)?;
+        candidate
+            .styles
+            .styles
+            .retain(|style| style.style_id != style_id);
+        style::validate_style_graph_change(&self.styles, &candidate.styles)?;
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
         Ok(true)
@@ -19425,6 +29416,162 @@ impl Document {
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
         Ok(added)
+    }
+
+    /// Materialize the requested supported built-in table style, without changing defaults.
+    pub fn ensure_builtin_table_style(&mut self, name: &str) -> Result<bool> {
+        if !matches!(name, "LightShading-Accent1" | "Light Shading Accent 1") {
+            return Ok(false);
+        }
+        if self.styles.styles.iter().any(|s| {
+            s.style_id == "LightShading-Accent1"
+                || s.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        }) {
+            return Ok(false);
+        }
+        // python-docx 1.2.0 default.docx, SHA-256 2094b5bddffe9cf973d61fe03388413804f034160718494a65db7e98da40d35d.
+        // The existing TableNormal base is retained. A copied absent base is nondefault.
+        let definitions = CT_Styles::from_xml(br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="table" w:styleId="TableNormal">
+    <w:name w:val="Normal Table"/>
+    <w:uiPriority w:val="99"/>
+    <w:semiHidden/>
+    <w:unhideWhenUsed/>
+    <w:tblPr>
+      <w:tblInd w:w="0" w:type="dxa"/>
+      <w:tblCellMar>
+        <w:top w:w="0" w:type="dxa"/>
+        <w:left w:w="108" w:type="dxa"/>
+        <w:bottom w:w="0" w:type="dxa"/>
+        <w:right w:w="108" w:type="dxa"/>
+      </w:tblCellMar>
+    </w:tblPr>
+  </w:style><w:style w:type="table" w:styleId="LightShading-Accent1">
+    <w:name w:val="Light Shading Accent 1"/>
+    <w:basedOn w:val="TableNormal"/>
+    <w:uiPriority w:val="60"/>
+    <w:rsid w:val="00FC693F"/>
+    <w:pPr>
+      <w:spacing w:after="0" w:line="240" w:lineRule="auto"/>
+    </w:pPr>
+    <w:rPr>
+      <w:color w:val="365F91" w:themeColor="accent1" w:themeShade="BF"/>
+    </w:rPr>
+    <w:tblPr>
+      <w:tblStyleRowBandSize w:val="1"/>
+      <w:tblStyleColBandSize w:val="1"/>
+      <w:tblInd w:w="0" w:type="dxa"/>
+      <w:tblBorders>
+        <w:top w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+        <w:bottom w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+      </w:tblBorders>
+      <w:tblCellMar>
+        <w:top w:w="0" w:type="dxa"/>
+        <w:left w:w="108" w:type="dxa"/>
+        <w:bottom w:w="0" w:type="dxa"/>
+        <w:right w:w="108" w:type="dxa"/>
+      </w:tblCellMar>
+    </w:tblPr>
+    <w:tblStylePr w:type="firstRow">
+      <w:pPr>
+        <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
+      </w:pPr>
+      <w:rPr>
+        <w:b/>
+        <w:bCs/>
+      </w:rPr>
+      <w:tblPr/>
+      <w:tcPr>
+        <w:tcBorders>
+          <w:top w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+          <w:left w:val="nil"/>
+          <w:bottom w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+          <w:right w:val="nil"/>
+          <w:insideH w:val="nil"/>
+          <w:insideV w:val="nil"/>
+        </w:tcBorders>
+      </w:tcPr>
+    </w:tblStylePr>
+    <w:tblStylePr w:type="lastRow">
+      <w:pPr>
+        <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
+      </w:pPr>
+      <w:rPr>
+        <w:b/>
+        <w:bCs/>
+      </w:rPr>
+      <w:tblPr/>
+      <w:tcPr>
+        <w:tcBorders>
+          <w:top w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+          <w:left w:val="nil"/>
+          <w:bottom w:val="single" w:sz="8" w:space="0" w:color="4F81BD" w:themeColor="accent1"/>
+          <w:right w:val="nil"/>
+          <w:insideH w:val="nil"/>
+          <w:insideV w:val="nil"/>
+        </w:tcBorders>
+      </w:tcPr>
+    </w:tblStylePr>
+    <w:tblStylePr w:type="firstCol">
+      <w:rPr>
+        <w:b/>
+        <w:bCs/>
+      </w:rPr>
+    </w:tblStylePr>
+    <w:tblStylePr w:type="lastCol">
+      <w:rPr>
+        <w:b/>
+        <w:bCs/>
+      </w:rPr>
+    </w:tblStylePr>
+    <w:tblStylePr w:type="band1Vert">
+      <w:tblPr/>
+      <w:tcPr>
+        <w:tcBorders>
+          <w:left w:val="nil"/>
+          <w:right w:val="nil"/>
+          <w:insideH w:val="nil"/>
+          <w:insideV w:val="nil"/>
+        </w:tcBorders>
+        <w:shd w:val="clear" w:color="auto" w:fill="D3DFEE" w:themeFill="accent1" w:themeFillTint="3F"/>
+      </w:tcPr>
+    </w:tblStylePr>
+    <w:tblStylePr w:type="band1Horz">
+      <w:tblPr/>
+      <w:tcPr>
+        <w:tcBorders>
+          <w:left w:val="nil"/>
+          <w:right w:val="nil"/>
+          <w:insideH w:val="nil"/>
+          <w:insideV w:val="nil"/>
+        </w:tcBorders>
+        <w:shd w:val="clear" w:color="auto" w:fill="D3DFEE" w:themeFill="accent1" w:themeFillTint="3F"/>
+      </w:tcPr>
+    </w:tblStylePr>
+  </w:style></w:styles>"#)?;
+        let mut candidate = self.clone_for_staging();
+        candidate.reserve_styles_bundle()?;
+        for definition in definitions.styles {
+            if let Some(existing) = candidate
+                .styles
+                .styles
+                .iter()
+                .find(|s| s.style_id == definition.style_id)
+            {
+                if existing.style_type != definition.style_type {
+                    return Err(Error::Other(
+                        "built-in table style base has a conflicting type".into(),
+                    ));
+                }
+            } else {
+                candidate.styles.styles.push(definition);
+            }
+        }
+        style::validate_style_graph(&candidate.styles)?;
+        candidate.invalidate_layout();
+        self.commit_staged_mutation(candidate);
+        Ok(true)
     }
 
     /// Validate all style IDs, defaults, links, next styles, and inheritance chains.
@@ -19670,6 +29817,31 @@ impl Document {
             })
     }
 
+    /// Report explicit invalid or one-sided section page sizes without normalizing source.
+    pub fn validate_sections(&self) -> ValidationReport {
+        let mut findings = Vec::new();
+        for section in self.sections() {
+            let properties = section.properties();
+            if properties.page_width.is_some_and(|size| size.0 <= 0)
+                || properties.page_height.is_some_and(|size| size.0 <= 0)
+            {
+                findings.push(ValidationFinding {
+                    severity: ValidationSeverity::Error,
+                    message: format!("section {} has nonpositive page size", section.ordinal()),
+                });
+            } else if properties.page_width.is_some() != properties.page_height.is_some() {
+                findings.push(ValidationFinding {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "section {} has incomplete page size: width or height is missing",
+                        section.ordinal()
+                    ),
+                });
+            }
+        }
+        ValidationReport { findings }
+    }
+
     /// Resolve the effective header or footer story for one section variant.
     pub fn section_story(
         &self,
@@ -19728,33 +29900,61 @@ impl Document {
         if let Some(story) = self.section_story(section_index, kind, hdr_type)?
             && !story.is_inherited()
         {
-            let first_page_is_enabled = self
-                .section(section_index)
-                .is_some_and(|section| section.properties().title_pg.unwrap_or(false));
-            if hdr_type != HdrFtrType::First || first_page_is_enabled {
+            let enabled = match hdr_type {
+                HdrFtrType::Default => true,
+                HdrFtrType::First => self
+                    .section(section_index)
+                    .is_some_and(|section| section.properties().title_pg.unwrap_or(false)),
+                HdrFtrType::Even => self.even_and_odd_headers(),
+            };
+            if enabled {
                 return Ok(story.story);
             }
-            let mut candidate = self.clone_for_staging();
-            candidate
-                .section_mut(section_index)
-                .ok_or_else(|| {
-                    Error::Other(format!("section index {section_index} is out of range"))
-                })?
-                .inner
-                .title_pg = Some(true);
+            let mut candidate = if hdr_type == HdrFtrType::Even {
+                self.settings_mutation_candidate()?
+            } else {
+                self.clone_for_staging()
+            };
+            match hdr_type {
+                HdrFtrType::First => {
+                    candidate
+                        .section_mut(section_index)
+                        .ok_or_else(|| {
+                            Error::Other(format!("section index {section_index} is out of range"))
+                        })?
+                        .inner
+                        .title_pg = Some(true);
+                }
+                HdrFtrType::Even => candidate
+                    .settings
+                    .get_or_insert_with(CT_Settings::new)
+                    .set_even_and_odd_headers(true)?,
+                HdrFtrType::Default => {}
+            }
             let reopened = candidate.prepare_and_reopen_staged()?;
             let result = reopened
                 .section_story(section_index, kind, hdr_type)?
                 .map(|section_story| section_story.story)
                 .ok_or_else(|| {
-                    Error::Other("existing first-page story was not published".to_owned())
+                    Error::Other("existing section story was not published".to_owned())
                 })?;
             self.commit_staged_mutation(reopened);
             return Ok(result);
         }
-        let mut candidate = self.clone_for_staging();
+        let mut candidate = if hdr_type == HdrFtrType::Even {
+            self.settings_mutation_candidate()?
+        } else {
+            self.clone_for_staging()
+        };
+        if hdr_type == HdrFtrType::Even {
+            candidate
+                .settings
+                .get_or_insert_with(CT_Settings::new)
+                .set_even_and_odd_headers(true)?;
+        }
         candidate.flush_to_package()?;
         let story = candidate.install_empty_section_story(section_index, kind, hdr_type)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         let result = reopened
             .section_story(section_index, kind, hdr_type)?
@@ -19784,6 +29984,7 @@ impl Document {
             Some(relationship_id),
         )?;
         candidate.prune_unreachable_authored_section_stories(&removed)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         let result = reopened
             .section_story(section_index, kind, hdr_type)?
@@ -19806,6 +30007,7 @@ impl Document {
         let removed =
             candidate.set_direct_section_story_reference(section_index, kind, hdr_type, None)?;
         candidate.prune_unreachable_authored_section_stories(&removed)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         self.commit_staged_mutation(reopened);
         Ok(())
@@ -19844,6 +30046,7 @@ impl Document {
             Some(relationship_id),
         )?;
         candidate.prune_unreachable_authored_section_stories(&removed)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         let result = reopened
             .section_story(section_index, kind, hdr_type)?
@@ -19863,6 +30066,7 @@ impl Document {
         let mut candidate = self.clone_for_staging();
         candidate.flush_to_package()?;
         candidate.install_empty_section_story(section_index, kind, hdr_type)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         let result = reopened
             .section_story(section_index, kind, hdr_type)?
@@ -20120,6 +30324,7 @@ impl Document {
         let mut candidate = self.clone_for_staging();
         let removed_references = candidate.remove_section_in_place(index)?;
         candidate.prune_unreachable_authored_section_stories(&removed_references)?;
+        candidate.reconcile_comment_removal(self)?;
         let reopened = candidate.prepare_and_reopen_staged()?;
         self.commit_staged_mutation(reopened);
         Ok(())
@@ -20132,9 +30337,41 @@ impl Document {
                 "section index {index} is out of bounds for insertion into {count} sections"
             )));
         }
+        // Copy resolved geometry only. Relationship owners and other section
+        // policies belong to the old section and must not be cloned.
+        let previous = self
+            .section(index.saturating_sub(1))
+            .map(|s| s.properties());
+        let mut inserted = empty_section_properties();
+        inserted.page_width = Some(previous.and_then(|s| s.page_width).unwrap_or(Twips(12240)));
+        inserted.page_height = Some(previous.and_then(|s| s.page_height).unwrap_or(Twips(15840)));
+        inserted.orientation = Some(
+            previous
+                .and_then(|s| s.orientation)
+                .unwrap_or(ST_PageOrientation::Portrait),
+        );
+        inserted.margin_top = Some(previous.and_then(|s| s.margin_top).unwrap_or(Twips(1440)));
+        inserted.margin_right = Some(previous.and_then(|s| s.margin_right).unwrap_or(Twips(1440)));
+        inserted.margin_bottom = Some(
+            previous
+                .and_then(|s| s.margin_bottom)
+                .unwrap_or(Twips(1440)),
+        );
+        inserted.margin_left = Some(previous.and_then(|s| s.margin_left).unwrap_or(Twips(1440)));
+        inserted.gutter = Some(previous.and_then(|s| s.gutter).unwrap_or(Twips(0)));
+        inserted.header_distance = Some(
+            previous
+                .and_then(|s| s.header_distance)
+                .unwrap_or(Twips(720)),
+        );
+        inserted.footer_distance = Some(
+            previous
+                .and_then(|s| s.footer_distance)
+                .unwrap_or(Twips(720)),
+        );
         self.invalidate_layout();
         if count == 0 {
-            self.document.body.sect_pr = Some(empty_section_properties());
+            self.document.body.sect_pr = Some(inserted);
             return Ok(());
         }
         if index == count {
@@ -20150,7 +30387,7 @@ impl Document {
                 .body
                 .content
                 .push(BodyContent::Paragraph(paragraph));
-            self.document.body.sect_pr = Some(empty_section_properties());
+            self.document.body.sect_pr = Some(inserted);
             return Ok(());
         }
 
@@ -20165,7 +30402,7 @@ impl Document {
         };
         let mut paragraph = CT_P::new();
         paragraph.properties = Some(CT_PPr {
-            sect_pr: Some(empty_section_properties()),
+            sect_pr: Some(inserted),
             ..CT_PPr::default()
         });
         self.document
@@ -20343,6 +30580,75 @@ impl Document {
             .collect::<HashSet<_>>();
         let opaque_ids = self.opaque_relationship_ids_from_serialized_story(&modeled_ids)?;
         active_ids.extend(opaque_ids.iter().map(String::as_str));
+        // Imported producer parts stay in the package. Retire only their qualified
+        // marker spans when no modeled, inherited or opaque physical use survives.
+        let retired_targets = removed
+            .iter()
+            .map(|reference| {
+                let relationship = self
+                    .package
+                    .get_part_rels(&self.doc_part_name)
+                    .and_then(|rels| rels.items.iter().find(|rel| rel.id == reference.rel_id))
+                    .ok_or_else(|| {
+                        Error::Other(format!(
+                            "retired section relationship {} is missing",
+                            reference.rel_id
+                        ))
+                    })?;
+                if !relationship_is_internal(relationship)
+                    || !matches!(
+                        relationship.rel_type.as_str(),
+                        rel_types::HEADER | rel_types::FOOTER
+                    )
+                {
+                    return Err(Error::Other(
+                        "retired section relationship is not an internal story".into(),
+                    ));
+                }
+                Ok(OpcPackage::resolve_rel_target(
+                    &self.doc_part_name,
+                    &relationship.target,
+                ))
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        for target in retired_targets {
+            let identity = part_name_identity(&target);
+            let mut used = false;
+            for (owner, relationships) in &self.package.part_rels {
+                for relationship in &relationships.items {
+                    if !relationship_is_internal(relationship)
+                        || part_name_identity(&OpcPackage::resolve_rel_target(
+                            owner,
+                            &relationship.target,
+                        )) != identity
+                    {
+                        continue;
+                    }
+                    if part_name_identity(owner) == part_name_identity(&self.doc_part_name) {
+                        used |= active_ids.contains(relationship.id.as_str());
+                    } else {
+                        let xml = self.package.get_part(owner).ok_or_else(|| {
+                            Error::Other(format!(
+                                "cannot prove incoming section-story ownership from missing {owner}"
+                            ))
+                        })?;
+                        if !xml_relationship_ids_in_order(xml)?.contains(&relationship.id) {
+                            return Err(Error::Other(format!(
+                                "cannot prove opaque incoming section-story relationship {} from {owner}",
+                                relationship.id
+                            )));
+                        }
+                        used = true;
+                    }
+                }
+            }
+            if !used && let Some(xml) = self.package.get_part(&target) {
+                let omitted = Self::omit_comment_markers(xml)?;
+                if omitted != xml {
+                    set_story_source_xml(self, &target, omitted)?;
+                }
+            }
+        }
         let removable_ids = removed
             .iter()
             .map(|reference| reference.rel_id.as_str())
@@ -20542,6 +30848,64 @@ impl Document {
     /// opens the document, or `None` when the part does not say.
     pub fn update_fields_on_open(&self) -> Option<bool> {
         self.settings.as_ref()?.update_fields()
+    }
+
+    /// Document-wide note policy in the relationship-resolved settings part.
+    pub fn note_properties(&self, family: NoteFamily) -> Option<&CT_NoteProperties> {
+        let settings = self.settings.as_ref()?;
+        match family {
+            NoteFamily::Footnote => settings.footnote_properties(),
+            NoteFamily::Endnote => settings.endnote_properties(),
+        }
+    }
+
+    /// Set a checked document-wide note policy and publish the staged package.
+    pub fn set_note_policy(&mut self, family: NoteFamily, policy: NotePolicy) -> Result<()> {
+        let mut properties = self.note_properties(family).cloned().unwrap_or_default();
+        let checked = policy.properties(family)?;
+        properties.pos = checked.pos;
+        properties.num_fmt = checked.num_fmt;
+        properties.num_start = checked.num_start;
+        properties.num_restart = checked.num_restart;
+        self.stage_settings_mutation(|settings| match family {
+            NoteFamily::Footnote => settings.set_footnote_properties(properties),
+            NoteFamily::Endnote => settings.set_endnote_properties(properties),
+        })
+    }
+
+    /// Remove an explicit document-wide note policy.
+    pub fn remove_note_policy(&mut self, family: NoteFamily) -> Result<Option<CT_NoteProperties>> {
+        let Some(mut properties) = self.note_properties(family).cloned() else {
+            return Ok(None);
+        };
+        if properties.pos.is_none()
+            && properties.num_fmt.is_none()
+            && properties.num_start.is_none()
+            && properties.num_restart.is_none()
+        {
+            return Ok(None);
+        }
+        let removed = properties.clone();
+        properties.pos = None;
+        properties.num_fmt = None;
+        properties.num_start = None;
+        properties.num_restart = None;
+        if properties.special_references.is_empty() && properties.extra_xml.is_empty() {
+            match family {
+                NoteFamily::Footnote => {
+                    self.stage_settings_removal(CT_Settings::remove_footnote_properties)?;
+                }
+                NoteFamily::Endnote => {
+                    self.stage_settings_removal(CT_Settings::remove_endnote_properties)?;
+                }
+            }
+        } else {
+            self.stage_settings_mutation(|settings| match family {
+                NoteFamily::Footnote => settings.set_footnote_properties(properties),
+                NoteFamily::Endnote => settings.set_endnote_properties(properties),
+            })?;
+        }
+        Ok(Some(removed))
     }
 
     /// Ask Word to update fields when it opens the document, stop asking with
@@ -21454,64 +31818,288 @@ impl Document {
 
     /// Return font-table records with related embedded bytes deobfuscated.
     pub fn fonts(&self) -> Vec<FontDefinition> {
+        self.try_fonts().unwrap_or_default()
+    }
+
+    /// Return checked font snapshots after bounding every projected byte copy.
+    pub fn try_fonts(&self) -> Result<Vec<FontDefinition>> {
         let Some(table) = &self.font_table else {
-            return Vec::new();
+            if self.font_table_part_name.is_some() {
+                return Err(Error::Other("font table is unmodeled".to_owned()));
+            }
+            return Ok(Vec::new());
         };
-        let relationships = self
-            .font_table_part_name
-            .as_deref()
-            .and_then(|part_name| self.package.get_part_rels(part_name));
-        table
-            .fonts()
+        if table.fonts().len() > 4096 {
+            return Err(Error::Other(
+                "font snapshot exceeds 4096 records".to_owned(),
+            ));
+        }
+        self.project_font_records(&table.fonts().iter().collect::<Vec<_>>())
+    }
+
+    fn project_font_records(&self, records: &[&FontRecord]) -> Result<Vec<FontDefinition>> {
+        if records.len() > 4096 {
+            return Err(Error::Other(
+                "font snapshot exceeds 4096 records".to_owned(),
+            ));
+        }
+        let mut bytes = 0usize;
+        let mut faces = 0usize;
+        let mut metadata = 0usize;
+        for font in records {
+            for value in [
+                Some(&font.name),
+                font.alternate_name.as_ref(),
+                font.family.as_ref(),
+                font.pitch.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                metadata = metadata
+                    .checked_add(value.len())
+                    .ok_or_else(|| Error::Other("font metadata size overflow".to_owned()))?;
+                if value.len() > 4096 || metadata > 4 * 1024 * 1024 {
+                    return Err(Error::Other(
+                        "font snapshot metadata exceeds its bound".to_owned(),
+                    ));
+                }
+            }
+            for reference in &font.embedded_fonts {
+                faces += 1;
+                let (_, body) = self.checked_embedded_font_source(reference)?;
+                bytes = bytes
+                    .checked_add(body.len())
+                    .ok_or_else(|| Error::Other("font snapshot size overflow".to_owned()))?;
+                if body.len() > 64 * 1024 * 1024 || bytes > 256 * 1024 * 1024 || faces > 16384 {
+                    return Err(Error::Other(
+                        "font snapshot exceeds its byte or face bound".to_owned(),
+                    ));
+                }
+                metadata = metadata
+                    .checked_add(reference.font_key.len())
+                    .and_then(|size| {
+                        size.checked_add(reference.license_identity.as_ref().map_or(0, String::len))
+                    })
+                    .ok_or_else(|| Error::Other("font metadata size overflow".to_owned()))?;
+                if reference.font_key.len() > 4096
+                    || reference
+                        .license_identity
+                        .as_ref()
+                        .is_some_and(|value| value.len() > 4096)
+                    || metadata > 4 * 1024 * 1024
+                {
+                    return Err(Error::Other(
+                        "font snapshot metadata exceeds its bound".to_owned(),
+                    ));
+                }
+            }
+        }
+        records
             .iter()
             .map(|font| {
                 let embedded_fonts = font
                     .embedded_fonts
                     .iter()
-                    .map(|embedded| {
-                        let data = relationships
-                            .and_then(|relationships| {
-                                relationships.items.iter().find(|relationship| {
-                                    relationship.id == embedded.relationship_id
-                                        && relationship.rel_type == rel_types::FONT
-                                        && relationship_is_internal(relationship)
-                                })
-                            })
-                            .and_then(|relationship| {
-                                let owner = self.font_table_part_name.as_deref()?;
-                                let target =
-                                    OpcPackage::resolve_rel_target(owner, &relationship.target);
-                                self.package.get_part(&target)
-                            })
-                            .and_then(|bytes| deobfuscate_odttf_with_key(bytes, &embedded.font_key))
-                            .unwrap_or_default();
-                        EmbeddedFont {
-                            kind: embedded.kind.into(),
-                            data,
-                            font_key: embedded.font_key.clone(),
-                            subsetted: embedded.subsetted.unwrap_or(false),
+                    .map(|reference| {
+                        let (_, bytes) = self.checked_embedded_font_source(reference)?;
+                        Ok(EmbeddedFont {
+                            kind: reference.kind.into(),
+                            data: deobfuscate_odttf_with_key(bytes, &reference.font_key)
+                                .unwrap_or_default(),
+                            font_key: reference.font_key.clone(),
+                            subsetted: reference.subsetted.unwrap_or(false),
                             license: FontEmbeddingLicense {
-                                authorized: embedded.authorized.unwrap_or(false),
-                                identity: embedded.license_identity.clone().unwrap_or_default(),
+                                authorized: reference.authorized.unwrap_or(false),
+                                identity: reference.license_identity.clone().unwrap_or_default(),
                             },
-                        }
+                        })
                     })
-                    .collect();
-                FontDefinition {
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(FontDefinition {
                     name: font.name.clone(),
                     alternate_name: font.alternate_name.clone(),
                     family: font.family.clone(),
                     pitch: font.pitch.clone(),
                     embedded_fonts,
-                }
+                })
             })
             .collect()
     }
 
+    /// Resolve the actual stored part and byte length for an indexed font face.
+    /// Indices follow `try_fonts()` record and face order.
+    pub fn font_part_metadata(
+        &self,
+        record_index: usize,
+        face_index: usize,
+    ) -> Result<(String, usize)> {
+        let reference = self
+            .font_table
+            .as_ref()
+            .and_then(|table| table.fonts().get(record_index))
+            .and_then(|record| record.embedded_fonts.get(face_index))
+            .ok_or_else(|| Error::Other("font record or face index is out of range".to_owned()))?;
+        let (part, bytes) = self.checked_embedded_font_source(reference)?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(Error::Other(
+                "embedded font part exceeds its byte bound".to_owned(),
+            ));
+        }
+        Ok((part, bytes.len()))
+    }
+
+    fn checked_embedded_font_source(
+        &self,
+        reference: &EmbeddedFontReference,
+    ) -> Result<(String, &[u8])> {
+        if reference.relationship_id.len() > 4096 || reference.font_key.len() > 4096 {
+            return Err(Error::Other(
+                "embedded font metadata exceeds its bound".to_owned(),
+            ));
+        }
+        let owner = self
+            .font_table_part_name
+            .as_deref()
+            .ok_or_else(|| Error::Other("font-table part name is missing".to_owned()))?;
+        let relationships = self
+            .package
+            .get_part_rels(owner)
+            .ok_or_else(|| Error::Other("font relationships are missing".to_owned()))?;
+        let mut matches = relationships
+            .items
+            .iter()
+            .filter(|rel| rel.id == reference.relationship_id);
+        let relationship = matches
+            .next()
+            .filter(|rel| rel.rel_type == rel_types::FONT && relationship_is_internal(rel))
+            .ok_or_else(|| {
+                Error::Other("embedded font relationship is missing or unsupported".to_owned())
+            })?;
+        if matches.next().is_some() {
+            return Err(Error::Other(
+                "embedded font relationship is ambiguous".to_owned(),
+            ));
+        }
+        if relationship.target.len() > 4096 {
+            return Err(Error::Other(
+                "embedded font target exceeds its bound".to_owned(),
+            ));
+        }
+        let target = OpcPackage::resolve_rel_target(owner, &relationship.target);
+        let part = self
+            .package
+            .parts
+            .keys()
+            .find(|part| part.eq_ignore_ascii_case(&target))
+            .ok_or_else(|| Error::Other("embedded font part is missing".to_owned()))?;
+        if self.package.content_types.content_type_for(part) != Some(EMBEDDED_FONT_CONTENT_TYPE) {
+            return Err(Error::Other(
+                "embedded font part has an unsupported content type".to_owned(),
+            ));
+        }
+        Ok((
+            part.clone(),
+            self.package.get_part(part).expect("checked font part"),
+        ))
+    }
+
+    /// Return the presence-sensitive embedded TrueType setting.
+    pub fn embed_true_type_fonts(&self) -> Result<Option<bool>> {
+        if self.settings.is_none() && self.settings_part_name.is_some() {
+            return Err(Error::Other("cannot inspect unmodeled settings".to_owned()));
+        }
+        Ok(self
+            .settings
+            .as_ref()
+            .map(CT_Settings::embed_true_type_fonts)
+            .transpose()?
+            .flatten())
+    }
+
+    /// Set or remove the embedded TrueType setting atomically.
+    pub fn set_embed_true_type_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        if self.embed_true_type_fonts()? == value {
+            return Ok(());
+        }
+        let mut candidate = self.settings_mutation_candidate()?;
+        candidate
+            .settings
+            .get_or_insert_with(CT_Settings::new)
+            .set_embed_true_type_fonts(value)?;
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
+    /// Return the presence-sensitive embedded system font setting.
+    pub fn embed_system_fonts(&self) -> Result<Option<bool>> {
+        if self.settings.is_none() && self.settings_part_name.is_some() {
+            return Err(Error::Other("cannot inspect unmodeled settings".to_owned()));
+        }
+        Ok(self
+            .settings
+            .as_ref()
+            .map(CT_Settings::embed_system_fonts)
+            .transpose()?
+            .flatten())
+    }
+
+    /// Set or remove the embedded system font setting atomically.
+    pub fn set_embed_system_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        if self.embed_system_fonts()? == value {
+            return Ok(());
+        }
+        let mut candidate = self.settings_mutation_candidate()?;
+        candidate
+            .settings
+            .get_or_insert_with(CT_Settings::new)
+            .set_embed_system_fonts(value)?;
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
+    /// Return the presence-sensitive font subsetting setting.
+    pub fn save_subset_fonts(&self) -> Result<Option<bool>> {
+        if self.settings.is_none() && self.settings_part_name.is_some() {
+            return Err(Error::Other("cannot inspect unmodeled settings".to_owned()));
+        }
+        Ok(self
+            .settings
+            .as_ref()
+            .map(CT_Settings::save_subset_fonts)
+            .transpose()?
+            .flatten())
+    }
+
+    /// Set or remove the font subsetting setting atomically.
+    pub fn set_save_subset_fonts(&mut self, value: Option<bool>) -> Result<()> {
+        if self.save_subset_fonts()? == value {
+            return Ok(());
+        }
+        let mut candidate = self.settings_mutation_candidate()?;
+        candidate
+            .settings
+            .get_or_insert_with(CT_Settings::new)
+            .set_save_subset_fonts(value)?;
+        self.commit_staged_mutation(candidate);
+        Ok(())
+    }
+
     /// Add or replace one descriptive font-table record.
     pub fn set_font(&mut self, font: FontDefinition) -> Result<()> {
-        if font.name.trim().is_empty() {
-            return Err(Error::Other("font name must not be empty".to_owned()));
+        if font.name.trim().is_empty()
+            || std::iter::once(font.name.as_str())
+                .chain(font.alternate_name.as_deref())
+                .any(|value| {
+                    value.len() > 4096
+                        || value
+                            .chars()
+                            .any(|ch| ch < ' ' || ch == '\u{fffe}' || ch == '\u{ffff}')
+                })
+        {
+            return Err(Error::Other(
+                "font metadata is empty or unsupported".to_owned(),
+            ));
         }
         if font.family.as_deref().is_some_and(|family| {
             !matches!(
@@ -21537,6 +32125,29 @@ impl Document {
                 "set_font does not accept embedded bytes, use embed_font".to_owned(),
             ));
         }
+        if let Some(table) = &self.font_table {
+            let mut matches = table
+                .fonts()
+                .iter()
+                .filter(|record| record.name == font.name);
+            if let Some(record) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(Error::Other("ambiguous font record".to_owned()));
+                }
+                if record.alternate_name == font.alternate_name
+                    && record.family == font.family
+                    && record.pitch == font.pitch
+                {
+                    return Ok(());
+                }
+                if (record.alternate_name.is_some() && font.alternate_name.is_none())
+                    || (record.family.is_some() && font.family.is_none())
+                    || (record.pitch.is_some() && font.pitch.is_none())
+                {
+                    table.can_remove_font(&font.name)?;
+                }
+            }
+        }
         let mut candidate = self.font_table_mutation_candidate()?;
         candidate
             .font_table
@@ -21556,9 +32167,17 @@ impl Document {
 
     /// Remove one font-table record and every embedded face it owns.
     pub fn remove_font(&mut self, name: &str) -> Result<Option<FontDefinition>> {
-        let Some(removed) = self.fonts().into_iter().find(|font| font.name == name) else {
+        if let Some(table) = &self.font_table {
+            table.can_remove_font(name)?;
+        }
+        let Some(record) = self
+            .font_table
+            .as_ref()
+            .and_then(|table| table.fonts().iter().find(|font| font.name == name))
+        else {
             return Ok(None);
         };
+        let removed = self.project_font_records(&[record])?.remove(0);
         let mut candidate = self.font_table_mutation_candidate()?;
         let references = candidate
             .font_table
@@ -21578,6 +32197,14 @@ impl Document {
 
     /// Embed caller-provided font bytes after explicit license authorization.
     pub fn embed_font(&mut self, font_name: &str, embedded: EmbeddedFont) -> Result<()> {
+        if font_name.trim().is_empty()
+            || font_name.len() > 4096
+            || font_name
+                .chars()
+                .any(|ch| ch < ' ' || ch == '\u{fffe}' || ch == '\u{ffff}')
+        {
+            return Err(Error::Other("font name is empty or unsupported".to_owned()));
+        }
         if !embedded.license.authorized {
             return Err(Error::Other(
                 "font embedding requires explicit caller authorization".to_owned(),
@@ -21596,14 +32223,14 @@ impl Document {
         if embedded
             .license
             .identity
-            .bytes()
-            .any(|byte| matches!(byte, b'\t' | b'\n' | b'\r'))
+            .chars()
+            .any(|ch| ch < ' ' || ch == '\u{fffe}' || ch == '\u{ffff}')
         {
             return Err(Error::Other(
-                "font embedding license identity contains XML-normalized whitespace".to_owned(),
+                "font embedding license identity contains unsupported XML characters".to_owned(),
             ));
         }
-        if !looks_like_sfnt(&embedded.data) {
+        if !valid_authored_sfnt(&embedded.data) {
             return Err(Error::Other(
                 "embedded font bytes are not a supported sfnt font".to_owned(),
             ));
@@ -21615,13 +32242,26 @@ impl Document {
         let mut candidate = self.font_table_mutation_candidate()?;
         let table = candidate
             .font_table
-            .as_ref()
+            .as_mut()
             .expect("font-table mutation candidate has a model");
+        if table
+            .fonts()
+            .iter()
+            .filter(|font| font.name == font_name)
+            .count()
+            > 1
+        {
+            return Err(Error::Other("font-table record is ambiguous".to_owned()));
+        }
+        if !table.fonts().iter().any(|font| font.name == font_name) {
+            table.set_font(font_name.to_owned(), None, None, None);
+        }
+        let table = candidate.font_table.as_ref().unwrap();
         let font = table
             .fonts()
             .iter()
             .find(|font| font.name == font_name)
-            .ok_or_else(|| Error::Other(format!("font-table record {font_name} does not exist")))?;
+            .unwrap();
         let kind = FontFaceKind::from(embedded.kind);
         let existing = font
             .embedded_fonts
@@ -21633,28 +32273,34 @@ impl Document {
             .clone()
             .expect("font-table mutation candidate has a part name");
 
-        let existing_target = if let Some(existing) = &existing {
-            let relationship = candidate
-                .package
-                .get_part_rels(&font_table_part)
-                .and_then(|relationships| relationships.get_by_id(&existing.relationship_id))
-                .filter(|relationship| {
-                    relationship.rel_type == rel_types::FONT
-                        && relationship_is_internal(relationship)
-                })
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "embedded font relationship {} is missing",
-                        existing.relationship_id
-                    ))
-                })?;
-            Some(OpcPackage::resolve_rel_target(
-                &font_table_part,
-                &relationship.target,
-            ))
-        } else {
-            None
-        };
+        if font
+            .embedded_fonts
+            .iter()
+            .filter(|face| face.kind == kind)
+            .count()
+            > 1
+        {
+            return Err(Error::Other("embedded font face is ambiguous".to_owned()));
+        }
+        let existing_target = existing
+            .as_ref()
+            .map(|reference| {
+                candidate
+                    .checked_embedded_font_source(reference)
+                    .map(|(target, _)| target)
+            })
+            .transpose()?;
+        let obfuscated = obfuscate_odttf_with_key(&embedded.data, &guid);
+        if let (Some(reference), Some(target)) = (&existing, &existing_target)
+            && reference.font_key == embedded.font_key
+            && reference.subsetted == Some(embedded.subsetted)
+            && reference.authorized == Some(true)
+            && reference.license_identity.as_ref() == Some(&embedded.license.identity)
+            && candidate.package.get_part(target) == Some(obfuscated.as_slice())
+            && candidate.embed_true_type_fonts()? == Some(true)
+        {
+            return Ok(());
+        }
         let can_reuse_existing = existing.as_ref().is_some_and(|existing| {
             let relationship_reference_count =
                 table.embedded_relationship_reference_count(&existing.relationship_id);
@@ -21677,7 +32323,8 @@ impl Document {
                 })
                 .filter(|(source, relationship)| {
                     relationship_is_internal(relationship)
-                        && OpcPackage::resolve_rel_target(source, &relationship.target) == *target
+                        && OpcPackage::resolve_rel_target(source, &relationship.target)
+                            .eq_ignore_ascii_case(target)
                 })
                 .count();
             relationship_reference_count == 1
@@ -21709,9 +32356,7 @@ impl Document {
             (relationship_id, part_name)
         };
 
-        candidate
-            .package
-            .set_part(&part_name, obfuscate_odttf_with_key(&embedded.data, &guid));
+        candidate.package.set_part(&part_name, obfuscated);
         candidate
             .package
             .content_types
@@ -21741,6 +32386,27 @@ impl Document {
             .as_ref()
             .expect("font-table mutation candidate has a model")
             .to_xml()?;
+        if candidate.settings_part_name.is_some() && candidate.settings.is_none() {
+            return Err(Error::Other("cannot mutate unmodeled settings".to_owned()));
+        }
+        let created = candidate.settings_part_name.is_none();
+        let settings_part = match &candidate.settings_part_name {
+            Some(part) => part.clone(),
+            None => candidate
+                .identifiers
+                .reserve_preferred_part_name(DEFAULT_SETTINGS_PART)?,
+        };
+        candidate.ensure_part_relationship_checked(
+            &settings_part,
+            rel_types::SETTINGS,
+            SETTINGS_CONTENT_TYPE,
+        )?;
+        candidate.settings_part_name = Some(settings_part);
+        candidate.settings_owned |= created;
+        candidate
+            .settings
+            .get_or_insert_with(CT_Settings::new)
+            .set_embed_true_type_fonts(Some(true))?;
         candidate.font_table_dirty = true;
         candidate.invalidate_layout();
         self.commit_staged_mutation(candidate);
@@ -21753,17 +32419,42 @@ impl Document {
         font_name: &str,
         kind: EmbeddedFontKind,
     ) -> Result<Option<EmbeddedFont>> {
-        let Some(removed) = self
-            .fonts()
-            .into_iter()
-            .find(|font| font.name == font_name)
+        if let Some(table) = &self.font_table {
+            table.can_remove_embedded_font(font_name, kind.into())?;
+        }
+        let Some(reference) = self
+            .font_table
+            .as_ref()
+            .and_then(|table| table.fonts().iter().find(|font| font.name == font_name))
             .and_then(|font| {
                 font.embedded_fonts
-                    .into_iter()
-                    .find(|embedded| embedded.kind == kind)
+                    .iter()
+                    .find(|face| face.kind == kind.into())
             })
         else {
             return Ok(None);
+        };
+        let (_, data) = self.checked_embedded_font_source(reference)?;
+        if data.len() > 64 * 1024 * 1024
+            || reference.font_key.len() > 4096
+            || reference
+                .license_identity
+                .as_ref()
+                .is_some_and(|value| value.len() > 4096)
+        {
+            return Err(Error::Other(
+                "embedded font snapshot exceeds its bound".to_owned(),
+            ));
+        }
+        let removed = EmbeddedFont {
+            kind,
+            data: deobfuscate_odttf_with_key(data, &reference.font_key).unwrap_or_default(),
+            font_key: reference.font_key.clone(),
+            subsetted: reference.subsetted.unwrap_or(false),
+            license: FontEmbeddingLicense {
+                authorized: reference.authorized.unwrap_or(false),
+                identity: reference.license_identity.clone().unwrap_or_default(),
+            },
         };
         let mut candidate = self.font_table_mutation_candidate()?;
         let reference = candidate
@@ -21818,23 +32509,13 @@ impl Document {
             .font_table_part_name
             .clone()
             .ok_or_else(|| Error::Other("font-table part name is missing".to_owned()))?;
+        let (target, _) = self.checked_embedded_font_source(reference)?;
         if self.font_table.as_ref().is_some_and(|table| {
             table.embedded_relationship_reference_count(&reference.relationship_id) > 0
                 || table.retained_raw_mentions_relationship(&reference.relationship_id)
         }) {
             return Ok(());
         }
-        let target = self
-            .package
-            .get_part_rels(&owner)
-            .and_then(|relationships| relationships.get_by_id(&reference.relationship_id))
-            .filter(|relationship| {
-                relationship.rel_type == rel_types::FONT && relationship_is_internal(relationship)
-            })
-            .map(|relationship| OpcPackage::resolve_rel_target(&owner, &relationship.target));
-        let Some(target) = target else {
-            return Ok(());
-        };
         if let Some(relationships) = self.package.get_part_rels_mut(&owner) {
             relationships.items.retain(|relationship| {
                 relationship.id != reference.relationship_id
@@ -21854,7 +32535,8 @@ impl Document {
             .any(|(source, relationships)| {
                 relationships.items.iter().any(|relationship| {
                     relationship_is_internal(relationship)
-                        && OpcPackage::resolve_rel_target(source, &relationship.target) == target
+                        && OpcPackage::resolve_rel_target(source, &relationship.target)
+                            .eq_ignore_ascii_case(&target)
                 })
             });
         if !still_referenced {
@@ -22022,7 +32704,18 @@ impl Document {
     }
 
     /// Replace the complete application-properties model.
+    ///
+    /// An `application_version` must have the form `XX.YYYY` (ECMA-376 Part 1,
+    /// 22.2.2.3), because Word refuses to open a package with any other shape.
     pub fn set_application_properties(&mut self, properties: AppProperties) -> Result<()> {
+        if let Some(version) = properties.application_version.as_deref()
+            && !is_app_version(version)
+        {
+            return Err(Error::Other(format!(
+                "application version {version:?} must have the form XX.YYYY \
+                 (two digits, a dot, four digits), which Word requires to open the file"
+            )));
+        }
         let mut candidate = self.clone_for_staging();
         candidate.reserve_application_properties_bundle()?;
         candidate.application_properties = Some(properties);
@@ -22411,13 +33104,17 @@ impl Document {
     }
 
     /// Merge styles from another document, avoiding duplicates.
+    ///
+    /// A defect the destination styles already have is retained. Only a
+    /// defect the merged styles introduce rejects the merge.
     fn merge_styles(&mut self, other: &Document) -> Result<()> {
+        let source = self.styles.clone();
         for style in &other.styles.styles {
             if self.styles.get_by_id(&style.style_id).is_none() {
                 self.styles.styles.push(style.clone());
             }
         }
-        style::validate_style_graph(&self.styles)
+        style::validate_style_graph_change(&source, &self.styles).map(|_| ())
     }
 
     pub(crate) fn equivalent_numbering_dependency_id(
@@ -22629,7 +33326,7 @@ impl Document {
         let mut identifiers = self.identifiers.clone();
         let mut duplicate_typed_id = false;
         let mut typed_ids = HashSet::new();
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |paragraph| {
             for marker in &paragraph.bookmark_markers {
                 if marker.is_start()
                     && let Some(id) = marker.id()
@@ -22804,7 +33501,7 @@ impl Document {
     /// Numeric `_TocN` bookmark suffixes already present in the body.
     fn toc_bookmark_suffixes(&self) -> HashSet<u64> {
         let mut suffixes = HashSet::new();
-        visit_body_paragraphs(&self.document.body.content, &mut |p| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |p| {
             for marker in &p.bookmark_markers {
                 let Some(name) = marker.name() else {
                     continue;
@@ -22897,6 +33594,380 @@ impl Document {
         Ok(count)
     }
 
+    /// Replace literal text only within one checked paragraph, table or block control.
+    /// Matching retains run formatting and never crosses paragraph or wrapper boundaries.
+    /// Count mismatch and preparation failures leave the complete document unchanged.
+    pub fn try_replace_text_at(
+        &mut self,
+        location: &ContentLocation,
+        placeholder: &str,
+        replacement: &str,
+        expected: Option<usize>,
+    ) -> Result<std::result::Result<usize, ReplacementCountMismatch>> {
+        self.try_replace_scoped(
+            ScopedReplacementTarget::Item(location),
+            placeholder,
+            replacement,
+            expected,
+        )
+    }
+
+    /// Replace text in exactly one physical body table cell or one of its paragraphs.
+    /// Whole-cell scope includes supported nested tables and controls.
+    #[doc(hidden)]
+    pub fn try_replace_text_in_cell(
+        &mut self,
+        cell: (usize, usize, usize),
+        paragraph: Option<usize>,
+        placeholder: &str,
+        replacement: &str,
+        expected: Option<usize>,
+    ) -> Result<std::result::Result<usize, ReplacementCountMismatch>> {
+        self.try_replace_scoped(
+            ScopedReplacementTarget::Cell {
+                coordinates: cell,
+                paragraph,
+            },
+            placeholder,
+            replacement,
+            expected,
+        )
+    }
+
+    /// Replace literal text only in one checked related physical table cell.
+    #[doc(hidden)]
+    pub fn try_replace_text_in_story_cell(
+        &mut self,
+        story: &StoryId,
+        placeholder: &str,
+        replacement: &str,
+        expected: Option<usize>,
+    ) -> Result<std::result::Result<usize, ReplacementCountMismatch>> {
+        self.try_replace_scoped(
+            ScopedReplacementTarget::RelatedCell(story),
+            placeholder,
+            replacement,
+            expected,
+        )
+    }
+
+    fn try_replace_scoped(
+        &mut self,
+        target: ScopedReplacementTarget<'_>,
+        placeholder: &str,
+        replacement: &str,
+        expected: Option<usize>,
+    ) -> Result<std::result::Result<usize, ReplacementCountMismatch>> {
+        oxml_core::xml::reject_non_xml_characters("replacement text", replacement)?;
+        let mut candidate = self.clone_for_staging();
+        let (story, path, paragraph) = match target {
+            ScopedReplacementTarget::Item(location) => {
+                if location.is_end
+                    || !matches!(
+                        location.item_kind,
+                        StoryItemKind::Paragraph
+                            | StoryItemKind::Table
+                            | StoryItemKind::ContentControl
+                    )
+                {
+                    return Err(Error::Other("scoped replacement requires an existing paragraph, table or content control".into()));
+                }
+                candidate.story_range_paragraph_source(location)?;
+                (location.story.clone(), Some(location.clone()), None)
+            }
+            ScopedReplacementTarget::RelatedCell(story) => {
+                if story.kind() != StoryKind::TableCell {
+                    return Err(Error::Other(
+                        "scoped cell replacement needs a table-cell owner".to_owned(),
+                    ));
+                }
+                candidate.story_source_and_owner(story)?;
+                (story.clone(), None, None)
+            }
+            ScopedReplacementTarget::Cell {
+                coordinates: (table, row, cell),
+                paragraph,
+            } => {
+                let selected = candidate
+                    .table(table)
+                    .and_then(|t| t.cell(row, cell).map(|c| c.inner as *const CT_Tc))
+                    .ok_or_else(|| {
+                        Error::Other(format!("cell {table}:{row}:{cell} is out of range"))
+                    })?;
+                let xml = candidate.document.to_xml()?;
+                let owners = scan_story_owners(&xml, StoryKind::Body)?;
+                let mut found = None;
+                for owner in owners
+                    .iter()
+                    .filter(|owner| owner.kind == StoryKind::TableCell)
+                {
+                    let (content, mut ordinal) = modeled_main_cell_route(&xml, owner)?;
+                    let modeled = match candidate.document.body.content.get_mut(content) {
+                        Some(BodyContent::Table(t)) => nth_cell_in_table(t, &mut ordinal),
+                        Some(BodyContent::ContentControl(c)) => {
+                            nth_cell_in_control(c, &mut ordinal)
+                        }
+                        _ => None,
+                    };
+                    if modeled.is_some_and(|c| std::ptr::eq(selected, c)) {
+                        found = Some(StoryId {
+                            kind: owner.kind,
+                            part_name: candidate.doc_part_name.clone(),
+                            owner_index: owner.owner_index,
+                            fingerprint: owner.fingerprint,
+                        });
+                        break;
+                    }
+                }
+                (
+                    found.ok_or_else(|| {
+                        Error::Other("cell has no checked physical story owner".into())
+                    })?,
+                    None,
+                    paragraph,
+                )
+            }
+        };
+        // Flush only the private candidate before choosing the preserved physical span.
+        candidate.prepare_staged_package()?;
+        let (canonical, canonical_owner) = candidate.story_source_and_owner(&story)?;
+        let (source, owner) = candidate.fragment_story_source_and_owner(&story)?;
+        let canonical_owners = scan_story_owners(&canonical.xml, canonical.root_kind)?;
+        let actual_owners = scan_story_owners(&source.xml, source.root_kind)?;
+        if canonical_owners
+            .iter()
+            .map(|o| (o.kind, o.owner_index))
+            .collect::<Vec<_>>()
+            != actual_owners
+                .iter()
+                .map(|o| (o.kind, o.owner_index))
+                .collect::<Vec<_>>()
+        {
+            return Err(Error::Other(
+                "scoped replacement namespace context changes physical ownership".into(),
+            ));
+        }
+        let (canonical_span, span) = if let Some(location) = path {
+            let canonical_items = scan_story_items(&canonical.xml, &canonical_owner)?;
+            let index = location.index_path[0];
+            let selected = canonical_items.get(index).ok_or(StoryError::OutOfBounds {
+                index,
+                len: canonical_items.len(),
+            })?;
+            if !selected.direct_owner_child {
+                return Err(Error::Other(
+                    "scoped replacement requires a block owner item".into(),
+                ));
+            }
+            let canonical_direct = direct_story_content_items(&canonical.xml, &canonical_owner)?;
+            let actual_direct = direct_story_content_items(&source.xml, &owner)?;
+            let slot = canonical_direct
+                .iter()
+                .position(|item| item.full == selected.full)
+                .ok_or_else(|| {
+                    Error::Other("scoped replacement has no direct physical slot".into())
+                })?;
+            let item = actual_direct.get(slot).ok_or(StoryError::OutOfBounds {
+                index: slot,
+                len: actual_direct.len(),
+            })?;
+            if item.kind != selected.kind {
+                return Err(StoryError::KindMismatch {
+                    expected: selected.kind,
+                    actual: item.kind,
+                }
+                .into());
+            }
+            if let [_, ordinal] = location.index_path.as_slice() {
+                let canonical_paragraphs = scan_story_control_paragraphs(&canonical.xml, selected)?;
+                let paragraphs = scan_story_control_paragraphs(&source.xml, item)?;
+                let select = |paragraphs: &[Range<usize>]| {
+                    paragraphs
+                        .get(*ordinal)
+                        .cloned()
+                        .ok_or(StoryError::OutOfBounds {
+                            index: *ordinal,
+                            len: paragraphs.len(),
+                        })
+                };
+                (select(&canonical_paragraphs)?, select(&paragraphs)?)
+            } else {
+                (selected.full.clone(), item.full.clone())
+            }
+        } else {
+            (canonical_owner.full.clone(), owner.full.clone())
+        };
+        if source.part_name == candidate.doc_part_name {
+            candidate.prove_scoped_main_source(
+                &canonical.xml,
+                canonical_span,
+                &source.xml,
+                span.clone(),
+            )?;
+        } else if canonical.xml != source.xml || canonical_span != span {
+            return Err(Error::Other(
+                "scoped related-story source correspondence changed".into(),
+            ));
+        }
+        let part = source.part_name.clone();
+        let mut xml = source.xml.into_owned();
+        let scope = story_namespace_scope_at(&xml, span.start)?;
+        let mut raw = close_content_fragment_namespaces(&xml[span.clone()], &scope)?;
+        let count = rdocx_oxml::placeholder::try_replace_in_block(
+            &mut raw,
+            paragraph,
+            placeholder,
+            replacement,
+        )?;
+        if let Some(expected) = expected
+            && count != expected
+        {
+            return Ok(Err(ReplacementCountMismatch {
+                index: 0,
+                placeholder: placeholder.into(),
+                expected,
+                found: count,
+            }));
+        }
+        if count == 0 {
+            return Ok(Ok(0));
+        }
+        if let Some(edits) = paired_scoped_edits(
+            &xml,
+            &owner,
+            &PairedReplacement {
+                span: &span,
+                paragraph,
+                placeholder,
+                replacement,
+                count,
+            },
+        )? {
+            for edit in edits.into_iter().rev() {
+                xml.splice(edit.range, edit.raw);
+            }
+        } else {
+            xml.splice(span, raw);
+        }
+        set_story_source_xml(&mut candidate, &part, xml)?;
+        candidate.prepare_staged_package()?;
+        let limits = PackageReadLimits::UNBOUNDED;
+        #[cfg(test)]
+        let limits = if FAIL_NEXT_SCOPED_REOPEN.replace(false) {
+            PackageReadLimits {
+                max_entries: 0,
+                ..limits
+            }
+        } else {
+            limits
+        };
+        let reopened = candidate.reopen_prepared_staged_with_limits(limits)?;
+        self.commit_staged_mutation(reopened);
+        Ok(Ok(count))
+    }
+
+    // A private model probe distinguishes physical positions even when siblings
+    // contain identical text. Producer normalization is allowed, raw output is
+    // still edited only at the proved retained span.
+    fn prove_scoped_main_source(
+        &self,
+        canonical: &[u8],
+        canonical_span: Range<usize>,
+        original: &[u8],
+        retained_span: Range<usize>,
+    ) -> Result<()> {
+        let restored = self.namespace_restored_main_source()?;
+        let (boundaries, _) = comment_namespace_source_boundaries(canonical, &restored)?
+            .ok_or_else(|| {
+                Error::Other("scoped canonical namespace source changed payload".into())
+            })?;
+        let start = *boundaries.get(&canonical_span.start).ok_or_else(|| {
+            Error::Other("scoped start has no physical namespace boundary".into())
+        })?;
+        let end = *boundaries
+            .get(&canonical_span.end)
+            .ok_or_else(|| Error::Other("scoped end has no physical namespace boundary".into()))?;
+        // One typed serialization establishes the same canonical defaults and
+        // root namespace inventory on both sides before model comparison.
+        let normalize = |xml: &[u8]| -> Result<CT_Document> {
+            Ok(CT_Document::from_xml(
+                &CT_Document::from_xml(xml)?.to_xml()?,
+            )?)
+        };
+        let baseline = normalize(original)?;
+        if normalize(&self.document.to_xml()?)? != baseline || normalize(&restored)? != baseline {
+            return Err(Error::Other(
+                "scoped source has no equivalent checked model projection".into(),
+            ));
+        }
+        let mut identity = 0usize;
+        let marker = loop {
+            let marker = format!("rdocxScopedPositionProof{identity}");
+            if !original
+                .windows(marker.len())
+                .any(|bytes| bytes == marker.as_bytes())
+                && !restored
+                    .windows(marker.len())
+                    .any(|bytes| bytes == marker.as_bytes())
+            {
+                break marker;
+            }
+            identity = identity
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("scoped source proof identity exhausted".into()))?;
+        };
+        let scope = story_namespace_scope_at(&restored, start)?;
+        let selected_closed = close_content_fragment_namespaces(&restored[start..end], &scope)?;
+        let mut reader = NsReader::from_reader(selected_closed.as_slice());
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let root = match event {
+            Event::Start(element) | Event::Empty(element) => element,
+            _ => return Err(Error::Other("scoped source proof has no root".into())),
+        };
+        if !word_element(&namespace) {
+            return Err(Error::Other(
+                "scoped source proof needs a qualified Word block".into(),
+            ));
+        }
+        let paragraph =
+            format!(r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:r><w:t>{marker}</w:t></w:r></w:p>"#);
+        let sentinel = match root.local_name().as_ref() {
+            b"p" => paragraph,
+            b"tbl" => format!(
+                r#"<w:tbl xmlns:w="{WORD_NAMESPACE}"><w:tr><w:tc>{paragraph}</w:tc></w:tr></w:tbl>"#
+            ),
+            b"tc" => format!(r#"<w:tc xmlns:w="{WORD_NAMESPACE}">{paragraph}</w:tc>"#),
+            b"sdt" => format!(
+                r#"<w:sdt xmlns:w="{WORD_NAMESPACE}"><w:sdtPr/><w:sdtContent>{paragraph}</w:sdtContent></w:sdt>"#
+            ),
+            _ => return Err(Error::Other("unsupported scoped source proof kind".into())),
+        };
+        let mut checked_probe = restored;
+        checked_probe.splice(start..end, sentinel.bytes());
+        let mut retained_probe = original.to_vec();
+        retained_probe.splice(retained_span, sentinel.bytes());
+        let checked_model = normalize(&checked_probe)?;
+        let retained_model = normalize(&retained_probe)?;
+        let occurrences = |model: &CT_Document| -> Result<usize> {
+            Ok(model
+                .to_xml()?
+                .windows(marker.len())
+                .filter(|bytes| *bytes == marker.as_bytes())
+                .count())
+        };
+        if occurrences(&checked_model)? != 1
+            || occurrences(&retained_model)? != 1
+            || checked_model != retained_model
+        {
+            return Err(Error::Other(
+                "scoped selection does not identify the same physical source".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Replace multiple placeholders at once. Returns total replacements.
     ///
     /// Cheaper than calling [`Self::replace_text`] per entry: the document is
@@ -22926,6 +33997,9 @@ impl Document {
         &mut self,
         pairs: &[(&str, &str, Option<usize>)],
     ) -> Result<std::result::Result<Vec<usize>, ReplacementCountMismatch>> {
+        if pairs.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
         let mut candidate = self.clone_for_staging();
         let mut counts = Vec::with_capacity(pairs.len());
         for (index, &(placeholder, replacement, expected)) in pairs.iter().enumerate() {
@@ -23092,7 +34166,7 @@ impl Document {
                 }
             }
         };
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, false, &mut |paragraph| {
             if let Some(section) = paragraph
                 .properties
                 .as_ref()
@@ -23111,21 +34185,7 @@ impl Document {
     fn header_footer_rel_ids_for_layout(&self) -> HashSet<String> {
         let even_headers_enabled = self.even_headers_enabled();
         let mut rel_ids = HashSet::new();
-        let sections = self
-            .document
-            .body
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                BodyContent::Paragraph(paragraph) => paragraph
-                    .properties
-                    .as_ref()
-                    .and_then(|properties| properties.sect_pr.as_ref()),
-                BodyContent::Table(_) | BodyContent::ContentControl(_) | BodyContent::RawXml(_) => {
-                    None
-                }
-            })
-            .chain(self.document.body.sect_pr.iter());
+        let sections = rdocx_layout::engine::document_sections(&self.document);
         for section in sections {
             for reference in section.header_refs.iter().chain(&section.footer_refs) {
                 if reference.hdr_ftr_type != HdrFtrType::Even || even_headers_enabled {
@@ -23179,6 +34239,99 @@ impl Document {
             count += candidate.replace_regex_compiled(regex, replacement)?;
         }
         self.commit_staged_mutation(candidate);
+        Ok(count)
+    }
+
+    /// Apply ordered regex pairs with checked owner errors and atomic expected counts.
+    /// Patterns use Rust regex syntax. Empty batches preserve the original state.
+    pub fn try_replace_all_regex_expected(
+        &mut self,
+        pairs: &[(&str, &str, Option<usize>)],
+    ) -> Result<std::result::Result<Vec<usize>, ReplacementCountMismatch>> {
+        let compiled = pairs
+            .iter()
+            .map(|(pattern, replacement, expected)| {
+                oxml_core::xml::reject_non_xml_characters("replacement text", replacement)?;
+                let regex = regex::Regex::new(pattern)
+                    .map_err(|error| Error::Other(format!("invalid regex: {error}")))?;
+                Ok((regex, *replacement, *expected))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if pairs.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        let mut candidate = self.clone_for_staging();
+        let mut counts = Vec::with_capacity(pairs.len());
+        for (index, (regex, replacement, expected)) in compiled.iter().enumerate() {
+            let found = candidate.replace_regex_compiled_checked(regex, replacement)?;
+            if let Some(expected) = expected
+                && *expected != found
+            {
+                return Ok(Err(ReplacementCountMismatch {
+                    index,
+                    placeholder: pairs[index].0.to_owned(),
+                    expected: *expected,
+                    found,
+                }));
+            }
+            counts.push(found);
+        }
+        self.commit_staged_mutation(candidate.prepare_and_reopen_staged()?);
+        Ok(Ok(counts))
+    }
+
+    fn replace_regex_compiled_checked(
+        &mut self,
+        re: &regex::Regex,
+        replacement: &str,
+    ) -> Result<usize> {
+        use rdocx_oxml::placeholder;
+        self.flush_to_package()?;
+        let mut count = 0;
+        visit_body_paragraphs_mut(&mut self.document.body.content, &mut |paragraph| {
+            count += placeholder::replace_regex_in_paragraph(paragraph, re, replacement);
+        });
+        for (rel_id, is_header) in self.header_footer_rel_ids() {
+            let mut hf = self.load_header_footer(&rel_id, is_header).ok_or_else(|| {
+                Error::Other(format!("required header/footer {rel_id} cannot be read"))
+            })?;
+            let n = placeholder::replace_regex_in_header_footer(&mut hf, re, replacement);
+            if n > 0 {
+                self.save_header_footer(&rel_id, &hf, is_header)?;
+                count += n;
+            }
+        }
+        self.flush_to_package()?;
+        for (part_name, _) in self.text_bearing_part_names() {
+            let xml = self
+                .package
+                .get_part(&part_name)
+                .ok_or_else(|| Error::Other(format!("required text owner {part_name} is missing")))?
+                .to_vec();
+            let (changed, n) = placeholder::replace_regex_in_xml_part(&xml, re, replacement)?;
+            if changed != xml {
+                if part_name == self.doc_part_name {
+                    self.document = CT_Document::from_xml(&changed)?;
+                }
+                self.package.set_part(&part_name, changed);
+            }
+            count += n;
+        }
+        for part_name in self.note_part_names() {
+            let xml = self
+                .package
+                .get_part(&part_name)
+                .ok_or_else(|| Error::Other(format!("required note owner {part_name} is missing")))?
+                .to_vec();
+            let (changed, n) = placeholder::replace_regex_in_notes_part(&xml, re, replacement)?;
+            if changed != xml {
+                if self.footnotes_part_name.as_deref() == Some(part_name.as_str()) {
+                    self.footnotes = rdocx_oxml::footnotes::CT_Footnotes::from_xml(&changed)?;
+                }
+                self.package.set_part(&part_name, changed);
+            }
+            count += n;
+        }
         Ok(count)
     }
 
@@ -23446,7 +34599,9 @@ impl Document {
     /// body content matches exactly. A rejected transfer leaves both engines
     /// unchanged. Completed layout results remain owned by their documents.
     pub fn transfer_reusable_layout_from(&mut self, source: &mut Document) -> bool {
-        let input = self.build_layout_input();
+        let Ok(input) = self.build_layout_input() else {
+            return false;
+        };
         let transferred = {
             let mut source_engine = source
                 .normal_layout_engine
@@ -23475,7 +34630,10 @@ impl Document {
         source: &mut Document,
         font_files: &[(&str, &[u8])],
     ) -> bool {
-        let input = self.build_layout_input_with_fonts(font_files, RenderOptions::default());
+        let Ok(input) = self.build_layout_input_with_fonts(font_files, RenderOptions::default())
+        else {
+            return false;
+        };
         let transferred = {
             let mut source_engine = source
                 .bundled_fallback_layout_engine
@@ -23504,7 +34662,10 @@ impl Document {
         font_files: &[(&str, &[u8])],
         font_aliases: &[(&str, &str)],
     ) -> bool {
-        let input = self.build_layout_input_with_fonts(font_files, RenderOptions::default());
+        let Ok(input) = self.build_layout_input_with_fonts(font_files, RenderOptions::default())
+        else {
+            return false;
+        };
         let font_aliases = owned_font_aliases(font_aliases);
         let transferred = {
             let mut source_engine = source
@@ -23630,7 +34791,7 @@ impl Document {
                 })
             })
             .map(|relationship| relationship.id.as_str());
-        let input = self.build_layout_input_with_fonts(&[], options);
+        let input = self.build_layout_input_with_fonts(&[], options)?;
         let (height_points, diagnostics) = rdocx_layout::measure_content_deterministic(
             &input,
             &content,
@@ -23661,7 +34822,7 @@ impl Document {
         font_files: &[(&str, &[u8])],
         options: RenderOptions,
     ) -> Result<rdocx_layout::WordLayoutResult> {
-        let input = self.build_layout_input_with_fonts(font_files, options);
+        let input = self.build_layout_input_with_fonts(font_files, options)?;
         #[cfg(test)]
         record_layout_invocation();
         Ok(rdocx_layout::layout_document_with_caller_fonts_and_provenance(&input)?)
@@ -23689,7 +34850,7 @@ impl Document {
         font_files: &[(&str, &[u8])],
         options: RenderOptions,
     ) -> Result<rdocx_layout::WordLayoutResult> {
-        let input = self.build_layout_input_with_fonts(font_files, options);
+        let input = self.build_layout_input_with_fonts(font_files, options)?;
         #[cfg(test)]
         record_layout_invocation();
         let mut engine = self
@@ -23729,7 +34890,7 @@ impl Document {
         font_aliases: &[(&str, &str)],
         options: RenderOptions,
     ) -> Result<rdocx_layout::WordLayoutResult> {
-        let input = self.build_layout_input_with_fonts(font_files, options);
+        let input = self.build_layout_input_with_fonts(font_files, options)?;
         let font_aliases = owned_font_aliases(font_aliases);
         #[cfg(test)]
         record_layout_invocation();
@@ -23751,9 +34912,17 @@ impl Document {
         &self,
         font_files: &[(&str, &[u8])],
         options: RenderOptions,
-    ) -> rdocx_layout::LayoutInput {
-        let mut input = self.build_layout_input();
+    ) -> Result<rdocx_layout::LayoutInput> {
+        if options.revision_style != rdocx_layout::RevisionStyle::Plain
+            && options.revision_view != rdocx_layout::RevisionView::Tracked
+        {
+            return Err(Error::Other(
+                "revision style applies only with tracked view".to_owned(),
+            ));
+        }
+        let mut input = self.build_layout_input()?;
         input.revision_view = options.revision_view;
+        input.revision_style = options.revision_style;
         input.fonts.extend(
             font_files
                 .iter()
@@ -23762,7 +34931,7 @@ impl Document {
                     data: data.to_vec(),
                 }),
         );
-        input
+        Ok(input)
     }
 
     /// Render the document to PDF bytes.
@@ -23781,7 +34950,7 @@ impl Document {
     /// Render the document to PDF bytes with the selected revision view.
     pub fn to_pdf_with_options(&self, options: RenderOptions) -> Result<Vec<u8>> {
         let layout = self.layout_with_options(options)?;
-        Ok(oxml_pdf::render_to_pdf(&layout.layout))
+        Ok(oxml_pdf::render_to_pdf_checked(&layout.layout)?)
     }
 
     /// Render the document to PDF bytes using bundled fonts without system
@@ -23802,10 +34971,63 @@ impl Document {
         )?)
     }
 
+    /// Encode one bundled-fallback caller-font archival bundle with its owned diagnostics.
+    pub fn to_pdfa_with_diagnostics(
+        &self,
+        profile: oxml_pdf::PdfConformance,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<(Vec<u8>, Vec<oxml_layout::Diagnostic>)> {
+        let layout =
+            self.layout_with_fonts_and_bundled_fallback_and_options(font_files, options)?;
+        let bytes = oxml_pdf::render_to_pdf_with_options(
+            &layout.layout,
+            oxml_pdf::PdfOptions::new(profile),
+        )?;
+        Ok((bytes, layout.layout.diagnostics.clone()))
+    }
+
     /// Render the selected revision view to deterministic PDF bytes.
     pub fn to_pdf_deterministic_with_options(&self, options: RenderOptions) -> Result<Vec<u8>> {
         let layout = self.layout_for_options(options, true)?;
-        Ok(oxml_pdf::render_to_pdf(&layout.layout))
+        Ok(oxml_pdf::render_to_pdf_checked(&layout.layout)?)
+    }
+
+    /// Lay out caller fonts over the normal system and bundled fallback policy.
+    /// The returned bundle owns the exact face instances used by every renderer.
+    pub fn layout_with_additional_fonts_and_options(
+        &self,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<rdocx_layout::WordLayoutResult> {
+        let input = self.build_layout_input_with_fonts(font_files, options)?;
+        #[cfg(test)]
+        record_layout_invocation();
+        Ok(rdocx_layout::layout_document_with_provenance(&input)?)
+    }
+
+    /// Render caller fonts using the bundled fallback policy and selected revision view.
+    pub fn to_pdf_with_fonts_deterministic_and_options(
+        &self,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<Vec<u8>> {
+        let layout =
+            self.layout_with_fonts_and_bundled_fallback_and_options(font_files, options)?;
+        Ok(oxml_pdf::render_to_pdf_checked(&layout.layout)?)
+    }
+
+    /// Render caller fonts to the selected archival profile using bundled fallback.
+    pub fn to_pdfa_with_fonts_deterministic(
+        &self,
+        font_files: &[(&str, &[u8])],
+        profile: oxml_pdf::PdfConformance,
+    ) -> Result<Vec<u8>> {
+        let layout = self.layout_with_fonts_and_bundled_fallback(font_files)?;
+        Ok(oxml_pdf::render_to_pdf_with_options(
+            &layout.layout,
+            oxml_pdf::PdfOptions::new(profile),
+        )?)
     }
 
     /// Render the document to PDF bytes with user-provided font files.
@@ -23834,11 +35056,8 @@ impl Document {
         font_files: &[(&str, &[u8])],
         options: RenderOptions,
     ) -> Result<Vec<u8>> {
-        let input = self.build_layout_input_with_fonts(font_files, options);
-        #[cfg(test)]
-        record_layout_invocation();
-        let layout = rdocx_layout::layout_document_with_provenance(&input)?;
-        Ok(oxml_pdf::render_to_pdf(&layout.layout))
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        Ok(oxml_pdf::render_to_pdf_checked(&layout.layout)?)
     }
 
     /// Save the document as a PDF file.
@@ -24084,6 +35303,117 @@ impl Document {
         Ok(oxml_pdf::render_all_pages(&layout.layout, dpi))
     }
 
+    /// Encode one normal-fallback bundle and return its owned diagnostics.
+    pub fn to_pdf_with_diagnostics(
+        &self,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<(Vec<u8>, Vec<oxml_layout::Diagnostic>)> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        let bytes = oxml_pdf::render_to_pdf_checked(&layout.layout)?;
+        Ok((bytes, layout.layout.diagnostics.clone()))
+    }
+
+    /// Paint one PNG page from one bundle without rerendering for diagnostics.
+    pub fn render_page_to_png_with_diagnostics(
+        &self,
+        page_index: usize,
+        dpi: f64,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<(Option<Vec<u8>>, Vec<oxml_layout::Diagnostic>)> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        let bytes = oxml_pdf::render_page_to_png(&layout.layout, page_index, dpi);
+        Ok((bytes, layout.layout.diagnostics.clone()))
+    }
+
+    /// Paint every PNG page once and return the same bundle's ordered facts.
+    pub fn render_all_pages_with_diagnostics(
+        &self,
+        dpi: f64,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<(Vec<Vec<u8>>, Vec<oxml_layout::Diagnostic>)> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        let bytes = oxml_pdf::render_all_pages(&layout.layout, dpi);
+        Ok((bytes, layout.layout.diagnostics.clone()))
+    }
+
+    /// Paint explicit or all pages from one configured bundle, preserving TIFF.
+    pub fn render_pages_with_diagnostics(
+        &self,
+        page_indices: Option<&[usize]>,
+        raster_options: oxml_pdf::RasterOptions,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<(oxml_pdf::RasterOutput, Vec<oxml_layout::Diagnostic>)> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        let all_pages;
+        let selected = match page_indices {
+            Some(selected) => selected,
+            None => {
+                all_pages = (0..layout.layout.pages.len()).collect::<Vec<_>>();
+                &all_pages
+            }
+        };
+        let bytes = oxml_pdf::render_pages(&layout.layout, selected, raster_options)?;
+        Ok((bytes, layout.layout.diagnostics.clone()))
+    }
+
+    /// Render caller-selected normal fonts to one zero-based PNG page.
+    pub fn render_page_to_png_with_fonts_and_options(
+        &self,
+        page_index: usize,
+        dpi: f64,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<Option<Vec<u8>>> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        Ok(oxml_pdf::render_page_to_png(
+            &layout.layout,
+            page_index,
+            dpi,
+        ))
+    }
+
+    /// Render caller-selected normal fonts to one searchable SVG page.
+    pub fn render_page_to_svg_with_fonts_and_options(
+        &self,
+        page_index: usize,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<Option<crate::SvgRenderResult>> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        Ok(crate::svg::render_page(&layout.layout, page_index))
+    }
+
+    /// Render selected pages from one caller-selected normal-font bundle.
+    pub fn render_pages_with_fonts_and_options(
+        &self,
+        page_indices: &[usize],
+        raster_options: oxml_pdf::RasterOptions,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<oxml_pdf::RasterOutput> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        Ok(oxml_pdf::render_pages(
+            &layout.layout,
+            page_indices,
+            raster_options,
+        )?)
+    }
+
+    /// Render every PNG page from one caller-selected normal-font bundle.
+    pub fn render_all_pages_with_fonts_and_options(
+        &self,
+        dpi: f64,
+        font_files: &[(&str, &[u8])],
+        options: RenderOptions,
+    ) -> Result<Vec<Vec<u8>>> {
+        let layout = self.layout_with_additional_fonts_and_options(font_files, options)?;
+        Ok(oxml_pdf::render_all_pages(&layout.layout, dpi))
+    }
+
     /// Return a cloned positioned page from the cached normal-font layout.
     ///
     /// `page_index` is zero-based. An index beyond the document returns `None`.
@@ -24106,11 +35436,39 @@ impl Document {
     }
 
     /// Build a LayoutInput from the document's current state.
-    fn build_layout_input(&self) -> rdocx_layout::LayoutInput {
+    fn layout_story_body(&self, story: &StoryId) -> Result<rdocx_oxml::document::CT_Body> {
+        let (source, owner) = self.story_source_and_owner(story)?;
+        let xml = source.xml.as_ref();
+        let mut projected = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#.to_vec();
+        for item in direct_story_content_items(xml, &owner)? {
+            let scope = story_namespace_scope_at(xml, item.full.start)?;
+            projected.extend(close_content_fragment_namespaces(&xml[item.full], &scope)?);
+        }
+        projected.extend(b"</w:body></w:document>");
+        Ok(rdocx_oxml::document::CT_Document::from_xml(&projected)?.body)
+    }
+
+    pub(crate) fn build_layout_input(&self) -> Result<rdocx_layout::LayoutInput> {
+        let embedded_fonts = self.extract_embedded_fonts()?;
+        let modern_compatibility = self.settings.as_ref().is_some_and(|settings| {
+            settings.compatibility_settings().iter().any(|setting| {
+                setting.name == "compatibilityMode"
+                    && setting.uri == "http://schemas.microsoft.com/office/word"
+                    && setting
+                        .value
+                        .trim()
+                        .parse::<u32>()
+                        .is_ok_and(|mode| mode >= 15)
+            })
+        });
         use oxml_opc::relationship::rel_types;
         use rdocx_layout::{ImageData, LayoutInput};
         use std::collections::HashMap;
 
+        let mut story_part_names = HashMap::from([(
+            rdocx_layout::WordStory::Document,
+            self.doc_part_name.clone(),
+        )]);
         let mut headers: HashMap<String, CT_HdrFtr> = HashMap::new();
         let mut footers: HashMap<String, CT_HdrFtr> = HashMap::new();
         let mut images: HashMap<String, ImageData> = HashMap::new();
@@ -24122,7 +35480,7 @@ impl Document {
         let even_headers_enabled = self.even_headers_enabled();
 
         // Extract embedded fonts from the DOCX package
-        let fonts = self.extract_embedded_fonts();
+        let fonts = Vec::new();
 
         let insert_part_images =
             |images: &mut HashMap<String, ImageData>, part_rel_id: &str, part_name: &str| {
@@ -24162,6 +35520,12 @@ impl Document {
                         if let Some(xml) = self.package.get_part(&part_name)
                             && let Ok(hf) = CT_HdrFtr::from_xml(xml)
                         {
+                            story_part_names.insert(
+                                rdocx_layout::WordStory::Header {
+                                    relationship_id: rel.id.clone(),
+                                },
+                                part_name.clone(),
+                            );
                             headers.insert(rel.id.clone(), hf);
                         }
                         insert_part_images(&mut images, &rel.id, &part_name);
@@ -24177,6 +35541,12 @@ impl Document {
                         if let Some(xml) = self.package.get_part(&part_name)
                             && let Ok(hf) = CT_HdrFtr::from_xml(xml)
                         {
+                            story_part_names.insert(
+                                rdocx_layout::WordStory::Footer {
+                                    relationship_id: rel.id.clone(),
+                                },
+                                part_name.clone(),
+                            );
                             footers.insert(rel.id.clone(), hf);
                         }
                         insert_part_images(&mut images, &rel.id, &part_name);
@@ -24230,6 +35600,14 @@ impl Document {
                             OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
                         if let Some(xml) = self.package.get_part(&part_name) {
                             footnotes = rdocx_oxml::footnotes::CT_Footnotes::from_xml(xml).ok();
+                            if let Some(stream) = &footnotes {
+                                for note in &stream.footnotes {
+                                    story_part_names.insert(
+                                        rdocx_layout::WordStory::Footnote { id: note.id },
+                                        part_name.clone(),
+                                    );
+                                }
+                            }
                         }
                     }
                     t if t == rel_types::ENDNOTES => {
@@ -24240,6 +35618,14 @@ impl Document {
                             OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
                         if let Some(xml) = self.package.get_part(&part_name) {
                             endnotes = rdocx_oxml::footnotes::CT_Footnotes::from_xml(xml).ok();
+                            if let Some(stream) = &endnotes {
+                                for note in &stream.footnotes {
+                                    story_part_names.insert(
+                                        rdocx_layout::WordStory::Endnote { id: note.id },
+                                        part_name.clone(),
+                                    );
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -24302,8 +35688,146 @@ impl Document {
             &footers.keys().cloned().collect(),
         );
 
-        LayoutInput {
+        if let Some(story) = self.stories().ok().and_then(|stories| {
+            stories
+                .into_iter()
+                .find(|story| story.kind == StoryKind::Body)
+        }) && let Ok((source, owner)) = self.story_source_and_owner(&story)
+            && bind_text_box_source_owners(
+                &mut document.body,
+                source.xml.as_ref(),
+                source.root_kind,
+                owner.full,
+            )
+            .is_err()
+        {
+            // Binding is atomic. Unresolved physical owners retain their caches.
+        }
+
+        let mut story_bodies = HashMap::new();
+        if let Ok(stories) = self.stories() {
+            for (identity, part_name) in &story_part_names {
+                let kind = match identity {
+                    rdocx_layout::WordStory::Header { .. } => StoryKind::Header,
+                    rdocx_layout::WordStory::Footer { .. } => StoryKind::Footer,
+                    rdocx_layout::WordStory::Footnote { .. } => StoryKind::Footnote,
+                    rdocx_layout::WordStory::Endnote { .. } => StoryKind::Endnote,
+                    _ => continue,
+                };
+                let story = match identity {
+                    rdocx_layout::WordStory::Footnote { id } => {
+                        self.footnote_story(*id).ok().flatten()
+                    }
+                    rdocx_layout::WordStory::Endnote { id } => {
+                        self.endnote_story(*id).ok().flatten()
+                    }
+                    _ => stories
+                        .iter()
+                        .find(|story| story.kind == kind && &story.part_name == part_name)
+                        .cloned(),
+                };
+                if let Some(story) = story
+                    && let Ok(mut body) = self.layout_story_body(&story)
+                {
+                    if let Ok((source, owner)) = self.story_source_and_owner(&story)
+                        && bind_text_box_source_owners(
+                            &mut body,
+                            source.xml.as_ref(),
+                            source.root_kind,
+                            owner.full,
+                        )
+                        .is_err()
+                    {
+                        // The unbound authoritative projection remains renderable.
+                    }
+                    story_bodies.insert(identity.clone(), body);
+                }
+            }
+        }
+
+        // Rendering may consume a sole effects-only default without changing
+        // either authored style part or merging the effects style catalogue.
+        let mut layout_styles = self.styles.clone();
+        if layout_styles.get_default(StyleType::Table).is_none() {
+            let effects = self.package.get_part_rels(&self.doc_part_name).and_then(|rels| {
+                let mut candidates = rels.items.iter().filter(|rel| {
+                    rel.rel_type == "http://schemas.microsoft.com/office/2007/relationships/stylesWithEffects"
+                        && relationship_is_internal(rel)
+                });
+                let rel = candidates.next()?;
+                if candidates.next().is_some() {
+                    return None;
+                }
+                let target = OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
+                let xml = self.package.get_part(&target)?;
+                let parsed = CT_Styles::from_xml(xml).ok()?;
+                let mut style_ids = std::collections::HashSet::new();
+                if !parsed.styles.iter().all(|style| style_ids.insert(&style.style_id)) {
+                    return None;
+                }
+                // The general projection omits empty style owners. Reject an
+                // effects catalogue whose physical owners are not all modeled,
+                // rather than accepting an invisible duplicate or default.
+                let mut reader = NsReader::from_reader(xml);
+                let mut buffer = Vec::new();
+                let mut depth = 0usize;
+                let mut root_seen = false;
+                let mut style_count = 0usize;
+                loop {
+                    let (namespace, event) = reader.read_resolved_event_into(&mut buffer).ok()?;
+                    let word = matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == WORD_NAMESPACE.as_bytes());
+                    let starts_scope = matches!(&event, Event::Start(_));
+                    match event {
+                        Event::Start(element) | Event::Empty(element) => {
+                            if depth == 0 {
+                                if root_seen || !word || element.local_name().as_ref() != b"styles" {
+                                    return None;
+                                }
+                                root_seen = true;
+                            } else if depth == 1 && word && element.local_name().as_ref() == b"style" {
+                                style_count += 1;
+                            }
+                            // Empty events do not open an ownership level.
+                            if starts_scope {
+                                depth += 1;
+                            }
+                        }
+                        Event::End(_) => depth = depth.checked_sub(1)?,
+                        Event::DocType(_) => return None,
+                        Event::Text(text) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => return None,
+                        Event::Eof => break,
+                        _ => {}
+                    }
+                    buffer.clear();
+                }
+                (root_seen && depth == 0 && style_count == parsed.styles.len()).then_some(parsed)
+            });
+            if let Some(effects) = effects {
+                let mut defaults = effects
+                    .styles
+                    .iter()
+                    .filter(|style| style.style_type == StyleType::Table && style.is_default);
+                if let Some(default) = defaults.next()
+                    && !default.style_id.is_empty()
+                    && defaults.next().is_none()
+                    && default.based_on.is_none()
+                    && layout_styles.get_by_id(&default.style_id).is_none()
+                    && effects
+                        .styles
+                        .iter()
+                        .filter(|style| style.style_id == default.style_id)
+                        .count()
+                        == 1
+                {
+                    layout_styles.styles.push(default.clone());
+                }
+            }
+        }
+
+        Ok(LayoutInput {
+            sequence_snapshot: None,
             revision_view: rdocx_layout::RevisionView::Accepted,
+            revision_style: rdocx_layout::RevisionStyle::Plain,
             document,
             automatic_hyphenation: self
                 .settings
@@ -24313,6 +35837,18 @@ impl Document {
                 .settings
                 .as_ref()
                 .and_then(CT_Settings::default_tab_stop),
+            clamp_tabs_past_margin: modern_compatibility,
+            legacy_table_positioning: !modern_compatibility,
+            modern_footnote_layout: modern_compatibility,
+            footnote_layout_like_word8: self
+                .settings
+                .as_ref()
+                .and_then(|settings| {
+                    settings.compatibility_option(
+                        rdocx_oxml::settings::CompatibilityOption::FootnoteLayoutLikeWW8,
+                    )
+                })
+                .unwrap_or(false),
             mirror_margins: self
                 .settings
                 .as_ref()
@@ -24336,8 +35872,20 @@ impl Document {
                 .as_ref()
                 .and_then(CT_Settings::math_properties)
                 .cloned(),
-            styles: self.styles.clone(),
+            note_defaults: [
+                self.settings
+                    .as_ref()
+                    .and_then(CT_Settings::footnote_properties)
+                    .cloned(),
+                self.settings
+                    .as_ref()
+                    .and_then(CT_Settings::endnote_properties)
+                    .cloned(),
+            ],
+            styles: layout_styles,
             numbering: self.numbering.clone(),
+            story_part_names,
+            story_bodies,
             headers,
             footers,
             images,
@@ -24350,70 +35898,83 @@ impl Document {
             endnotes,
             theme,
             fonts,
-        }
+            embedded_fonts,
+        })
     }
 
-    /// Extract embedded fonts from the DOCX package.
-    ///
-    /// Word can embed fonts as `.odttf` (obfuscated TrueType) or regular `.ttf`/`.otf`
-    /// files in the `word/fonts/` directory. ODTTF files have the first 32 bytes
-    /// XOR'd with a 16-byte GUID derived from the font's relationship ID.
-    fn extract_embedded_fonts(&self) -> Vec<rdocx_layout::FontFile> {
-        if let (Some(table), Some(owner)) = (&self.font_table, &self.font_table_part_name) {
-            let relationships = self.package.get_part_rels(owner);
-            return table
-                .fonts()
-                .iter()
-                .flat_map(|font| {
-                    font.embedded_fonts.iter().filter_map(|embedded| {
-                        let relationship = relationships?.items.iter().find(|relationship| {
-                            relationship.id == embedded.relationship_id
-                                && relationship.rel_type == rel_types::FONT
-                                && relationship_is_internal(relationship)
-                        })?;
-                        let part_name = OpcPackage::resolve_rel_target(owner, &relationship.target);
-                        let data = self.package.get_part(&part_name)?;
-                        let data = deobfuscate_odttf_with_key(data, &embedded.font_key)?;
-                        Some(rdocx_layout::FontFile {
-                            family: font.name.clone(),
-                            data,
-                        })
-                    })
-                })
-                .collect();
+    /// Prepare distinct owned font bodies and all aliases before layout allocation.
+    fn extract_embedded_fonts(&self) -> Result<Vec<rdocx_layout::input::EmbeddedFontSource>> {
+        if self.embed_true_type_fonts()? == Some(false) {
+            return Ok(Vec::new());
         }
-
-        let mut fonts = Vec::new();
-
-        // Look for font parts in word/fonts/ directory
-        for (part_name, data) in &self.package.parts {
-            let lower = part_name.to_lowercase();
-            if !lower.contains("/word/fonts/") && !lower.contains("/word/font") {
-                continue;
+        let Some(table) = &self.font_table else {
+            if self.font_table_part_name.is_some() {
+                return Err(Error::Other("font table is unmodeled".to_owned()));
             }
-
-            // Determine font family name from the file name
-            let file_name = part_name.rsplit('/').next().unwrap_or(part_name);
-            let family = file_name.split('.').next().unwrap_or(file_name).to_string();
-
-            if lower.ends_with(".odttf") {
-                // Deobfuscate ODTTF: XOR first 32 bytes with GUID from the file name
-                if let Some(deobfuscated) = deobfuscate_odttf(data, file_name) {
-                    fonts.push(rdocx_layout::FontFile {
-                        family,
-                        data: deobfuscated,
-                    });
+            return Ok(Vec::new());
+        };
+        let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut by_part = HashMap::new();
+        let mut total = 0usize;
+        let mut alias_count = 0usize;
+        let mut alias_bytes = 0usize;
+        for font in table.fonts() {
+            for reference in &font.embedded_fonts {
+                let (part, body) = self.checked_embedded_font_source(reference)?;
+                if body.len() > 64 * 1024 * 1024
+                    || font.name.len() > 4096
+                    || reference.font_key.len() > 4096
+                {
+                    return Err(Error::Other(
+                        "embedded font input exceeds its bound".to_owned(),
+                    ));
                 }
-            } else if lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".ttc")
-            {
-                fonts.push(rdocx_layout::FontFile {
-                    family,
-                    data: data.clone(),
-                });
+                let identity = part.to_ascii_lowercase();
+                let index = if let Some(&index) = by_part.get(&identity) {
+                    index
+                } else {
+                    total = total
+                        .checked_add(body.len())
+                        .ok_or_else(|| Error::Other("embedded font size overflow".to_owned()))?;
+                    if total > 256 * 1024 * 1024 || groups.len() >= 4096 {
+                        return Err(Error::Other(
+                            "embedded font input exceeds its aggregate bound".to_owned(),
+                        ));
+                    }
+                    let index = groups.len();
+                    groups.push((part, reference.font_key.clone(), Vec::new()));
+                    by_part.insert(identity, index);
+                    index
+                };
+                let group = &mut groups[index];
+                if group.1 != reference.font_key {
+                    return Err(Error::Other(
+                        "shared font part has conflicting obfuscation keys".to_owned(),
+                    ));
+                }
+                if !group.2.contains(&font.name) {
+                    alias_count += 1;
+                    alias_bytes = alias_bytes.checked_add(font.name.len()).ok_or_else(|| {
+                        Error::Other("embedded font alias size overflow".to_owned())
+                    })?;
+                    if alias_count > 16384 || alias_bytes > 4 * 1024 * 1024 {
+                        return Err(Error::Other(
+                            "embedded font aliases exceed their bound".to_owned(),
+                        ));
+                    }
+                    group.2.push(font.name.clone());
+                }
             }
         }
-
-        fonts
+        let mut sources = Vec::new();
+        for (part, key, aliases) in groups {
+            let body = self.package.get_part(&part).expect("preflighted font part");
+            // Unsupported producer bytes remain in the original package and use fallback.
+            if let Some(data) = deobfuscate_odttf_with_key(body, &key) {
+                sources.push((aliases, Arc::from(data)));
+            }
+        }
+        Ok(sources)
     }
 
     /// Load font files from a directory and return them as FontFile entries.
@@ -24579,10 +36140,12 @@ impl Document {
     /// Count the number of words in the document.
     ///
     /// Counts whitespace-separated tokens across all paragraphs (including
-    /// paragraphs inside table cells and content controls).
+    /// paragraphs inside table cells and content controls), leaving out the
+    /// table rows that accepting every tracked change removes, as
+    /// [`Self::text`] does.
     pub fn word_count(&self) -> usize {
         let mut count = 0;
-        visit_body_paragraphs(&self.document.body.content, &mut |paragraph| {
+        visit_body_paragraphs(&self.document.body.content, true, &mut |paragraph| {
             count += paragraph.text().split_whitespace().count();
         });
         count
@@ -24649,26 +36212,44 @@ impl Document {
             prev_level = Some(*level);
         }
 
-        // Check: excessive empty paragraphs
-        let mut consecutive_empty = 0u32;
-        for content in &self.document.body.content {
-            if let BodyContent::Paragraph(p) = content {
-                if p.text().trim().is_empty() {
-                    consecutive_empty += 1;
-                    if consecutive_empty >= 3 {
-                        issues.push(AccessibilityIssue {
-                            severity: IssueSeverity::Info,
-                            message: format!(
-                                "{consecutive_empty} consecutive empty paragraphs (consider using spacing instead)"
-                            ),
-                        });
+        // Check direct body streaks only. An uncertain source omits this whole check.
+        let visibility = (|| {
+            let mut candidate = self.clone_for_staging();
+            candidate.flush_document_to_package()?;
+            let source = candidate
+                .package
+                .get_part(&candidate.doc_part_name)
+                .ok_or(Error::NoDocumentPart)?;
+            paragraph_visibility_from_main_source(
+                &candidate,
+                source,
+                ParagraphVisibilityScope::DirectBody,
+            )
+        })();
+        match visibility {
+            Ok(visibility) => {
+                let mut flags = visibility.into_iter();
+                let mut consecutive_empty = 0u32;
+                for content in &self.document.body.content {
+                    if let BodyContent::Paragraph(_) = content {
+                        if flags.next() == Some(false) {
+                            consecutive_empty += 1;
+                            if consecutive_empty >= 3 {
+                                issues.push(AccessibilityIssue { severity: IssueSeverity::Info,
+                                    message: format!("{consecutive_empty} consecutive empty paragraphs (consider using spacing instead)") });
+                            }
+                        } else {
+                            consecutive_empty = 0;
+                        }
+                    } else {
+                        consecutive_empty = 0;
                     }
-                } else {
-                    consecutive_empty = 0;
                 }
-            } else {
-                consecutive_empty = 0;
             }
+            Err(error) => issues.push(AccessibilityIssue {
+                severity: IssueSeverity::Warning,
+                message: format!("Paragraph visibility could not be determined: {error}"),
+            }),
         }
 
         issues
@@ -24686,6 +36267,86 @@ fn next_toc_bookmark_suffix(occupied: &HashSet<u64>, after: u64) -> Option<u64> 
         .checked_add(1)
         .filter(|candidate| !occupied.contains(candidate))
         .or_else(|| (1..=u64::MAX).find(|candidate| !occupied.contains(candidate)))
+}
+
+#[derive(Clone)]
+struct WordChartReference {
+    relationship_id: String,
+    value_span: Range<usize>,
+    owned: bool,
+}
+
+fn word_chart_references(xml: &[u8]) -> Result<Vec<WordChartReference>> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut references = Vec::new();
+    let mut parents: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let namespace = match namespace {
+            ResolveResult::Bound(Namespace(uri)) => uri.to_vec(),
+            _ => Vec::new(),
+        };
+        let after = reader.buffer_position() as usize;
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let local = element.local_name().as_ref().to_vec();
+                // Only the supported direct paragraph/run/drawing owner grants
+                // authority. A qualified lookalike under any opaque ancestor does not.
+                let owned = namespace == oxml_chart::C_NS.as_bytes()
+                    && local == b"chart"
+                    && parents.len() == 6
+                    && parents[0].0 == W_NS.as_bytes()
+                    && parents[0].1 == b"p"
+                    && parents[1].0 == W_NS.as_bytes()
+                    && parents[1].1 == b"r"
+                    && parents[2].0 == W_NS.as_bytes()
+                    && parents[2].1 == b"drawing"
+                    && parents[3].0 == drawing_ns::WP.as_bytes()
+                    && matches!(parents[3].1.as_slice(), b"inline" | b"anchor")
+                    && parents[4].0 == oxml_chart::A_NS.as_bytes()
+                    && parents[4].1 == b"graphic"
+                    && parents[5].0 == oxml_chart::A_NS.as_bytes()
+                    && parents[5].1 == b"graphicData"
+                    && parents[5].2;
+                let mut chart_data = false;
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(|e| Error::Other(e.to_string()))?;
+                    let value = attribute
+                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, element.decoder())
+                        .map_err(|e| Error::Other(e.to_string()))?;
+                    if attribute.key.as_ref() == b"uri" && value == oxml_chart::C_NS {
+                        chart_data = true;
+                    }
+                    let (ns, name) = reader.resolver().resolve_attribute(attribute.key);
+                    if matches!(ns,ResolveResult::Bound(Namespace(uri)) if uri==rdocx_oxml::namespace::R_NS.as_bytes())
+                    {
+                        let (start, end) =
+                            story_attribute_value_span(&xml[before..after], attribute.key.as_ref())
+                                .ok_or_else(|| {
+                                    Error::Other("chart relationship source span is absent".into())
+                                })?;
+                        references.push(WordChartReference {
+                            relationship_id: value.into_owned(),
+                            value_span: before + start..before + end,
+                            owned: owned && name.as_ref() == b"id",
+                        });
+                    }
+                }
+                if !empty {
+                    parents.push((namespace, local, chart_data));
+                }
+            }
+            Event::End(_) => {
+                parents.pop();
+            }
+            Event::Eof => return Ok(references),
+            _ => {}
+        }
+    }
 }
 
 fn chart_with_workbook_relationship(
@@ -24841,28 +36502,7 @@ fn materialize_header_footer_inheritance(
             }
         }
     };
-    for content in &mut document.body.content {
-        if let BodyContent::Paragraph(paragraph) = content
-            && let Some(section) = paragraph
-                .properties
-                .as_mut()
-                .and_then(|properties| properties.sect_pr.as_mut())
-        {
-            inherit(
-                &mut section.header_refs,
-                &mut effective_headers,
-                available_headers,
-                even_headers_enabled,
-            );
-            inherit(
-                &mut section.footer_refs,
-                &mut effective_footers,
-                available_footers,
-                false,
-            );
-        }
-    }
-    if let Some(section) = document.body.sect_pr.as_mut() {
+    let mut apply = |section: &mut CT_SectPr| {
         inherit(
             &mut section.header_refs,
             &mut effective_headers,
@@ -24875,6 +36515,49 @@ fn materialize_header_footer_inheritance(
             available_footers,
             false,
         );
+    };
+    // Match document_sections: only main-story paragraphs and block controls
+    // end sections. A paragraph in a table cell does not end a body section.
+    fn control_sections(control: &mut CT_Sdt) -> Vec<&mut CT_SectPr> {
+        let mut sections = Vec::new();
+        for content in &mut control.content {
+            match content {
+                SdtContent::Paragraph(paragraph) => {
+                    if let Some(section) = paragraph
+                        .properties
+                        .as_mut()
+                        .and_then(|properties| properties.sect_pr.as_mut())
+                    {
+                        sections.push(section);
+                    }
+                }
+                SdtContent::ContentControl(control) => sections.extend(control_sections(control)),
+                _ => {}
+            }
+        }
+        sections
+    }
+    for content in &mut document.body.content {
+        match content {
+            BodyContent::Paragraph(paragraph) => {
+                if let Some(section) = paragraph
+                    .properties
+                    .as_mut()
+                    .and_then(|properties| properties.sect_pr.as_mut())
+                {
+                    apply(section);
+                }
+            }
+            BodyContent::ContentControl(control) => {
+                for section in control_sections(control) {
+                    apply(section);
+                }
+            }
+            BodyContent::Table(_) | BodyContent::RawXml(_) => {}
+        }
+    }
+    if let Some(section) = document.body.sect_pr.as_mut() {
+        apply(section);
     }
 }
 
@@ -26319,6 +38002,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// accepted if it starts with a recognised sfnt version. A wrong key yields
 /// bytes that no font parser can use, so validating here means a bad guess
 /// degrades to "font not embedded" instead of feeding garbage downstream.
+#[cfg(test)]
 fn deobfuscate_odttf(data: &[u8], file_name: &str) -> Option<Vec<u8>> {
     if data.len() < 32 {
         return None;
@@ -26386,33 +38070,53 @@ fn obfuscate_odttf_with_key(data: &[u8], guid: &[u8; 16]) -> Vec<u8> {
 }
 
 fn deobfuscate_odttf_with_key(data: &[u8], font_key: &str) -> Option<Vec<u8>> {
-    if data.len() < 32 {
+    if data.len() < 32 || data.len() > 64 * 1024 * 1024 {
         return None;
     }
     let guid = font_key_bytes(font_key)?;
-
     let candidates = odttf_key_candidates(&guid);
-    let decoded: Vec<Vec<u8>> = candidates
+    let prefixes = candidates.map(|key| {
+        let mut prefix = *data.first_chunk::<32>().unwrap();
+        for (index, byte) in prefix.iter_mut().enumerate() {
+            *byte ^= key[index % 16];
+        }
+        prefix
+    });
+    // Producer subset headers may omit the derived binary-search hints.
+    let index = prefixes
         .iter()
-        .map(|key| {
-            let mut result = data.to_vec();
-            // XOR the first 32 bytes with the 16-byte key, applied twice.
-            for (i, byte) in result.iter_mut().take(32).enumerate() {
-                *byte ^= key[i % 16];
-            }
-            result
-        })
-        .collect();
+        .position(|prefix| has_consistent_sfnt_header(prefix))
+        .or_else(|| prefixes.iter().position(|prefix| looks_like_sfnt(prefix)))?;
+    let mut result = Vec::new();
+    result.try_reserve_exact(data.len()).ok()?;
+    result.extend_from_slice(data);
+    result[..32].copy_from_slice(&prefixes[index]);
+    Some(result)
+}
 
-    // A well-formed table directory pins down which key was used. Fall back to
-    // the weaker signature check for fonts whose header arithmetic is wrong —
-    // subsetting tools do emit those — so they still load rather than being
-    // dropped entirely.
-    decoded
-        .iter()
-        .find(|d| has_consistent_sfnt_header(d))
-        .or_else(|| decoded.iter().find(|d| looks_like_sfnt(d)))
-        .cloned()
+/// Bound and check every authored single-face sfnt table before obfuscation.
+fn valid_authored_sfnt(data: &[u8]) -> bool {
+    if data.len() > 64 * 1024 * 1024 || !looks_like_sfnt(data) || data.starts_with(b"ttcf") {
+        return false;
+    }
+    let count = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let Some(directory) = data.get(12..12 + count * 16) else {
+        return false;
+    };
+    let mut tags = std::collections::HashSet::new();
+    for record in directory.chunks_exact(16) {
+        let offset = u32::from_be_bytes(record[8..12].try_into().unwrap()) as usize;
+        let length = u32::from_be_bytes(record[12..16].try_into().unwrap()) as usize;
+        if !tags.insert(&record[..4])
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > data.len())
+            || (length > 0 && offset < 12 + count * 16)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// The two candidate XOR keys for ODTTF deobfuscation, most likely first.
@@ -26522,6 +38226,2669 @@ fn validate_output_xml_characters(part: &str, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "Owned release-mode same-host performance qualification"]
+    fn fx222_release_scaling_and_output_equivalence() {
+        use std::time::Instant;
+        let output = std::path::PathBuf::from(std::env::var("FX222_BENCH_OUTPUT_DIR").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        for scale in [1usize, 2, 4] {
+            let mut seed = Document::new();
+            for section in 0..20 * scale {
+                seed.add_paragraph(&format!("Section {}", section + 1))
+                    .style("Heading1");
+                for paragraph in 0..5 {
+                    seed.add_paragraph(&format!(
+                        "Paragraph {} of section {}.",
+                        paragraph + 1,
+                        section + 1
+                    ));
+                }
+            }
+            let mut table = seed.add_table(100 * scale, 4);
+            for row in 0..100 * scale {
+                for column in 0..4 {
+                    table
+                        .cell(row, column)
+                        .unwrap()
+                        .set_text(&format!("r{row} c{column}"));
+                }
+            }
+            seed.insert_toc(0, 3).unwrap();
+            let input = seed.to_bytes().unwrap();
+            std::fs::write(output.join(format!("input-scale{scale}.docx")), &input).unwrap();
+            for operation in [
+                "rebuild_toc",
+                "update_page_fields",
+                "update_fields",
+                "story_ranges",
+                "comments",
+            ] {
+                for sample in 0..4 {
+                    let mut document = Document::from_bytes(&input).unwrap();
+                    let started = Instant::now();
+                    match operation {
+                        "rebuild_toc" => {
+                            document.rebuild_toc().unwrap();
+                        }
+                        "update_page_fields" => {
+                            document.update_page_fields().unwrap();
+                        }
+                        "update_fields" => {
+                            document.update_fields(&Default::default()).unwrap();
+                            document.update_layout_backed_fields().unwrap();
+                        }
+                        "story_ranges" => {
+                            document.story_ranges().unwrap();
+                        }
+                        "comments" => {
+                            document.comment_anchor_snapshots().unwrap();
+                            document.story_item_snapshots().unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    let elapsed = started.elapsed().as_secs_f64();
+                    println!(
+                        "FX222_BENCH scale={scale} operation={operation} sample={sample} seconds={elapsed:.9}"
+                    );
+                    if sample == 3 {
+                        std::fs::write(
+                            output.join(format!("output-scale{scale}-{operation}.docx")),
+                            document.to_bytes().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+    }
+    fn fx237_assert_combined_inventory(document: &Document) {
+        let legacy = (|| -> Result<_> {
+            Ok((
+                document.story_item_snapshots()?,
+                document.story_table_cell_snapshots()?,
+                document.story_range_paragraphs()?,
+                document.story_link_snapshots()?,
+            ))
+        })();
+        let combined = document.story_owner_snapshots();
+        match (legacy, combined) {
+            (Ok(legacy), Ok(combined)) => assert_eq!(legacy, combined),
+            (Err(_), Err(_)) => {}
+            (legacy, combined) => {
+                panic!("inventory admission changed: legacy={legacy:?} combined={combined:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn fx237_namespace_scope_boundaries_match_legacy() {
+        for xml in [
+            "<r xmlns='urn:base' xmlns:p='urn:one'><a plain='1'><b xmlns:p='urn:two'><p:c/><d xmlns='' xmlns:p=''><e/></d><p:c/></b><p:c/></a></r>",
+            "<r xmlns:p='urn:base'><a><b><c xmlns:q='urn:&amp;escaped'><q:d/></c></b><p:e/></a><p:f/></r>",
+            "<r><bad xmlns:p='&unknown;' duplicate='1' duplicate='2'><later/></bad></r>",
+            "<r><bad duplicate='1' duplicate='2'><later/></bad></r>",
+            "<r><bad xmlns:p='one' xmlns:p='two'><later/></bad></r>",
+            "<r><bad duplicate='1' duplicate='2'/><later/></r>",
+            "<r><bad xmlns:p='&unknown;'/><later/></r>",
+            "<r><a></r>",
+            "<r><a",
+            "</r>",
+            "<r><a/></r><tail",
+            "<r xmlns='urn:base'><a xmlns=''><leaf/></a><sibling/></r>",
+        ] {
+            let xml = xml.as_bytes();
+            let mut reader = quick_xml::Reader::from_reader(xml);
+            let mut offsets = Vec::new();
+            let mut buffer = Vec::new();
+            loop {
+                let before = reader.buffer_position() as usize;
+                match reader.read_event_into(&mut buffer) {
+                    Ok(Event::Start(_) | Event::Empty(_)) => offsets.push(before),
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                buffer.clear();
+            }
+            for offset in offsets.iter().copied().chain([xml.len() + 1]) {
+                assert_eq!(
+                    story_namespace_scope_at(xml, offset).map_err(|error| error.to_string()),
+                    fx237_legacy_namespace_scope_at(xml, offset).map_err(|error| error.to_string()),
+                    "scalar boundary {offset} in {}",
+                    String::from_utf8_lossy(xml),
+                );
+                assert_eq!(
+                    story_namespace_scopes_at(xml, [offset, offset])
+                        .map_err(|error| error.to_string()),
+                    fx237_legacy_namespace_scopes_at(xml, [offset, offset])
+                        .map_err(|error| error.to_string()),
+                    "duplicate requested boundary {offset} in {}",
+                    String::from_utf8_lossy(xml),
+                );
+            }
+            assert_eq!(
+                story_namespace_scopes_at(xml, offsets.clone()).map_err(|error| error.to_string()),
+                fx237_legacy_namespace_scopes_at(xml, offsets).map_err(|error| error.to_string()),
+                "complete consumed boundaries in {}",
+                String::from_utf8_lossy(xml),
+            );
+            assert!(story_namespace_scopes_at(xml, []).unwrap().is_empty());
+            assert!(
+                fx237_legacy_namespace_scopes_at(xml, [])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let xml = b"<r xmlns='urn:base' xmlns:p='urn:one'><a xmlns='' xmlns:p=''><leaf/></a><sibling/></r>";
+        let at = |needle: &[u8]| {
+            xml.windows(needle.len())
+                .position(|bytes| bytes == needle)
+                .unwrap()
+        };
+        let leaf = story_namespace_scope_at(xml, at(b"<leaf")).unwrap();
+        assert!(!leaf.contains_key(""));
+        assert!(!leaf.contains_key("p"));
+        let restored = story_namespace_scope_at(xml, at(b"<sibling")).unwrap();
+        assert_eq!(restored.get("").map(String::as_str), Some("urn:base"));
+        assert_eq!(restored.get("p").map(String::as_str), Some("urn:one"));
+        let inherited = story_namespace_scopes_at(xml, [at(b"<a ")]).unwrap();
+        assert_eq!(inherited[&at(b"<a ")], restored);
+    }
+
+    #[test]
+    fn fx237_namespace_scope_frames_only_copy_declarations() {
+        for cells in [60, 120, 240] {
+            let mut document = Document::new();
+            document.add_table(cells / 6, 6);
+            let xml = document.document.to_xml().unwrap();
+            let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+            let mut offsets = Vec::new();
+            let mut buffer = Vec::new();
+            loop {
+                let before = reader.buffer_position() as usize;
+                match reader.read_event_into(&mut buffer).unwrap() {
+                    Event::Start(_) | Event::Empty(_) => offsets.push(before),
+                    Event::Eof => break,
+                    _ => {}
+                }
+                buffer.clear();
+            }
+            FX237_NAMESPACE_FRAME_COPIES.set(0);
+            story_namespace_scopes_at(&xml, offsets.clone()).unwrap();
+            story_namespace_scope_at(&xml, *offsets.last().unwrap()).unwrap();
+            let copies = FX237_NAMESPACE_FRAME_COPIES.get();
+            eprintln!(
+                "FX237 namespaceframes cells={cells} copies={copies} requested={}",
+                offsets.len()
+            );
+            assert!(
+                copies <= 2,
+                "only the root introduces namespace declarations: {copies}"
+            );
+        }
+    }
+
+    #[test]
+    fn fx237_combined_inventory_keeps_projection_and_relationship_refusals() {
+        for content in [
+            "<w:p><w:hyperlink r:id='missing'><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p>",
+            "<w:p><w:r><w:t>text</w:t></w:r></w:p>",
+            "<w:p><f:hyperlink xmlns:f='urn:foreign'><w:r><w:t>opaque</w:t></w:r></f:hyperlink></w:p>",
+            "<w:p><w:sdt><w:sdtContent><w:r><w:t>inline</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+        ] {
+            let xml = format!(
+                "<w:document xmlns:w='{WORD_NAMESPACE}' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>{content}<w:sectPr/></w:body></w:document>"
+            );
+            let mut document = Document::new();
+            document.document = CT_Document::from_xml(xml.as_bytes()).unwrap();
+            fx237_assert_combined_inventory(&document);
+            if content.contains("r:id='missing'") {
+                assert!(document.story_link_snapshots().is_err());
+                assert!(document.story_owner_snapshots().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn fx237_batched_cell_routes_equal_checked_single_cell_routes() {
+        let table = |content: &str| {
+            format!(
+                "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w='1000'/><w:gridCol w:w='1000'/></w:tblGrid>{content}</w:tbl>"
+            )
+        };
+        let cell = "<w:tc><w:tcPr/><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc>";
+        let row = format!("<w:tr>{cell}{cell}</w:tr>");
+        let merged = "<w:tr><w:trPr><w:gridBefore w:val='1'/></w:trPr><w:tc><w:tcPr><w:gridSpan w:val='2'/><w:vMerge w:val='restart'/></w:tcPr><w:p/></w:tc></w:tr>";
+        let controlled =
+            format!("<w:sdt><w:sdtPr/><w:sdtContent>{row}</w:sdtContent></w:sdt>{row}");
+        let cell_control = format!(
+            "<w:tr><w:sdt><w:sdtPr/><w:sdtContent>{cell}</w:sdtContent></w:sdt>{cell}</w:tr>"
+        );
+        for content in [
+            table(&row),
+            table(merged),
+            table(&controlled),
+            table(&cell_control),
+            format!(
+                "<w:sdt><w:sdtPr/><w:sdtContent>{}</w:sdtContent></w:sdt>",
+                table(&row)
+            ),
+            table(
+                "<w:tr><f:tc xmlns:f='urn:foreign'><w:p/></f:tc><w:tc><w:tcPr><x:keep xmlns:x='urn:opaque'/></w:tcPr><w:p/></w:tc></w:tr>",
+            ),
+        ] {
+            let mut document = Document::new();
+            let xml = format!(
+                "<w:document xmlns:w='{WORD_NAMESPACE}'><w:body>{content}<w:sectPr/></w:body></w:document>"
+            );
+            document.document = CT_Document::from_xml(xml.as_bytes()).unwrap();
+            fx237_assert_combined_inventory(&document);
+            let actual = document.story_table_cell_snapshots().unwrap();
+            let mut expected = HashMap::new();
+            for snapshot in document.story_item_snapshots().unwrap() {
+                if snapshot.location().item_kind() != StoryItemKind::Table {
+                    continue;
+                }
+                let location = snapshot.location();
+                for (row, cell) in document
+                    .read_story_table(location, |table| {
+                        (0..table.row_count())
+                            .flat_map(|row| {
+                                (0..table.row(row).unwrap().cell_count())
+                                    .map(move |cell| (row, cell))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap()
+                {
+                    assert_eq!(
+                        document.story_table_cell(location, row, cell).unwrap(),
+                        document
+                            .fx237_legacy_story_table_cell(location, row, cell)
+                            .unwrap()
+                    );
+                    expected.insert(
+                        (location.clone(), row, cell),
+                        document
+                            .fx237_legacy_story_table_cell(location, row, cell)
+                            .unwrap(),
+                    );
+                }
+            }
+            assert_eq!(
+                actual
+                    .into_iter()
+                    .map(|(table, row, cell, story)| ((table, row, cell), story))
+                    .collect::<HashMap<_, _>>(),
+                expected
+            );
+        }
+        let mut related = all_story_range_fixture();
+        let roots = related
+            .stories()
+            .unwrap()
+            .into_iter()
+            .filter(|story| story.kind() != StoryKind::TableCell)
+            .collect::<Vec<_>>();
+        let mut seed = Document::new();
+        let model = seed.add_table(1, 1).inner.clone();
+        for root in roots {
+            let current = related
+                .stories()
+                .unwrap()
+                .into_iter()
+                .find(|story| {
+                    story.kind() == root.kind()
+                        && story.part_name() == root.part_name()
+                        && story.owner_index() == root.owner_index()
+                })
+                .unwrap();
+            if current.kind() == StoryKind::TextBox {
+                let (source, owner) = related.story_source_and_owner(&current).unwrap();
+                if scan_story_owners(&source.xml, source.root_kind)
+                    .unwrap()
+                    .iter()
+                    .any(|parent| {
+                        parent.kind == StoryKind::TableCell
+                            && parent.full.start < owner.full.start
+                            && owner.full.end < parent.full.end
+                    })
+                {
+                    // The scalar contract refuses cells hidden in paragraph
+                    // drawing XML inside an enclosing modeled table.
+                    continue;
+                }
+            }
+            related
+                .insert_content(
+                    &ContentLocation::end(current),
+                    ContentFragment::table(model.clone()).unwrap(),
+                )
+                .unwrap();
+        }
+        fx237_assert_combined_inventory(&related);
+        let mut kinds = HashSet::new();
+        let mut expected = HashMap::new();
+        for snapshot in related.story_item_snapshots().unwrap() {
+            if snapshot.location().item_kind() != StoryItemKind::Table {
+                continue;
+            }
+            let location = snapshot.location();
+            kinds.insert(location.story().kind());
+            for (row, cell) in related
+                .read_story_table(location, |table| {
+                    (0..table.row_count())
+                        .flat_map(|row| {
+                            (0..table.row(row).unwrap().cell_count()).map(move |cell| (row, cell))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap()
+            {
+                let legacy = related
+                    .fx237_legacy_story_table_cell(location, row, cell)
+                    .unwrap();
+                assert_eq!(
+                    related.story_table_cell(location, row, cell).unwrap(),
+                    legacy
+                );
+                expected.insert((location.clone(), row, cell), legacy);
+            }
+        }
+        for kind in [
+            StoryKind::Body,
+            StoryKind::Header,
+            StoryKind::Footer,
+            StoryKind::Footnote,
+            StoryKind::Endnote,
+            StoryKind::Comment,
+            StoryKind::TextBox,
+        ] {
+            assert!(
+                kinds.contains(&kind),
+                "missing qualified related table {kind:?}"
+            );
+        }
+        assert_eq!(
+            related.story_table_cell_snapshots().unwrap().len(),
+            expected.len(),
+            "physical alias routes must not duplicate owners"
+        );
+        assert_eq!(
+            related
+                .story_table_cell_snapshots()
+                .unwrap()
+                .into_iter()
+                .map(|(table, row, cell, story)| ((table, row, cell), story))
+                .collect::<HashMap<_, _>>(),
+            expected
+        );
+        for rows in [1, 2] {
+            let mut document = Document::new();
+            document
+                .add_table(rows, 2)
+                .cell(0, 0)
+                .unwrap()
+                .add_table(1, 2);
+            document.add_table(1, 1);
+            document.set_header("related");
+            let mut expected = HashMap::new();
+            for snapshot in document.story_item_snapshots().unwrap() {
+                if snapshot.location().item_kind() != StoryItemKind::Table {
+                    continue;
+                }
+                let location = snapshot.location();
+                let coordinates = document
+                    .read_story_table(location, |table| {
+                        (0..table.row_count())
+                            .flat_map(|row| {
+                                (0..table.row(row).unwrap().cell_count())
+                                    .map(move |cell| (row, cell))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap();
+                for (row, cell) in coordinates {
+                    assert_eq!(
+                        document.story_table_cell(location, row, cell).unwrap(),
+                        document
+                            .fx237_legacy_story_table_cell(location, row, cell)
+                            .unwrap()
+                    );
+                    expected.insert(
+                        (location.clone(), row, cell),
+                        document
+                            .fx237_legacy_story_table_cell(location, row, cell)
+                            .unwrap(),
+                    );
+                }
+            }
+            STORY_SOURCE_BUILDS.set(0);
+            FX237_TABLE_VISITS.set(0);
+            FX237_CELL_VISITS.set(0);
+            let actual = document
+                .story_table_cell_snapshots()
+                .unwrap()
+                .into_iter()
+                .map(|(table, row, cell, story)| ((table, row, cell), story))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(actual, expected);
+            assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
+            assert_eq!(FX237_TABLE_VISITS.get(), 3);
+            assert_eq!(FX237_CELL_VISITS.get(), rows * 2 + 3);
+            let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                reopened.story_table_cell_snapshots().unwrap().len(),
+                actual.len()
+            );
+        }
+    }
+
+    #[test]
+    fn fx237_table_cell_snapshots_scan_each_source_and_visit_each_cell_once() {
+        for cells in [60, 120, 240] {
+            let mut document = Document::new();
+            document.add_table(cells / 6, 6);
+            STORY_SOURCE_BUILDS.set(0);
+            STORY_OWNER_SCANS.set(0);
+            STORY_NAMESPACE_SCANS.set(0);
+            FX237_ITEM_SCANS.set(0);
+            FX237_PREFIX_NAMESPACE_BYTES.set(0);
+            FX237_TABLE_VISITS.set(0);
+            FX237_CELL_VISITS.set(0);
+            let routes = document.story_owner_snapshots().unwrap().1;
+            assert_eq!(FX237_ITEM_SCANS.get(), cells + 1);
+            let source_bytes = document.document.to_xml().unwrap().len();
+            assert!(
+                FX237_PREFIX_NAMESPACE_BYTES.get() <= source_bytes,
+                "prefix namespace work must remain bounded per registry"
+            );
+            eprintln!(
+                "FX237 fullregistry cells={cells} source={} owners={} namespace={} items={} prefix_bytes={} source_bytes={source_bytes}",
+                STORY_SOURCE_BUILDS.get(),
+                STORY_OWNER_SCANS.get(),
+                STORY_NAMESPACE_SCANS.get(),
+                FX237_ITEM_SCANS.get(),
+                FX237_PREFIX_NAMESPACE_BYTES.get()
+            );
+            assert_eq!(FX237_TABLE_VISITS.get(), 1);
+            assert_eq!(FX237_CELL_VISITS.get(), cells);
+            assert_eq!(STORY_NAMESPACE_SCANS.get(), 3);
+            assert_eq!(routes.len(), cells);
+            assert_eq!(
+                STORY_SOURCE_BUILDS.get(),
+                1,
+                "complete cell inventory must materialize sources once"
+            );
+            assert_eq!(
+                STORY_OWNER_SCANS.get(),
+                1,
+                "complete cell inventory must scan each source once"
+            );
+            STORY_SOURCE_BUILDS.set(0);
+            STORY_OWNER_SCANS.set(0);
+            FX237_ITEM_SCANS.set(0);
+            FX237_PREFIX_NAMESPACE_BYTES.set(0);
+            FX237_LEGACY_CELL_STEPS.set(0);
+            FX237_CELL_VISITS.set(0);
+            FX237_TABLE_VISITS.set(0);
+            document
+                .story_table_cell(&routes[0].0, cells / 6 - 1, 5)
+                .unwrap();
+            assert_eq!(
+                FX237_CELL_VISITS.get(),
+                cells,
+                "public scalar provider visits each cell once"
+            );
+            assert_eq!(
+                STORY_SOURCE_BUILDS.get(),
+                1,
+                "scalar source must be materialized once"
+            );
+            assert_eq!(
+                STORY_OWNER_SCANS.get(),
+                2,
+                "scalar qualification and physical correspondence scans"
+            );
+            assert_eq!(FX237_ITEM_SCANS.get(), 1);
+            assert!(FX237_PREFIX_NAMESPACE_BYTES.get() <= source_bytes);
+            assert_eq!(FX237_TABLE_VISITS.get(), 1);
+            assert!(
+                FX237_LEGACY_CELL_STEPS.get() <= cells,
+                "scalar lookup repeats physical cell walks: {}",
+                FX237_LEGACY_CELL_STEPS.get()
+            );
+        }
+    }
+
+    #[test]
+    fn fx222_owner_and_namespace_scans_are_per_source() {
+        for rows in [32, 64] {
+            let mut document = Document::new();
+            document.add_paragraph("before");
+            let mut table = document.add_table(rows, 8);
+            for row in 0..rows {
+                for column in 0..8 {
+                    table.cell(row, column).unwrap().set_text("cell");
+                }
+            }
+            document.set_header("header");
+            let document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+            let source_count = document.story_sources().unwrap().len();
+            STORY_OWNER_SCANS.set(0);
+            STORY_NAMESPACE_SCANS.set(0);
+            let paragraphs = document.story_range_paragraphs().unwrap();
+            assert_eq!(
+                paragraphs
+                    .iter()
+                    .filter(|(location, _)| location.story().kind() == StoryKind::TableCell)
+                    .count(),
+                rows * 8
+            );
+            assert_eq!(STORY_OWNER_SCANS.get(), source_count);
+            assert_eq!(STORY_NAMESPACE_SCANS.get(), source_count * 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "Owned release-mode separate doubled-TOC cost qualification"]
+    fn fx222_multiple_toc_costs() {
+        let output = std::path::PathBuf::from(std::env::var("FX222_BENCH_OUTPUT_DIR").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        for toc_count in [1usize, 2] {
+            let mut seed = Document::new();
+            for section in 0..40 {
+                seed.add_paragraph(&format!("Section {}", section + 1))
+                    .style("Heading1");
+                for paragraph in 0..5 {
+                    seed.add_paragraph(&format!("Paragraph {paragraph} of section {section}."));
+                }
+            }
+            let mut table = seed.add_table(200, 4);
+            for row in 0..200 {
+                for column in 0..4 {
+                    table
+                        .cell(row, column)
+                        .unwrap()
+                        .set_text(&format!("r{row} c{column}"));
+                }
+            }
+            for _ in 0..toc_count {
+                seed.insert_toc(0, 3).unwrap();
+            }
+            let input = seed.to_bytes().unwrap();
+            for sample in 0..4 {
+                let mut document = Document::from_bytes(&input).unwrap();
+                let started = std::time::Instant::now();
+                let report = document.rebuild_toc().unwrap();
+                let elapsed = started.elapsed().as_secs_f64();
+                assert_eq!(report.entry_count, 40 * toc_count);
+                println!("FX222_TOC_COST count={toc_count} sample={sample} seconds={elapsed:.9}");
+                if sample == 3 {
+                    std::fs::write(output.join(format!("input-tocs{toc_count}.docx")), &input)
+                        .unwrap();
+                    std::fs::write(
+                        output.join(format!("output-tocs{toc_count}.docx")),
+                        document.to_bytes().unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fx222_empty_owners_and_invalid_scopes() {
+        let xml = format!(
+            r#"<q:comments xmlns:q="{WORD_NAMESPACE}" xmlns:x="urn:foreign"><q:comment q:id="7" x:opaque="keep"/></q:comments>"#
+        );
+        let owner = scan_story_owners(xml.as_bytes(), StoryKind::Comment)
+            .unwrap()
+            .remove(0);
+        let story = StoryId {
+            kind: owner.kind,
+            part_name: "/word/comments.xml".into(),
+            owner_index: owner.owner_index,
+            fingerprint: owner.fingerprint,
+        };
+        let result =
+            story_range_paragraph_spans(xml.as_bytes(), &[(story.clone(), owner.clone())]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_empty());
+        let foreign = xml.replace(WORD_NAMESPACE, "urn:foreign-comments");
+        assert!(
+            scan_story_owners(foreign.as_bytes(), StoryKind::Comment)
+                .unwrap()
+                .is_empty()
+        );
+        let mut invalid = owner.clone();
+        invalid.full.end = xml.len() + 1;
+        assert!(story_range_paragraph_spans(xml.as_bytes(), &[(story.clone(), invalid)]).is_err());
+        let mut invalid = owner;
+        invalid.full.start = xml.len() + 1;
+        invalid.full.end = xml.len() + 2;
+        assert!(story_range_paragraph_spans(xml.as_bytes(), &[(story, invalid)]).is_err());
+    }
+
+    #[test]
+    fn fx222_inventory_builds_each_source_once() {
+        let mut document = Document::new();
+        document.add_paragraph("before");
+        let mut table = document.add_table(32, 8);
+        for row in 0..32 {
+            for column in 0..8 {
+                table
+                    .cell(row, column)
+                    .unwrap()
+                    .set_text(&format!("cell {row} {column}"));
+            }
+        }
+        document.add_paragraph("after");
+        document.set_header("header");
+        let document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+
+        STORY_SOURCE_BUILDS.set(0);
+        let paragraphs = document.story_range_paragraphs().unwrap();
+        assert_eq!(
+            paragraphs
+                .iter()
+                .filter(|(location, _)| location.story().kind() == StoryKind::TableCell)
+                .count(),
+            256
+        );
+        assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
+
+        STORY_SOURCE_BUILDS.set(0);
+        assert!(document.story_ranges().unwrap().is_empty());
+        assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
+
+        STORY_SOURCE_BUILDS.set(0);
+        assert!(document.text_box_cache_paragraphs().unwrap().is_empty());
+        assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
+    }
+
+    #[test]
+    fn fx222_self_closing_owner_lists_without_failure() {
+        let w = WORD_NAMESPACE;
+        let mut seed = Document::new();
+        seed.add_paragraph("Commented text");
+        let id = seed
+            .add_comment_on_text("Commented", 0, "Ada", None, "note", None)
+            .unwrap();
+        let mut package = OpcPackage::from_reader(Cursor::new(seed.to_bytes().unwrap())).unwrap();
+        let part = seed.comments_part_name.clone().unwrap();
+        let comments = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
+        let root = comments.find("<w:comments").unwrap();
+        let first = root + comments[root..].find('>').unwrap() + 1;
+        let comments = format!(
+            r#"{}<w:comment xmlns:w="{w}" w:id="{}" w:author="Ada"/>{}"#,
+            &comments[..first],
+            id + 1,
+            &comments[first..]
+        );
+        package.set_part(&part, comments.into_bytes());
+        let original_comments = package.get_part(&part).unwrap().to_vec();
+        let mut bytes = Cursor::new(Vec::new());
+        package.write_to(&mut bytes).unwrap();
+        let mut document = Document::from_bytes(bytes.get_ref()).unwrap();
+
+        let paragraphs = document.story_range_paragraphs().unwrap();
+        assert_eq!(
+            paragraphs
+                .iter()
+                .filter(|(location, _)| location.story().kind() == StoryKind::Comment)
+                .count(),
+            1
+        );
+        assert_eq!(document.story_ranges().unwrap().len(), 1);
+        assert_eq!(document.comment_anchor_snapshots().unwrap().len(), 2);
+        document.update_page_fields().unwrap();
+        let saved = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        assert_eq!(reopened.comment_anchor_snapshots().unwrap().len(), 2);
+        assert_eq!(
+            reopened
+                .story_range_paragraphs()
+                .unwrap()
+                .iter()
+                .filter(|(location, _)| location.story().kind() == StoryKind::Comment)
+                .count(),
+            1
+        );
+        let saved_package = OpcPackage::from_reader(Cursor::new(saved)).unwrap();
+        assert_eq!(saved_package.get_part(&part).unwrap(), original_comments);
+    }
+
+    #[test]
+    fn fx211_loaded_owner_refusal_precedes_staging_and_file_replacement() {
+        for owner in 0..4 {
+            let source = format!(
+                "<w:document xmlns:w=\"{WORD_NAMESPACE}\"><w:body><w:p><w:sdt><w:sdtContent><w:r><w:t>leaf</w:t></w:r></w:sdtContent></w:sdt></w:p></w:body></w:document>"
+            );
+            let mut model = CT_Document::from_xml(source.as_bytes()).unwrap();
+            let BodyContent::Paragraph(mut paragraph) = model.body.content.remove(0) else {
+                panic!("expected paragraph");
+            };
+            let template = paragraph.content_controls[0].3.clone();
+            let mut control = template.clone();
+            for _ in 1..257 {
+                let mut outer = template.clone();
+                outer.content = vec![rdocx_oxml::content_control::SdtContent::ContentControl(
+                    control,
+                )];
+                control = outer;
+            }
+            paragraph.content_controls[0].3 = control;
+            let mut document = Document::new();
+            document.add_paragraph("unrelated source");
+            match owner {
+                0 => document.document.body.content = vec![BodyContent::Paragraph(paragraph)],
+                1 => document
+                    .footnotes
+                    .footnotes
+                    .push(rdocx_oxml::footnotes::CT_Footnote {
+                        id: 1,
+                        note_type: rdocx_oxml::footnotes::NoteType::Normal,
+                        paragraphs: vec![paragraph],
+                    }),
+                2 => {
+                    let source = format!(
+                        "<w:comments xmlns:w=\"{WORD_NAMESPACE}\"><w:comment w:id=\"1\"><w:p/></w:comment></w:comments>"
+                    );
+                    let mut comments =
+                        rdocx_oxml::comments::CT_Comments::from_xml(source.as_bytes()).unwrap();
+                    comments.comments[0].paragraphs = vec![paragraph];
+                    document.comments = Some(comments);
+                }
+                3 => {
+                    let source = format!(
+                        "<w:glossaryDocument xmlns:w=\"{WORD_NAMESPACE}\"><w:docParts><w:docPart><w:docPartPr/><w:docPartBody><w:p/></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>"
+                    );
+                    let mut glossary =
+                        rdocx_oxml::glossary::CT_GlossaryDocument::from_xml(source.as_bytes())
+                            .unwrap();
+                    glossary.doc_parts[0].body.content = vec![BodyContent::Paragraph(paragraph)];
+                    document.glossary = Some(glossary);
+                }
+                _ => unreachable!(),
+            }
+            let mut before = std::io::Cursor::new(Vec::new());
+            document.package.write_to(&mut before).unwrap();
+            let directory = std::env::temp_dir().join(format!(
+                "rdocx-fx211-save-atomic-{}-{owner}",
+                std::process::id()
+            ));
+            assert!(!directory.exists());
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("existing.docx");
+            std::fs::write(&path, b"retained destination").unwrap();
+            for error in [
+                document.to_bytes().unwrap_err(),
+                document
+                    .to_bytes_as(WordPackageClass::Document)
+                    .unwrap_err(),
+                document.save(&path).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains("weighted limit 256"),
+                    "owner {owner}: {error}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"retained destination");
+            let mut after = std::io::Cursor::new(Vec::new());
+            document.package.write_to(&mut after).unwrap();
+            assert_eq!(
+                after.into_inner(),
+                before.into_inner(),
+                "owner {owner} package unchanged"
+            );
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn fx211_authored_table_refusal_precedes_facade_clone_and_file_replacement() {
+        let mut table = CT_Tbl::new();
+        for _ in 1..33 {
+            let mut outer = CT_Tbl::new();
+            let mut row = rdocx_oxml::table::CT_Row::new();
+            let mut cell = rdocx_oxml::table::CT_Tc::new();
+            cell.content = vec![rdocx_oxml::table::CellContent::Table(table)];
+            row.cells = vec![cell];
+            outer.rows = vec![row];
+            table = outer;
+        }
+        let mut document = Document::new();
+        document.document.body.content = vec![BodyContent::Table(table)];
+        assert!(document.validate_model_resource_limits().is_err());
+        let mut before = std::io::Cursor::new(Vec::new());
+        document.package.write_to(&mut before).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "rdocx-fx211-table-save-atomic-{}",
+            std::process::id()
+        ));
+        assert!(!directory.exists());
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("existing.docx");
+        std::fs::write(&path, b"retained table destination").unwrap();
+        for error in [
+            document.to_bytes().unwrap_err(),
+            document
+                .to_bytes_as(WordPackageClass::Document)
+                .unwrap_err(),
+            document.save(&path).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("table limit"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained table destination");
+        let mut after = std::io::Cursor::new(Vec::new());
+        document.package.write_to(&mut after).unwrap();
+        assert_eq!(before.into_inner(), after.into_inner());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fx211_drawing_marker_closure_preserves_owner_identity() {
+        let wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+        let source = format!(
+            r#"<w:r xmlns:w="{WORD_NAMESPACE}" xmlns:wp="{wp}"><w:drawing xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><wp:inline><wp:extent cx="1" cy="1"/><wp:docPr id="31" name="Inherited picture"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="bodyImage"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+        );
+        let run = CT_R::from_xml_fragment_checked(source.as_bytes()).unwrap();
+        let mut writer = quick_xml::Writer::new(Vec::new());
+        run.to_xml(&mut writer).unwrap();
+        let candidate = writer.into_inner();
+        let declarations = vec![("xmlns:wp".into(), wp.into())];
+        let inherited = vec![("xmlns:w".into(), WORD_NAMESPACE.into())];
+        let expected =
+            namespace_owner_markers(source.as_bytes(), &declarations, &inherited, false).unwrap();
+
+        assert!(!expected.is_empty());
+        let matched =
+            candidate_namespace_owner_markers(&candidate, &declarations, &inherited, &expected)
+                .unwrap();
+        assert!(marker_multiset_matches(&expected, &matched, true));
+        let candidate = String::from_utf8(candidate).unwrap();
+        for hostile in [
+            candidate.replace(
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"",
+                "xmlns:a=\"urn:foreign\"",
+            ),
+            candidate.replace(
+                " xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+                "",
+            ),
+            candidate.replace("<wp:inline ", "<wp:inline xmlns=\"urn:foreign-default\" "),
+            candidate.replace("<w:drawing>", "<w:drawing xmlns:w=\"urn:foreign-word\">"),
+        ] {
+            let matched = candidate_namespace_owner_markers(
+                hostile.as_bytes(),
+                &declarations,
+                &inherited,
+                &expected,
+            )
+            .unwrap();
+            assert!(
+                !marker_multiset_matches(&expected, &matched, true),
+                "hostile namespace closure: {hostile}"
+            );
+        }
+        for payload in [
+            " keep=\"a:Producer\"",
+            " xmlns:unused=\"urn:producer\" keep=\"unchanged\"",
+        ] {
+            let source = source.replace("<w:drawing ", &format!("<w:drawing{payload} "));
+            let candidate = candidate.replace("<w:drawing>", &format!("<w:drawing{payload}>"));
+            let expected =
+                namespace_owner_markers(source.as_bytes(), &declarations, &inherited, false)
+                    .unwrap();
+            let matched = candidate_namespace_owner_markers(
+                candidate.as_bytes(),
+                &declarations,
+                &inherited,
+                &expected,
+            )
+            .unwrap();
+            assert!(
+                !marker_multiset_matches(&expected, &matched, true),
+                "opaque wrapper attributes"
+            );
+        }
+        for payload in [
+            "<x:opaque xmlns:x=\"urn:producer\">a:QName</x:opaque>",
+            "&#97;&#58;&#80;",
+        ] {
+            let source = source.replace("</w:drawing>", &format!("{payload}</w:drawing>"));
+            let candidate = candidate.replace("</w:drawing>", &format!("{payload}</w:drawing>"));
+            let expected =
+                namespace_owner_markers(source.as_bytes(), &declarations, &inherited, false)
+                    .unwrap();
+            let matched = candidate_namespace_owner_markers(
+                candidate.as_bytes(),
+                &declarations,
+                &inherited,
+                &expected,
+            )
+            .unwrap();
+            assert!(
+                !marker_multiset_matches(&expected, &matched, true),
+                "opaque wrapper payload {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn fx211_checked_table_cell_foreign_w_replacements_survive_modeled_save() {
+        let mut document = Document::new();
+        document.add_table(1, 1);
+        let table = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let xml = format!(
+            r#"<q:tbl xmlns:q="{WORD_NAMESPACE}" xmlns:w="urn:producer" w:keep="table"><q:tblGrid><q:gridCol q:w="1440"/></q:tblGrid><q:tr><q:tc><q:p><q:r><q:t>table replacement</q:t></q:r></q:p></q:tc></q:tr></q:tbl>"#
+        );
+        document.replace_table_xml(&table, &xml).unwrap();
+        let table = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let cell = format!(
+            r#"<q:tc xmlns:q="{WORD_NAMESPACE}" xmlns:w="urn:cell-producer" w:keep="cell"><q:p><q:r><q:t>cell replacement</q:t></q:r></q:p></q:tc>"#
+        );
+        document.replace_cell_xml(&table, 0, 0, &cell).unwrap();
+        let owner = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let before = document.to_bytes().unwrap();
+        let unsupported = xml.replace(
+            "w:keep=\"table\"",
+            &format!(
+                "w:keep=\"table\" xmlns:mc=\"{}\" mc:Ignorable=\"w\"",
+                rdocx_oxml::namespace::MC_NS
+            ),
+        );
+        let error = document
+            .replace_table_xml(&owner, &unsupported)
+            .unwrap_err();
+        assert!(error.to_string().contains("namespace-valued"), "{error}");
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(
+            document.read_story_table(&owner, |_| ()).is_ok(),
+            "failed replacement retired the held owner"
+        );
+        document.add_paragraph("force modeled document serialization");
+        let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.tables().len(),
+            1,
+            "checked replacement lost typed table"
+        );
+        assert_eq!(
+            reopened.tables()[0]
+                .cell(0, 0)
+                .unwrap()
+                .paragraphs()
+                .next()
+                .unwrap()
+                .text(),
+            "cell replacement"
+        );
+        let twice = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(twice.tables().len(), 1);
+        let serialized = String::from_utf8(twice.document.to_xml().unwrap()).unwrap();
+        assert!(
+            serialized.contains("urn:producer") && serialized.contains("urn:cell-producer"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn fx211_section_xml_refuses_bad_references_and_preserves_owned_source() {
+        let mut document = Document::new();
+        document.add_paragraph("unrelated");
+        document.try_set_header("retained header").unwrap();
+        let reference = document.section(0).unwrap().properties().header_refs[0]
+            .rel_id
+            .clone();
+        let xml = format!(
+            r#"<q:sectPr xmlns:q="{WORD_NAMESPACE}" xmlns:r="{}" xmlns:x="urn:producer" x:root="retained"><q:headerReference q:type="default" r:id="{reference}"/><q:pgSz q:w="12240" q:h="15840"/><x:payload xmlns:x="urn:producer" keep="exact"><x:opaque/></x:payload><q:titlePg/></q:sectPr>"#,
+            rdocx_oxml::namespace::R_NS
+        );
+        let before = document.to_bytes().unwrap();
+        for invalid in [
+            xml.replace(&reference, "absent"),
+            xml.replace("q:type=\"default\"", "q:type=\"invalid\""),
+            xml.replace("<q:titlePg/>", "<q:pgSz q:w=\"100\"/>"),
+            xml.replace("<q:titlePg/>", "<q:titlePg q:val=\"invalid\"/>"),
+            xml.replace("<q:titlePg/>", "<q:titlePg><q:p/></q:titlePg>"),
+            xml.replace("<q:headerReference", "<q:footerReference"),
+        ] {
+            assert!(
+                document
+                    .replace_section_properties_xml(0, &invalid)
+                    .is_err(),
+                "accepted {invalid}"
+            );
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        document.replace_section_properties_xml(0, &xml).unwrap();
+        assert_eq!(document.paragraphs()[0].text(), "unrelated");
+        assert_eq!(document.header_text().as_deref(), Some("retained header"));
+        let mut output = Vec::new();
+        document
+            .section(0)
+            .unwrap()
+            .properties()
+            .to_xml(&mut Writer::new(&mut output))
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("x:root=\"retained\""), "{output}");
+        assert!(
+            output.contains(
+                "<x:payload xmlns:x=\"urn:producer\" keep=\"exact\"><x:opaque/></x:payload>"
+            ),
+            "{output}"
+        );
+        let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.section(0).unwrap().properties().page_width,
+            Some(Twips(12240))
+        );
+        assert_eq!(reopened.header_text().as_deref(), Some("retained header"));
+        assert!(document.replace_section_properties_xml(1, &xml).is_err());
+    }
+
+    #[test]
+    fn fx211_physical_table_and_merged_cell_xml_are_atomic() {
+        let mut document = Document::new();
+        document.add_paragraph("unrelated");
+        document.add_table(1, 2);
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.location().story.kind == StoryKind::Body
+                    && snapshot.location().item_kind == StoryItemKind::Table
+            })
+            .unwrap()
+            .location()
+            .clone();
+        let table = format!(
+            r#"<a:tbl xmlns:a="{WORD_NAMESPACE}" xmlns:x="urn:producer" x:table="retained"><a:tblGrid><a:gridCol a:w="1440"/><a:gridCol a:w="1440"/></a:tblGrid><a:tr><a:tc xmlns:y="urn:cell" y:cell="retained"><a:tcPr><a:gridSpan a:val="2"/></a:tcPr><a:p><a:r><a:t>merged</a:t></a:r></a:p></a:tc></a:tr></a:tbl>"#
+        );
+        document.replace_table_xml(&location, &table).unwrap();
+        assert!(document.read_story_table(&location, |_| ()).is_err());
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.location().story.kind == StoryKind::Body
+                    && snapshot.location().item_kind == StoryItemKind::Table
+            })
+            .unwrap()
+            .location()
+            .clone();
+        assert_eq!(
+            document
+                .read_story_table(&location, |table| table.cell(0, 0).unwrap().text())
+                .unwrap(),
+            "merged"
+        );
+        assert!(document.story_table_cell(&location, 0, 1).is_err());
+        assert_eq!(
+            document
+                .read_story_table(&location, |table| table.cell(0, 0).unwrap().grid_span())
+                .unwrap(),
+            Some(2)
+        );
+        let before = document.to_bytes().unwrap();
+        for invalid in [
+            format!(r#"<w:tbl xmlns:w="{WORD_NAMESPACE}"><w:tblGrid/><w:tblGrid/></w:tbl>"#),
+            format!(r#"<w:tbl xmlns:w="{WORD_NAMESPACE}"><w:p/></w:tbl>"#),
+        ] {
+            assert!(document.replace_table_xml(&location, &invalid).is_err());
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        let bad_cell = format!(
+            r#"<w:tc xmlns:w="{WORD_NAMESPACE}"><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p/></w:tc>"#
+        );
+        assert!(
+            document
+                .replace_cell_xml(&location, 0, 0, &bad_cell)
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let cell = format!(
+            r#"<w:tc xmlns:w="{WORD_NAMESPACE}" xmlns:y="urn:cell" y:cell="retained"><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>replacement</w:t></w:r><x:payload xmlns:x="urn:producer" x:keep='exact'><x:child/></x:payload></w:p></w:tc>"#
+        );
+        document.replace_cell_xml(&location, 0, 0, &cell).unwrap();
+        assert_eq!(document.paragraph(0).unwrap().text(), "unrelated");
+        let saved = document.to_bytes().unwrap();
+        let mut reopened = Document::from_bytes(&saved).unwrap();
+        let location = reopened
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.location().story.kind == StoryKind::Body
+                    && snapshot.location().item_kind == StoryItemKind::Table
+            })
+            .unwrap()
+            .location()
+            .clone();
+        assert_eq!(
+            reopened
+                .read_story_table(&location, |table| table.cell(0, 0).unwrap().text())
+                .unwrap(),
+            "replacement"
+        );
+        assert!(reopened.story_table_cell(&location, 0, 1).is_err());
+        assert_eq!(
+            reopened
+                .read_story_table(&location, |table| table.cell(0, 0).unwrap().grid_span())
+                .unwrap(),
+            Some(2)
+        );
+        let main = String::from_utf8(
+            reopened
+                .story_sources()
+                .unwrap()
+                .into_iter()
+                .find(|source| source.part_name == reopened.doc_part_name)
+                .unwrap()
+                .xml
+                .into_owned(),
+        )
+        .unwrap();
+        assert!(main.contains("x:table=\"retained\""));
+        assert!(main.contains("y:cell=\"retained\""));
+        assert!(
+            main.contains(
+                "<x:payload xmlns:x=\"urn:producer\" x:keep='exact'><x:child/></x:payload>"
+            )
+        );
+        let twice = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(twice.paragraph(0).unwrap().text(), "unrelated");
+    }
+
+    #[test]
+    fn fx211_excluded_nested_owners_preserve_later_text_fields_and_raw_spans() {
+        let field = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>7</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+        let table_start = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc>"#;
+        let table_end = "</w:tc></w:tr></w:tbl>";
+        let leaf = r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>excluded</w:t></w:r></w:p></w:sdtContent></w:sdt>"#;
+        let owned = format!(
+            r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>before</w:t></w:r></w:p>{table_start}{table_start}{leaf}{table_end}{table_end}<w:p><w:r><w:t>after</w:t></w:r>{field}</w:p></w:sdtContent></w:sdt>"#
+        );
+        let opaque = r#"<x:node x:keep='yes'><w:tc><w:p><w:r><w:t>foreign-phantom</w:t></w:r></w:p></w:tc></x:node>"#;
+        let rebound = r#"<w:p xmlns:w="urn:foreign"><w:r><w:t>rebound-phantom</w:t></w:r></w:p>"#;
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}" xmlns:x="urn:producer"><w:body>{owned}{opaque}{rebound}</w:body></w:document>"#
+        );
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        assert_eq!(
+            owners.iter().map(|owner| owner.kind).collect::<Vec<_>>(),
+            [StoryKind::Body, StoryKind::TableCell, StoryKind::TableCell]
+        );
+        FX211_PROFILE.set([0; 12]);
+        let body = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+        let selected = body
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        assert_eq!(&xml[selected.full.clone()], owned);
+        assert_eq!(
+            story_item_text(xml.as_bytes(), selected, &[], 0..xml.len(), 0)
+                .unwrap()
+                .as_deref(),
+            Some("beforeafter7")
+        );
+        assert!(
+            body.iter()
+                .any(|item| item.kind == StoryItemKind::PreservedNode
+                    && &xml[item.full.clone()] == opaque)
+        );
+        assert!(
+            body.iter()
+                .any(|item| item.kind == StoryItemKind::PreservedNode
+                    && &xml[item.full.clone()] == rebound)
+        );
+        let leaf_items = scan_story_items(xml.as_bytes(), &owners[2]).unwrap();
+        let leaf_item = leaf_items
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        assert_eq!(&xml[leaf_item.full.clone()], leaf);
+        assert_eq!(
+            story_item_text(xml.as_bytes(), leaf_item, &[], 0..xml.len(), 0)
+                .unwrap()
+                .as_deref(),
+            Some("excluded")
+        );
+        let counts = FX211_PROFILE.get();
+        assert_eq!(counts[2], 0);
+        assert_eq!(counts[10], 0);
+    }
+
+    #[test]
+    fn fx211_control_paragraph_inventory_refuses_raw_wrapper_authority() {
+        for raw in [
+            r#"<f:payload xmlns:f="urn:foreign"><w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent></f:payload>"#,
+            r#"<f:payload xmlns:f="urn:foreign"><w:sdt><w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent></w:sdt></f:payload>"#,
+        ] {
+            let original = format!(
+                r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt>{raw}<w:sdtContent><w:p><w:r><w:t>visible</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>"#
+            );
+            for xml in [
+                original.clone(),
+                original.replace("w:", "q:").replace("xmlns:w=", "xmlns:q="),
+                original.replace("w:", "").replace("xmlns:w=", "xmlns="),
+            ] {
+                let typed = CT_Document::from_xml(xml.as_bytes()).unwrap();
+                assert_eq!(
+                    typed.body.paragraphs().map(CT_P::text).collect::<Vec<_>>(),
+                    ["visible"]
+                );
+                let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+                let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+                let control = items
+                    .iter()
+                    .find(|item| item.kind == StoryItemKind::ContentControl)
+                    .unwrap();
+                let scope = story_namespace_scope_at(xml.as_bytes(), control.full.start).unwrap();
+                assert_eq!(
+                    story_item_text_with_scope(xml.as_bytes(), control, &scope, &items)
+                        .unwrap()
+                        .as_deref(),
+                    Some("visible")
+                );
+                let paragraphs =
+                    scan_story_control_paragraphs_with_scope(xml.as_bytes(), control, &scope)
+                        .unwrap();
+                assert_eq!(paragraphs.len(), 1, "actual modeled direct owner: {xml}");
+                assert!(
+                    std::str::from_utf8(&xml.as_bytes()[paragraphs[0].clone()])
+                        .unwrap()
+                        .contains("visible")
+                );
+                assert!(xml[control.full.clone()].contains("phantom"));
+            }
+        }
+    }
+
+    #[test]
+    fn fx211_duplicate_content_projects_only_native_first_typed_slot() {
+        let raw = "<w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent>";
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt><w:sdtContent><w:p><w:r><w:t>visible</w:t></w:r></w:p></w:sdtContent>{raw}</w:sdt><w:p><w:r><w:t>tail</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let typed = CT_Document::from_xml(xml.as_bytes()).unwrap();
+        let paragraphs = typed.body.paragraphs().map(CT_P::text).collect::<Vec<_>>();
+        assert_eq!(paragraphs, ["visible", "tail"]);
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+        let root = items
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        let scope = story_namespace_scope_at(xml.as_bytes(), root.scan.start).unwrap();
+        assert_eq!(
+            story_item_text_with_scope(xml.as_bytes(), root, &scope, &items)
+                .unwrap()
+                .as_deref(),
+            Some(paragraphs[0].as_str())
+        );
+        assert!(xml[root.full.clone()].contains(raw));
+    }
+
+    #[test]
+    fn fx211_duplicate_content_namespace_and_first_slot_lifecycle() {
+        let duplicate = "<w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent>";
+        let first = "<w:sdtContent><w:p><w:r><w:t>visible</w:t></w:r></w:p></w:sdtContent>";
+        for content in [
+            format!("{first}{duplicate}"),
+            format!("<w:sdtContent><w:sdt>{first}{duplicate}</w:sdt></w:sdtContent>{duplicate}"),
+            format!("<w:sdtContent/>{first}{duplicate}"),
+            format!(
+                "<f:sdtContent xmlns:f=\"urn:foreign\"><w:p><w:r><w:t>foreign</w:t></w:r></w:p></f:sdtContent>{first}{duplicate}"
+            ),
+        ] {
+            let original = format!(
+                r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt>{content}</w:sdt></w:body></w:document>"#
+            );
+            for xml in [
+                original.clone(),
+                original.replace("w:", "q:").replace("xmlns:w=", "xmlns:q="),
+                original.replace("w:", "").replace("xmlns:w=", "xmlns="),
+            ] {
+                let typed = CT_Document::from_xml(xml.as_bytes()).unwrap();
+                let native = typed.body.paragraphs().map(CT_P::text).collect::<String>();
+                assert_eq!(native, "visible");
+                let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+                let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+                let root = items
+                    .iter()
+                    .find(|item| item.kind == StoryItemKind::ContentControl)
+                    .unwrap();
+                let scope = story_namespace_scope_at(xml.as_bytes(), root.scan.start).unwrap();
+                assert_eq!(
+                    story_item_text_with_scope(xml.as_bytes(), root, &scope, &items)
+                        .unwrap()
+                        .as_deref(),
+                    Some(native.as_str())
+                );
+                // This inventory deliberately owns only direct paragraphs of the selected control.
+                let direct_paragraphs = usize::from(!content.starts_with("<w:sdtContent><w:sdt>"));
+                assert_eq!(
+                    scan_story_control_paragraphs_with_scope(xml.as_bytes(), root, &scope)
+                        .unwrap()
+                        .len(),
+                    direct_paragraphs
+                );
+                let mut document = Document::new();
+                document
+                    .package
+                    .set_part(&document.doc_part_name.clone(), xml.as_bytes().to_vec());
+                let mut document = Document::from_package(document.package).unwrap();
+                let saved = document.to_bytes().unwrap();
+                let reopened = Document::from_bytes(&saved).unwrap();
+                let output = std::str::from_utf8(
+                    reopened.package.get_part(&reopened.doc_part_name).unwrap(),
+                )
+                .unwrap();
+                let raw = if xml.contains("<q:document") {
+                    duplicate.replace("w:", "q:")
+                } else if xml.contains("<document") {
+                    duplicate.replace("w:", "")
+                } else {
+                    duplicate.to_owned()
+                };
+                assert!(output.contains(&raw));
+                assert_eq!(
+                    reopened
+                        .document
+                        .body
+                        .paragraphs()
+                        .map(CT_P::text)
+                        .collect::<String>(),
+                    native
+                );
+                assert!(xml[root.full.clone()].contains("phantom"));
+            }
+        }
+    }
+
+    #[test]
+    fn fx211_duplicate_content_consumers_preserve_opaque_payload() {
+        let phantom = r#"<w:sdtContent><w:p><w:bookmarkStart w:id="7" w:name="raw"/><w:hyperlink w:anchor="raw"><w:r><w:t>phantom</w:t></w:r></w:hyperlink><w:bookmarkEnd w:id="7"/></w:p><w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:sdtContent>"#;
+        let first = r#"<w:sdtContent><w:p><w:bookmarkStart w:id="6" w:name="visible"/><w:hyperlink w:anchor="visible"><w:r><w:t>visible</w:t></w:r></w:hyperlink><w:bookmarkEnd w:id="6"/></w:p></w:sdtContent>"#;
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt>{first}{phantom}</w:sdt></w:body></w:document>"#
+        );
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        assert_eq!(owners.len(), 1);
+        let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+        let root = items
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        assert_eq!(
+            scan_story_control_paragraphs(xml.as_bytes(), root)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            scan_story_item_links(xml.as_bytes(), root).unwrap().len(),
+            1
+        );
+        let bookmarks = bookmark_marker_spans(xml.as_bytes()).unwrap();
+        assert_eq!(bookmarks.len(), 2);
+        assert!(bookmarks.iter().all(|marker| marker.id == "6"));
+        let changed = replace_story_item_text(xml.as_bytes(), root, "changed").unwrap();
+        assert!(std::str::from_utf8(&changed).unwrap().contains(phantom));
+        assert_eq!(
+            CT_Document::from_xml(&changed)
+                .unwrap()
+                .body
+                .paragraphs()
+                .map(CT_P::text)
+                .collect::<String>(),
+            "changed"
+        );
+        let textbox = format!(
+            r#"<w:txbxContent xmlns:w="{WORD_NAMESPACE}"><w:sdt>{first}{phantom}</w:sdt></w:txbxContent>"#
+        );
+        let projection = paired_text_box_projection(textbox.as_bytes(), 0..textbox.len()).unwrap();
+        assert!(projection.signature.iter().any(|fact| fact == "visible"));
+        assert!(
+            !projection
+                .signature
+                .iter()
+                .any(|fact| fact.contains("phantom"))
+        );
+    }
+
+    #[test]
+    fn fx211_duplicate_content_empty_start_and_paired_copy_boundaries() {
+        let raw = "<w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent>";
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt><w:sdtContent></w:sdtContent>{raw}</w:sdt></w:body></w:document>"#
+        );
+        assert_eq!(
+            CT_Document::from_xml(xml.as_bytes())
+                .unwrap()
+                .body
+                .paragraphs()
+                .count(),
+            0
+        );
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+        let root = items
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        let scope = story_namespace_scope_at(xml.as_bytes(), root.scan.start).unwrap();
+        assert_eq!(
+            story_item_text_with_scope(xml.as_bytes(), root, &scope, &items).unwrap(),
+            None
+        );
+        assert_eq!(
+            scan_story_control_paragraphs(xml.as_bytes(), root)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(xml[root.full.clone()].contains(raw));
+        let paired = r#"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"#;
+        for (first, expected_copies) in [
+            ("<w:sdtContent></w:sdtContent>".to_owned(), 0),
+            (format!("<w:sdtContent>{paired}</w:sdtContent>"), 2),
+        ] {
+            let duplicate = format!("<w:sdtContent>{paired}</w:sdtContent>");
+            let source = format!(
+                r#"<w:document xmlns:w="{WORD_NAMESPACE}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:sdt>{first}{duplicate}</w:sdt></w:body></w:document>"#
+            );
+            let copies = scoped_alternate_text_box_copies(source.as_bytes()).unwrap();
+            assert_eq!(copies.len(), expected_copies);
+            assert!(
+                copies
+                    .iter()
+                    .all(|copy| copy.range.end < source.find(&duplicate).unwrap() + first.len())
+            );
+            assert!(source.contains(&duplicate));
+        }
+    }
+
+    #[test]
+    fn fx211_qualified_inventory_reuse_requires_exact_context_offset_and_scope() {
+        let nested =
+            r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>tail</w:t></w:r></w:p></w:sdtContent></w:sdt>"#;
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt><w:sdtContent><w:p><w:r><w:t>visible</w:t></w:r></w:p>{nested}</w:sdtContent></w:sdt></w:body></w:document>"#
+        );
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+        let root = items
+            .iter()
+            .find(|item| item.kind == StoryItemKind::ContentControl)
+            .unwrap();
+        let scope = story_namespace_scope_at(xml.as_bytes(), root.scan.start).unwrap();
+        let original = xml.clone();
+        FX211_PROFILE.set([0; 12]);
+        let expected = story_item_text_with_scope(xml.as_bytes(), root, &scope, &[]).unwrap();
+        assert_eq!(expected.as_deref(), Some("visibletail"));
+        assert_eq!(FX211_PROFILE.get()[8], 1);
+        FX211_PROFILE.set([0; 12]);
+        assert_eq!(
+            story_item_text_with_scope(xml.as_bytes(), root, &scope, &items).unwrap(),
+            expected
+        );
+        assert_eq!(FX211_PROFILE.get()[8], 0);
+        for mismatch in ["context", "offset", "end"] {
+            let mut wrong = items.clone();
+            let child = wrong
+                .iter_mut()
+                .find(|item| item.full.start == xml.find(nested).unwrap())
+                .unwrap();
+            match mismatch {
+                "context" => child.sdt_context = Some(StorySdtContext::Inline),
+                "offset" => {
+                    child.full.start += 1;
+                    child.scan.start += 1;
+                }
+                "end" => {
+                    child.full.end = root.scan.end + 1;
+                    child.scan.end = child.full.end;
+                }
+                _ => unreachable!(),
+            }
+            FX211_PROFILE.set([0; 12]);
+            assert_eq!(
+                story_item_text_with_scope(xml.as_bytes(), root, &scope, &wrong).unwrap(),
+                expected
+            );
+            assert_eq!(FX211_PROFILE.get()[8], 1, "{mismatch}");
+        }
+        assert_eq!(xml, original);
+        for aliased in [
+            xml.replace("w:", "q:").replace("xmlns:w=", "xmlns:q="),
+            xml.replace("w:", "").replace("xmlns:w=", "xmlns="),
+        ] {
+            let owners = scan_story_owners(aliased.as_bytes(), StoryKind::Body).unwrap();
+            let items = scan_story_items(aliased.as_bytes(), &owners[0]).unwrap();
+            let root = items
+                .iter()
+                .find(|item| item.kind == StoryItemKind::ContentControl)
+                .unwrap();
+            let scope = story_namespace_scope_at(aliased.as_bytes(), root.scan.start).unwrap();
+            assert_eq!(
+                story_item_text_with_scope(aliased.as_bytes(), root, &scope, &items).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fx211_qualified_parent_does_not_promote_raw_or_shadowed_children() {
+        for (raw, expected_text) in [
+            (
+                r#"<w:r><w:sdt><w:sdtContent><w:r><w:t>phantom</w:t></w:r></w:sdtContent></w:sdt></w:r>"#,
+                "visibletail",
+            ),
+            (
+                r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent><w:sdtContent/></w:sdt>"#,
+                "visiblephantomtail",
+            ),
+            (
+                r#"<w:sdt><w:sdtPr><w:id w:val="not-an-integer"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
+                "visibletail",
+            ),
+            (
+                r#"<q:sdt xmlns:q="urn:foreign"><w:sdt><w:sdtContent><w:p><w:r><w:t>phantom</w:t></w:r></w:p></w:sdtContent></w:sdt></q:sdt>"#,
+                "visibletail",
+            ),
+        ] {
+            let xml = format!(
+                r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:sdt><w:sdtContent><w:p><w:r><w:t>visible</w:t></w:r></w:p>{raw}<w:p><w:r><w:t>tail</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>"#
+            );
+            let original = xml.clone();
+            let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+            let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+            let root = items
+                .iter()
+                .find(|item| item.kind == StoryItemKind::ContentControl)
+                .unwrap();
+            let scope = story_namespace_scope_at(xml.as_bytes(), root.scan.start).unwrap();
+            let expected = story_item_text_with_scope(xml.as_bytes(), root, &scope, &[]).unwrap();
+            assert_eq!(
+                expected.as_deref(),
+                Some(expected_text),
+                "legacy admission: {raw}"
+            );
+            assert_eq!(
+                story_item_text_with_scope(xml.as_bytes(), root, &scope, &items).unwrap(),
+                expected
+            );
+            assert_eq!(xml, original);
+            assert!(xml[root.full.clone()].contains(raw));
+        }
+        let malformed = format!(
+            r#"<w:sdt xmlns:w="{WORD_NAMESPACE}"><w:sdtContent><w:p></w:sdtContent></w:sdt>"#
+        );
+        let item = StoryItemSpan {
+            kind: StoryItemKind::ContentControl,
+            full: 0..malformed.len(),
+            scan: 0..malformed.len(),
+            direct_owner_child: true,
+            complex_field: false,
+            complex_ancestors: Vec::new(),
+            sdt_context: Some(StorySdtContext::Block),
+        };
+        assert!(story_item_text(malformed.as_bytes(), &item, &[], 0..malformed.len(), 0).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic requires owned FX211_TABLES and FX211_CONTROLS runner"]
+    fn fx211_small_table_control_transaction_profile() {
+        let tables: usize = std::env::var("FX211_TABLES").unwrap().parse().unwrap();
+        let controls: usize = std::env::var("FX211_CONTROLS").unwrap().parse().unwrap();
+        assert!([1, 2, 4].contains(&tables));
+        assert!([8, 16, 32].contains(&controls));
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        let table_start = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc>"#;
+        let table_end = "</w:tc></w:tr></w:tbl>";
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>{}{}<w:p><w:r><w:t>leaf</w:t></w:r></w:p>{}{}<w:sectPr/></w:body></w:document>"#,
+            table_start.repeat(tables),
+            "<w:sdt><w:sdtContent>".repeat(controls),
+            "</w:sdtContent></w:sdt>".repeat(controls),
+            table_end.repeat(tables)
+        );
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let mut document = Document::from_package(document.package).unwrap();
+        eprintln!(
+            "FX211_PROFILE load {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        eprintln!(
+            "FX211_PROFILE snapshots1 {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let snapshot = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.location() == &location)
+            .unwrap();
+        eprintln!(
+            "FX211_PROFILE snapshots2 {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        let raw = std::str::from_utf8(snapshot.xml()).unwrap();
+        assert!(raw.starts_with("<w:tbl>"));
+        let xml = raw
+            .replacen(
+                "<w:tbl>",
+                &format!(r#"<w:tbl xmlns:w="{WORD_NAMESPACE}">"#),
+                1,
+            )
+            .replace(">leaf<", ">changed<");
+        assert_eq!(
+            xml.split_once('>').unwrap().1,
+            raw.split_once('>')
+                .unwrap()
+                .1
+                .replace(">leaf<", ">changed<")
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        document.replace_table_xml(&location, &xml).unwrap();
+        eprintln!(
+            "FX211_PROFILE replace {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let bytes = document.to_bytes().unwrap();
+        eprintln!(
+            "FX211_PROFILE save {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let reopened = Document::from_bytes(&bytes).unwrap();
+        eprintln!(
+            "FX211_PROFILE reopen {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        let output = reopened.package.get_part(&reopened.doc_part_name).unwrap();
+        let xml = std::str::from_utf8(output).unwrap();
+        let BodyContent::Table(table) = &reopened.document.body.content[0] else {
+            panic!("typed root table")
+        };
+        let mut table = table;
+        for depth in 1..tables {
+            assert_eq!(table.rows.len(), 1);
+            assert_eq!(table.rows[0].cells.len(), 1);
+            let CellContent::Table(next) = &table.rows[0].cells[0].content[0] else {
+                panic!("typed nested table at {depth}")
+            };
+            table = next;
+        }
+        let CellContent::ContentControl(control) = &table.rows[0].cells[0].content[0] else {
+            panic!("typed leaf control")
+        };
+        let mut control = control;
+        for depth in 1..controls {
+            let SdtContent::ContentControl(next) = &control.content[0] else {
+                panic!("typed nested control at {depth}")
+            };
+            control = next;
+        }
+        let SdtContent::Paragraph(paragraph) = &control.content[0] else {
+            panic!("typed terminal paragraph")
+        };
+        assert_eq!(paragraph.text(), "changed");
+        assert!(xml.contains(">changed<"));
+        drop(reopened);
+        drop(document);
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic requires owned bounded FX211_TABLES and FX211_CONTROLS runner"]
+    fn fx211_controlled_larger_table_control_transaction_profile() {
+        let tables: usize = std::env::var("FX211_TABLES").unwrap().parse().unwrap();
+        let controls: usize = std::env::var("FX211_CONTROLS").unwrap().parse().unwrap();
+        assert!([(8, 64), (16, 128), (32, 256)].contains(&(tables, controls)));
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        let table_start = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc>"#;
+        let table_end = "</w:tc></w:tr></w:tbl>";
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>{}{}<w:p><w:r><w:t>leaf</w:t></w:r></w:p>{}{}<w:sectPr/></w:body></w:document>"#,
+            table_start.repeat(tables),
+            "<w:sdt><w:sdtContent>".repeat(controls),
+            "</w:sdtContent></w:sdt>".repeat(controls),
+            table_end.repeat(tables)
+        );
+        eprintln!("FX211_INPUT {source}");
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let mut document = Document::from_package(document.package).unwrap();
+        eprintln!(
+            "FX211_PROFILE load {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        eprintln!(
+            "FX211_PROFILE snapshots1 {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let snapshot = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.location() == &location)
+            .unwrap();
+        eprintln!(
+            "FX211_PROFILE snapshots2 {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        let raw = std::str::from_utf8(snapshot.xml()).unwrap();
+        assert!(raw.starts_with("<w:tbl>"));
+        let xml = raw
+            .replacen(
+                "<w:tbl>",
+                &format!(r#"<w:tbl xmlns:w="{WORD_NAMESPACE}">"#),
+                1,
+            )
+            .replace(">leaf<", ">changed<");
+        assert_eq!(
+            xml.split_once('>').unwrap().1,
+            raw.split_once('>')
+                .unwrap()
+                .1
+                .replace(">leaf<", ">changed<")
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        document.replace_table_xml(&location, &xml).unwrap();
+        eprintln!(
+            "FX211_PROFILE replace {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let bytes = document.to_bytes().unwrap();
+        eprintln!(
+            "FX211_PROFILE save {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        started = std::time::Instant::now();
+        FX211_PROFILE.set([0; 12]);
+        let reopened = Document::from_bytes(&bytes).unwrap();
+        eprintln!(
+            "FX211_PROFILE reopen {} {:?}",
+            started.elapsed().as_micros(),
+            FX211_PROFILE.get()
+        );
+        let output = reopened.package.get_part(&reopened.doc_part_name).unwrap();
+        let xml = std::str::from_utf8(output).unwrap();
+        eprintln!("FX211_OUTPUT {xml}");
+        let BodyContent::Table(table) = &reopened.document.body.content[0] else {
+            panic!("typed root table")
+        };
+        let mut table = table;
+        for depth in 1..tables {
+            assert_eq!(table.rows.len(), 1);
+            assert_eq!(table.rows[0].cells.len(), 1);
+            let CellContent::Table(next) = &table.rows[0].cells[0].content[0] else {
+                panic!("typed nested table at {depth}")
+            };
+            table = next;
+        }
+        let CellContent::ContentControl(control) = &table.rows[0].cells[0].content[0] else {
+            panic!("typed leaf control")
+        };
+        let mut control = control;
+        for depth in 1..controls {
+            let SdtContent::ContentControl(next) = &control.content[0] else {
+                panic!("typed nested control at {depth}")
+            };
+            control = next;
+        }
+        let SdtContent::Paragraph(paragraph) = &control.content[0] else {
+            panic!("typed terminal paragraph")
+        };
+        assert_eq!(paragraph.text(), "changed");
+        assert!(xml.contains(">changed<"));
+        drop(reopened);
+        drop(document);
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic requires owned FX211_CLONE_MEMBER runner"]
+    fn fx211_standalone_loaded_maximal_clone_diagnostic() {
+        let member = std::env::var("FX211_CLONE_MEMBER").unwrap();
+        assert!(["document", "typed", "equal", "serialize", "save"].contains(&member.as_str()));
+        let table_start = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc>"#;
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>{}{}<w:p><w:r><w:t>leaf</w:t></w:r></w:p>{}{}<w:sectPr/></w:body></w:document>"#,
+            table_start.repeat(32),
+            "<w:sdt><w:sdtContent>".repeat(256),
+            "</w:sdtContent></w:sdt>".repeat(256),
+            "</w:tc></w:tr></w:tbl>".repeat(32)
+        );
+        eprintln!("FX211_CLONE_INPUT {source}");
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.as_bytes().to_vec());
+        let mut document = Document::from_package(document.package).unwrap();
+        eprintln!("FX211_CLONE loaded");
+        let check = |model: &CT_Document| {
+            assert_eq!(model.body.content.len(), 1);
+            let BodyContent::Table(table) = &model.body.content[0] else {
+                panic!("typed root table")
+            };
+            let mut table = table;
+            for depth in 1..32 {
+                assert_eq!(table.rows.len(), 1);
+                assert_eq!(table.rows[0].cells.len(), 1);
+                assert_eq!(table.grid.as_ref().unwrap().columns.len(), 1);
+                let CellContent::Table(next) = &table.rows[0].cells[0].content[0] else {
+                    panic!("typed table {depth}")
+                };
+                table = next;
+            }
+            let CellContent::ContentControl(control) = &table.rows[0].cells[0].content[0] else {
+                panic!("typed control root")
+            };
+            let mut control = control;
+            for depth in 1..256 {
+                let SdtContent::ContentControl(next) = &control.content[0] else {
+                    panic!("typed control {depth}")
+                };
+                control = next;
+            }
+            let SdtContent::Paragraph(paragraph) = &control.content[0] else {
+                panic!("typed leaf")
+            };
+            assert_eq!(paragraph.text(), "leaf");
+        };
+        check(&document.document);
+        match member.as_str() {
+            "document" => {
+                eprintln!("FX211_CLONE Document-before");
+                let candidate = document.clone_for_staging();
+                eprintln!("FX211_CLONE Document-after");
+                check(&candidate.document);
+                assert_eq!(
+                    candidate
+                        .package
+                        .get_part(&candidate.doc_part_name)
+                        .unwrap(),
+                    source.as_bytes()
+                );
+                eprintln!("FX211_CLONE Document-drop-before");
+                drop(candidate);
+                eprintln!("FX211_CLONE Document-drop-after");
+            }
+            "typed" => {
+                eprintln!("FX211_CLONE CT_Document-before");
+                let candidate = document.document.clone();
+                eprintln!("FX211_CLONE CT_Document-after");
+                check(&candidate);
+                eprintln!("FX211_CLONE CT_Document-drop-before");
+                drop(candidate);
+                eprintln!("FX211_CLONE CT_Document-drop-after");
+            }
+            "relationships" => {
+                eprintln!("FX211_CLONE relationships-before");
+                let mut relationships = Vec::new();
+                collect_relationship_ids(&document.document.body.content, &mut relationships);
+                eprintln!("FX211_CLONE relationships-after");
+                assert!(relationships.is_empty());
+                check(&document.document);
+            }
+            "equal" => {
+                eprintln!("FX211_CLONE equal-parse-before");
+                let parsed = CT_Document::from_xml(source.as_bytes()).unwrap();
+                eprintln!("FX211_CLONE equal-parse-after");
+                eprintln!("FX211_CLONE equal-before");
+                assert!(parsed == document.document);
+                eprintln!("FX211_CLONE equal-after");
+                drop(parsed);
+                eprintln!("FX211_CLONE equal-drop-after");
+            }
+            "serialize" => {
+                eprintln!("FX211_CLONE serialize-before");
+                let xml = document.document.to_xml().unwrap();
+                eprintln!("FX211_CLONE serialize-after");
+                let reopened = CT_Document::from_xml(&xml).unwrap();
+                check(&reopened);
+                drop(reopened);
+                eprintln!("FX211_CLONE serialize-reopen-drop-after");
+            }
+            "save" => {
+                eprintln!("FX211_CLONE save-before");
+                let bytes = document.to_bytes().unwrap();
+                eprintln!("FX211_CLONE save-after");
+                let reopened = Document::from_bytes(&bytes).unwrap();
+                check(&reopened.document);
+                drop(reopened);
+                eprintln!("FX211_CLONE save-reopen-drop-after");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            document.package.get_part(&document.doc_part_name).unwrap(),
+            source.as_bytes()
+        );
+        eprintln!("FX211_CLONE original-drop-before");
+        drop(document);
+        eprintln!("FX211_CLONE original-drop-after");
+    }
+
+    #[test]
+    fn fx211_imported_local_picture_snapshot_remains_namespace_complete() {
+        let mut document = Document::new();
+        let png = super::watermark_tests::PNG;
+        document.add_picture(png, "owned.png", Length::pt(12.0), Length::pt(12.0));
+        let relationship = document
+            .package
+            .get_part_rels(&document.doc_part_name)
+            .unwrap()
+            .items
+            .iter()
+            .find(|relationship| relationship.rel_type == rel_types::IMAGE)
+            .unwrap()
+            .clone();
+        let target = OpcPackage::resolve_rel_target(&document.doc_part_name, &relationship.target);
+        assert_eq!(document.package.get_part(&target).unwrap(), png);
+        let opaque = r#"<x:payload xmlns:x="urn:producer" x:keep='yes'/>"#;
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:r><w:t>old</w:t></w:r><w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><wp:inline><wp:extent cx="152400" cy="152400"/><wp:docPr id="1" name="owned.png"/>{opaque}<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="owned.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="152400" cy="152400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+            relationship.id
+        );
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut document = Document::from_package(document.package).unwrap();
+        let before = document.to_bytes().unwrap();
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let snapshot = document.story_range_paragraph_snapshot(&location).unwrap();
+        CT_P::from_xml_fragment_checked(snapshot.xml()).unwrap();
+        let xml = std::str::from_utf8(snapshot.xml())
+            .unwrap()
+            .replace(">old<", ">changed<");
+        assert_eq!(document.to_bytes().unwrap(), before, "read is nonmutating");
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        for _ in 0..2 {
+            document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+            assert_eq!(document.paragraph(0).unwrap().text(), "changed");
+            assert_eq!(document.package.get_part(&target).unwrap(), png);
+            let raw = document.package.get_part(&document.doc_part_name).unwrap();
+            assert!(
+                raw.windows(opaque.len())
+                    .any(|window| window == opaque.as_bytes())
+            );
+            CT_Document::from_xml(raw).unwrap();
+            assert_eq!(
+                document
+                    .package
+                    .get_part_rels(&document.doc_part_name)
+                    .unwrap()
+                    .items
+                    .iter()
+                    .filter(|item| item.id == relationship.id && item.target == relationship.target)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn fx211_drawing_identity_preserves_existing_repetitions_and_refuses_new_collision() {
+        let drawing = |id: u32| {
+            format!(
+                r#"<w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="{id}" name="owned"/><a:graphic><a:graphicData uri="urn:producer"/></a:graphic></wp:inline></w:drawing></w:r>"#
+            )
+        };
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body><w:p><w:r><w:t>first</w:t></w:r>{}</w:p><w:p><w:r><w:t>last</w:t></w:r>{}</w:p><w:sectPr/></w:body></w:document>"#,
+            drawing(7),
+            drawing(7)
+        );
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut document = Document::from_package(document.package).unwrap();
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let xml = String::from_utf8(
+            document
+                .story_range_paragraph_snapshot(&location)
+                .unwrap()
+                .xml()
+                .to_vec(),
+        )
+        .unwrap()
+        .replace(">first<", ">changed<");
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        let mut document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(document.paragraph(0).unwrap().text(), "changed");
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let before = document.to_bytes().unwrap();
+        let xml = String::from_utf8(
+            document
+                .story_range_paragraph_snapshot(&location)
+                .unwrap()
+                .xml()
+                .to_vec(),
+        )
+        .unwrap()
+        .replace("</w:p>", &format!("{}</w:p>", drawing(7)));
+        assert!(
+            document
+                .replace_paragraph_xml(&location, &xml)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate drawing id 7")
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(document.story_range_paragraph_snapshot(&location).is_ok());
+    }
+
+    #[test]
+    fn fx211_nested_section_profiles_are_preserved_or_refused_atomically() {
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        let opaque = r#"<x:payload xmlns:x="urn:producer"><w:sectPr w:keep="opaque"/></x:payload>"#;
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:pPr><w:sectPr><w:pgSz w:w="0" w:h="1440"/></w:sectPr></w:pPr><w:r><w:t>old</w:t></w:r>{opaque}</w:p><w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"#
+        );
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut document = Document::from_package(document.package).unwrap();
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let exact = document
+            .story_range_paragraph_snapshot(&location)
+            .unwrap()
+            .xml()
+            .to_vec();
+        let before = document.to_bytes().unwrap();
+        document
+            .replace_paragraph_xml(&location, std::str::from_utf8(&exact).unwrap())
+            .unwrap();
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let changed_text = String::from_utf8(exact.clone())
+            .unwrap()
+            .replace(">old<", ">changed<");
+        document
+            .replace_paragraph_xml(&location, &changed_text)
+            .unwrap();
+        let mut document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(document.paragraph(0).unwrap().text(), "changed");
+        assert!(
+            document.story_item_snapshots().unwrap()[0]
+                .xml()
+                .windows(opaque.len())
+                .any(|window| window == opaque.as_bytes())
+        );
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let before = document.to_bytes().unwrap();
+        let changed_section = String::from_utf8(
+            document
+                .story_range_paragraph_snapshot(&location)
+                .unwrap()
+                .xml()
+                .to_vec(),
+        )
+        .unwrap()
+        .replace(r#"w:w="0""#, r#"w:w="1440""#);
+        assert!(
+            document
+                .replace_paragraph_xml(&location, &changed_section)
+                .unwrap_err()
+                .to_string()
+                .contains("checked section owner")
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let table = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let introduced = format!(
+            r#"<w:tc xmlns:w="{WORD_NAMESPACE}"><w:p><w:pPr><w:sectPr><w:pgSz w:w="1440" w:h="2880"/></w:sectPr></w:pPr><w:r><w:t>new</w:t></w:r></w:p></w:tc>"#
+        );
+        assert!(
+            document
+                .replace_cell_xml(&table, 0, 0, &introduced)
+                .unwrap_err()
+                .to_string()
+                .contains("checked section owner")
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let valid = format!(
+            r#"<w:sectPr xmlns:w="{WORD_NAMESPACE}"><w:pgSz w:w="1440" w:h="2880"/></w:sectPr>"#
+        );
+        document.replace_section_properties_xml(1, &valid).unwrap();
+        assert_eq!(
+            document.section(1).unwrap().properties().page_width,
+            Some(Twips(1440))
+        );
+        assert!(
+            !document.validate_sections().is_valid(),
+            "unrelated preserved section stays unchanged"
+        );
+    }
+
+    #[test]
+    fn fx211_identity_profiles_preserve_cross_owner_bookmarks_and_refuse_collisions() {
+        let mut document = Document::new();
+        document.add_paragraph("placeholder");
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:bookmarkStart w:id="7" w:name="cross"/><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>last</w:t></w:r><w:bookmarkEnd w:id="7"/></w:p><w:sectPr/></w:body></w:document>"#
+        );
+        document
+            .package
+            .set_part(&document.doc_part_name.clone(), source.into_bytes());
+        let mut document = Document::from_package(document.package).unwrap();
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let xml = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:bookmarkStart w:id="7" w:name="cross"/><w:bookmarkStart w:id="8" w:name="local"/><w:r><w:t>changed</w:t></w:r><w:bookmarkEnd w:id="8"/></w:p>"#
+        );
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        let mut document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(document.bookmarks().len(), 2);
+        let location = document.story_item_snapshots().unwrap()[1]
+            .location()
+            .clone();
+        let before = document.to_bytes().unwrap();
+        let duplicate = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:bookmarkStart w:id="8" w:name="duplicate"/><w:r><w:t>last</w:t></w:r><w:bookmarkEnd w:id="8"/><w:bookmarkEnd w:id="7"/></w:p>"#
+        );
+        assert!(
+            document
+                .replace_paragraph_xml(&location, &duplicate)
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let bad_order = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:bookmarkEnd w:id="9"/><w:r><w:t>last</w:t></w:r><w:bookmarkStart w:id="9" w:name="reversed"/><w:bookmarkEnd w:id="7"/></w:p>"#
+        );
+        assert!(
+            document
+                .replace_paragraph_xml(&location, &bad_order)
+                .unwrap_err()
+                .to_string()
+                .contains("precedes")
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn fx211_comment_identity_uses_current_owned_target_and_other_physical_occurrences() {
+        let mut document = Document::new();
+        document.add_paragraph("first");
+        document.add_paragraph("other");
+        let id = document
+            .add_comment(
+                crate::comments::RunRange {
+                    start: crate::comments::RunPosition {
+                        body_index: 0,
+                        run_index: 0,
+                    },
+                    end: crate::comments::RunPosition {
+                        body_index: 0,
+                        run_index: 1,
+                    },
+                },
+                "author",
+                None,
+                "owned definition",
+            )
+            .unwrap();
+        let bytes = document.to_bytes().unwrap();
+        let mut package = OpcPackage::from_reader(Cursor::new(bytes)).unwrap();
+        let source = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>other</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        );
+        package.set_part(&document.doc_part_name, source.into_bytes());
+        let mut document = Document::from_package(package).unwrap();
+        document.add_paragraph("dirty unrelated owner");
+        // Capture the current owner after a legitimate unrelated dirty model change.
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let xml = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:commentRangeStart w:id="{id}"/><w:r><w:t>changed</w:t></w:r><w:commentRangeEnd w:id="{id}"/><w:r><w:commentReference w:id="{id}"/></w:r></w:p>"#
+        );
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        reopened.validate_comment_ownership().unwrap();
+        assert_eq!(reopened.comments().len(), 1);
+        assert_eq!(
+            reopened.paragraph(2).unwrap().text(),
+            "dirty unrelated owner"
+        );
+        let location = reopened.story_item_snapshots().unwrap()[1]
+            .location()
+            .clone();
+        let before = reopened.to_bytes().unwrap();
+        assert!(reopened.replace_paragraph_xml(&location, &xml).is_err());
+        assert_eq!(reopened.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn fx211_identity_profiles_refuse_new_dangling_markers_atomically() {
+        let mut failures = Vec::new();
+        for content in [
+            r#"<w:bookmarkStart w:id="7" w:name="new"/><w:r><w:t>value</w:t></w:r>"#,
+            r#"<w:r><w:t>value</w:t></w:r><w:bookmarkEnd w:id="7"/>"#,
+            r#"<w:r><w:commentReference w:id="7"/></w:r>"#,
+            r#"<w:commentRangeStart w:id="7"/><w:r><w:t>value</w:t></w:r><w:commentRangeEnd w:id="7"/>"#,
+        ] {
+            let mut document = Document::new();
+            document.add_paragraph("retained");
+            let location = document.story_item_snapshots().unwrap()[0]
+                .location()
+                .clone();
+            let before = document.to_bytes().unwrap();
+            let xml = format!(r#"<w:p xmlns:w="{WORD_NAMESPACE}">{content}</w:p>"#);
+            if document.replace_paragraph_xml(&location, &xml).is_ok() {
+                failures.push(format!("introduced dangling identity accepted: {content}"));
+            } else {
+                assert_eq!(document.to_bytes().unwrap(), before);
+                assert_eq!(
+                    document.story_item_snapshots().unwrap()[0].location(),
+                    &location
+                );
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn fx211_note_and_field_profiles_reuse_existing_qualified_providers() {
+        let mut document = Document::new();
+        document.add_paragraph("before");
+        let id = document.add_footnote("note owner");
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let xml = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}"><w:r><w:footnoteReference w:id="{id}"/></w:r><w:fldSimple w:instr="PAGE"><w:r><w:t>7</w:t></w:r></w:fldSimple></w:p>"#
+        );
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        let bytes = document.to_bytes().unwrap();
+        let mut reopened = Document::from_bytes(&bytes).unwrap();
+        assert!(
+            reopened
+                .fragment_note_dependency(StoryKind::Footnote, id)
+                .unwrap()
+                .1
+                .windows(b"note owner".len())
+                .any(|slice| slice == b"note owner")
+        );
+        assert_eq!(reopened.paragraph(0).unwrap().text(), "7");
+        let twice = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(twice.paragraph(0).unwrap().text(), "7");
+    }
+
+    #[test]
+    fn fx211_note_field_and_section_profiles_refuse_atomically() {
+        let mut failures = Vec::new();
+        for content in [
+            r#"<w:r><w:footnoteReference w:id="99"/></w:r>"#,
+            r#"<w:r><w:endnoteReference w:id="99"/></w:r>"#,
+            r#"<w:fldSimple w:instr="REF &quot;unclosed"><w:r><w:t>cache</w:t></w:r></w:fldSimple>"#,
+        ] {
+            let mut document = Document::new();
+            document.add_paragraph("retained");
+            let location = document.story_item_snapshots().unwrap()[0]
+                .location()
+                .clone();
+            let before = document.to_bytes().unwrap();
+            let xml = format!(r#"<w:p xmlns:w="{WORD_NAMESPACE}">{content}</w:p>"#);
+            if document.replace_paragraph_xml(&location, &xml).is_ok() {
+                failures.push(format!("invalid known profile accepted: {content}"));
+            } else {
+                assert_eq!(document.to_bytes().unwrap(), before);
+                assert_eq!(
+                    document.story_item_snapshots().unwrap()[0].location(),
+                    &location
+                );
+            }
+        }
+        let mut document = Document::new();
+        document.add_paragraph("retained");
+        let before = document.to_bytes().unwrap();
+        let xml = format!(
+            r#"<w:sectPr xmlns:w="{WORD_NAMESPACE}"><w:pgSz w:w="0" w:h="1440"/></w:sectPr>"#
+        );
+        if document.replace_section_properties_xml(0, &xml).is_ok() {
+            failures.push("invalid known profile accepted: nonpositive section geometry".into());
+        } else {
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn fx211_xml_relationship_kind_and_mode_refuse_before_publication() {
+        for (relationship_type, external) in
+            [(rel_types::IMAGE, true), (rel_types::HYPERLINK, false)]
+        {
+            let mut document = Document::new();
+            document.add_paragraph("retained");
+            let part_name = document.doc_part_name.clone();
+            let mut relationships = document.package.get_part_rels(&part_name).unwrap().clone();
+            let id = if external {
+                relationships.add_external(relationship_type, "https://example.com/target")
+            } else {
+                relationships.add(relationship_type, "https://example.com/target")
+            };
+            document.package.set_part_rels(&part_name, relationships);
+            let location = document.story_item_snapshots().unwrap()[0]
+                .location()
+                .clone();
+            let before = document.to_bytes().unwrap();
+            let xml = format!(
+                r#"<w:p xmlns:w="{WORD_NAMESPACE}" xmlns:r="{}"><w:hyperlink r:id="{id}"><w:r><w:t>changed</w:t></w:r></w:hyperlink></w:p>"#,
+                rdocx_oxml::namespace::R_NS
+            );
+            let result = document.replace_paragraph_xml(&location, &xml);
+            assert!(
+                result.is_err(),
+                "wrong typed hyperlink relationship accepted"
+            );
+            assert_eq!(document.to_bytes().unwrap(), before);
+            assert_eq!(document.paragraph(0).unwrap().text(), "retained");
+            assert_eq!(
+                document.story_item_snapshots().unwrap()[0].location(),
+                &location
+            );
+        }
+    }
+
+    #[test]
+    fn fx211_cell_paragraph_location_uses_checked_range_axis() {
+        let mut document = Document::new();
+        document.add_table(1, 1);
+        let table = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind() == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let xml = format!(
+            r#"<w:tbl xmlns:w="{WORD_NAMESPACE}"><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:fldSimple w:instr="PAGE"><w:r><w:t>7</w:t></w:r></w:fldSimple></w:p><w:p><w:r><w:t>middle</w:t></w:r></w:p><w:p><w:r><w:t>last</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+        );
+        document.replace_table_xml(&table, &xml).unwrap();
+        let modeled = document
+            .table(0)
+            .unwrap()
+            .cell(0, 0)
+            .unwrap()
+            .paragraphs()
+            .map(|paragraph| paragraph.text())
+            .collect::<Vec<_>>();
+        assert_eq!(modeled, ["7", "middle", "last"]);
+        let mut failures = Vec::new();
+        for (ordinal, expected) in modeled.iter().enumerate() {
+            match document.cell_paragraph_story_location(0, 0, 0, ordinal) {
+                Ok(location) => {
+                    let actual = document.story_range_paragraph_snapshot(&location).unwrap();
+                    if actual.text() != Some(expected.as_str()) {
+                        failures.push(format!(
+                            "paragraph {ordinal}: selected {:?}, expected {expected}",
+                            actual.text()
+                        ));
+                    }
+                }
+                Err(error) => failures.push(format!("paragraph {ordinal}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "wrong cell paragraph physical owner: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn fx211_cell_paragraph_range_preserves_nested_control_and_opaque_scope() {
+        let mut document = Document::new();
+        document.add_table(1, 1);
+        let table = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.location().item_kind() == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let opaque = r#"<p xmlns="urn:producer" keep="exact"><w:r><w:t>phantom</w:t></w:r></p>"#;
+        let xml = format!(
+            r#"<w:tbl xmlns:w="{WORD_NAMESPACE}"><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:fldSimple w:instr="PAGE"><w:r><w:t>7</w:t></w:r></w:fldSimple></w:p>{opaque}<w:sdt><w:sdtContent><w:p><w:r><w:t>outer before</w:t></w:r></w:p><w:sdt><w:sdtContent><w:p><w:r><w:t>nested</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>outer after</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>tail</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+        );
+        document.replace_table_xml(&table, &xml).unwrap();
+        let expected = ["7", "outer before", "nested", "outer after", "tail"];
+        assert_eq!(
+            document
+                .table(0)
+                .unwrap()
+                .cell(0, 0)
+                .unwrap()
+                .paragraphs()
+                .map(|paragraph| paragraph.text())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (ordinal, text) in expected.iter().enumerate() {
+            let location = document
+                .cell_paragraph_story_location(0, 0, 0, ordinal)
+                .unwrap();
+            assert_eq!(
+                document
+                    .story_range_paragraph_snapshot(&location)
+                    .unwrap()
+                    .text(),
+                Some(*text)
+            );
+        }
+        let before = document.to_bytes().unwrap();
+        for (table, row, cell, paragraph) in
+            [(1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 5)]
+        {
+            assert!(
+                document
+                    .cell_paragraph_story_location(table, row, cell, paragraph)
+                    .is_err()
+            );
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        let location = document.cell_paragraph_story_location(0, 0, 0, 4).unwrap();
+        assert!(
+            document
+                .replace_paragraph_xml(&location, r#"<x:p xmlns:x="urn:producer"/>"#)
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(
+            String::from_utf8(document.document.to_xml().unwrap())
+                .unwrap()
+                .contains(opaque)
+        );
+        let reopened = Document::from_bytes(&before).unwrap();
+        for (ordinal, text) in expected.iter().enumerate() {
+            let location = reopened
+                .cell_paragraph_story_location(0, 0, 0, ordinal)
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .story_range_paragraph_snapshot(&location)
+                    .unwrap()
+                    .text(),
+                Some(*text)
+            );
+        }
+    }
+
+    #[test]
+    fn fx211_selected_paragraph_xml_stages_noops_and_late_refusals() {
+        let mut document = Document::new();
+        document.add_paragraph("before");
+        document.add_paragraph("unrelated");
+        let snapshots = document.story_item_snapshots().unwrap();
+        let location = snapshots[0].location().clone();
+        let selected = document.story_range_paragraph_snapshot(&location).unwrap();
+        let identical = std::str::from_utf8(selected.xml()).unwrap().to_owned();
+        let before = document.to_bytes().unwrap();
+        document
+            .replace_paragraph_xml(&location, &identical)
+            .unwrap();
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let invalid = format!(
+            r#"<w:p xmlns:w="{WORD_NAMESPACE}" xmlns:r="{}"><w:hyperlink r:id="absent"><w:r><w:t>late</w:t></w:r></w:hyperlink></w:p>"#,
+            rdocx_oxml::namespace::R_NS
+        );
+        let error = document
+            .replace_paragraph_xml(&location, &invalid)
+            .unwrap_err();
+        assert!(error.to_string().contains("relationship"), "{error}");
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let opaque = r#"<x:payload xmlns:x="urn:producer" x:key='keep'><x:item/></x:payload>"#;
+        let xml =
+            format!(r#"<q:p xmlns:q="{WORD_NAMESPACE}"><q:r><q:t>after</q:t></q:r>{opaque}</q:p>"#);
+        document.replace_paragraph_xml(&location, &xml).unwrap();
+        let saved = document.to_bytes().unwrap();
+        let mut reopened = Document::from_bytes(&saved).unwrap();
+        assert_eq!(reopened.paragraph(0).unwrap().text(), "after");
+        assert_eq!(reopened.paragraph(1).unwrap().text(), "unrelated");
+        assert!(
+            String::from_utf8(reopened.story_item_snapshots().unwrap()[0].xml().to_vec())
+                .unwrap()
+                .contains(opaque)
+        );
+        let twice = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert!(
+            String::from_utf8(twice.story_item_snapshots().unwrap()[0].xml().to_vec())
+                .unwrap()
+                .contains(opaque)
+        );
+    }
+
+    #[test]
+    fn fx211_selected_run_xml_replaces_checked_existing_owner_atomically() {
+        let mut document = Document::new();
+        document.add_paragraph("first").add_run("second");
+        let location = document.story_item_snapshots().unwrap()[0]
+            .location()
+            .clone();
+        let position = StoryRunPosition {
+            location: location.clone(),
+            run_index: 1,
+        };
+        let before = document.to_bytes().unwrap();
+        let wrong = format!(r#"<w:fld xmlns:w="{WORD_NAMESPACE}"/>"#);
+        assert!(document.replace_run_xml(&position, &wrong).is_err());
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let xml = format!(
+            r#"<alias:r xmlns:alias="{WORD_NAMESPACE}"><alias:t>changed</alias:t></alias:r>"#
+        );
+        let missing = StoryRunPosition {
+            location: location.clone(),
+            run_index: 999,
+        };
+        assert!(document.replace_run_xml(&missing, &xml).is_err());
+        assert_eq!(document.to_bytes().unwrap(), before);
+        document.replace_run_xml(&position, &xml).unwrap();
+        let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.paragraph(0).unwrap().text(), "firstchanged");
+    }
+
     use super::*;
     use crate::FieldEvaluationContext;
     use crate::paragraph::Alignment;
@@ -26539,7 +40906,7 @@ mod tests {
     const WORD_VERSION: &str = "16.104";
     const WORD_BUILD: &str = "16.104.25121423";
     const WORD_CHART_CANDIDATE_SHA256: &str =
-        "79e9b9ff9e7557dbd09a365bb8c189806e700ed48ca768b27d7158cf2b41370b";
+        "904e718b1fe0e524be7df75430705a8a70e03089ed96460ad008c4016c36ad3d";
     const FX087_WORD_VERSION: &str = "16.112.3";
     const FX087_WORD_BUILD: &str = "16.112.26083020";
     const FX087_PAGES_VERSION: &str = "15.1.1";
@@ -26548,83 +40915,54 @@ mod tests {
         "ab67b50393fc5258f7a3e9719344639d665feccc2615b13cab1915ea9a84566b";
 
     #[test]
-    fn saving_forbidden_xml_characters_fails_without_overwriting_the_destination() {
-        let path =
-            std::env::temp_dir().join(format!("rdocx-invalid-xml-{}.docx", std::process::id()));
-        fs::write(&path, b"previous output").unwrap();
-        for character in [
-            '\0', '\u{1}', '\u{b}', '\u{c}', '\u{1f}', '\u{fffe}', '\u{ffff}',
-        ] {
-            for location in ["body", "table", "header", "footer", "title", "hyperlink"] {
-                let mut document = Document::new();
-                let text = format!("before{character}after");
-                match location {
-                    "body" => {
-                        document.add_paragraph(&text);
-                    }
-                    "table" => {
-                        document
-                            .add_table(1, 1)
-                            .cell(0, 0)
-                            .unwrap()
-                            .add_paragraph(&text);
-                    }
-                    "header" => document.set_header(&text),
-                    "footer" => document.set_footer(&text),
-                    "title" => document.set_title(&text),
-                    "hyperlink" => {
-                        document.add_hyperlink_relationship(&format!("https://example.com/{text}"));
-                    }
-                    _ => unreachable!(),
-                }
-                let error = document.to_bytes().unwrap_err().to_string();
-                assert!(
-                    error.contains("forbidden by XML 1.0"),
-                    "{location}: {error}"
-                );
-                assert!(document.save(&path).is_err(), "{location}");
-                assert_eq!(fs::read(&path).unwrap(), b"previous output");
-            }
+    fn fx200_checked_one_call_lists_reject_malformed_graph_without_publication() {
+        for numbered in [false, true] {
+            let mut document = Document::new();
+            document.try_add_numbered_list_item("existing", 0).unwrap();
+            let duplicate = document.numbering.as_ref().unwrap().nums[0].clone();
+            document.numbering.as_mut().unwrap().nums.push(duplicate);
+            let numbering_before = document.numbering.as_ref().unwrap().to_xml().unwrap();
+            let count_before = document.paragraph_count();
+            let error = if numbered {
+                document.try_add_numbered_list_item("bad", 0).map(|_| ())
+            } else {
+                document.try_add_bullet_list_item("bad", 0).map(|_| ())
+            };
+            assert!(
+                error
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate numbering instance")
+            );
+            assert_eq!(
+                document.numbering.as_ref().unwrap().to_xml().unwrap(),
+                numbering_before
+            );
+            assert_eq!(document.paragraph_count(), count_before);
         }
-        fs::remove_file(path).unwrap();
     }
-
     #[test]
-    fn replacing_an_imported_header_cannot_bypass_output_character_checks() {
-        let mut original = Document::new();
-        original.set_header("valid header");
-        let mut reopened = Document::from_bytes(&original.to_bytes().unwrap()).unwrap();
-        reopened.set_header("invalid\u{1}header");
-        assert!(
-            reopened
-                .to_bytes()
-                .unwrap_err()
-                .to_string()
-                .contains("forbidden by XML 1.0")
-        );
-    }
-
-    #[test]
-    fn output_character_checks_preserve_valid_unicode_and_opaque_parts() {
+    fn pagination_update_publishes_one_atomic_candidate() {
         let mut document = Document::new();
-        document.add_paragraph(" \t\r\nŽluťoučký <&> 😀\u{85}\u{fffd} ");
-        let binary = vec![0, 1, 0xff, 0xfe];
-        document.package.set_part("/opaque.bin", binary.clone());
-        document
-            .package
-            .content_types
-            .add_default("bin", "application/octet-stream");
-        let utf16: Vec<_> = "\u{feff}<root>Valid</root>"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        document.package.set_part("/opaque.xml", utf16.clone());
-        let bytes = document.to_bytes().unwrap();
-        let package = OpcPackage::from_reader(Cursor::new(bytes)).unwrap();
-        assert_eq!(package.get_part("/opaque.bin").unwrap(), binary);
-        assert_eq!(package.get_part("/opaque.xml").unwrap(), utf16);
-        let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
-        assert!(xml.contains("Žluťoučký &lt;&amp;&gt; 😀"));
+        for name in ["PAGE", "NUMPAGES", "SECTION", "SECTIONPAGES"] {
+            document
+                .add_paragraph("")
+                .add_run("")
+                .add_field(name, "OLD")
+                .unwrap();
+        }
+        document.set_header("physical header");
+        document.to_bytes().unwrap();
+        LAYOUT_INVOCATIONS.set(0);
+        let report = document.update_layout_backed_fields().unwrap();
+        assert_eq!(report.updated_count(), 4);
+        assert_eq!(LAYOUT_INVOCATIONS.get(), 1);
+        let saved = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        let evaluations = reopened
+            .evaluate_fields(&crate::field::FieldEvaluationContext::default())
+            .unwrap();
+        assert!(evaluations.iter().all(|field| field.cached_result == "1"));
     }
 
     #[test]
@@ -26649,6 +40987,531 @@ mod tests {
             STORY_SOURCE_BUILDS.set(0);
             assert!(document.story_link_snapshots().unwrap().is_empty());
             assert_eq!(STORY_SOURCE_BUILDS.get(), 1);
+        }
+    }
+
+    // The per-story algorithm that `story_range_paragraph_sources` replaced.
+    // Each story looks up its source and owner again, each owner and control
+    // is scanned from the start of its source, and each paragraph scope, own
+    // declarations included, is read from the start of its source too.
+    fn reference_story_range_paragraph_spans(
+        xml: &[u8],
+        owner: &StoryOwnerSpan,
+        story: &StoryId,
+    ) -> Result<Vec<(ContentLocation, Range<usize>)>> {
+        let mut paragraphs = Vec::new();
+        for (index, item) in scan_story_items(xml, owner)?.iter().enumerate() {
+            let spans = match item.kind {
+                StoryItemKind::Paragraph => vec![(vec![index], item.full.clone())],
+                StoryItemKind::ContentControl => scan_story_control_paragraphs(xml, item)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(paragraph, span)| (vec![index, paragraph], span))
+                    .collect(),
+                _ => continue,
+            };
+            for (path, span) in spans {
+                paragraphs.push((
+                    ContentLocation::new(story.clone(), StoryItemKind::Paragraph, path),
+                    span,
+                ));
+            }
+        }
+        Ok(paragraphs)
+    }
+
+    fn reference_story_range_paragraphs(
+        document: &Document,
+    ) -> Result<Vec<(ContentLocation, Vec<u8>)>> {
+        let mut paragraphs = Vec::new();
+        for (story_index, story) in document.stories()?.into_iter().enumerate() {
+            let (source, owner) = document.story_source_and_owner(&story)?;
+            let source_xml = source.xml.as_ref();
+            for (location, span) in
+                reference_story_range_paragraph_spans(source_xml, &owner, &story)?
+            {
+                let scope = story_namespace_scope_at(source_xml, span.start)?;
+                let order = span.start;
+                let xml = close_content_fragment_namespaces(&source_xml[span], &scope)?;
+                paragraphs.push((story_index, order, location, xml));
+            }
+        }
+        paragraphs.sort_by_key(|(story_index, offset, _, _)| (*story_index, *offset));
+        Ok(paragraphs
+            .into_iter()
+            .map(|(_, _, location, xml)| (location, xml))
+            .collect())
+    }
+
+    fn reference_comment_story_range_paragraphs(
+        document: &Document,
+    ) -> Result<Vec<(ContentLocation, Vec<u8>)>> {
+        let mut paragraphs = reference_story_range_paragraphs(document)?;
+        let canonical = document.document.to_xml()?;
+        let restored = document.namespace_restored_main_source()?;
+        if restored == canonical {
+            return Ok(paragraphs);
+        }
+        let (boundaries, _) = comment_namespace_source_boundaries(&canonical, &restored)?
+            .ok_or_else(|| Error::Other("replay changed physical source".into()))?;
+        let mut paragraph_spans = HashMap::new();
+        for owner in &scan_story_owners(&canonical, StoryKind::Body)? {
+            let story = StoryId {
+                kind: owner.kind,
+                part_name: document.doc_part_name.clone(),
+                owner_index: owner.owner_index,
+                fingerprint: owner.fingerprint,
+            };
+            for (location, span) in
+                reference_story_range_paragraph_spans(&canonical, owner, &story)?
+            {
+                if paragraph_spans.insert(location, span).is_some() {
+                    return Err(Error::Other("duplicate physical paragraph path".into()));
+                }
+            }
+        }
+        let scopes = story_namespace_scopes_at(
+            &restored,
+            paragraph_spans
+                .values()
+                .filter_map(|span| boundaries.get(&span.start).copied()),
+        )?;
+        for (location, xml) in &mut paragraphs {
+            if location.story.part_name != document.doc_part_name {
+                continue;
+            }
+            let span = &paragraph_spans[location];
+            let start = boundaries[&span.start];
+            let end = boundaries[&span.end];
+            *xml = close_content_fragment_namespaces(&restored[start..end], &scopes[&start])?;
+        }
+        Ok(paragraphs)
+    }
+
+    #[allow(clippy::type_complexity)] // The cache fields, compared as one tuple.
+    fn reference_text_box_cache_paragraphs(
+        document: &Document,
+    ) -> Result<Vec<(ContentLocation, Vec<u8>, usize, usize)>> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for (location, xml) in reference_story_range_paragraphs(document)? {
+            if !matches!(
+                location.story.kind,
+                StoryKind::TextBox | StoryKind::TableCell
+            ) {
+                continue;
+            }
+            let (source, paragraph) = document.story_range_paragraph_source(&location)?;
+            let text_box = scan_story_owners(source.xml.as_ref(), source.root_kind)?
+                .into_iter()
+                .filter(|owner| {
+                    owner.kind == StoryKind::TextBox
+                        && owner.full.start <= paragraph.full.start
+                        && owner.full.end >= paragraph.full.end
+                })
+                .min_by_key(|owner| owner.full.len());
+            if let Some(text_box) = text_box
+                && seen.insert((
+                    source.part_name.clone(),
+                    paragraph.full.start,
+                    paragraph.full.end,
+                ))
+            {
+                result.push((location, xml, text_box.owner_index, paragraph.full.start));
+            }
+        }
+        result.sort_by(|left, right| {
+            (left.0.story.part_name.as_str(), left.2, left.3).cmp(&(
+                right.0.story.part_name.as_str(),
+                right.2,
+                right.3,
+            ))
+        });
+        let mut ordinals = HashMap::<(String, usize), usize>::new();
+        for (location, _, owner_index, paragraph_index) in &mut result {
+            let ordinal = ordinals
+                .entry((location.story.part_name.clone(), *owner_index))
+                .or_default();
+            *paragraph_index = *ordinal;
+            *ordinal += 1;
+        }
+        Ok(result)
+    }
+
+    // Every story family, a nested table, block, nested and inline controls,
+    // text boxes in the body, a cell and a header, complex fields, bookmarks
+    // and a comment range. Paragraphs of the raw parts carry their own
+    // namespace declarations: one redeclares an inherited prefix, one binds a
+    // second Word prefix and some are self-closing. The header uses another
+    // Word prefix and is also referenced as a footer, so its cells and text
+    // box are reached from two sources.
+    fn all_story_range_fixture() -> Document {
+        let w = WORD_NAMESPACE;
+        let r = drawing_ns::R;
+        let field = concat!(
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+            r#"<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        );
+        let text_box = |prefix: &str, text: &str| {
+            format!(
+                r#"<{prefix}:r><{prefix}:pict><v:shape><v:textbox><{prefix}:txbxContent><{prefix}:p><{prefix}:r><{prefix}:t>{text}</{prefix}:t></{prefix}:r></{prefix}:p><{prefix}:p xmlns:x="urn:box"/></{prefix}:txbxContent></v:textbox></v:shape></{prefix}:pict></{prefix}:r>"#
+            )
+        };
+        let body = format!(
+            concat!(
+                r#"<w:p><w:bookmarkStart w:id="1" w:name="BodyMark"/><w:r><w:t>body</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#,
+                r#"<w:p><w:r><w:t>page </w:t></w:r>{field}<w:sdt><w:sdtContent><w:r><w:t>inline control</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
+                r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc>"#,
+                r#"<w:tc><w:p><w:r><w:t>outer cell</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>nested cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:tc>"#,
+                r#"<w:tc><w:p>{cell_box}</w:p></w:tc></w:tr></w:tbl>"#,
+                r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>control</w:t></w:r></w:p><w:sdt><w:sdtContent><w:p><w:r><w:t>nested control</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>control end</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
+                r#"<w:p>{body_box}</w:p>"#,
+                r#"<w:p><w:commentRangeStart w:id="2"/><w:r><w:t>commented</w:t></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r></w:p>"#,
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="storyHeader"/><w:footerReference w:type="default" r:id="storyFooter"/><w:footerReference w:type="first" r:id="storyHeaderAsFooter"/></w:sectPr>"#,
+            ),
+            field = field,
+            cell_box = text_box("w", "cell text box"),
+            body_box = text_box("w", "body text box"),
+        );
+        let header = format!(
+            concat!(
+                r#"<q:hdr xmlns:q="{w}" xmlns:x="urn:producer" xmlns:v="urn:schemas-microsoft-com:vml">"#,
+                r#"<q:p><q:bookmarkStart q:id="3" q:name="HeaderMark"/><q:r><q:t>header</q:t></q:r><q:bookmarkEnd q:id="3"/></q:p>"#,
+                r#"<q:p xmlns:x="urn:other"><q:r><q:t>redeclared</q:t></q:r></q:p>"#,
+                r#"<q:p xmlns:z="{w}"><z:r><z:t>own word prefix</z:t></z:r></q:p>"#,
+                r#"<q:p xmlns:x="urn:empty"/>"#,
+                r#"<q:p>{field}</q:p>"#,
+                r#"<q:tbl><q:tr><q:tc><q:p><q:r><q:t>header cell</q:t></q:r></q:p></q:tc><q:tc><q:p>{header_box}</q:p></q:tc></q:tr></q:tbl>"#,
+                r#"<q:sdt><q:sdtContent><q:p><q:r><q:t>header control</q:t></q:r></q:p></q:sdtContent></q:sdt>"#,
+                r#"</q:hdr>"#,
+            ),
+            w = w,
+            field = field.replace("w:", "q:"),
+            header_box = text_box("q", "header text box"),
+        );
+        let mut seed = Document::new();
+        let mut package = OpcPackage::from_reader(Cursor::new(seed.to_bytes().unwrap())).unwrap();
+        package.set_part(
+            "/word/document.xml",
+            format!(
+                r#"<w:document xmlns:w="{w}" xmlns:r="{r}" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:x="urn:producer"><w:body>{body}</w:body></w:document>"#
+            )
+            .into_bytes(),
+        );
+        let relationships = package.get_or_create_part_rels("/word/document.xml");
+        for (id, relationship_type, target) in [
+            ("storyHeader", rel_types::HEADER, "header-story.xml"),
+            ("storyHeaderAsFooter", rel_types::FOOTER, "header-story.xml"),
+            ("storyFooter", rel_types::FOOTER, "footer-story.xml"),
+            (
+                "storyFootnotes",
+                rel_types::FOOTNOTES,
+                "footnotes-story.xml",
+            ),
+            ("storyEndnotes", rel_types::ENDNOTES, "endnotes-story.xml"),
+            ("storyComments", rel_types::COMMENTS, "comments-story.xml"),
+        ] {
+            relationships.add_with_id(id, relationship_type, target);
+        }
+        for (part, family, xml) in [
+            ("header-story.xml", "header", header),
+            (
+                "footer-story.xml",
+                "footer",
+                format!(
+                    r#"<w:ftr xmlns:w="{w}"><w:p><w:r><w:t>footer</w:t></w:r></w:p><w:p><w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:ftr>"#
+                ),
+            ),
+            (
+                "footnotes-story.xml",
+                "footnotes",
+                format!(
+                    r#"<w:footnotes xmlns:w="{w}"><w:footnote w:id="2"><w:p><w:bookmarkStart w:id="4" w:name="NoteMark"/><w:r><w:t>footnote</w:t></w:r><w:bookmarkEnd w:id="4"/></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>note cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:footnote></w:footnotes>"#
+                ),
+            ),
+            (
+                "endnotes-story.xml",
+                "endnotes",
+                format!(
+                    r#"<w:endnotes xmlns:w="{w}"><w:endnote w:id="2"><w:p><w:r><w:t>endnote</w:t></w:r></w:p><w:sdt><w:sdtContent><w:p><w:r><w:t>endnote control</w:t></w:r></w:p></w:sdtContent></w:sdt></w:endnote></w:endnotes>"#
+                ),
+            ),
+            (
+                "comments-story.xml",
+                "comments",
+                format!(
+                    r#"<w:comments xmlns:w="{w}"><w:comment w:id="2" w:author="Ada"><w:p><w:r><w:t>comment</w:t></w:r></w:p><w:p xmlns:x="urn:comment"><w:r><w:t>second</w:t></w:r></w:p></w:comment></w:comments>"#
+                ),
+            ),
+        ] {
+            let part = format!("/word/{part}");
+            package.set_part(&part, xml.into_bytes());
+            package.content_types.add_override(
+                &part,
+                &format!(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.{family}+xml"
+                ),
+            );
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        package.write_to(&mut bytes).unwrap();
+        Document::from_bytes(bytes.get_ref()).unwrap()
+    }
+
+    fn authored_story_range_fixture() -> Document {
+        let mut document = Document::new();
+        document.add_paragraph("Introduction");
+        let mut table = document.add_table(3, 3);
+        for row in 0..3 {
+            for column in 0..3 {
+                table
+                    .cell(row, column)
+                    .unwrap()
+                    .set_text(&format!("cell {row} {column}"));
+            }
+        }
+        document.add_paragraph("Commented text");
+        document.set_header("header");
+        document.set_footer("footer");
+        document.add_footnote("footnote");
+        document
+            .add_comment_on_text("Commented", 0, "Ada", None, "note", None)
+            .unwrap();
+        document.insert_toc(0, 3).unwrap();
+        Document::from_bytes(&document.to_bytes().unwrap()).unwrap()
+    }
+
+    // Namespace declarations that the typed main document drops, so the
+    // rich comment projection replays them on a restored main source.
+    fn restored_comment_story_range_fixture() -> Document {
+        let mut seed = Document::new();
+        seed.add_paragraph("A");
+        let id = seed
+            .add_comment_on_text("A", 0, "Ada", None, "Review", None)
+            .unwrap();
+        let body = format!(
+            concat!(
+                r#"<w:p xmlns:x="urn:x"><w:commentRangeStart w:id="{id}"/><w:r><w:t>A</w:t></w:r><w:r><x:custom x:a="1"/></w:r><w:commentRangeEnd w:id="{id}"/><w:r><w:commentReference w:id="{id}"/></w:r></w:p>"#,
+                r#"<w:tbl xmlns:x="urn:x"><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r><x:custom x:a="2"/></w:p></w:tc></w:tr></w:tbl>"#,
+                r#"<w:sdt><w:sdtContent><w:p xmlns:x="urn:x"><w:r><w:t>control</w:t></w:r><w:r><x:custom x:a="3"/></w:r></w:p></w:sdtContent></w:sdt>"#,
+                r#"<w:p/>"#,
+            ),
+            id = id,
+        );
+        let mut package = OpcPackage::from_reader(Cursor::new(seed.to_bytes().unwrap())).unwrap();
+        package.set_part(
+            "/word/document.xml",
+            format!(
+                r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body>{body}</w:body></w:document>"#
+            )
+            .into_bytes(),
+        );
+        let mut bytes = Cursor::new(Vec::new());
+        package.write_to(&mut bytes).unwrap();
+        Document::from_bytes(bytes.get_ref()).unwrap()
+    }
+
+    // A self-closing owner, here an empty comment, holds no paragraph. A scan
+    // from the start of its source used to run past it and fail at the next
+    // closing tag, which broke the comment listing and page field updates.
+    #[test]
+    fn story_range_paragraphs_match_the_per_story_scan() {
+        let all = all_story_range_fixture();
+        let paragraphs = all.story_range_paragraphs().unwrap();
+        assert_eq!(
+            paragraphs
+                .iter()
+                .map(|(location, _)| location.story().kind())
+                .collect::<HashSet<_>>()
+                .len(),
+            8
+        );
+        assert!(
+            paragraphs
+                .iter()
+                .any(|(location, _)| location.index_path().len() == 2)
+        );
+        assert!(!all.text_box_cache_paragraphs().unwrap().is_empty());
+        assert_eq!(
+            all.story_sources()
+                .unwrap()
+                .iter()
+                .filter(|source| source.part_name == "/word/header-story.xml")
+                .count(),
+            2
+        );
+        let restored = restored_comment_story_range_fixture();
+        assert_ne!(
+            restored.namespace_restored_main_source().unwrap(),
+            restored.document.to_xml().unwrap()
+        );
+
+        for document in [all, authored_story_range_fixture(), restored] {
+            assert_eq!(
+                document.story_range_paragraphs().unwrap(),
+                reference_story_range_paragraphs(&document).unwrap()
+            );
+            assert_eq!(
+                document.comment_story_range_paragraphs().unwrap(),
+                reference_comment_story_range_paragraphs(&document).unwrap()
+            );
+            assert_eq!(
+                document
+                    .text_box_cache_paragraphs()
+                    .unwrap()
+                    .into_iter()
+                    .map(|paragraph| (
+                        paragraph.location,
+                        paragraph.xml,
+                        paragraph.owner_index,
+                        paragraph.paragraph_index
+                    ))
+                    .collect::<Vec<_>>(),
+                reference_text_box_cache_paragraphs(&document).unwrap()
+            );
+            // The batched spans also match for every owner of every source,
+            // including owners `stories` reports from an earlier source.
+            for source in document.story_sources().unwrap() {
+                let owners = scan_story_owners(&source.xml, source.root_kind)
+                    .unwrap()
+                    .into_iter()
+                    .map(|owner| {
+                        let story = StoryId {
+                            kind: owner.kind,
+                            part_name: source.part_name.clone(),
+                            owner_index: owner.owner_index,
+                            fingerprint: owner.fingerprint,
+                        };
+                        (story, owner)
+                    })
+                    .collect::<Vec<_>>();
+                let mut reference = Vec::new();
+                for (story, owner) in &owners {
+                    reference.extend(
+                        reference_story_range_paragraph_spans(&source.xml, owner, story).unwrap(),
+                    );
+                }
+                assert_eq!(
+                    story_range_paragraph_spans(&source.xml, &owners)
+                        .unwrap()
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                    reference
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn story_excerpt_scope_preserves_single_root_local_declarations() {
+        let xml = format!(
+            r#"<q:document xmlns:q="{WORD_NAMESPACE}" xmlns:x="urn:ancestor"><q:body><q:p xmlns:x="{WORD_NAMESPACE}"><x:r><x:t>local</x:t></x:r></q:p><q:p xmlns:x="urn:empty"/></q:body></q:document>"#
+        );
+        let start = xml.find("<q:p ").unwrap();
+        let empty = xml.find(r#"<q:p xmlns:x="urn:empty"/>"#).unwrap();
+        let scopes = story_namespace_scopes_at(xml.as_bytes(), [start, empty]).unwrap();
+        assert_eq!(scopes[&start]["x"], "urn:ancestor");
+        assert_eq!(scopes[&empty]["x"], "urn:ancestor");
+        let end = start + xml[start..].find("</q:p>").unwrap() + "</q:p>".len();
+        let (closed, _) =
+            scoped_story_fragment(xml.as_bytes(), start..end, &scopes[&start]).unwrap();
+        let item = StoryItemSpan {
+            kind: StoryItemKind::Paragraph,
+            full: start..end,
+            scan: start..end,
+            direct_owner_child: true,
+            complex_field: false,
+            complex_ancestors: Vec::new(),
+            sdt_context: None,
+        };
+        assert_eq!(
+            story_item_text_with_scope(xml.as_bytes(), &item, &scopes[&start], &[])
+                .unwrap()
+                .as_deref(),
+            Some("local")
+        );
+        assert!(
+            String::from_utf8(closed)
+                .unwrap()
+                .contains(&format!(r#"xmlns:x="{WORD_NAMESPACE}""#))
+        );
+        assert_eq!(
+            story_namespace_scope_at(xml.as_bytes(), start).unwrap()["x"],
+            WORD_NAMESPACE
+        );
+    }
+
+    #[test]
+    fn complex_field_excerpt_link_offsets_preserve_exact_source_bytes() {
+        // This tests the private projection mechanism. Public typed discovery
+        // deliberately does not admit a hyperlink wrapper inside a field span.
+        let field = concat!(
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+            r#"<w:r><w:instrText> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#,
+            r#"<w:hyperlink r:id="rIdActual"><w:r><w:t>7</w:t></w:r></w:hyperlink>"#,
+            r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        );
+        for (word_prefix, rel_prefix, first_local) in
+            [("w", "r", false), ("q", "rel", false), ("q", "rel", true)]
+        {
+            let mut field = field
+                .replace("w:", &format!("{word_prefix}:"))
+                .replace("r:id", &format!("{rel_prefix}:id"));
+            if first_local {
+                field = field.replacen(
+                    &format!("<{word_prefix}:r>"),
+                    &format!(r#"<{word_prefix}:r xmlns:{rel_prefix}="urn:first-run">"#),
+                    1,
+                );
+            }
+            let xml = format!(
+                r#"<{word_prefix}:document xmlns:{word_prefix}="{WORD_NAMESPACE}" xmlns:{rel_prefix}="{}" xmlns:x="urn:producer&amp;escaped"><{word_prefix}:body><{word_prefix}:p><{word_prefix}:hyperlink {rel_prefix}:id="rIdBefore"><{word_prefix}:r><{word_prefix}:t>before</{word_prefix}:t></{word_prefix}:r></{word_prefix}:hyperlink>{field}<{word_prefix}:hyperlink {word_prefix}:anchor="after"><{word_prefix}:r><{word_prefix}:t>after</{word_prefix}:t></{word_prefix}:r></{word_prefix}:hyperlink></{word_prefix}:p></{word_prefix}:body></{word_prefix}:document>"#,
+                drawing_ns::R
+            );
+            let start = xml.find(&field).unwrap();
+            let end = start + field.len();
+            let item = StoryItemSpan {
+                kind: StoryItemKind::Field,
+                full: start + field.find('>').unwrap() + 1
+                    ..end - format!("</{word_prefix}:r>").len(),
+                scan: start..end,
+                direct_owner_child: false,
+                complex_field: true,
+                complex_ancestors: vec![0],
+                sdt_context: None,
+            };
+            let scope = story_namespace_scopes_at(xml.as_bytes(), [start])
+                .unwrap()
+                .remove(&start)
+                .unwrap();
+            let (closed, local, _) = scoped_story_item(xml.as_bytes(), &item, &scope).unwrap();
+            assert_eq!(&closed[local.scan.clone()], field.as_bytes());
+            assert_eq!(
+                &closed[local.full.clone()],
+                &xml.as_bytes()[item.full.clone()]
+            );
+            assert!(local.complex_ancestors.is_empty());
+            assert_eq!(
+                story_item_text_with_scope(xml.as_bytes(), &item, &scope, &[])
+                    .unwrap()
+                    .as_deref(),
+                Some("7")
+            );
+            let links = scan_story_item_links_with_scope(xml.as_bytes(), &item, &scope).unwrap();
+            assert_eq!(links.len(), 1);
+            let expected = format!(
+                r#"<{word_prefix}:hyperlink {rel_prefix}:id="rIdActual"><{word_prefix}:r><{word_prefix}:t>7</{word_prefix}:t></{word_prefix}:r></{word_prefix}:hyperlink>"#
+            );
+            assert_eq!(&xml.as_bytes()[links[0].full.clone()], expected.as_bytes());
+            assert_eq!(links[0].full.start, xml.find(&expected).unwrap());
+            assert_eq!(links[0].rel_id.as_deref(), Some("rIdActual"));
+            let mut invalid = item.clone();
+            invalid.full.start = start - 1;
+            assert!(scoped_story_item(xml.as_bytes(), &invalid, &scope).is_err());
         }
     }
 
@@ -26710,10 +41573,81 @@ mod tests {
                 [StoryItemKind::Paragraph]
             );
             assert_eq!(
-                story_item_text(xml.as_bytes(), &body_items[0]).unwrap(),
+                story_item_text(xml.as_bytes(), &body_items[0], &[], 0..xml.len(), 0).unwrap(),
                 Some("host".to_owned())
             );
         }
+    }
+
+    /// A run's `w:tab`, empty or not, reads as a tab. A tab stop in the
+    /// paragraph properties and a tab in a deleted run do not.
+    #[test]
+    fn fx203_validation_styles_select_qualified_first_supported_mc_branches() {
+        let word = W_NS;
+        let mc = MC_NS;
+        let source = format!(
+            r#"<w:document xmlns:w="{word}" xmlns:mc="{mc}" xmlns:x="urn:unsupported" xmlns:q="{word}"><w:body><w:pStyle w:val="before"/><mc:AlternateContent><mc:Choice Requires="x"><w:pStyle w:val="phantom"/></mc:Choice><mc:Choice Requires="q"><w:rStyle w:val="chosen"/></mc:Choice><mc:Choice Requires="w"><w:pStyle w:val="second"/></mc:Choice><mc:Fallback><w:pStyle w:val="fallback"/></mc:Fallback></mc:AlternateContent><w:tblStyle w:val="after"/></w:body></w:document>"#
+        );
+        assert_eq!(
+            document_style_references(source.as_bytes()).unwrap(),
+            [
+                ("paragraph", "before".into()),
+                ("character", "chosen".into()),
+                ("table", "after".into())
+            ]
+        );
+        let rebound = source.replace(
+            "<mc:Choice Requires=\"q\">",
+            "<mc:Choice xmlns:q=\"urn:foreign\" Requires=\"q\">",
+        );
+        assert_eq!(
+            document_style_references(rebound.as_bytes()).unwrap()[1],
+            ("paragraph", "second".into())
+        );
+        let fallback = rebound.replace(
+            "<mc:Choice Requires=\"w\">",
+            "<mc:Choice xmlns:w=\"urn:foreign\" Requires=\"w\">",
+        );
+        assert_eq!(
+            document_style_references(fallback.as_bytes()).unwrap(),
+            [
+                ("paragraph", "before".into()),
+                ("paragraph", "fallback".into()),
+                ("table", "after".into())
+            ]
+        );
+        let foreign = source.replace(
+            "<mc:Choice Requires=\"q\">",
+            "<mc:Choice xmlns:mc=\"urn:foreign\" Requires=\"q\">",
+        );
+        assert_eq!(
+            document_style_references(foreign.as_bytes()).unwrap()[1],
+            ("paragraph", "second".into())
+        );
+        assert!(
+            document_style_references(source.replace("</mc:Fallback>", "</mc:Choice>").as_bytes())
+                .is_err()
+        );
+        assert!(document_style_references(format!("{source}<other/>").as_bytes()).is_err());
+        assert!(document_style_references(b"<w:document").is_err());
+    }
+
+    #[test]
+    fn story_item_text_reads_run_tabs_only() {
+        let xml = format!(
+            r#"<w:document xmlns:w="{WORD_NAMESPACE}"><w:body><w:p><w:pPr><w:tabs><w:tab w:val="right" w:pos="9000"/><w:tab w:val="left" w:pos="100"></w:tab></w:tabs></w:pPr><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t></w:r><w:del w:id="1" w:author="A"><w:r><w:tab/></w:r></w:del><w:r><w:tab></w:tab><w:t>c</w:t></w:r></w:p><w:p><w:r><w:tab/></w:r></w:p></w:body></w:document>"#
+        );
+
+        let owners = scan_story_owners(xml.as_bytes(), StoryKind::Body).unwrap();
+        let items = scan_story_items(xml.as_bytes(), &owners[0]).unwrap();
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| story_item_text(xml.as_bytes(), item, &[], 0..xml.len(), 0).unwrap())
+                .collect::<Vec<_>>(),
+            [Some("a\tb\tc".to_owned()), Some("\t".to_owned())]
+        );
     }
 
     #[test]
@@ -26794,7 +41728,7 @@ mod tests {
     }
 
     #[test]
-    fn same_part_normalized_drawing_ids_remain_invalid() {
+    fn same_part_normalized_drawing_ids_are_counted_not_refused() {
         let mut package =
             OpcPackage::with_main_part("word/document.xml", content_types::WORD_DOCUMENT);
         package.set_part(
@@ -26805,8 +41739,12 @@ mod tests {
             )
             .into_bytes(),
         );
-        let error = DocumentIdentifiers::scan(&package).unwrap_err();
-        assert!(error.to_string().contains("duplicate drawing id 1"));
+        let mut identifiers = DocumentIdentifiers::scan(&package).unwrap();
+        assert_eq!(
+            identifiers.repeated_drawing_ids,
+            HashMap::from([("/word/document.xml".to_owned(), HashMap::from([(1, 2)]))])
+        );
+        assert_eq!(identifiers.reserve_drawing_id().unwrap(), 2);
     }
 
     #[test]
@@ -28129,6 +43067,8 @@ mod tests {
                 anchor: None,
                 name: None,
                 description: None,
+                title: None,
+                decorative: false,
             },
         );
         assert!(result.is_err());
@@ -28792,6 +43732,236 @@ mod tests {
     }
 
     #[test]
+    fn fx195_native_selected_pages_and_revision_options_keep_caller_bundle() {
+        let (family, bytes) = caller_only_font();
+        let mut document = Document::new();
+        document
+            .add_paragraph("caller first")
+            .add_run("iiiiWWWW")
+            .font(family);
+        let revision_xml = format!(
+            r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="{family}" w:hAnsi="{family}"/></w:rPr><w:t>WWWWiiii</w:t></w:r><w:ins w:id="195" w:author="Caller control"><w:r><w:rPr><w:rFonts w:ascii="{family}" w:hAnsi="{family}"/></w:rPr><w:t>INSERTED</w:t></w:r></w:ins><w:del w:id="196" w:author="Caller control"><w:r><w:rPr><w:rFonts w:ascii="{family}" w:hAnsi="{family}"/></w:rPr><w:delText>DELETED</w:delText></w:r></w:del></w:p>"#
+        );
+        let revised = CT_P::from_xml_fragment(revision_xml.as_bytes()).unwrap();
+        assert_eq!(revised.revisions.len(), 2, "both revisions must be typed");
+        assert_eq!(
+            revised.revisions[0].2.kind(),
+            rdocx_oxml::revision::RevisionKind::Insertion
+        );
+        assert_eq!(
+            revised.revisions[1].2.kind(),
+            rdocx_oxml::revision::RevisionKind::Deletion
+        );
+        assert_eq!(revised.accepted_text(), "WWWWiiiiINSERTED");
+        document
+            .document
+            .body
+            .content
+            .push(BodyContent::Paragraph(revised));
+        let source_before = document.document.to_xml().unwrap();
+        let source_xml = std::str::from_utf8(&source_before).unwrap();
+        assert!(source_xml.contains("<w:ins ") && source_xml.contains("<w:del "));
+        assert!(source_xml.contains("INSERTED") && source_xml.contains("DELETED"));
+        let before = document.to_bytes().unwrap();
+        let inputs = [(family, bytes.as_slice())];
+        let mut rendered_views = Vec::new();
+        for options in [
+            RenderOptions::default(),
+            RenderOptions {
+                revision_view: rdocx_layout::RevisionView::Tracked,
+                revision_style: rdocx_layout::RevisionStyle::Plain,
+            },
+        ] {
+            reset_layout_invocations();
+            let layout = document
+                .layout_with_additional_fonts_and_options(&inputs, options)
+                .unwrap();
+            assert_eq!(layout_invocations(), 1);
+            assert_eq!(layout.revision_view, options.revision_view);
+            assert_eq!(layout.layout.pages.len(), 2);
+            assert!(
+                layout
+                    .layout
+                    .fonts
+                    .iter()
+                    .any(|font| font.data.as_ref() == bytes.as_slice())
+            );
+            let tracked = options.revision_view == rdocx_layout::RevisionView::Tracked;
+            let mut visible_text = String::new();
+            oxml_layout::walk(&layout.layout.pages[1].elements, &mut |element, _| {
+                if let oxml_layout::PositionedElement::Text(run) = element {
+                    visible_text.push_str(&run.text);
+                    let selected = layout
+                        .layout
+                        .fonts
+                        .iter()
+                        .find(|font| font.id == run.font_id)
+                        .unwrap();
+                    assert_eq!(selected.data.as_ref(), bytes.as_slice());
+                    assert_eq!(selected.face_index, 0);
+                    assert_eq!(selected.family, family);
+                }
+            });
+            assert_eq!(
+                visible_text,
+                if tracked {
+                    "WWWWiiiiINSERTEDDELETED"
+                } else {
+                    "WWWWiiiiINSERTED"
+                },
+                "revision selection must affect actual shaped content"
+            );
+            let mut raster_results = Vec::new();
+            for format in [
+                oxml_pdf::RasterFormat::Png {
+                    transparent_background: false,
+                },
+                oxml_pdf::RasterFormat::Jpeg { quality: 80 },
+                oxml_pdf::RasterFormat::Tiff,
+            ] {
+                let raster = oxml_pdf::RasterOptions { dpi: 72.0, format };
+                reset_layout_invocations();
+                let rendered = document
+                    .render_pages_with_fonts_and_options(&[1], raster, &inputs, options)
+                    .unwrap();
+                assert_eq!(
+                    rendered,
+                    oxml_pdf::render_pages(&layout.layout, &[1], raster).unwrap()
+                );
+                assert_eq!(layout_invocations(), 1);
+                raster_results.push(rendered);
+                assert!(
+                    document
+                        .render_pages_with_fonts_and_options(&[2], raster, &inputs, options)
+                        .is_err()
+                );
+            }
+            let png = document
+                .render_page_to_png_with_fonts_and_options(1, 72.0, &inputs, options)
+                .unwrap();
+            assert_eq!(png, oxml_pdf::render_page_to_png(&layout.layout, 1, 72.0));
+            let svg = document
+                .render_page_to_svg_with_fonts_and_options(1, &inputs, options)
+                .unwrap();
+            assert_eq!(svg, crate::svg::render_page(&layout.layout, 1));
+            let svg_text = &svg.as_ref().unwrap().svg;
+            assert!(svg_text.contains("INSERTED"));
+            assert_eq!(svg_text.contains("DELETED"), tracked);
+            assert!(
+                document
+                    .render_page_to_svg_with_fonts_and_options(2, &inputs, options)
+                    .unwrap()
+                    .is_none()
+            );
+            let bundled = document
+                .layout_with_fonts_and_bundled_fallback_and_options(&inputs, options)
+                .unwrap();
+            let pdf = document
+                .to_pdf_with_fonts_deterministic_and_options(&inputs, options)
+                .unwrap();
+            assert_eq!(
+                pdf,
+                oxml_pdf::render_to_pdf_checked(&bundled.layout).unwrap()
+            );
+            rendered_views.push((pdf, png, svg, raster_results));
+            assert_eq!(document.document.to_xml().unwrap(), source_before);
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        assert_ne!(
+            rendered_views[0].0, rendered_views[1].0,
+            "PDF revision view"
+        );
+        assert_ne!(
+            rendered_views[0].1, rendered_views[1].1,
+            "PNG revision view"
+        );
+        assert_ne!(
+            rendered_views[0].2, rendered_views[1].2,
+            "SVG revision view"
+        );
+        for (accepted, tracked) in rendered_views[0].3.iter().zip(&rendered_views[1].3) {
+            assert_ne!(
+                accepted, tracked,
+                "each selected raster format honors revisions"
+            );
+        }
+        let bundled = document
+            .layout_with_fonts_and_bundled_fallback(&inputs)
+            .unwrap();
+        let profile = oxml_pdf::PdfConformance::PdfA2b;
+        assert_eq!(
+            document
+                .to_pdfa_with_fonts_deterministic(&inputs, profile)
+                .unwrap(),
+            oxml_pdf::render_to_pdf_with_options(
+                &bundled.layout,
+                oxml_pdf::PdfOptions::new(profile)
+            )
+            .unwrap()
+        );
+        let first = document.to_pdf_with_fonts(&inputs).unwrap();
+        assert_eq!(document.to_pdf_with_fonts(&inputs).unwrap(), first);
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn fx195_additional_caller_fonts_share_native_output_bundle() {
+        let (family, bytes) = caller_only_font();
+        let mut document = Document::new();
+        document.add_paragraph("caller geometry");
+        document
+            .paragraph_mut(0)
+            .unwrap()
+            .run_mut(0)
+            .expect("caller geometry fixture has a run")
+            .set_font(family);
+        let inputs = [(family, bytes.as_slice())];
+        let options = RenderOptions::default();
+        let layout = document
+            .layout_with_additional_fonts_and_options(&inputs, options)
+            .unwrap();
+        assert!(layout.layout.fonts.iter().any(|font| font.family == family
+            && font.data.as_ref() == bytes.as_slice()
+            && font.face_index == 0));
+        let before = document.to_bytes().unwrap();
+        assert_eq!(
+            document
+                .to_pdf_with_fonts_and_options(&inputs, options)
+                .unwrap(),
+            oxml_pdf::render_to_pdf_checked(&layout.layout).unwrap()
+        );
+        assert_eq!(
+            document
+                .render_page_to_png_with_fonts_and_options(0, 72.0, &inputs, options)
+                .unwrap(),
+            oxml_pdf::render_page_to_png(&layout.layout, 0, 72.0)
+        );
+        assert_eq!(
+            document
+                .render_all_pages_with_fonts_and_options(72.0, &inputs, options)
+                .unwrap(),
+            oxml_pdf::render_all_pages(&layout.layout, 72.0)
+        );
+        assert_eq!(
+            document
+                .render_page_to_svg_with_fonts_and_options(0, &inputs, options)
+                .unwrap(),
+            crate::svg::render_page(&layout.layout, 0)
+        );
+        assert!(
+            document
+                .render_page_to_png_with_fonts_and_options(usize::MAX, 72.0, &inputs, options)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert_eq!(
+            document.to_pdf_with_fonts(&[]).unwrap(),
+            document.to_pdf().unwrap()
+        );
+    }
+
+    #[test]
     fn body_items_preserve_paragraph_table_control_and_raw_order() {
         let mut doc = Document::new();
         doc.add_paragraph("first");
@@ -28888,6 +44058,7 @@ mod tests {
         doc.add_paragraph("tracked view");
         let options = RenderOptions {
             revision_view: rdocx_layout::RevisionView::Tracked,
+            revision_style: rdocx_layout::RevisionStyle::Plain,
         };
 
         reset_layout_invocations();
@@ -29066,7 +44237,7 @@ mod tests {
         document.settings =
             Some(CT_Settings::from_xml(settings_xml.as_bytes()).expect("math settings parse"));
 
-        let input = document.build_layout_input();
+        let input = document.build_layout_input().unwrap();
         assert_eq!(
             input
                 .math_properties
@@ -29754,6 +44925,7 @@ mod tests {
         doc.add_paragraph("revision cache separation");
         let tracked = RenderOptions {
             revision_view: rdocx_layout::RevisionView::Tracked,
+            revision_style: rdocx_layout::RevisionStyle::Plain,
         };
 
         reset_layout_invocations();
@@ -29794,6 +44966,7 @@ mod tests {
         doc.add_paragraph("tracked engine reuse");
         let tracked = RenderOptions {
             revision_view: rdocx_layout::RevisionView::Tracked,
+            revision_style: rdocx_layout::RevisionStyle::Plain,
         };
 
         let first = doc
@@ -30731,7 +45904,7 @@ mod tests {
     }
 
     fn deterministic_chart_layout(document: &Document) -> oxml_layout::LayoutResult {
-        rdocx_layout::layout_document_deterministic(&document.build_layout_input())
+        rdocx_layout::layout_document_deterministic(&document.build_layout_input().unwrap())
             .expect("deterministic Word chart layout")
     }
 
@@ -30878,7 +46051,7 @@ mod tests {
             .get_or_create_part_rels("/word/document.xml")
             .add(rel_types::THEME, "theme/custom-chart-theme.xml");
 
-        let input = document.build_layout_input();
+        let input = document.build_layout_input().unwrap();
         assert_eq!(
             input.chart_color_map,
             oxml_drawing::color::ColorMap::default()
@@ -30965,9 +46138,9 @@ mod tests {
         const CROP_WIDTH: &str = "750";
         const CROP_HEIGHT: &str = "450";
         const WORD_SHA256: &str =
-            "9acea62539e90e39078a3502c2f2a109073d60497a50db89bac065bd2b4785cf";
+            "5046f7a0f2305518ec8a0c439b2df482790f29c05e41f6f5ef1d49dbb5473348";
         const POWERPOINT_SHA256: &str =
-            "8edda1371d1da30b937108fc1cfa3366467c9dbeb90934391c160b532781eef1";
+            "79354125ec3c356ad4f5ff1fa3bb773b5938c57a92c249dc13770ab902c62ec6";
 
         let data = f158_chart_data(2);
         let evidence_dir = std::env::temp_dir();
@@ -31360,6 +46533,63 @@ mod tests {
     }
 
     #[test]
+    fn fx215_word_chart_after_direct_paragraph_is_atomic_and_ordered() {
+        let mut document = Document::new();
+        document.add_paragraph("before");
+        document.add_table(1, 1);
+        document.add_paragraph("after");
+        document
+            .add_chart_after(
+                0,
+                ChartKind::Bar,
+                Length::inches(4.0),
+                Length::inches(2.0),
+                &f158_chart_data(2),
+            )
+            .unwrap();
+        assert!(matches!(
+            document.document.body.content[1],
+            BodyContent::Paragraph(_)
+        ));
+        assert!(matches!(
+            document.document.body.content[2],
+            BodyContent::Table(_)
+        ));
+        assert_eq!(document.paragraph(0).unwrap().text(), "before");
+        assert_eq!(document.paragraph(2).unwrap().text(), "after");
+        let before = document.to_bytes().unwrap();
+        assert!(
+            document
+                .add_chart_after(
+                    usize::MAX,
+                    ChartKind::Line,
+                    Length::inches(4.0),
+                    Length::inches(2.0),
+                    &f158_chart_data(2)
+                )
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let mut invalid = f158_chart_data(2);
+        invalid.series[0].1[0] = f64::NAN;
+        assert!(
+            document
+                .add_chart_after(
+                    0,
+                    ChartKind::Line,
+                    Length::inches(4.0),
+                    Length::inches(2.0),
+                    &invalid
+                )
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let reopened = Document::from_bytes(&before).unwrap();
+        assert_eq!(reopened.paragraph_count(), 3);
+        assert_eq!(reopened.table_count(), 1);
+    }
+
+    #[test]
     fn word_add_chart_uses_inline_flow_placement() {
         let mut document = Document::new();
         let width = Length::inches(5.0);
@@ -31467,14 +46697,26 @@ mod tests {
             .collect()
     }
 
-    fn deterministic_page_sha(label: &str, png: &[u8]) -> String {
-        let png_path = std::env::temp_dir().join(format!(
-            "rdocx-fx092-{label}-render-{}.png",
-            std::process::id()
-        ));
-        fs::write(&png_path, png).expect("write deterministic raster candidate");
+    fn rendered_pdf_page_sha(label: &str, pdf: &[u8]) -> String {
+        let prefix =
+            std::env::temp_dir().join(format!("rdocx-fx092-{label}-render-{}", std::process::id()));
+        let pdf_path = prefix.with_extension("pdf");
+        let png_path = prefix.with_extension("png");
+        fs::write(&pdf_path, pdf).expect("write PDF raster candidate");
+        let output = Command::new("pdftoppm")
+            .args(["-png", "-r", "72", "-f", "1", "-l", "1", "-singlefile"])
+            .arg(&pdf_path)
+            .arg(&prefix)
+            .output()
+            .expect("run pinned pdftoppm");
+        assert!(
+            output.status.success(),
+            "pdftoppm failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let digest = sha256(&png_path);
-        fs::remove_file(png_path).expect("remove deterministic raster candidate");
+        fs::remove_file(pdf_path).expect("remove PDF raster candidate");
+        fs::remove_file(png_path).expect("remove PDF raster output");
         digest
     }
 
@@ -31487,6 +46729,14 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&version.stderr).lines().next(),
             Some("pdftotext version 26.01.0")
+        );
+        let version = Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .expect("run pinned pdftoppm version check");
+        assert_eq!(
+            String::from_utf8_lossy(&version.stderr).lines().next(),
+            Some("pdftoppm version 26.01.0")
         );
 
         let mut word = Document::new();
@@ -31529,18 +46779,37 @@ mod tests {
 
         let word_pdf = word.to_pdf_deterministic().expect("render Word PDF");
         assert_eq!(extracted_logical_lines("word", &word_pdf), expected_word);
-        // Pin the bundled-font layout with the repository's deterministic rasterizer.
-        // Poppler PNG hashes also depend on host FreeType and PNG libraries.
-        // The extracted PDF text above checks the PDF writer's logical ordering.
+        // Requested bold variable CJK selects weight 700 instead of the default Thin face.
+        // Paired source-bound captures isolate the instance advance and outline change.
         assert_eq!(
-            deterministic_page_sha(
-                "word",
-                &word
-                    .render_page_to_png_deterministic(0, 72.0)
-                    .expect("render Word page")
-                    .expect("Word first page"),
-            ),
-            "befbd15a780ec945181f55a31a70dcaf816dbe9d61421f86a1798aae41bcfc1d"
+            rendered_pdf_page_sha("word", &word_pdf),
+            "6b0dd949e017453379f25dde824d2d0dadd108afc3ce99a1c09dc81045960c16"
+        );
+
+        // The all-regular control retains the same three-run segmentation and default face.
+        let mut regular = Document::new();
+        for index in 0..120 {
+            let mut paragraph = regular.add_paragraph("");
+            paragraph.add_run(&format!("FX092-WORD-{index:03} alpha "));
+            paragraph.add_run("中文 ");
+            paragraph.add_run("beta gamma");
+        }
+        let regular_pdf = regular
+            .to_pdf_deterministic()
+            .expect("render regular Word PDF");
+        assert_eq!(
+            extracted_logical_lines("word-regular", &regular_pdf),
+            expected_word
+        );
+        assert_eq!(
+            regular
+                .to_pdf_deterministic()
+                .expect("repeat regular Word PDF"),
+            regular_pdf
+        );
+        assert_eq!(
+            rendered_pdf_page_sha("word-regular", &regular_pdf),
+            "f902ee1e9e2198ea4ebe172004d8e7f0e69ecf45d98c63fa02bbd93564e64a0b"
         );
 
         let presentation_pdf = presentation
@@ -31550,15 +46819,11 @@ mod tests {
             extracted_logical_lines("presentation", &presentation_pdf),
             expected_presentation
         );
+        // Recorded after PowerPoint line pitch, baseline placement and UAX 14
+        // spans moved the slide text, with the pinned Poppler build.
         assert_eq!(
-            deterministic_page_sha(
-                "presentation",
-                &presentation
-                    .slide_png_deterministic(0, 72.0)
-                    .expect("render presentation slide")
-                    .expect("presentation first slide"),
-            ),
-            "33ddb8d2d5883af16c56561e196be91b56098f2bbedb3beef73af721dcb77b1b"
+            rendered_pdf_page_sha("presentation", &presentation_pdf),
+            "963dc460e110aa260b7b0a4fbe4a77824b9cf9efe160ca45fdaf30ca08e31f52"
         );
     }
 
@@ -31587,7 +46852,7 @@ mod tests {
             .add(rel_types::IMAGE, "media/misleading.png");
 
         let html_input = document.build_html_input();
-        let layout_input = document.build_layout_input();
+        let layout_input = document.build_layout_input().unwrap();
 
         assert_eq!(
             html_input.images[&relationship_id].content_type,
@@ -31604,7 +46869,7 @@ mod tests {
         let mut doc = Document::new();
         doc.add_paragraph("Deterministic rendering");
 
-        let input = doc.build_layout_input();
+        let input = doc.build_layout_input().unwrap();
         let layout = rdocx_layout::layout_document_deterministic(&input)
             .expect("deterministic layout should succeed");
         let bundled_fonts = oxml_layout::bundled_fonts::bundled_font_data();
@@ -33756,6 +49021,633 @@ mod tests {
     }
 
     #[test]
+    fn visible_content_does_not_hide_malformed_remaining_xml() {
+        for ending in ["", "</w:r></w:body></w:document>"] {
+            let xml = format!(
+                r#"<w:document xmlns:w="{W_NS}"><w:body><w:p><w:r><w:drawing/></w:r></w:p>{ending}"#
+            );
+            assert!(
+                paragraph_visibility_from_main_source(
+                    &Document::new(),
+                    xml.as_bytes(),
+                    ParagraphVisibilityScope::FacadeRecursive
+                )
+                .is_err(),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_visibility_uses_current_picture_source_without_mutating_live_document() {
+        let mut document = Document::new();
+        document.add_paragraph("before");
+        document.add_picture(
+            super::watermark_tests::PNG,
+            "visible.png",
+            Length::inches(1.0),
+            Length::inches(1.0),
+        );
+        document.add_paragraph("");
+        let before_model = document.document.to_xml().unwrap();
+        let before_parts = document.package.parts.clone();
+        assert_eq!(
+            document.paragraph_visibility().unwrap(),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            document.paragraph_visibility().unwrap(),
+            vec![true, true, false]
+        );
+        assert_eq!(document.document.to_xml().unwrap(), before_model);
+        assert_eq!(document.package.parts, before_parts);
+        document.paragraph_mut(2).unwrap().add_run("unsaved");
+        let edited_model = document.document.to_xml().unwrap();
+        let edited_parts = document.package.parts.clone();
+        assert_eq!(
+            document.paragraph_visibility().unwrap(),
+            vec![true, true, true]
+        );
+        assert_eq!(document.document.to_xml().unwrap(), edited_model);
+        assert_eq!(document.package.parts, edited_parts);
+    }
+
+    #[test]
+    fn paragraph_visibility_checks_owner_slots_and_audit_direct_body_scope() {
+        let body = concat!(
+            "<w:p/><w:p/>",
+            "<w:sdt><w:sdtPr/><w:sdtContent><w:p><w:r><w:t>controlled</w:t></w:r></w:p><w:sdt><w:sdtPr/><w:sdtContent><w:p/></w:sdtContent></w:sdt></w:sdtContent></w:sdt>",
+            "<w:tbl><w:tblPr/><w:tblGrid/><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>excluded</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+            "<w:p/><w:p/><w:p/>",
+        );
+        let xml = format!(r#"<w:document xmlns:w="{W_NS}"><w:body>{body}</w:body></w:document>"#);
+        let mut document = Document::new();
+        document.document = rdocx_oxml::document::CT_Document::from_xml(xml.as_bytes()).unwrap();
+        assert_eq!(document.paragraphs().len(), 7);
+        assert_eq!(
+            paragraph_visibility_from_main_source(
+                &document,
+                xml.as_bytes(),
+                ParagraphVisibilityScope::FacadeRecursive
+            )
+            .unwrap(),
+            vec![false, false, true, false, false, false, false]
+        );
+        assert_eq!(
+            paragraph_visibility_from_main_source(
+                &document,
+                xml.as_bytes(),
+                ParagraphVisibilityScope::DirectBody
+            )
+            .unwrap(),
+            vec![false; 5]
+        );
+        let direct = "<w:p><w:r><w:t>controlled</w:t></w:r></w:p><w:p/>";
+        let shifted = xml.replace("<w:sdt><w:sdtPr/><w:sdtContent><w:p><w:r><w:t>controlled</w:t></w:r></w:p><w:sdt><w:sdtPr/><w:sdtContent><w:p/></w:sdtContent></w:sdt></w:sdtContent></w:sdt>", direct);
+        // Equal paragraph count cannot substitute for the original owners.
+        assert_eq!(
+            rdocx_oxml::document::CT_Document::from_xml(shifted.as_bytes())
+                .unwrap()
+                .body
+                .paragraphs()
+                .count(),
+            document.paragraphs().len()
+        );
+        assert!(
+            paragraph_visibility_from_main_source(
+                &document,
+                shifted.as_bytes(),
+                ParagraphVisibilityScope::FacadeRecursive
+            )
+            .is_err()
+        );
+        let issues = document.audit_accessibility();
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.message.contains("consecutive empty paragraphs"))
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3 consecutive empty paragraphs (consider using spacing instead)"]
+        );
+        assert!(!issues.iter().any(|issue| {
+            issue
+                .message
+                .starts_with("Paragraph visibility could not be determined:")
+        }));
+    }
+
+    #[test]
+    fn audit_picture_paragraphs_do_not_count_as_consecutive_empty_paragraphs() {
+        let mut document = Document::new();
+        for index in 0..3 {
+            document.add_picture(
+                super::watermark_tests::PNG,
+                &format!("picture{index}.png"),
+                Length::inches(1.0),
+                Length::inches(1.0),
+            );
+        }
+        let before_model = document.document.to_xml().unwrap();
+        let before_parts = document.package.parts.clone();
+        let issues = document.audit_accessibility();
+        assert_eq!(document.document.to_xml().unwrap(), before_model);
+        assert_eq!(document.package.parts, before_parts);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("no title"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("no author"))
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.message.contains("has no alt text"))
+                .count(),
+            3,
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.message.contains("consecutive empty paragraphs")),
+            "{issues:?}",
+        );
+
+        for _ in 0..4 {
+            document.add_paragraph("");
+        }
+        let before_model = document.document.to_xml().unwrap();
+        let before_parts = document.package.parts.clone();
+        let issues = document.audit_accessibility();
+        assert_eq!(document.document.to_xml().unwrap(), before_model);
+        assert_eq!(document.package.parts, before_parts);
+        let empty: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.message.contains("consecutive empty paragraphs"))
+            .map(|issue| issue.message.as_str())
+            .collect();
+        assert_eq!(
+            empty,
+            vec![
+                "3 consecutive empty paragraphs (consider using spacing instead)",
+                "4 consecutive empty paragraphs (consider using spacing instead)",
+            ]
+        );
+    }
+
+    #[test]
+    fn audit_qualified_display_content_and_field_controls_preserve_source() {
+        let cases = [
+            (
+                "simple-cr",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:cr/></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-cr",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:cr/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "simple-no-break-hyphen",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:noBreakHyphen/></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-no-break-hyphen",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:noBreakHyphen/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "simple-positional-tab",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:ptab w:alignment="left" w:relativeTo="margin" w:leader="none"/></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-positional-tab",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:ptab w:alignment="left" w:relativeTo="margin" w:leader="none"/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "simple-soft-hyphen",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:softHyphen/></w:r></w:fldSimple>"#,
+                false,
+            ),
+            (
+                "complex-soft-hyphen",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:softHyphen/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                false,
+            ),
+            (
+                "simple-leaf-deleted-only",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r></w:fldSimple>"#,
+                false,
+            ),
+            (
+                "simple-outer-deleted-only",
+                r#"<w:fldSimple w:instr="UNKNOWN"><w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r></w:fldSimple></w:fldSimple>"#,
+                false,
+            ),
+            (
+                "complex-outer-deleted-only",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>UNKNOWN</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r></w:fldSimple><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+                false,
+            ),
+            (
+                "simple-leaf-deleted-accepted",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r><w:r><w:t>accepted</w:t></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "simple-outer-deleted-accepted",
+                r#"<w:fldSimple w:instr="UNKNOWN"><w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r><w:r><w:t>accepted</w:t></w:r></w:fldSimple></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-outer-deleted-accepted",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>UNKNOWN</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:fldSimple w:instr="PAGE"><w:r><w:delText>gone</w:delText></w:r><w:r><w:t>accepted</w:t></w:r></w:fldSimple><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "alias-pict",
+                r#"<q:r xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><q:pict/></q:r>"#,
+                true,
+            ),
+            (
+                "default-object",
+                r#"<r xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><object/></r>"#,
+                true,
+            ),
+            (
+                "foreign-pict",
+                r#"<w:r><x:pict xmlns:x="urn:producer"/></w:r>"#,
+                false,
+            ),
+            (
+                "rebound-object",
+                r#"<w:r><w:object xmlns:w="urn:producer"/></w:r>"#,
+                false,
+            ),
+            ("soft-hyphen", "<w:r><w:softHyphen/></w:r>", false),
+            (
+                "producer-hint",
+                "<w:r><w:lastRenderedPageBreak/></w:r>",
+                false,
+            ),
+            (
+                "deleted-text",
+                "<w:r><w:delText>deleted</w:delText></w:r>",
+                false,
+            ),
+            (
+                "deleted-drawing",
+                "<w:del><w:r><w:drawing/></w:r></w:del>",
+                false,
+            ),
+            (
+                "moved-away",
+                "<w:moveFrom><w:r><w:drawing/></w:r></w:moveFrom>",
+                false,
+            ),
+            (
+                "inserted-drawing",
+                "<w:ins><w:r><w:drawing/></w:r></w:ins>",
+                true,
+            ),
+            (
+                "equation",
+                r#"<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x</m:t></m:r></m:oMath>"#,
+                true,
+            ),
+            (
+                "loose-begin",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+                false,
+            ),
+            (
+                "loose-separate",
+                r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#,
+                false,
+            ),
+            (
+                "loose-end",
+                r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+                false,
+            ),
+            (
+                "instruction",
+                "<w:r><w:instrText>PAGE</w:instrText></w:r>",
+                false,
+            ),
+            (
+                "deleted-instruction",
+                "<w:r><w:delInstrText>PAGE</w:delInstrText></w:r>",
+                false,
+            ),
+            ("simple-empty", r#"<w:fldSimple w:instr="PAGE"/>"#, false),
+            (
+                "simple-text",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:t>4</w:t></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "simple-whitespace",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:t xml:space="preserve"> </w:t></w:r></w:fldSimple>"#,
+                false,
+            ),
+            (
+                "simple-tab",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:tab/></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-text",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:t>4</w:t><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "complex-break",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:br/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "complex-whitespace",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:t xml:space="preserve"> </w:t><w:fldChar w:fldCharType="end"/></w:r>"#,
+                false,
+            ),
+            (
+                "incomplete-complex",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText></w:r>"#,
+                false,
+            ),
+            (
+                "simple-symbol",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:sym w:font="Symbol" w:char="F041"/></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "simple-drawing",
+                r#"<w:fldSimple w:instr="PAGE"><w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Actual"/><a:graphic><a:graphicData uri="urn:producer"/></a:graphic></wp:inline></w:drawing></w:r></w:fldSimple>"#,
+                true,
+            ),
+            (
+                "complex-symbol",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:sym w:font="Symbol" w:char="F041"/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "complex-drawing",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Actual"/><a:graphic><a:graphicData uri="urn:producer"/></a:graphic></wp:inline></w:drawing><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "spanning-complex",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>NUMPAGES</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>4</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "nested-complex",
+                r#"<w:r><w:fldChar w:fldCharType="begin"/><w:instrText>IF</w:instrText><w:fldChar w:fldCharType="separate"/><w:fldChar w:fldCharType="begin"/><w:instrText>PAGE</w:instrText><w:fldChar w:fldCharType="separate"/><w:t>4</w:t><w:fldChar w:fldCharType="end"/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                true,
+            ),
+            (
+                "unmatched-delimiters",
+                r#"<w:r><w:fldChar w:fldCharType="separate"/><w:fldChar w:fldCharType="end"/></w:r>"#,
+                false,
+            ),
+            (
+                "default-loose-marker",
+                r#"<r xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><fldChar fldCharType="begin"/></r>"#,
+                false,
+            ),
+            (
+                "alias-loose-marker",
+                r#"<q:r xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><q:fldChar q:fldCharType="begin"/></q:r>"#,
+                false,
+            ),
+            (
+                "foreign-marker",
+                r#"<w:r><x:fldChar xmlns:x="urn:producer" x:fldCharType="begin"/></w:r>"#,
+                false,
+            ),
+            (
+                "inserted-loose-marker",
+                r#"<w:ins><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:ins>"#,
+                false,
+            ),
+            (
+                "deleted-loose-marker",
+                r#"<w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:del>"#,
+                false,
+            ),
+            (
+                "duplicate-inline-slot",
+                "<w:sdt><w:sdtContent><w:r/></w:sdtContent><w:sdtContent><w:r><w:drawing/></w:r></w:sdtContent></w:sdt>",
+                false,
+            ),
+            (
+                "invalid-opaque-control",
+                r#"<w:sdt><w:sdtPr><w:id w:val="invalid"/></w:sdtPr><w:sdtContent><w:r><w:drawing/></w:r></w:sdtContent></w:sdt>"#,
+                false,
+            ),
+            (
+                "admitted-inline-control",
+                "<w:sdt><w:sdtPr/><w:sdtContent><w:r><w:drawing/></w:r></w:sdtContent></w:sdt>",
+                true,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, fragment, visible) in cases {
+            let mut seed = Document::new();
+            seed.add_paragraph("CONTENT");
+            let mut package =
+                OpcPackage::from_reader(Cursor::new(seed.to_bytes().unwrap())).unwrap();
+            let part = package.main_document_part().unwrap();
+            let xml = String::from_utf8(package.get_part(&part).unwrap().to_vec()).unwrap();
+            let start = xml.find("<w:p>").unwrap();
+            let end = start + xml[start..].find("</w:p>").unwrap() + "</w:p>".len();
+            let mut xml = xml;
+            xml.replace_range(start..end, &format!("<w:p>{fragment}</w:p>").repeat(3));
+            package.set_part(&part, xml.into_bytes());
+            let mut bytes = Cursor::new(Vec::new());
+            package.write_to(&mut bytes).unwrap();
+            let document = Document::from_bytes(bytes.get_ref()).unwrap();
+            assert_eq!(document.paragraph_count(), 3, "{label}");
+            let before_model = document.document.to_xml().unwrap();
+            let before_parts = document.package.parts.clone();
+            match document.paragraph_visibility() {
+                Ok(flags) if flags == vec![visible; 3] => {}
+                actual => failures.push(format!(
+                    "{label}: native visibility={actual:?}, expected={visible}"
+                )),
+            }
+            let issues = document.audit_accessibility();
+            assert_eq!(document.document.to_xml().unwrap(), before_model, "{label}");
+            assert_eq!(document.package.parts, before_parts, "{label}");
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.message.contains("no title")),
+                "{label}"
+            );
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.message.contains("no author")),
+                "{label}"
+            );
+            let empty_count = issues
+                .iter()
+                .filter(|issue| issue.message.contains("consecutive empty paragraphs"))
+                .count();
+            if empty_count != usize::from(!visible) {
+                failures.push(format!("{label}: visible={visible}, issues={issues:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn audit_current_field_cache_rejects_stale_nontext_results_without_mutation() {
+        // A non-placeholder instruction distinguishes stale cache emptiness.
+        // Empty PAGE/NUMPAGES caches deliberately serialize their visible "1".
+        let mut failures = Vec::new();
+        for instruction in ["DOCPROPERTY Title", "PAGE", "NUMPAGES"] {
+            let mut result = CT_R::new("");
+            result.content.push(RunContent::Tab);
+            let field = Field::from_raw(
+                instruction,
+                rdocx_oxml::text::FieldForm::Complex,
+                vec![result],
+            )
+            .unwrap();
+            assert_eq!(field.cached_result, "\t");
+            assert!(field.cached_result_runs().is_some());
+            let mut paragraph = CT_P::new();
+            let mut run = CT_R::new("");
+            run.content = vec![RunContent::Field(field)];
+            paragraph.runs.push(run);
+            for (cache, cached_visible) in
+                [("\t", true), ("changed", true), ("", false), (" ", false)]
+            {
+                let placeholder = cache.is_empty() && instruction != "DOCPROPERTY Title";
+                let visible = cached_visible || placeholder;
+                let mut document = Document::new();
+                for _ in 0..3 {
+                    let mut paragraph = paragraph.clone();
+                    let mut fields = 0;
+                    for run in &mut paragraph.runs {
+                        for item in &mut run.content {
+                            if let RunContent::Field(field) = item {
+                                fields += 1;
+                                assert!(field.cached_result_runs().is_some());
+                                field.cached_result = cache.to_owned();
+                                assert_eq!(field.cached_result_runs().is_some(), cache == "\t");
+                            }
+                        }
+                    }
+                    assert_eq!(fields, 1, "actual accepted complex-field projection");
+                    document
+                        .document
+                        .body
+                        .content
+                        .push(BodyContent::Paragraph(paragraph));
+                }
+                let before_model = document.document.to_xml().unwrap();
+                let serialized = String::from_utf8(before_model.clone()).unwrap();
+                let before_parts = document.package.parts.clone();
+                assert_eq!(
+                    serialized.matches("<w:tab").count(),
+                    if cache == "\t" { 3 } else { 0 },
+                    "{instruction}: stale typed result must not survive serialization"
+                );
+                assert_eq!(
+                    serialized.matches(">1</w:t>").count(),
+                    if placeholder { 3 } else { 0 },
+                    "{instruction}: actual empty-cache placeholder precondition"
+                );
+                assert_eq!(
+                    document.paragraph_visibility().unwrap(),
+                    vec![visible; 3],
+                    "{instruction}: cache={cache:?}"
+                );
+                let issues = document.audit_accessibility();
+                assert_eq!(document.document.to_xml().unwrap(), before_model);
+                assert_eq!(document.package.parts, before_parts);
+                let empty = issues
+                    .iter()
+                    .any(|issue| issue.message.contains("consecutive empty paragraphs"));
+                if empty == visible {
+                    failures.push(format!(
+                        "{instruction}: cache={cache:?}, visible={visible}: {issues:?}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn audit_indeterminate_current_source_retains_other_findings_and_omits_empty_streaks() {
+        let mut seed = Document::new();
+        let mut package = OpcPackage::from_reader(Cursor::new(seed.to_bytes().unwrap())).unwrap();
+        let part = package.main_document_part().unwrap();
+        let xml = concat!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns="urn:producer">"#,
+            "<w:body><w:p/><w:p/><w:p/><producer/></w:body></w:document>",
+        );
+        package.set_part(&part, xml.as_bytes().to_vec());
+        let mut bytes = Cursor::new(Vec::new());
+        package.write_to(&mut bytes).unwrap();
+        let mut document = Document::from_bytes(bytes.get_ref()).unwrap();
+        // A genuine unsaved edit forces current-source construction to refuse
+        // the producer's ambiguous default namespace, rather than reuse source.
+        document.add_paragraph("");
+        let before_model = document.document.to_xml().unwrap();
+        let before_parts = document.package.parts.clone();
+        let mut candidate = document.clone_for_staging();
+        let error = candidate
+            .flush_document_to_package()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("shadowed `default` namespace"), "{error}");
+        let issues = document.audit_accessibility();
+        assert_eq!(document.document.to_xml().unwrap(), before_model);
+        assert_eq!(document.package.parts, before_parts);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("no title"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("no author"))
+        );
+        let indeterminate: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue
+                    .message
+                    .starts_with("Paragraph visibility could not be determined:")
+            })
+            .collect();
+        assert_eq!(indeterminate.len(), 1, "{issues:?}");
+        assert_eq!(indeterminate[0].severity, IssueSeverity::Warning);
+        assert!(indeterminate[0].message.contains(&error));
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.message.contains("consecutive empty paragraphs")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
     fn audit_heading_level_gap() {
         let mut doc = Document::new();
         doc.set_title("Test");
@@ -33916,10 +49808,10 @@ mod tests {
 
         let mut table = doc.add_table(1, 1);
         let mut cell = table.cell(0, 0).expect("cell");
-        cell.remove_first_empty_paragraph();
         cell.add_paragraph("")
             .add_hyperlink("table link", &relationship_id)
             .bold(true);
+        cell.remove_first_empty_paragraph();
 
         let bytes = doc.to_bytes().unwrap();
         let reopened = Document::from_bytes(&bytes).unwrap();
@@ -33942,11 +49834,9 @@ mod tests {
     fn writer_hyperlink_tooltip_and_table_indent_round_trip() {
         let mut doc = Document::new();
         let relationship_id = doc.add_hyperlink_relationship("https://example.com");
-        doc.add_paragraph("").add_hyperlink_with_tooltip(
-            "linked",
-            &relationship_id,
-            Some("Example site"),
-        );
+        doc.add_paragraph("")
+            .add_hyperlink_with_tooltip("linked", &relationship_id, Some("Example site"))
+            .unwrap();
         doc.add_table(1, 1).set_indent(Length::twips(720));
 
         let bytes = doc.to_bytes().expect("document writes");
@@ -33983,7 +49873,7 @@ mod tests {
 
         let bytes = document.to_bytes().unwrap();
         let reopened = Document::from_bytes(&bytes).unwrap();
-        assert!(reopened.build_layout_input().automatic_hyphenation);
+        assert!(reopened.build_layout_input().unwrap().automatic_hyphenation);
         assert_eq!(
             reopened.paragraphs()[0].run(0).unwrap().language(),
             Some("en-US")
@@ -34924,7 +50814,7 @@ mod tests {
             + "</w:numPr>".len();
         assert_eq!(
             &unlinked[num_pr_start..num_pr_end],
-            "<w:numPr xmlns:ext=\"urn:producer\" ext:root=\"a&#x20;b\"><ext:before/><w:ilvl ext:leaf=\"level\"><ext:level-child/></w:ilvl><w:numId ext:leaf=\"id\"><ext:id-child/></w:numId><ext:after/>\n      </w:numPr>"
+            "<w:numPr xmlns:ext=\"urn:producer\" ext:root=\"a&#x20;b\"><ext:before/><w:ilvl ext:leaf=\"level\"><ext:level-child/></w:ilvl><w:numId ext:leaf=\"id\"><ext:id-child/></w:numId><ext:after/></w:numPr>"
         );
     }
 
@@ -35471,6 +51361,191 @@ mod tests {
     }
 
     #[test]
+    fn numbering_level_namespace_declarations_do_not_report_unmodeled_properties() {
+        let mut mismatches = Vec::new();
+        for owner in ["abstractNum", "lvl", "num"] {
+            for (name, value) in [
+                ("xmlns:w", WORD_NAMESPACE),
+                ("xmlns:q", WORD_NAMESPACE),
+                ("xmlns", "urn:producer:default"),
+                ("xmlns:producer", "urn:producer"),
+            ] {
+                let mut source = Document::new();
+                let num_id = source.add_list_definition(&[ListLevel::bullet()]);
+                let definition_id = source.numbering.as_ref().unwrap().nums[0].abstract_num_id;
+                let declaration = format!(r#" {name}="{value}""#);
+                let xml = format!(
+                    r#"<q:numbering xmlns:q="{WORD_NAMESPACE}"><q:abstractNum q:abstractNumId="{definition_id}"{}><q:lvl q:ilvl="0"{}><q:numFmt q:val="bullet"/><q:lvlText q:val="•"/></q:lvl></q:abstractNum><q:num q:numId="{num_id}"{}><q:abstractNumId q:val="{definition_id}"/></q:num></q:numbering>"#,
+                    if owner == "abstractNum" {
+                        &declaration
+                    } else {
+                        ""
+                    },
+                    if owner == "lvl" { &declaration } else { "" },
+                    if owner == "num" { &declaration } else { "" },
+                );
+                let bytes = replace_numbering_xml(&mut source, xml.into_bytes());
+                let mut imported = Document::from_bytes(&bytes).unwrap();
+                let saved = imported.to_bytes().unwrap();
+                let reopened = Document::from_bytes(&saved).unwrap();
+
+                for document in [&imported, &reopened] {
+                    let level = document.numbering_level(num_id, 0).unwrap();
+                    assert_eq!(level.format, NumberingFormat::Bullet, "{owner}: {name}");
+                    assert_eq!(level.start, 1, "{owner}: {name}");
+                    assert_eq!(level.suffix, ListLevelSuffix::Tab, "{owner}: {name}");
+                    if level.has_unmodeled_properties {
+                        mismatches.push(format!("{owner}: {name}"));
+                    }
+                    let numbering = document.numbering.as_ref().unwrap();
+                    let attributes = match owner {
+                        "abstractNum" => &numbering.abstract_nums[0].extra_attributes,
+                        "lvl" => &numbering.abstract_nums[0].levels[0].extra_attributes,
+                        "num" => &numbering.nums[0].extra_attributes,
+                        _ => unreachable!(),
+                    };
+                    assert!(attributes.contains(&(name.to_owned(), value.to_owned())));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "namespace-only reader cases: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn numbering_level_unknown_attributes_and_xml_remain_unmodeled_after_reopen() {
+        for owner in ["abstractNum", "lvl", "num"] {
+            for attribute in [
+                r#" producer:flag="kept""#,
+                r#" producer:xmlns="kept""#,
+                r#" xmlnsLike="kept""#,
+            ] {
+                let mut source = Document::new();
+                let num_id = source.add_list_definition(&[ListLevel::bullet()]);
+                let definition_id = source.numbering.as_ref().unwrap().nums[0].abstract_num_id;
+                let xml = format!(
+                    r#"<w:numbering xmlns:w="{WORD_NAMESPACE}"><w:abstractNum w:abstractNumId="{definition_id}" xmlns:producer="urn:producer"{}><w:lvl w:ilvl="0" xmlns:producer="urn:producer"{}><w:numFmt w:val="bullet"/><producer:fact producer:flag="kept"/></w:lvl></w:abstractNum><w:num w:numId="{num_id}" xmlns:producer="urn:producer"{}><w:abstractNumId w:val="{definition_id}"/></w:num></w:numbering>"#,
+                    if owner == "abstractNum" {
+                        attribute
+                    } else {
+                        ""
+                    },
+                    if owner == "lvl" { attribute } else { "" },
+                    if owner == "num" { attribute } else { "" },
+                );
+                let bytes = replace_numbering_xml(&mut source, xml.into_bytes());
+                let mut imported = Document::from_bytes(&bytes).unwrap();
+                // Check the attribute independently of the retained child.
+                let raw_children = std::mem::take(
+                    &mut imported.numbering.as_mut().unwrap().abstract_nums[0].levels[0].extra_xml,
+                );
+                assert!(
+                    imported
+                        .numbering_level(num_id, 0)
+                        .unwrap()
+                        .has_unmodeled_properties
+                );
+                imported.numbering.as_mut().unwrap().abstract_nums[0].levels[0].extra_xml =
+                    raw_children.clone();
+                let saved = imported.to_bytes().unwrap();
+                let reopened = Document::from_bytes(&saved).unwrap();
+                assert!(
+                    reopened
+                        .numbering_level(num_id, 0)
+                        .unwrap()
+                        .has_unmodeled_properties
+                );
+                let before = imported.numbering.as_ref().unwrap();
+                let after = reopened.numbering.as_ref().unwrap();
+                assert_eq!(
+                    before.abstract_nums[0].extra_attributes,
+                    after.abstract_nums[0].extra_attributes
+                );
+                assert_eq!(
+                    before.abstract_nums[0].levels[0].extra_attributes,
+                    after.abstract_nums[0].levels[0].extra_attributes
+                );
+                assert_eq!(
+                    before.nums[0].extra_attributes,
+                    after.nums[0].extra_attributes
+                );
+                assert_eq!(raw_children, after.abstract_nums[0].levels[0].extra_xml);
+            }
+        }
+
+        let mut source = Document::new();
+        let num_id = source.add_list_definition(&[ListLevel::bullet()]);
+        let definition_id = source.numbering.as_ref().unwrap().nums[0].abstract_num_id;
+        let xml = format!(
+            r#"<w:numbering xmlns:w="{WORD_NAMESPACE}" xmlns:q="{WORD_NAMESPACE}"><w:abstractNum w:abstractNumId="{definition_id}"><w:lvl w:ilvl="0" xmlns:q="urn:foreign" q:ilvl="7"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum><w:num w:numId="{num_id}"><w:abstractNumId w:val="{definition_id}"/></w:num></w:numbering>"#
+        );
+        let bytes = replace_numbering_xml(&mut source, xml.into_bytes());
+        let mut imported = Document::from_bytes(&bytes).unwrap();
+        assert!(
+            imported
+                .numbering_level(num_id, 0)
+                .unwrap()
+                .has_unmodeled_properties
+        );
+        let saved = imported.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        assert!(
+            reopened
+                .numbering_level(num_id, 0)
+                .unwrap()
+                .has_unmodeled_properties
+        );
+        assert_eq!(
+            imported.numbering.as_ref().unwrap().abstract_nums[0].levels[0].extra_attributes,
+            reopened.numbering.as_ref().unwrap().abstract_nums[0].levels[0].extra_attributes,
+        );
+    }
+
+    #[test]
+    fn numbering_level_raw_children_remain_unmodeled_on_each_owner() {
+        for owner in ["abstractNum", "lvl", "num"] {
+            let mut source = Document::new();
+            let num_id = source.add_list_definition(&[ListLevel::bullet()]);
+            let definition_id = source.numbering.as_ref().unwrap().nums[0].abstract_num_id;
+            let payload = r#"<producer:fact producer:flag="kept"><producer:inner>opaque payload</producer:inner></producer:fact>"#;
+            let xml = format!(
+                r#"<w:numbering xmlns:w="{WORD_NAMESPACE}"><w:abstractNum w:abstractNumId="{definition_id}" xmlns:producer="urn:producer"><w:lvl w:ilvl="0" xmlns:producer="urn:producer"><w:numFmt w:val="bullet"/>{}</w:lvl>{}</w:abstractNum><w:num w:numId="{num_id}" xmlns:producer="urn:producer"><w:abstractNumId w:val="{definition_id}"/>{}</w:num></w:numbering>"#,
+                if owner == "lvl" { payload } else { "" },
+                if owner == "abstractNum" { payload } else { "" },
+                if owner == "num" { payload } else { "" },
+            );
+            let bytes = replace_numbering_xml(&mut source, xml.into_bytes());
+            let mut imported = Document::from_bytes(&bytes).unwrap();
+            let saved = imported.to_bytes().unwrap();
+            let reopened = Document::from_bytes(&saved).unwrap();
+            let before = imported.numbering.as_ref().unwrap();
+            let after = reopened.numbering.as_ref().unwrap();
+            let before_children = match owner {
+                "abstractNum" => &before.abstract_nums[0].extra_xml,
+                "lvl" => &before.abstract_nums[0].levels[0].extra_xml,
+                "num" => &before.nums[0].extra_xml,
+                _ => unreachable!(),
+            };
+            let after_children = match owner {
+                "abstractNum" => &after.abstract_nums[0].extra_xml,
+                "lvl" => &after.abstract_nums[0].levels[0].extra_xml,
+                "num" => &after.nums[0].extra_xml,
+                _ => unreachable!(),
+            };
+            assert_eq!(before_children, after_children, "{owner}");
+            assert_eq!(before_children.len(), 1, "{owner}");
+            assert_eq!(before_children[0].1, payload.as_bytes(), "{owner}");
+            for document in [&imported, &reopened] {
+                let level = document.numbering_level(num_id, 0).unwrap();
+                assert_eq!(level.format, NumberingFormat::Bullet, "{owner}");
+                assert!(level.has_unmodeled_properties, "{owner}");
+            }
+        }
+    }
+
+    #[test]
     fn numbering_level_unmodeled_fact_contract_is_limited_to_extras() {
         let mut doc = Document::new();
         let modeled_and_raw_overlay_id = doc.add_list_definition(&[ListLevel::decimal()]);
@@ -35528,6 +51603,64 @@ mod tests {
             )
             .expect("raw leaf metadata definition")
             .has_unmodeled_properties
+        );
+    }
+
+    #[test]
+    fn fragment_numbering_equivalence_compares_owned_leaf_projection() {
+        let xml = format!(
+            r#"<w:numbering xmlns:w="{WORD_NAMESPACE}" xmlns:f="urn:fragment"><w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:start w:val="1" f:keep="A"><f:payload value="kept&#32;exact"/></w:start><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="9"><w:abstractNumId w:val="7" f:keep="A"><f:payload value="kept&#32;exact"/></w:abstractNumId></w:num></w:numbering>"#
+        );
+        let parsed = CT_Numbering::from_xml(xml.as_bytes()).unwrap();
+        let original = parsed.clone();
+        let mut remapped = parsed.clone();
+        remapped.abstract_nums[0].abstract_num_id = 12;
+        remapped.nums[0].num_id = 14;
+        remapped.nums[0].abstract_num_id = 12;
+        // Reparsing refreshes snapshots, but keeps the same output XML facts.
+        let remapped = CT_Numbering::from_xml(&remapped.to_xml().unwrap()).unwrap();
+        assert!(equivalent_abstract_numbering(
+            &parsed.abstract_nums[0],
+            &remapped.abstract_nums[0]
+        ));
+        assert!(equivalent_numbering_instance(
+            &parsed.nums[0],
+            &remapped.nums[0],
+            7
+        ));
+        let mut changed = remapped.clone();
+        changed.abstract_nums[0].levels[0].start = Some(2);
+        assert!(!equivalent_abstract_numbering(
+            &parsed.abstract_nums[0],
+            &changed.abstract_nums[0]
+        ));
+        let mut changed = remapped.clone();
+        let raw = &mut changed.nums[0].abstract_num_id_raw.as_mut().unwrap().1;
+        *raw = String::from_utf8(raw.clone())
+            .unwrap()
+            .replace("f:keep=\"A\"", "f:keep=\"B\"")
+            .into_bytes();
+        assert!(!equivalent_numbering_instance(
+            &parsed.nums[0],
+            &changed.nums[0],
+            7
+        ));
+        let mut changed = remapped.clone();
+        changed.nums[0].abstract_num_id_raw = None;
+        assert!(!equivalent_numbering_instance(
+            &parsed.nums[0],
+            &changed.nums[0],
+            7
+        ));
+        let mut changed = remapped.clone();
+        changed.abstract_nums[0].levels[0].start_raw = None;
+        assert!(!equivalent_abstract_numbering(
+            &parsed.abstract_nums[0],
+            &changed.abstract_nums[0]
+        ));
+        assert_eq!(
+            parsed, original,
+            "equivalence checks cannot mutate either graph"
         );
     }
 
@@ -36008,7 +52141,7 @@ mod watermark_tests {
         text.set_text_watermark("DRAFT").unwrap();
         text.set_text_watermark("FINAL").unwrap();
         let reopened = Document::from_bytes(&text.to_bytes().unwrap()).unwrap();
-        let input = reopened.build_layout_input();
+        let input = reopened.build_layout_input().unwrap();
         assert_eq!(input.headers.len(), 3);
         assert!(input.headers.values().all(|header| {
             matches!(
@@ -36023,7 +52156,7 @@ mod watermark_tests {
             .set_image_watermark(PNG, "watermark.png", Length::pt(72.0), Length::pt(36.0))
             .unwrap();
         let reopened = Document::from_bytes(&image.to_bytes().unwrap()).unwrap();
-        assert!(!reopened.build_layout_input().headers.is_empty());
+        assert!(!reopened.build_layout_input().unwrap().headers.is_empty());
 
         let mut invalid = Document::new();
         invalid.set_header("unchanged");
@@ -36296,7 +52429,7 @@ mod watermark_tests {
             &[("rId1", &alternate, "first.png")],
             HdrFtrType::First,
         );
-        let input = document.build_layout_input();
+        let input = document.build_layout_input().unwrap();
         let scoped = input
             .images
             .iter()
@@ -37238,11 +53371,12 @@ mod watermark_tests {
         assert_eq!(
             digests,
             [
-                740_018_920_125_384_146,
-                740_018_920_125_384_146,
-                740_018_920_125_384_146,
-                740_018_920_125_384_146,
-                1_020_215_290_976_271_429,
+                8_654_160_490_163_008_642,
+                8_654_160_490_163_008_642,
+                8_654_160_490_163_008_642,
+                8_654_160_490_163_008_642,
+                8_654_160_490_163_008_642,
+                9_924_658_905_511_625_255,
             ]
         );
     }
@@ -37319,6 +53453,618 @@ mod reader_fact_tests {
 #[cfg(test)]
 mod odttf_tests {
     use super::*;
+
+    #[test]
+    fn fx220_missing_record_embedding_is_one_native_transaction() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Regular.ttf");
+        let mut document = Document::new();
+        document.add_paragraph("unchanged body");
+        let font = EmbeddedFont::new(
+            EmbeddedFontKind::Regular,
+            body.to_vec(),
+            "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+            FontEmbeddingLicense::new(true, "OFL 1.1"),
+        );
+        document
+            .embed_font("FX220 native uninstalled", font.clone())
+            .unwrap();
+        let snapshot = document
+            .fonts()
+            .into_iter()
+            .find(|f| f.name == "FX220 native uninstalled")
+            .unwrap();
+        assert_eq!(
+            snapshot.embedded_fonts.as_slice(),
+            std::slice::from_ref(&font)
+        );
+        let before = document.to_bytes().unwrap();
+        document
+            .embed_font("FX220 native uninstalled", font)
+            .unwrap();
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let reopened = Document::from_bytes(&before).unwrap();
+        assert_eq!(reopened.fonts(), document.fonts());
+    }
+
+    #[test]
+    fn fx220_word_faces_flags_and_atomic_invalid_inputs() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Regular.ttf");
+        let mut document = Document::new();
+        assert_eq!(document.embed_true_type_fonts().unwrap(), None);
+        assert_eq!(document.embed_system_fonts().unwrap(), None);
+        assert_eq!(document.save_subset_fonts().unwrap(), None);
+        for kind in [
+            EmbeddedFontKind::Regular,
+            EmbeddedFontKind::Bold,
+            EmbeddedFontKind::Italic,
+            EmbeddedFontKind::BoldItalic,
+        ] {
+            let font = EmbeddedFont::new(
+                kind,
+                body.to_vec(),
+                "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+                FontEmbeddingLicense::new(true, "OFL 1.1"),
+            )
+            .with_subsetted(kind == EmbeddedFontKind::Italic);
+            document.embed_font("FX220 face controls", font).unwrap();
+        }
+        assert_eq!(document.embed_true_type_fonts().unwrap(), Some(true));
+        document.set_embed_system_fonts(Some(false)).unwrap();
+        document.set_save_subset_fonts(Some(true)).unwrap();
+        let before = document.to_bytes().unwrap();
+        let fonts = document.try_fonts().unwrap();
+        let faces = &fonts
+            .iter()
+            .find(|font| font.name == "FX220 face controls")
+            .unwrap()
+            .embedded_fonts;
+        assert_eq!(faces.len(), 4);
+        assert!(
+            faces
+                .iter()
+                .all(|face| face.data.as_slice() == body.as_slice()
+                    && face.license.identity == "OFL 1.1")
+        );
+        let mut reopened = Document::from_bytes(&before).unwrap();
+        assert_eq!(reopened.try_fonts().unwrap(), fonts);
+        assert_eq!(reopened.embed_system_fonts().unwrap(), Some(false));
+        assert_eq!(reopened.save_subset_fonts().unwrap(), Some(true));
+        for case in 0..8 {
+            let mut font = faces[0].clone();
+            match case {
+                0 => font.license.authorized = false,
+                1 => font.font_key = "invalid".to_owned(),
+                2 => font.license.identity = "bad\nidentity".to_owned(),
+                3 => font.data = b"ttcf\0\x01\0\0".to_vec(),
+                4 => font.data[20..24].copy_from_slice(&u32::MAX.to_be_bytes()),
+                5 => font.license.identity = "bad\0identity".to_owned(),
+                6 => font.license.identity = "bad\u{fffe}identity".to_owned(),
+                7 => font.license.identity = "bad\u{ffff}identity".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(reopened.embed_font("FX220 face controls", font).is_err());
+            assert_eq!(reopened.to_bytes().unwrap(), before);
+        }
+        for kind in [
+            EmbeddedFontKind::Regular,
+            EmbeddedFontKind::Bold,
+            EmbeddedFontKind::Italic,
+            EmbeddedFontKind::BoldItalic,
+        ] {
+            assert!(
+                reopened
+                    .remove_embedded_font("FX220 face controls", kind)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(reopened.embed_true_type_fonts().unwrap(), Some(true));
+        assert!(
+            reopened
+                .try_fonts()
+                .unwrap()
+                .iter()
+                .find(|font| font.name == "FX220 face controls")
+                .unwrap()
+                .embedded_fonts
+                .is_empty()
+        );
+        reopened.set_embed_true_type_fonts(None).unwrap();
+        reopened.set_embed_system_fonts(None).unwrap();
+        reopened.set_save_subset_fonts(None).unwrap();
+        assert_eq!(reopened.embed_true_type_fonts().unwrap(), None);
+        assert_eq!(reopened.embed_system_fonts().unwrap(), None);
+        assert_eq!(reopened.save_subset_fonts().unwrap(), None);
+    }
+
+    #[test]
+    fn fx220_word_snapshot_counts_repeated_projected_body_copies() {
+        let body = include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf");
+        let mut document = Document::new();
+        document
+            .embed_font(
+                "FX220 shared source",
+                EmbeddedFont::new(
+                    EmbeddedFontKind::Regular,
+                    body.to_vec(),
+                    "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+                    FontEmbeddingLicense::new(true, "OFL 1.1"),
+                ),
+            )
+            .unwrap();
+        let table = document.font_table.as_mut().unwrap();
+        let reference = table
+            .fonts()
+            .iter()
+            .find(|font| font.name == "FX220 shared source")
+            .unwrap()
+            .embedded_fonts[0]
+            .clone();
+        for index in 0..2000 {
+            let name = format!("FX220 shared alias {index}");
+            table.set_font(name.clone(), None, None, None);
+            table.set_embedded_font(&name, reference.clone());
+        }
+        let before = table.to_xml().unwrap();
+        assert!(
+            matches!(document.try_fonts(), Err(error) if error.to_string().contains("byte or face bound"))
+        );
+        assert_eq!(
+            document.font_table.as_ref().unwrap().to_xml().unwrap(),
+            before
+        );
+        assert!(document.fonts().is_empty());
+        assert!(
+            document
+                .remove_embedded_font("FX220 shared alias 1000", EmbeddedFontKind::Regular)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            document
+                .package
+                .parts
+                .values()
+                .any(|bytes| bytes.len() == body.len())
+        );
+    }
+
+    fn fx220_word_source_snapshot(document: &Document) -> (Vec<u8>, Vec<u8>) {
+        let mut writer = std::io::Cursor::new(Vec::new());
+        document.package.write_to(&mut writer).unwrap();
+        (
+            writer.into_inner(),
+            document.font_table.as_ref().unwrap().to_xml().unwrap(),
+        )
+    }
+
+    #[test]
+    fn fx220_word_invalid_removed_face_graph_refuses_before_publication() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Regular.ttf");
+        for case in 0..5 {
+            for preserve in [false, true] {
+                for whole in [false, true] {
+                    let mut document = Document::new();
+                    document
+                        .embed_font(
+                            "FX220 graph owner",
+                            EmbeddedFont::new(
+                                EmbeddedFontKind::Regular,
+                                body.to_vec(),
+                                "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+                                FontEmbeddingLicense::new(true, "OFL 1.1"),
+                            ),
+                        )
+                        .unwrap();
+                    let reference = document
+                        .font_table
+                        .as_ref()
+                        .unwrap()
+                        .fonts()
+                        .iter()
+                        .find(|font| font.name == "FX220 graph owner")
+                        .unwrap()
+                        .embedded_fonts[0]
+                        .clone();
+                    let (part, _) = document.checked_embedded_font_source(&reference).unwrap();
+                    if preserve {
+                        let xml = String::from_utf8(
+                            document.font_table.as_ref().unwrap().to_xml().unwrap(),
+                        )
+                        .unwrap()
+                        .replace(
+                            "</w:fonts>",
+                            &format!(
+                                "<x:payload xmlns:x='urn:fx220-retention' r:id='{}'/></w:fonts>",
+                                reference.relationship_id
+                            ),
+                        );
+                        document.font_table = Some(FontTable::from_xml(xml.as_bytes()).unwrap());
+                    }
+                    let owner = document.font_table_part_name.clone().unwrap();
+                    let relations = document.package.get_part_rels_mut(&owner).unwrap();
+                    let relation = relations
+                        .items
+                        .iter_mut()
+                        .find(|rel| rel.id == reference.relationship_id)
+                        .unwrap();
+                    match case {
+                        0 => relation.rel_type = rel_types::IMAGE.to_owned(),
+                        1 => relations
+                            .items
+                            .retain(|rel| rel.id != reference.relationship_id),
+                        2 => relation.target_mode = Some("External".to_owned()),
+                        3 => {
+                            document.package.remove_part(&part);
+                        }
+                        4 => document
+                            .package
+                            .content_types
+                            .add_override(&part, "image/png"),
+                        _ => unreachable!(),
+                    }
+                    let before = fx220_word_source_snapshot(&document);
+                    if whole {
+                        assert!(document.remove_font("FX220 graph owner").is_err());
+                    } else {
+                        assert!(
+                            document
+                                .remove_embedded_font(
+                                    "FX220 graph owner",
+                                    EmbeddedFontKind::Regular
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(fx220_word_source_snapshot(&document), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fx220_word_shared_target_replacement_and_removal_use_copy_on_write() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Regular.ttf");
+        let replacement = include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf");
+        let mut document = Document::new();
+        let font = EmbeddedFont::new(
+            EmbeddedFontKind::Regular,
+            body.to_vec(),
+            "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+            FontEmbeddingLicense::new(true, "OFL 1.1"),
+        );
+        document
+            .embed_font("FX220 original owner", font.clone())
+            .unwrap();
+        let table = document.font_table.as_mut().unwrap();
+        let reference = table
+            .fonts()
+            .iter()
+            .find(|font| font.name == "FX220 original owner")
+            .unwrap()
+            .embedded_fonts[0]
+            .clone();
+        table.set_font("FX220 shared owner".to_owned(), None, None, None);
+        table.set_embedded_font("FX220 shared owner", reference.clone());
+        let (original_part, original_bytes) =
+            document.checked_embedded_font_source(&reference).unwrap();
+        let original_bytes = original_bytes.to_vec();
+        let mut changed = font;
+        changed.data = replacement.to_vec();
+        document
+            .embed_font("FX220 original owner", changed)
+            .unwrap();
+        assert_eq!(
+            document.package.get_part(&original_part),
+            Some(original_bytes.as_slice())
+        );
+        assert_eq!(
+            document
+                .try_fonts()
+                .unwrap()
+                .iter()
+                .find(|font| font.name == "FX220 shared owner")
+                .unwrap()
+                .embedded_fonts[0]
+                .data
+                .as_slice(),
+            body.as_slice()
+        );
+        document.remove_font("FX220 original owner").unwrap();
+        assert_eq!(
+            document.package.get_part(&original_part),
+            Some(original_bytes.as_slice())
+        );
+        document
+            .remove_embedded_font("FX220 shared owner", EmbeddedFontKind::Regular)
+            .unwrap();
+        assert!(document.package.get_part(&original_part).is_none());
+        assert_eq!(document.embed_true_type_fonts().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn fx220_word_render_caller_tier_wins_embedded_css_face_rank() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Bold.ttf");
+        let caller = include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf");
+        let name = "FX220 Word uninstalled tier";
+        let mut document = Document::new();
+        document
+            .add_paragraph("")
+            .add_run("iiiiWWWW")
+            .font(name)
+            .bold(true);
+        document
+            .embed_font(
+                name,
+                EmbeddedFont::new(
+                    EmbeddedFontKind::Bold,
+                    body.to_vec(),
+                    "{00112233-4455-6677-8899-AABBCCDDEEFF}",
+                    FontEmbeddingLicense::new(true, "OFL 1.1"),
+                ),
+            )
+            .unwrap();
+        let embedded = document.layout_deterministic().unwrap();
+        assert!(
+            embedded
+                .layout
+                .fonts
+                .iter()
+                .any(|font| font.data.as_ref() == body.as_slice())
+        );
+        let layout = document
+            .layout_with_fonts_and_bundled_fallback(&[(name, caller.as_slice())])
+            .unwrap();
+        let mut painted = 0;
+        oxml_layout::walk(&layout.layout.pages[0].elements, &mut |element, _| {
+            let (text, id) = match element {
+                oxml_layout::PositionedElement::Text(run) => (run.text.as_str(), run.font_id),
+                oxml_layout::PositionedElement::MultilingualText(run) => {
+                    (run.logical_text.as_str(), run.font_id)
+                }
+                _ => return,
+            };
+            if text.contains("iiiiWWWW") {
+                painted += 1;
+                let selected = layout
+                    .layout
+                    .fonts
+                    .iter()
+                    .find(|font| font.id == id)
+                    .unwrap();
+                assert!(
+                    selected.data.as_ref() == caller.as_slice(),
+                    "actual selected family {}",
+                    selected.family
+                );
+            }
+        });
+        assert!(painted > 0);
+    }
+
+    #[test]
+    fn fx220_word_derived_key_has_checked_reversible_byte_order() {
+        let body = include_bytes!("../../oxml-layout/fonts/Caladea-Regular.ttf");
+        let key = derive_font_key(body).unwrap();
+        assert_eq!(key, derive_font_key(body).unwrap());
+        assert_eq!(key.len(), 38);
+        assert_eq!(key, key.to_uppercase());
+        let guid = font_key_bytes(&key).unwrap();
+        let stored = obfuscate_odttf_with_key(body, &guid);
+        assert_ne!(&stored[..32], &body[..32]);
+        assert_eq!(&stored[32..], &body[32..]);
+        assert_eq!(
+            deobfuscate_odttf_with_key(&stored, &key).as_deref(),
+            Some(body.as_slice())
+        );
+        assert!(derive_font_key(b"ttcf").is_err());
+        assert!(derive_font_key(&[0; 32]).is_err());
+    }
+
+    #[test]
+    fn fx220_word_distinct_source_renders_all_shared_aliases_and_preserves_noop_cache() {
+        let body = include_bytes!("../../oxml-layout/fonts/LiberationMono-Regular.ttf");
+        let caller = include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf");
+        let mut document = Document::new();
+        let font = EmbeddedFont::new(
+            EmbeddedFontKind::Regular,
+            body.to_vec(),
+            derive_font_key(body).unwrap(),
+            FontEmbeddingLicense::new(true, "OFL 1.1"),
+        );
+        document
+            .embed_font("FX220 alias source", font.clone())
+            .unwrap();
+        let table = document.font_table.as_mut().unwrap();
+        let reference = table
+            .fonts()
+            .iter()
+            .find(|font| font.name == "FX220 alias source")
+            .unwrap()
+            .embedded_fonts[0]
+            .clone();
+        for index in 0..2000 {
+            let name = format!("FX220 render alias {index}");
+            table.set_font(name.clone(), None, None, None);
+            table.set_embedded_font(&name, reference.clone());
+        }
+        document.font_table_dirty = true;
+        for index in [0, 1000, 1999] {
+            document
+                .add_paragraph("")
+                .add_run("iiiiWWWW")
+                .font(&format!("FX220 render alias {index}"));
+        }
+        let input = document.build_layout_input().unwrap();
+        assert!(input.fonts.is_empty());
+        assert_eq!(input.embedded_fonts.len(), 1);
+        assert_eq!(input.embedded_fonts[0].0.len(), 2001);
+        assert_eq!(input.embedded_fonts[0].1.as_ref(), body.as_slice());
+        let before = document.to_bytes().unwrap();
+        let first = document.layout_deterministic().unwrap();
+        let mut painted = 0;
+        for page in &first.layout.pages {
+            oxml_layout::walk(&page.elements, &mut |element, _| {
+                let (text, id) = match element {
+                    oxml_layout::PositionedElement::Text(run) => (run.text.as_str(), run.font_id),
+                    oxml_layout::PositionedElement::MultilingualText(run) => {
+                        (run.logical_text.as_str(), run.font_id)
+                    }
+                    _ => return,
+                };
+                if text.contains("iiiiWWWW") {
+                    painted += 1;
+                    assert!(
+                        first
+                            .layout
+                            .fonts
+                            .iter()
+                            .find(|font| font.id == id)
+                            .unwrap()
+                            .data
+                            .as_ref()
+                            == body.as_slice()
+                    );
+                }
+            });
+        }
+        assert_eq!(painted, 3);
+        document.embed_font("FX220 alias source", font).unwrap();
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &first,
+            &document.layout_deterministic().unwrap()
+        ));
+        document.set_embed_true_type_fonts(None).unwrap();
+        assert!(
+            document
+                .layout_deterministic()
+                .unwrap()
+                .layout
+                .fonts
+                .iter()
+                .any(|font| font.data.as_ref() == body.as_slice())
+        );
+        document.set_embed_true_type_fonts(Some(false)).unwrap();
+        assert!(
+            document
+                .build_layout_input()
+                .unwrap()
+                .embedded_fonts
+                .is_empty()
+        );
+        assert!(
+            document
+                .layout_deterministic()
+                .unwrap()
+                .layout
+                .fonts
+                .iter()
+                .all(|font| font.data.as_ref() != body.as_slice())
+        );
+        let layout = document
+            .layout_with_fonts_and_bundled_fallback(&[(
+                "FX220 render alias 1999",
+                caller.as_slice(),
+            )])
+            .unwrap();
+        assert!(
+            layout
+                .layout
+                .fonts
+                .iter()
+                .any(|font| font.data.as_ref() == caller.as_slice())
+        );
+    }
+
+    #[test]
+    fn fx220_word_descriptive_font_noop_retains_cached_layout() {
+        let mut document = Document::new();
+        let font = FontDefinition::new("FX220 metadata font")
+            .with_alternate_name("FX220 alternate")
+            .with_family("roman")
+            .with_pitch("variable");
+        document.set_font(font.clone()).unwrap();
+        document.add_paragraph("metadata no-op");
+        let first = document.layout_deterministic().unwrap();
+        let before = document.to_bytes().unwrap();
+        document.set_font(font).unwrap();
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &first,
+            &document.layout_deterministic().unwrap()
+        ));
+    }
+
+    #[test]
+    fn fx220_word_descriptive_font_opaque_clear_refuses_atomically() {
+        let xml = format!(
+            r#"<w:fonts xmlns:w="{}" xmlns:x="urn:producer"><w:font w:name="FX220 opaque"><w:altName w:val="alternate" x:fact="kept"/></w:font></w:fonts>"#,
+            rdocx_oxml::namespace::W_NS
+        );
+        let mut document = Document::new();
+        document
+            .set_font(FontDefinition::new("FX220 opaque"))
+            .unwrap();
+        document.font_table = Some(FontTable::from_xml(xml.as_bytes()).unwrap());
+        document.font_table_dirty = true;
+        let before = document.to_bytes().unwrap();
+        assert!(
+            document
+                .set_font(FontDefinition::new("FX220 opaque"))
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn fx220_word_multiple_font_flags_serialize_and_reopen() {
+        let mut document = Document::new();
+        for (kind, body) in [
+            (
+                EmbeddedFontKind::Regular,
+                include_bytes!("../../oxml-layout/fonts/Selawik-Regular.ttf").as_slice(),
+            ),
+            (
+                EmbeddedFontKind::Bold,
+                include_bytes!("../../oxml-layout/fonts/Selawik-Bold.ttf").as_slice(),
+            ),
+        ] {
+            document
+                .embed_font(
+                    "Selawik",
+                    EmbeddedFont::new(
+                        kind,
+                        body.to_vec(),
+                        derive_font_key(body).unwrap(),
+                        FontEmbeddingLicense::new(true, "SIL Open Font License 1.1"),
+                    ),
+                )
+                .unwrap();
+        }
+        document.set_save_subset_fonts(Some(false)).unwrap();
+        document.set_embed_true_type_fonts(Some(false)).unwrap();
+        let raw = document.settings.as_ref().unwrap().to_xml().unwrap();
+        assert!(
+            oxml_core::xml::validate_strict_xml_1_0(&raw).is_ok(),
+            "settings: {raw:?}"
+        );
+        let bytes = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.embed_true_type_fonts().unwrap(), Some(false));
+        assert_eq!(reopened.save_subset_fonts().unwrap(), Some(false));
+        assert_eq!(
+            reopened
+                .try_fonts()
+                .unwrap()
+                .iter()
+                .find(|font| font.name == "Selawik")
+                .unwrap()
+                .embedded_fonts
+                .len(),
+            2
+        );
+    }
 
     /// Build a TrueType header with a two-entry table directory.
     fn fake_font() -> Vec<u8> {
@@ -37431,10 +54177,11 @@ mod odttf_tests {
             let mut file = archive.by_index(index).unwrap();
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).unwrap();
-            if file.name() == "word/_rels/document.xml.rels" {
+            let name = file.name().unwrap().into_owned();
+            if name == "word/_rels/document.xml.rels" {
                 bytes = b"<Relationships".to_vec();
             }
-            entries.push((file.name().to_owned(), file.compression(), bytes));
+            entries.push((name, file.compression(), bytes));
         }
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, compression, bytes) in entries {
@@ -37471,24 +54218,1165 @@ mod odttf_tests {
         );
         assert_eq!(destination.to_bytes().unwrap(), before);
     }
+    #[test]
+    fn scoped_source_probe_distinguishes_identical_sibling_positions_and_publishes_nothing() {
+        let mut document = Document::new();
+        document.add_paragraph("identical");
+        document.add_paragraph("identical");
+        document.prepare_staged_package().unwrap();
+        let canonical = document.document.to_xml().unwrap();
+        let original = document
+            .package
+            .get_part(&document.doc_part_name)
+            .unwrap()
+            .to_vec();
+        let owner = scan_story_owners(&canonical, StoryKind::Body)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == StoryKind::Body)
+            .unwrap();
+        let items = direct_story_content_items(&canonical, &owner).unwrap();
+        let retained_owner = scan_story_owners(&original, StoryKind::Body)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == StoryKind::Body)
+            .unwrap();
+        let retained = direct_story_content_items(&original, &retained_owner).unwrap();
+        assert!(
+            document
+                .prove_scoped_main_source(
+                    &canonical,
+                    items[0].full.clone(),
+                    &original,
+                    retained[0].full.clone()
+                )
+                .is_ok()
+        );
+        assert!(
+            document
+                .prove_scoped_main_source(
+                    &canonical,
+                    items[0].full.clone(),
+                    &original,
+                    retained[1].full.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            document.package.get_part(&document.doc_part_name),
+            Some(original.as_slice())
+        );
+    }
+
+    #[test]
+    fn scoped_replacement_preparation_failures_leave_models_and_package_unchanged() {
+        use std::io::Cursor;
+        let mut source =
+            Document::new_with_profile(WordCreationProfile::Minimal(WordPackageClass::Document));
+        source.add_paragraph("Version");
+        let mut package = OpcPackage::from_reader(Cursor::new(source.to_bytes().unwrap())).unwrap();
+        let relationships = package.get_or_create_part_rels("/word/document.xml");
+        relationships
+            .items
+            .retain(|relationship| relationship.rel_type != rel_types::STYLES);
+        relationships.add_with_id(&format!("rId{}", u32::MAX), "urn:producer", "producer.bin");
+        package.parts.remove(DEFAULT_STYLES_PART);
+        package.content_types.overrides.remove(DEFAULT_STYLES_PART);
+        let mut bytes = Cursor::new(Vec::new());
+        package.write_to(&mut bytes).unwrap();
+        let mut document = Document::from_bytes(bytes.get_ref()).unwrap();
+        let location = document.paragraph_story_location(0).unwrap().unwrap();
+        let model = document.document.clone();
+        let mut before = Cursor::new(Vec::new());
+        document.package.write_to(&mut before).unwrap();
+        let result = document.try_replace_text_at(&location, "Version", "Release", Some(1));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("styles relationship allocation failed")
+        );
+        assert_eq!(document.document, model);
+        let mut after = Cursor::new(Vec::new());
+        document.package.write_to(&mut after).unwrap();
+        assert_eq!(after.into_inner(), before.into_inner());
+    }
+    #[test]
+    fn scoped_replacement_final_reopen_failure_discards_the_complete_candidate() {
+        let mut document = Document::new();
+        document.add_paragraph("Version");
+        document.add_paragraph("Version");
+        let location = document.paragraph_story_location(0).unwrap().unwrap();
+        let before = document.to_bytes().unwrap();
+        let model = document.document.clone();
+        FAIL_NEXT_SCOPED_REOPEN.set(true);
+        let result = document.try_replace_text_at(&location, "Version", "Release", Some(1));
+        let missed_boundary = FAIL_NEXT_SCOPED_REOPEN.replace(false);
+        assert!(
+            !missed_boundary,
+            "final reopen boundary must have been reached"
+        );
+        assert!(result.unwrap_err().to_string().contains("entry count"));
+        assert_eq!(document.document, model);
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+    #[test]
+    fn whole_story_final_reopen_and_preparation_failures_discard_candidates() {
+        let mut document = Document::new();
+        document.add_paragraph("live");
+        document.set_header("original");
+        let before = document.to_bytes().unwrap();
+        let model = document.document.clone();
+        FAIL_NEXT_STAGED_REOPEN.set(true);
+        let result = document.try_set_first_page_header("new");
+        let missed = FAIL_NEXT_STAGED_REOPEN.replace(false);
+        assert!(!missed, "actual final reopen boundary reached");
+        assert!(result.unwrap_err().to_string().contains("entry count"));
+        assert_eq!(document.document, model);
+        assert_eq!(document.to_bytes().unwrap(), before);
+        assert!(document.try_set_header("invalid \u{1}").is_err());
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+
+    fn fx210_layout_runs(layout: &oxml_layout::LayoutResult) -> Vec<oxml_layout::GlyphRun> {
+        let mut runs = Vec::new();
+        for page in &layout.pages {
+            oxml_layout::walk(&page.elements, &mut |element, _| match element {
+                oxml_layout::PositionedElement::Text(run) => runs.push(run.clone()),
+                oxml_layout::PositionedElement::MultilingualText(run) => {
+                    runs.push(run.legacy_projection())
+                }
+                _ => {}
+            });
+        }
+        runs
+    }
+
+    #[test]
+    fn fx210_word_public_aptos_diagnostics_follow_actual_owned_contributions() {
+        let mut document = Document::new();
+        for family in ["Aptos", "Aptos", "Aptos Display", "Calibri"] {
+            document.add_paragraph("").add_run("iiiiWWWW").font(family);
+        }
+        document.add_paragraph("").add_run("").font("Aptos");
+        let before = document.to_bytes().unwrap();
+        let cold = document
+            .layout_with_fonts_and_bundled_fallback(&[])
+            .unwrap();
+        let runs = fx210_layout_runs(&cold.layout);
+        assert_eq!(
+            runs.iter().filter(|run| run.text == "iiiiWWWW").count(),
+            4,
+            "actual final contribution precondition"
+        );
+        for run in &runs {
+            assert!(run.glyph_ids.iter().all(|glyph| *glyph != 0));
+            let selected = cold
+                .layout
+                .fonts
+                .iter()
+                .find(|font| font.id == run.font_id)
+                .unwrap();
+            assert_eq!(
+                selected.family, "Carlito",
+                "actual approximate-face precondition"
+            );
+            assert_eq!(
+                selected.data.as_ref(),
+                include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf").as_slice()
+            );
+        }
+        let messages: Vec<_> = cold
+            .layout
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Aptos"))
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "F-X210 Word owned layout must report both Aptos requests once"
+        );
+        assert!(messages[0].contains("Aptos") && !messages[0].contains("Aptos Display"));
+        assert!(messages[1].contains("Aptos Display"));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.contains("Carlito") && message.contains("approximate"))
+        );
+        let warm = document
+            .layout_with_fonts_and_bundled_fallback(&[])
+            .unwrap();
+        assert_eq!(warm.layout.diagnostics, cold.layout.diagnostics);
+        assert_eq!(fx210_layout_runs(&warm.layout), runs);
+        assert_eq!(document.to_bytes().unwrap(), before);
+        for index in 0..4 {
+            document
+                .paragraph_mut(index)
+                .unwrap()
+                .run_mut(0)
+                .unwrap()
+                .set_font("Calibri");
+        }
+        let non_aptos = document
+            .layout_with_fonts_and_bundled_fallback(&[])
+            .unwrap();
+        assert!(
+            !non_aptos
+                .layout
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("Aptos")),
+            "prior FontIds must not contaminate a later non-Aptos output"
+        );
+    }
+
+    #[test]
+    fn fx210_word_public_symbols_and_list_markers_use_only_qualified_semantics() {
+        let cases = [
+            ("Wingdings", 0xa7, '\u{25aa}'),
+            ("Wingdings", 0xd8, '\u{27a2}'),
+            ("Wingdings", 0xfc, '\u{2713}'),
+            ("Wingdings", 0x76, '\u{2756}'),
+            ("Wingdings", 0x71, '\u{2751}'),
+            ("Wingdings", 0x6e, '\u{25a0}'),
+            ("Wingdings", 0xfe, '\u{2611}'),
+            ("Symbol", 0xb7, '\u{2022}'),
+        ];
+        for (family, code, target) in cases {
+            for original in [code, 0xf000 + code] {
+                let mut document = Document::new();
+                document
+                    .add_paragraph("")
+                    .add_run("")
+                    .add_symbol_char(family, original);
+                let before = document.to_bytes().unwrap();
+                let source = document.document.to_xml().unwrap();
+                let result = document.layout_deterministic().unwrap();
+                let runs = fx210_layout_runs(&result.layout);
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "explicit symbol fixture must reach one painted run"
+                );
+                assert_eq!(
+                    runs[0].text,
+                    target.to_string(),
+                    "F-X210 Word explicit symbol must use its qualified Unicode target"
+                );
+                assert!(runs[0].glyph_ids.iter().all(|glyph| *glyph != 0));
+                assert_eq!(document.document.to_xml().unwrap(), source);
+                assert_eq!(document.to_bytes().unwrap(), before);
+                let reopened = Document::from_bytes(&before).unwrap();
+                assert_eq!(
+                    fx210_layout_runs(&reopened.layout_deterministic().unwrap().layout),
+                    runs
+                );
+            }
+            let mut document = Document::new();
+            let marker = char::from_u32(u32::from(0xf000 + code))
+                .unwrap()
+                .to_string();
+            let level = ListLevel::bullet()
+                .level_text(&marker)
+                .marker_properties(CT_RPr {
+                    font_ascii: Some(family.to_owned()),
+                    font_hansi: Some(family.to_owned()),
+                    ..Default::default()
+                });
+            let id = document.add_list_definition(&[level]);
+            assert!(document.add_paragraph("item").set_numbering(id, 0));
+            let before = document.to_bytes().unwrap();
+            let result = document.layout_deterministic().unwrap();
+            let runs = fx210_layout_runs(&result.layout);
+            let visible = runs
+                .iter()
+                .find(|run| run.text != "item")
+                .expect("a real list marker is emitted");
+            assert_eq!(
+                visible.text.trim(),
+                target.to_string(),
+                "F-X210 Word list marker must use its qualified Unicode target"
+            );
+            assert!(visible.glyph_ids.iter().all(|glyph| *glyph != 0));
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        // Ordinary text, unknown codes and other font families retain source semantics.
+        for (family, character, explicit) in [
+            ("Wingdings", '\u{f0a7}', false),
+            ("Wingdings", '\u{f001}', true),
+            ("Wingdings 2", '\u{f0a7}', true),
+            ("Unrelated face", '\u{f0a7}', true),
+        ] {
+            let mut document = Document::new();
+            let mut paragraph = document.add_paragraph("");
+            let mut run = paragraph.add_run("");
+            run.set_font(family);
+            if explicit {
+                run.add_symbol_char(family, character as u16);
+            } else {
+                run.add_text(&character.to_string());
+            }
+            let before = document.to_bytes().unwrap();
+            let result = document.layout_deterministic().unwrap();
+            assert_eq!(
+                fx210_layout_runs(&result.layout)[0].text,
+                character.to_string()
+            );
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+    }
+    #[test]
+    fn fx210_word_diagnostic_companions_keep_payload_and_one_layout() {
+        let mut document = Document::new();
+        document
+            .add_paragraph("")
+            .add_run("Actual contributing text")
+            .font("Aptos");
+        let before = document.to_bytes().unwrap();
+        let fonts = [(
+            "Aptos",
+            include_bytes!("../../oxml-layout/fonts/Carlito-Regular.ttf").as_slice(),
+        )];
+        let options = RenderOptions::default();
+        super::LAYOUT_INVOCATIONS.set(0);
+        let (pdf, facts) = document.to_pdf_with_diagnostics(&fonts, options).unwrap();
+        assert_eq!(
+            super::LAYOUT_INVOCATIONS.get(),
+            1,
+            "diagnostic companions must not infer earlier bytes from another render"
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|d| d.message.contains("Font 'Aptos' is approximate"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            pdf,
+            document
+                .to_pdf_with_fonts_and_options(&fonts, options)
+                .unwrap()
+        );
+        super::LAYOUT_INVOCATIONS.set(0);
+        let (png, png_facts) = document
+            .render_page_to_png_with_diagnostics(0, 72.0, &fonts, options)
+            .unwrap();
+        assert_eq!(super::LAYOUT_INVOCATIONS.get(), 1);
+        assert_eq!(png_facts, facts);
+        assert_eq!(
+            png,
+            document
+                .render_page_to_png_with_fonts_and_options(0, 72.0, &fonts, options)
+                .unwrap()
+        );
+        assert!(png.unwrap().starts_with(b"\x89PNG"));
+        let raster_options = oxml_pdf::RasterOptions {
+            dpi: 72.0,
+            format: oxml_pdf::RasterFormat::Png {
+                transparent_background: false,
+            },
+        };
+        super::LAYOUT_INVOCATIONS.set(0);
+        let (all, all_facts) = document
+            .render_pages_with_diagnostics(None, raster_options, &fonts, options)
+            .unwrap();
+        assert_eq!(super::LAYOUT_INVOCATIONS.get(), 1);
+        assert_eq!(all_facts, facts);
+        let oxml_pdf::RasterOutput::SeparatePages(all) = all else {
+            panic!("PNG must retain the separate-page payload");
+        };
+        assert_eq!(all.len(), 1);
+        let empty_error = document
+            .render_pages_with_diagnostics(Some(&[]), raster_options, &fonts, options)
+            .unwrap_err();
+        assert!(matches!(
+            empty_error,
+            crate::Error::Raster(oxml_pdf::RasterError::EmptyPageSelection)
+        ));
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let (tiff, _) = document
+            .render_pages_with_diagnostics(
+                None,
+                oxml_pdf::RasterOptions {
+                    dpi: 72.0,
+                    format: oxml_pdf::RasterFormat::Tiff,
+                },
+                &fonts,
+                options,
+            )
+            .unwrap();
+        assert!(matches!(tiff, oxml_pdf::RasterOutput::MultiPageTiff(_)));
+        super::LAYOUT_INVOCATIONS.set(0);
+        let (archival, archival_facts) = document
+            .to_pdfa_with_diagnostics(oxml_pdf::PdfConformance::PdfA2b, &fonts, options)
+            .unwrap();
+        assert_eq!(super::LAYOUT_INVOCATIONS.get(), 1);
+        assert_eq!(archival_facts, facts);
+        assert_eq!(
+            archival,
+            document
+                .to_pdfa_with_fonts_deterministic(&fonts, oxml_pdf::PdfConformance::PdfA2b)
+                .unwrap()
+        );
+        let svg = document
+            .render_page_to_svg_with_fonts_and_options(0, &fonts, options)
+            .unwrap()
+            .unwrap();
+        assert!(
+            svg.diagnostics
+                .iter()
+                .any(|d| d.message.contains("Font 'Aptos' is approximate"))
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+    #[test]
+    fn fx200_complete_style_snapshot_clears_borders_and_tabs_without_losing_other_properties() {
+        let mut document = Document::new();
+        let properties = CT_PPr {
+            keep_next: Some(true),
+            tabs: Some(rdocx_oxml::borders::CT_Tabs {
+                tabs: vec![rdocx_oxml::borders::CT_TabStop {
+                    val: rdocx_oxml::shared::ST_TabJc::Right,
+                    pos: Twips(720),
+                    leader: None,
+                    source_occurrence: None,
+                }],
+            }),
+            borders: Some(Box::new(rdocx_oxml::borders::CT_PBdr {
+                top: Some(rdocx_oxml::borders::CT_BorderEdge::new(
+                    rdocx_oxml::shared::ST_Border::Single,
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        document
+            .add_style(StyleBuilder::paragraph("Fx200", "Fx200").paragraph_properties(properties))
+            .unwrap();
+        let mut cleared = document
+            .style("Fx200")
+            .unwrap()
+            .paragraph_properties()
+            .unwrap()
+            .clone();
+        cleared.tabs = None;
+        cleared.refresh_tabs_source(None).unwrap();
+        cleared.borders = None;
+        document
+            .set_style(
+                StyleBuilder::paragraph("Fx200", "Fx200")
+                    .replace_paragraph_properties(cleared.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            document.style("Fx200").unwrap().paragraph_properties(),
+            Some(&cleared)
+        );
+        assert_eq!(cleared.keep_next, Some(true));
+        assert!(cleared.tabs.is_none() && cleared.borders.is_none());
+        let bytes = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&bytes).unwrap();
+        let reopened_style = reopened.style("Fx200").unwrap();
+        let properties = reopened_style.paragraph_properties().unwrap();
+        assert!(properties.tabs.is_none() && properties.borders.is_none());
+        assert_eq!(properties.keep_next, Some(true));
+    }
+    #[test]
+    fn fx200_document_default_updates_are_checked_and_do_not_restyle_normal() {
+        let mut document = Document::new();
+        document.add_paragraph("retained");
+        let styles = document.styles.styles.clone();
+        // Compare imported metadata with an unchanged import of the same authored seed.
+        let unchanged_bytes = document.to_bytes().unwrap();
+        let mut unchanged = Document::from_bytes(&unchanged_bytes).unwrap();
+        let imported_styles = unchanged.styles.styles.clone();
+        let unchanged_reopened = Document::from_bytes(&unchanged.to_bytes().unwrap()).unwrap();
+        assert_eq!(unchanged_reopened.styles.styles, imported_styles);
+        document
+            .set_default_font_name_value(Some("Gelasio"))
+            .unwrap();
+        document
+            .set_default_font_size_value(Some(Length::pt(13.0)))
+            .unwrap();
+        assert_eq!(document.default_font_name(), Some("Gelasio"));
+        assert_eq!(document.default_font_size(), Some(Length::pt(13.0)));
+        let rpr = document
+            .styles
+            .doc_defaults
+            .as_ref()
+            .unwrap()
+            .rpr
+            .as_ref()
+            .unwrap();
+        assert_eq!(rpr.font_ascii, rpr.font_hansi);
+        assert_eq!(rpr.font_ascii, rpr.font_east_asia);
+        assert_eq!(rpr.font_ascii, rpr.font_cs);
+        assert!(rpr.font_ascii_theme.is_none() && rpr.font_cs_theme.is_none());
+        assert_eq!(rpr.sz, rpr.sz_cs);
+        assert_eq!(document.styles.styles, styles);
+        assert_eq!(document.paragraph(0).unwrap().text(), "retained");
+        let before = document.to_bytes().unwrap();
+        assert!(
+            document
+                .set_default_font_size_value(Some(Length::emu(-1)))
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let mut reopened = Document::from_bytes(&before).unwrap();
+        assert_eq!(reopened.default_font_name(), Some("Gelasio"));
+        assert_eq!(reopened.default_font_size(), Some(Length::pt(13.0)));
+        assert_eq!(reopened.styles.styles, imported_styles);
+        reopened.set_default_font_name_value(None).unwrap();
+        reopened.set_default_font_size_value(None).unwrap();
+        assert!(reopened.default_font_name().is_none() && reopened.default_font_size().is_none());
+        assert_eq!(reopened.styles.styles, imported_styles);
+        let cleared_reopened = Document::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(cleared_reopened.styles.styles, imported_styles);
+        assert!(
+            cleared_reopened.default_font_name().is_none()
+                && cleared_reopened.default_font_size().is_none()
+        );
+    }
+
+    #[test]
+    fn fx200_absent_default_getters_and_clears_do_not_materialize_defaults() {
+        let mut document = Document::new();
+        document.styles.doc_defaults = None;
+        let before = document.to_bytes().unwrap();
+        assert!(document.default_font_name().is_none() && document.default_font_size().is_none());
+        document.set_default_font_name_value(None).unwrap();
+        document.set_default_font_size_value(None).unwrap();
+        assert!(document.styles.doc_defaults.is_none());
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+}
+
+/// The accepted-view text of one story that the body view leaves out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryText {
+    /// The story the items belong to.
+    pub story: StoryId,
+    /// Each direct paragraph and block content control of the story.
+    pub items: Vec<StoryTextItem>,
+}
+
+/// One direct paragraph or block content control of a [`StoryText`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryTextItem {
+    /// The index path of the item inside its story.
+    pub index_path: Vec<usize>,
+    /// [`StoryItemKind::Paragraph`] or [`StoryItemKind::ContentControl`].
+    pub kind: StoryItemKind,
+    /// The accepted-view text of the item.
+    pub text: String,
+}
+
+/// A diagnostic accompanying an owned accepted text projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextDiagnostic {
+    pub message: String,
+}
+
+/// The CLI-compatible text presentation and its explicit source scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextReport {
+    pub text: String,
+    pub scope: &'static str,
+    pub revision_view: &'static str,
+    pub diagnostics: Vec<TextDiagnostic>,
+}
+
+const STORY_TEXT_RELATIONSHIPS: [&str; 5] = [
+    rel_types::HEADER,
+    rel_types::FOOTER,
+    rel_types::FOOTNOTES,
+    rel_types::ENDNOTES,
+    rel_types::COMMENTS,
+];
+
+impl Document {
+    /// Read every story but the main body and its table cells, which the body
+    /// view already covers, in [`Document::stories`] order.
+    ///
+    /// Only the direct items of a story are read, so the text of an inline
+    /// control or a field is not repeated after its paragraph. A table is left
+    /// out because each of its cells is a table-cell story of its own.
+    ///
+    /// A story part that cannot be read, such as a truncated header or a
+    /// header relationship to a missing part, returns the reason, naming the
+    /// first part that is not well-formed XML when there is one. `validate`
+    /// reports the same part as an error.
+    pub fn other_story_texts(&self) -> std::result::Result<Vec<StoryText>, String> {
+        self.read_other_story_texts().map_err(|error| {
+            self.malformed_story_part()
+                .unwrap_or_else(|| error.to_string())
+        })
+    }
+
+    fn read_other_story_texts(&self) -> Result<Vec<StoryText>> {
+        let mut main_part = None;
+        let mut stories: Vec<StoryText> = Vec::new();
+        for item in self.story_item_snapshots()? {
+            let story = item.location().story();
+            if story.kind() == StoryKind::Body {
+                main_part = Some(story.part_name().to_owned());
+                continue;
+            }
+            if story.kind() == StoryKind::TableCell
+                && main_part.as_deref() == Some(story.part_name())
+            {
+                continue;
+            }
+            if stories.last().is_none_or(|last| &last.story != story) {
+                stories.push(StoryText {
+                    story: story.clone(),
+                    items: Vec::new(),
+                });
+            }
+            let kind = item.location().item_kind();
+            if !matches!(
+                kind,
+                StoryItemKind::Paragraph | StoryItemKind::ContentControl
+            ) {
+                continue;
+            }
+            if item.is_direct_child()
+                && let Some(last) = stories.last_mut()
+            {
+                last.items.push(StoryTextItem {
+                    index_path: item.location().index_path().to_vec(),
+                    kind,
+                    text: item.text().unwrap_or_default().to_owned(),
+                });
+            }
+        }
+        Ok(stories)
+    }
+
+    /// Name the first story part of the main document that is not
+    /// well-formed XML, with the reason.
+    fn malformed_story_part(&self) -> Option<String> {
+        let package = &self.package;
+        let doc_part = package.main_document_part()?;
+        let rels = package.get_part_rels(&doc_part)?;
+        rels.items
+            .iter()
+            .filter(|rel| {
+                rel.target_mode.as_deref() != Some("External")
+                    && STORY_TEXT_RELATIONSHIPS.contains(&rel.rel_type.as_str())
+            })
+            .find_map(|rel| {
+                let part_name = OpcPackage::resolve_rel_target(&doc_part, &rel.target);
+                let detail = document_style_references(package.get_part(&part_name)?).err()?;
+                Some(format!("part {part_name} is not well-formed XML: {detail}"))
+            })
+    }
+
+    /// Present accepted body text followed by readable other stories.
+    /// If any other story is malformed, return main-only text and the CLI warning.
+    pub fn text_report(&self) -> TextReport {
+        let mut text = self.text();
+        let mut diagnostics = Vec::new();
+        let (stories, scope) = match self.other_story_texts() {
+            Ok(stories) => (stories, "all-supported-stories"),
+            Err(reason) => {
+                diagnostics.push(TextDiagnostic {
+                    message: format!("other stories left out: {reason}"),
+                });
+                (Vec::new(), "main")
+            }
+        };
+        for (kind, part_name, texts) in document_story_parts(&stories) {
+            text.push_str(&format!(
+                "--- {} ({part_name}) ---\n",
+                document_story_kind_name(kind)
+            ));
+            for line in texts {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        TextReport {
+            text,
+            scope,
+            revision_view: "accepted",
+            diagnostics,
+        }
+    }
+
+    /// Count Unicode scalars in the same accepted body paragraphs as word_count.
+    /// No presentation separators or story labels contribute characters.
+    pub fn character_count(&self, include_spaces: bool) -> usize {
+        let mut count = 0;
+        visit_body_paragraphs(&self.document.body.content, true, &mut |paragraph| {
+            count += paragraph
+                .text()
+                .chars()
+                .filter(|character| include_spaces || !character.is_whitespace())
+                .count();
+        });
+        count
+    }
+}
+/// Group the texts of the stories by package part, each part labelled with
+/// the kind of its first story, such as a header part holding table cells.
+/// A part without any text, such as an empty header variant, is left out.
+fn document_story_parts(stories: &[StoryText]) -> Vec<(StoryKind, &str, Vec<&str>)> {
+    let mut parts: Vec<(StoryKind, &str, Vec<&str>)> = Vec::new();
+    for story in stories {
+        let part_name = story.story.part_name();
+        if parts.last().is_none_or(|(_, last, _)| *last != part_name) {
+            parts.push((story.story.kind(), part_name, Vec::new()));
+        }
+        if let Some((_, _, texts)) = parts.last_mut() {
+            texts.extend(story.items.iter().map(|item| item.text.as_str()));
+        }
+    }
+    parts.retain(|(_, _, texts)| texts.iter().any(|text| !text.trim().is_empty()));
+    parts
+}
+
+fn document_story_kind_name(kind: StoryKind) -> &'static str {
+    match kind {
+        StoryKind::Body => "body",
+        StoryKind::TableCell => "table_cell",
+        StoryKind::Header => "header",
+        StoryKind::Footer => "footer",
+        StoryKind::Footnote => "footnote",
+        StoryKind::Endnote => "endnote",
+        StoryKind::Comment => "comment",
+        StoryKind::TextBox => "text_box",
+    }
+}
+
+// Selected MC branches and preserved property-change subtrees determine the
+// exact style-reference stream. Capabilities share the embedded-content authority.
+#[derive(Default)]
+struct StyleReferenceScope {
+    excluded: bool,
+    alternate: Option<(bool, bool, bool)>, // saw choice, selected branch, saw fallback
+}
+
+fn document_choice_supported(
+    reader: &NsReader<&[u8]>,
+    element: &BytesStart<'_>,
+) -> std::result::Result<bool, String> {
+    let mut requires = None;
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|e| e.to_string())?;
+        let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+        if matches!(namespace, ResolveResult::Unbound) && local.as_ref() == b"Requires" {
+            if requires.is_some() {
+                return Err("MC Choice has duplicate Requires".into());
+            }
+            requires = Some(
+                attribute
+                    .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                    .map_err(|e| e.to_string())?
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(requires.is_some_and(|requires| {
+        let mut prefixes = requires.split_ascii_whitespace();
+        prefixes.clone().next().is_some()
+            && prefixes
+                .all(|prefix| crate::embedded::must_understand_prefix_is_valid(reader, prefix))
+    }))
+}
+
+fn document_style_references(
+    xml: &[u8],
+) -> std::result::Result<Vec<(&'static str, String)>, String> {
+    let mut reader = NsReader::from_reader(xml);
+    let mut open: Vec<StyleReferenceScope> = Vec::new();
+    let mut roots = 0usize;
+    let mut references = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let (namespace, event) = match reader.read_resolved_event_into(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => return Err(format!("{error} at byte {}", reader.error_position())),
+        };
+        let is_word =
+            matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W_NS.as_bytes());
+        let is_compatibility =
+            matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == MC_NS.as_bytes());
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                if open.is_empty() {
+                    roots += 1;
+                    if roots > 1 {
+                        return Err("the part has more than one root element".into());
+                    }
+                }
+                let local = element.local_name();
+                let mut excluded = open.last().is_some_and(|scope| scope.excluded)
+                    || (is_word && local.as_ref().ends_with(b"PrChange"));
+                if let Some(state) = open.last_mut().and_then(|scope| scope.alternate.as_mut()) {
+                    if is_compatibility && local.as_ref() == b"Choice" {
+                        if state.2 {
+                            return Err("MC Choice follows Fallback".into());
+                        }
+                        state.0 = true;
+                        let selected = !state.1 && document_choice_supported(&reader, element)?;
+                        state.1 |= selected;
+                        excluded |= !selected;
+                    } else if is_compatibility && local.as_ref() == b"Fallback" {
+                        if !state.0 || state.2 {
+                            return Err(
+                                "MC Fallback has no preceding Choice or is duplicated".into()
+                            );
+                        }
+                        state.2 = true;
+                        excluded |= state.1;
+                        state.1 = true;
+                    } else {
+                        // A foreign lookalike is opaque, never an admitted branch.
+                        excluded = true;
+                    }
+                } else if is_compatibility && matches!(local.as_ref(), b"Choice" | b"Fallback") {
+                    excluded = true;
+                }
+                let kind = match local.as_ref() {
+                    b"pStyle" => Some("paragraph"),
+                    b"rStyle" => Some("character"),
+                    b"tblStyle" => Some("table"),
+                    _ => None,
+                };
+                if let Some(kind) = kind.filter(|_| is_word && !excluded)
+                    && let Some(style_id) = document_word_value(&reader, element)?
+                    && !style_id.is_empty()
+                {
+                    references.push((kind, style_id));
+                }
+                if matches!(event, Event::Start(_)) {
+                    open.push(StyleReferenceScope {
+                        excluded,
+                        alternate: (is_compatibility && local.as_ref() == b"AlternateContent")
+                            .then_some((false, false, false)),
+                    });
+                }
+            }
+            Event::End(_) => {
+                open.pop();
+            }
+            Event::Text(text) if open.is_empty() && !text.iter().all(u8::is_ascii_whitespace) => {
+                return Err("the part has text outside its root element".into());
+            }
+            Event::CData(_) if open.is_empty() => {
+                return Err("the part has CDATA outside its root element".into());
+            }
+            Event::Eof if roots == 0 => return Err("the part has no root element".into()),
+            Event::Eof if !open.is_empty() => {
+                return Err(format!(
+                    "the part ends inside {} unclosed element(s)",
+                    open.len()
+                ));
+            }
+            Event::Eof => return Ok(references),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+/// Return the `w:val` attribute of a WordprocessingML element.
+fn document_word_value(
+    reader: &NsReader<&[u8]>,
+    element: &BytesStart<'_>,
+) -> std::result::Result<Option<String>, String> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| error.to_string())?;
+        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
+        if matches!(namespace, ResolveResult::Bound(Namespace(uri)) if uri == W_NS.as_bytes())
+            && local_name.as_ref() == b"val"
+        {
+            let value = attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .map_err(|error| error.to_string())?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Validate serialized document bytes without changing a live document.
+/// Non-package input and unexplained document-open failures remain errors.
+pub fn validate_document_bytes(bytes: &[u8]) -> Result<ValidationReport> {
+    validate_document_package(OpcPackage::from_reader(std::io::Cursor::new(bytes))?)
+}
+
+/// Validate a document package at a path with the same findings as byte validation.
+pub fn validate_document_file(path: impl AsRef<Path>) -> Result<ValidationReport> {
+    validate_document_package(OpcPackage::open(path)?)
+}
+
+fn document_validation_report(errors: Vec<String>, warnings: Vec<String>) -> ValidationReport {
+    ValidationReport {
+        findings: errors
+            .into_iter()
+            .map(|message| ValidationFinding {
+                severity: ValidationSeverity::Error,
+                message,
+            })
+            .chain(warnings.into_iter().map(|message| ValidationFinding {
+                severity: ValidationSeverity::Warning,
+                message,
+            }))
+            .collect(),
+    }
+}
+
+impl Document {
+    /// Validate an owned serialized snapshot, retaining this document's source and handles.
+    pub fn validate(&self) -> Result<ValidationReport> {
+        let mut snapshot = self.clone_for_staging();
+        validate_document_bytes(&snapshot.to_bytes()?)
+    }
+}
+fn validate_document_package(package: OpcPackage) -> Result<ValidationReport> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // --- Structural errors ---
+
+    // Every relationship must point at a part that is actually in the package.
+    if let Some(doc_part) = package.main_document_part() {
+        if package.get_part(&doc_part).is_none() {
+            errors.push(format!("main document part {doc_part} is missing"));
+        }
+        if let Some(rels) = package.get_part_rels(&doc_part) {
+            for rel in &rels.items {
+                // External targets live outside the package by definition.
+                if rel.target_mode.as_deref() == Some("External") {
+                    continue;
+                }
+                let target = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
+                if package.get_part(&target).is_none() {
+                    errors.push(format!(
+                        "relationship {} points at missing part {target}",
+                        rel.id
+                    ));
+                }
+            }
+        }
+    } else {
+        errors.push("package declares no main document relationship".to_string());
+    }
+
+    // Every part needs a declared content type.
+    for part_name in package.parts.keys() {
+        if package.content_types.content_type_for(part_name).is_none() {
+            errors.push(format!("part {part_name} has no declared content type"));
+        }
+    }
+
+    // Markup Compatibility requires every prefix that `mc:Ignorable` or
+    // `mc:MustUnderstand` lists to be declared, and a consumer may reject a
+    // part that breaks the rule. A part that does not parse as XML is
+    // outside this check.
+    let mut xml_parts = package
+        .parts
+        .iter()
+        .filter(|(part_name, _)| {
+            package
+                .content_types
+                .content_type_for(part_name)
+                .is_some_and(|content_type| content_type.ends_with("xml"))
+        })
+        .collect::<Vec<_>>();
+    xml_parts.sort();
+    for (part_name, xml) in xml_parts {
+        let Ok(findings) = rdocx_oxml::namespace::undeclared_compatibility_prefixes(xml) else {
+            continue;
+        };
+        for (attribute, prefix) in findings {
+            errors.push(format!(
+                "part {part_name} lists undeclared prefix `{prefix}` in mc:{attribute}"
+            ));
+        }
+    }
+
+    // Every XML part the main document relates to must be well formed. The
+    // style ids that its story parts name are checked once the document opens.
+    let mut style_references = Vec::new();
+    if let Some(doc_part) = package.main_document_part() {
+        let mut parts = vec![(doc_part.clone(), true)];
+        for rel in package
+            .get_part_rels(&doc_part)
+            .iter()
+            .flat_map(|rels| &rels.items)
+        {
+            if rel.target_mode.as_deref() == Some("External") {
+                continue;
+            }
+            let target = oxml_opc::OpcPackage::resolve_rel_target(&doc_part, &rel.target);
+            let story = STORY_TEXT_RELATIONSHIPS.contains(&rel.rel_type.as_str());
+            if !parts.iter().any(|(known, _)| *known == target) {
+                parts.push((target, story));
+            }
+        }
+        for (part_name, story) in parts {
+            let is_xml = package
+                .content_types
+                .content_type_for(&part_name)
+                .is_some_and(|content_type| {
+                    content_type.ends_with("+xml") || content_type.ends_with("/xml")
+                });
+            let Some(xml) = package.get_part(&part_name).filter(|_| is_xml) else {
+                continue;
+            };
+            match document_style_references(xml) {
+                Err(detail) => {
+                    errors.push(format!("part {part_name} is not well-formed XML: {detail}"));
+                }
+                Ok(references) if story => style_references.extend(
+                    references
+                        .into_iter()
+                        .map(|(kind, style_id)| (kind, style_id, part_name.clone())),
+                ),
+                Ok(_) => {}
+            }
+        }
+    }
+
+    // A malformed part can keep the document from opening. The errors found
+    // so far explain why, so they are reported together with the failure.
+    let doc = match Document::from_package(package) {
+        Ok(doc) => doc,
+        Err(error) if !errors.is_empty() => {
+            errors.push(format!("the document does not open: {error}"));
+            return Ok(document_validation_report(errors, warnings));
+        }
+        Err(error) => return Err(error),
+    };
+
+    // Word falls back to the default style for a style id that no style
+    // defines, so the style that the document names is silently lost.
+    for (kind, style_id, part_name) in style_references {
+        let issue = format!("{kind} style {style_id:?} used in {part_name} is not defined");
+        if doc.style(&style_id).is_none() && !errors.contains(&issue) {
+            errors.push(issue);
+        }
+    }
+
+    if let Err(error) = doc.validate_comment_ownership() {
+        errors.push(format!("invalid comment ownership: {error}"));
+    }
+
+    // --- Advisory findings ---
+
+    if doc.content_count() == 0 {
+        warnings.push("Document has no content (no paragraphs or tables)".to_string());
+    }
+
+    match doc.paragraph_visibility() {
+        Ok(visibility) => {
+            let empty_count = visibility.iter().filter(|visible| !**visible).count();
+            if empty_count > 0 {
+                warnings.push(format!("{empty_count} empty paragraph(s) found"));
+            }
+        }
+        Err(error) if !errors.is_empty() => warnings.push(format!(
+            "Paragraph visibility could not be determined: {error}"
+        )),
+        Err(error) => return Err(error),
+    }
+
+    let mut prev_level: Option<u32> = None;
+    for (level, _) in doc.headings() {
+        if let Some(prev) = prev_level
+            && level > prev + 1
+        {
+            warnings.push(format!(
+                "Heading level gap: Heading{prev} -> Heading{level} (skipped level(s))"
+            ));
+        }
+        prev_level = Some(level);
+    }
+
+    if doc.title().is_none() {
+        warnings.push("Missing document title".to_string());
+    }
+    if doc.author().is_none() {
+        warnings.push("Missing document author".to_string());
+    }
+
+    for finding in doc.validate_sections().findings {
+        match finding.severity {
+            ValidationSeverity::Error => errors.push(finding.message),
+            ValidationSeverity::Warning => warnings.push(finding.message),
+        }
+    }
+    Ok(document_validation_report(errors, warnings))
 }
 
 #[cfg(test)]
-mod word_app_version_tests {
-    use super::word_app_version;
+#[test]
+fn fx204_checked_regex_late_note_failure_preserves_native_source() {
+    let mut document = Document::new();
+    document.add_paragraph("before");
+    document
+        .package
+        .set_part("/word/endnotes.xml", b"<w:endnotes".to_vec());
+    document.package.content_types.add_override(
+        "/word/endnotes.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+    );
+    document
+        .package
+        .get_or_create_part_rels(&document.doc_part_name.clone())
+        .add(rel_types::ENDNOTES, "endnotes.xml");
+    let before = document.document.to_xml().unwrap();
+    let package = document.package.parts.clone();
+    assert!(
+        document
+            .try_replace_all_regex_expected(&[("before", "after", Some(1))])
+            .is_err()
+    );
+    assert_eq!(document.document.to_xml().unwrap(), before);
+    assert_eq!(document.package.parts, package);
+}
 
-    #[test]
-    fn app_version_uses_the_xx_yyyy_shape_word_requires() {
-        assert_eq!(word_app_version("0.14.0"), "00.1400");
-        assert_eq!(word_app_version("1.2.3"), "01.0203");
-        assert_eq!(word_app_version("12.34.56-beta.1"), "12.3456");
-        assert_eq!(word_app_version("250.1.0"), "99.0100");
-        assert_eq!(word_app_version(""), "00.0000");
-        let shaped = word_app_version(env!("CARGO_PKG_VERSION"));
-        let (int, frac) = shaped.split_once('.').expect("one dot");
-        assert!(
-            int.len() == 2 && frac.len() == 4 && shaped.chars().filter(|c| *c == '.').count() == 1
-        );
-        assert!(int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()));
-    }
+#[cfg(test)]
+#[test]
+fn fx204_checked_regex_counts_and_mismatch_are_atomic() {
+    let mut document = Document::new();
+    document.add_paragraph("a12 a34");
+    let original = document.document.to_xml().unwrap();
+    assert_eq!(
+        document
+            .try_replace_all_regex_expected(&[("a([0-9]+)", "b$1", Some(2)), ("b", "c", Some(1))])
+            .unwrap()
+            .unwrap_err()
+            .index,
+        1
+    );
+    assert_eq!(document.document.to_xml().unwrap(), original);
+    assert_eq!(
+        document
+            .try_replace_all_regex_expected(&[("a([0-9]+)", "b$1", Some(2)), ("b", "c", Some(2))])
+            .unwrap()
+            .unwrap(),
+        vec![2, 2]
+    );
+    assert_eq!(document.paragraph(0).unwrap().text(), "c12 c34");
+    let original = document.document.to_xml().unwrap();
+    assert!(
+        document
+            .try_replace_all_regex_expected(&[("c", "a", None), ("[", "x", None)])
+            .is_err()
+    );
+    assert_eq!(document.document.to_xml().unwrap(), original);
+    assert_eq!(
+        document
+            .try_replace_all_regex_expected(&[("", "x", Some(0))])
+            .unwrap()
+            .unwrap(),
+        vec![0]
+    );
 }

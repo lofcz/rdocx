@@ -1484,6 +1484,8 @@ impl Importer<'_> {
             field_kind: None,
             field_source: None,
             note: None,
+            note_reference_source: None,
+            tab_aligned: None,
         };
         if state.graphics_supported && state.fill_supported && state.text_visible {
             self.ensure_shape_room(page, 1)?;
@@ -1502,9 +1504,25 @@ impl Importer<'_> {
                 effects: Vec::new(),
                 children: vec![PositionedElement::Text(run)],
             }));
+            // The box top sits where a single-spaced first line puts the
+            // baseline this far down, in PowerPoint and in the renderer: 1.2
+            // em less the descent, and no higher than three quarters of the
+            // line or the font's own ascent share.
+            let metrics = self
+                .fonts
+                .metrics(font_id, state.font_size)
+                .map_err(|error| {
+                    import_error(
+                        Some(page.number),
+                        Some(offset),
+                        format!("text metrics failed: {error}"),
+                    )
+                })?;
+            let line = 1.2 * state.font_size;
+            let share = (metrics.ascent / (metrics.ascent + metrics.descent)).min(0.75);
             let rect = Rect {
                 x: 0.0,
-                y: -state.font_size * 0.875,
+                y: -(line - metrics.descent).max(line * share),
                 width: unscaled_advance.abs().max(state.font_size * 0.25),
                 height: state.font_size * 1.4,
             };

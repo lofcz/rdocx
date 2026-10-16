@@ -11,7 +11,7 @@ a zero-finding `/microscope`. Full verification and sprint review cover the
 final integrated result at closure. A formal dependency checkpoint completes
 a prerequisite from scoped evidence and focused integration checks.
 
-The active roadmap runs through S104, with earlier deferred cutover boundaries
+The active roadmap runs through S110, with earlier deferred cutover boundaries
 retained in place. The sizing rationale and compression options are in
 `docs/hld/14-development-backlog.md`.
 
@@ -759,9 +759,9 @@ against `14-development-backlog.md` M14 through M24.
 The order is deliberate and each boundary is a stopping point. Stopping after
 S45 leaves one chart engine serving both families. Stopping after S51 leaves a
 document-automation product. S69 closes the first Word-depth programme. S73
-closes from-scratch generation for the five private business documents, and S94
+closes from-scratch generation for the five private business documents, and S99
 closes the broader modern DOCX authoring boundary. The advanced spreadsheet
-programme starts only after S94 and only if its feasibility gate confirms a gap
+programme starts only after the S100 benchmark sprint and only if its feasibility gate confirms a gap
 worth filling in the Rust ecosystem.
 
 | Sprints | Milestone | Stories | Days |
@@ -775,12 +775,13 @@ worth filling in the Rust ecosystem.
 | S59 to S64 | M21, presentation depth | 15 | 60 |
 | S65 to S69 | M22, Word depth | 12 | 44 |
 | S70 to S73 | M23, from-scratch business documents | 24 | 112 |
-| S74 to S75, S89 to S94 | M24, modern DOCX authoring completeness | 47 | 219 |
-| S95 to S104 | M19, advanced spreadsheets | 21 | 85 |
+| S74 to S75, S86, S89 to S91, S95.2 to S95.4, S97 to S99 | M24, modern DOCX authoring completeness | 47 | 219 |
+| S100 | M20, external Word benchmark fidelity | 6 | 21 |
+| S101 to S110 | M19, advanced spreadsheets | 21 | 85 |
 
 The table counts milestone stories only. S70 also carries four cross-cutting
 Issue 67 and Issue 69 stories estimated at 12 developer-days. S76 through
-S88 hold the separate contribution and issue repair programme.
+S85 hold the separate contribution, issue repair and hosted CI programme.
 
 ### M15, Charts beyond PowerPoint
 
@@ -1333,7 +1334,7 @@ evidence is attributed correctly. F-X084 through F-X086 are independent after
 that intake and may run in parallel, but only one story may own a rendering
 baseline change. F-240 is the planning authority. F-241 and F-242 consume its
 approved matrix, and F-240 updates the provisional sprint contents before
-S70 closes. The M24 end gate is S94.
+S70 closes. The M24 end gate is S99.
 
 #### Sprint S71, Fresh package, styles, and numbering
 
@@ -1528,7 +1529,7 @@ six remaining contributor branches and repairs open reports without a pull
 request. F-X136 finishes the distinct Issue 138 line-height and row-splitting
 report after F-X135's spacing and table-margin changes. F-X133 and F-271
 through F-277 were carried to the then-planned S76 at the approved cutoff.
-The unstarted S76 stories are now scheduled from S89 after repair intake.
+The unstarted S76 stories are now scheduled from S86 after repair intake.
 
 #### Sprint S76, Contribution intake and core repair
 
@@ -1691,240 +1692,218 @@ F-X160 reviews PRs 248, 249 and 250 against that prefix. It closes Issues
 mutator or read path pass on the integrated result. Word opening, exact XML,
 round-trip, CLI and Python checks accompany the deterministic hash gate.
 
-#### Sprint S84, Compact Word part preservation
+#### Sprint S84, Integrated contribution and issue repair
 
-**Goal**: repair the serialized form of edited Word parts without losing
-unknown XML or producer identity attributes.
+**Goal**: finish the current contribution queue and every remaining open issue
+criterion in one integrated sprint. Run scoped feature checks and dependency
+checkpoints during implementation, then one full verification and sprint review
+on the combined result.
 
 | F-ID | Title | Size |
 |------|-------|------|
+| F-X169 | Reconcile live contributions and open issue contracts | L |
 | F-X161 | Compact Word XML and namespace preservation | L |
-
-F-X161 reviews PR 251 after S83 and owns this sprint's reviewed baseline
-change. Issue 245 remains open until edited parts keep a single root `w`
-declaration, compact layout and untouched content, and the expected 20 hash
-entries are explained. Recheck the Issue 160 producer matrix against the
-serialized output.
-
-#### Sprint S85, Section-aware Word layout
-
-**Goal**: lay out each paragraph in its section and verify the result against
-Word using deterministic fonts.
-
-| F-ID | Title | Size |
-|------|-------|------|
 | F-X162 | Per-paragraph section width and pagination | M |
-
-F-X162 reviews PR 241 after the compact serialization prefix. It owns this
-sprint's reviewed baseline change. Run the section boundary and table cases,
-the deterministic Word fidelity gate, and the hash harness before closure.
-
-#### Sprint S86, Word line fit and PowerPoint shape style
-
-**Goal**: finish the two line-breaking symptoms in Issue 226 and make a newly
-added PowerPoint shape visible through its theme style.
-
-| F-ID | Title | Size |
-|------|-------|------|
 | F-X163 | Plain-line trailing-space fit | M |
 | F-X164 | Added shape theme style | M |
-
-F-X163 reviews PR 242 after S79 PR 222 and owns this sprint's only hash and
-golden pixel baseline update. Test plain and rich paths at both reported
-widths. F-X164 reviews PR 252 after PRs 207, 230 and 234 and completes Issue
-244 only with PowerPoint opening and visibility evidence in addition to
-python-pptx and LibreOffice checks.
-
-#### Sprint S87, Tracked view and comparison repairs
-
-**Goal**: expose the revision view in Python and the CLI, then repair changed
-pictures and final table or paragraph comparisons.
-
-| F-ID | Title | Size |
-|------|-------|------|
 | F-X165 | Python and CLI tracked revision view | M |
 | F-X166 | Picture and final-block comparison revisions | L |
+| F-X167 | Accepted-view exporters and readers | L |
+| F-X170 | High-level Word style formatting API | M |
+| F-X168 | Current issue and contribution closure evidence | M |
 
-F-X165 reviews PR 256 after F-X143 and verifies Issue 253's selectors and
-rendered old and new text. F-X166 reviews PR 257, then PR 258, PR 260 and
-PR 261 in that order. It reconciles their shared comparison and revision
-code. Issue 254 requires the contributor's Word for Mac cases on the
-integrated output. Issue 255 requires Word to open and display the inserted
-or deleted table, plus correct accept and reject properties and content.
+F-X169 classifies all 31 open PRs against integrated main before implementation.
+The 19 older heads need patch-equivalence and contributor disposition checks.
+The 12 newer heads belong to F-X161 through F-X167. Complete F-X169 at a
+scoped dependency-prefix checkpoint so F-X161, F-X164 and F-X165 may start.
 
-#### Sprint S88, Accepted-view output and issue evidence
+F-X161 reviews PR 251 first and owns its labelled 20-entry OOXML hash delta.
+F-X162 follows F-X161 with PR 241 and a separate section-layout baseline.
+F-X163 follows F-X162 with PR 242, its separate hash delta and golden pixel
+manifest. The three baseline changes are exclusive and reviewed in order.
+F-X164 reviews PR 252 independently after intake, with python-pptx and viewer
+checks. F-X165 reviews PR 256, then F-X166 reconciles PRs 257, 258, 260 and
+261. F-X167 follows F-X165 and F-X166 with PRs 259, 262 and 263. F-X170
+addresses Issue 264, opened after the 2 October intake, independently. F-X168
+checks every open issue against the final integrated result. Formal
+prerequisites complete through scoped checkpoints before their consumers
+start. These checkpoints do not run the full workspace or sprint review.
 
-**Goal**: make HTML, Markdown, text and layout use the same accepted revision
-view, then reconcile all currently open issue criteria against verified main.
+PR 265 arrived on 3 October after F-X162 completed. It targets the same section
+ownership defect as PR 241. F-X168 adopts its distinct mixed-orientation,
+multipage table and content-control regression on the integrated F-X162 fix,
+then records a superseded disposition for PR 265. Its head has no CI run and
+reports incomplete local full-gate coverage, so the integrated sprint gate
+supplies the missing evidence.
+
+The ten F-IDs represent about 29 to 38 estimated developer-days, above the
+normal sprint size by request. Keep their approved designs, individual
+microscope reviews and scoped verification. Run the union of risk riders,
+source-built round trips, reporter fixtures, the 18 by 7 identity and 11 by 8
+producer matrices, Python and CLI checks, deterministic Word and PowerPoint
+comparisons, the hash harness, `/verify --full` and `/sprint-review` once on
+the final integrated S84 result. After `/close-sprint` merges that result to
+main, close all 32 open PRs and nine open issues through the 3 October refresh
+with evidence links. Feature work resumes at S86.
+
+#### Live contribution and issue inventory, 2 October 2026
+
+The 2 October intake reported 31 open PRs and eight open issues. Every PR in
+that intake targets
+`main`, has a green latest head CI run, has no submitted review, and is marked
+conflicting with current `main`. PRs #179 and #259 retain failed historical
+runs in the rollup, but their latest checks pass. Head CI does not prove that
+the combined result passes. The source overlap column shows one current PR
+with overlapping source files, not every possible conflict.
+
+| PR | Base | Head branch and SHA | Latest CI | Review | Mergeability | Stack | Source overlap | F-ID | Issues |
+|---|---|---|---|---|---|---|---|---|---|
+| [#174](https://github.com/tensorbee/rdocx/pull/174) | `main` | `fix/cli-output-overwrite-and-closed-pipe` / `0f108ffb90` | green | none | conflict | - | #256 (`crates/rdocx-cli/src/main.rs`) | F-X137 | [156](https://github.com/tensorbee/rdocx/issues/156)*, [166](https://github.com/tensorbee/rdocx/issues/166)* |
+| [#177](https://github.com/tensorbee/rdocx/pull/177) | `main` | `fix/body-readers-reach-content-controls` / `367c48ace8` | green | none | conflict | - | #263 (`crates/rdocx/src/document.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#178](https://github.com/tensorbee/rdocx/pull/178) | `main` | `fix/atomic-library-save` / `4e582fcb09` | green | none | conflict | - | #193 (`crates/rdocx/src/document.rs`) | F-X137 | [164](https://github.com/tensorbee/rdocx/issues/164)* |
+| [#179](https://github.com/tensorbee/rdocx/pull/179) | `main` | `fix/direct-body-index-coordinates` / `128e61bdee` | green | none | conflict | - | #191 (`crates/rdocx/src/document.rs`) | F-X138 | [163](https://github.com/tensorbee/rdocx/issues/163) |
+| [#180](https://github.com/tensorbee/rdocx/pull/180) | `main` | `fix/text-box-rewrite-keeps-all-children` / `242e9984b3` | green | none | conflict | - | #211 (`crates/rdocx-oxml/src/placeholder.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#182](https://github.com/tensorbee/rdocx/pull/182) | `main` | `fix/story-splice-namespace-facts` / `46c128e3c9` | green | none | conflict | - | #263 (`crates/rdocx/src/document.rs`) | F-X137 | [157](https://github.com/tensorbee/rdocx/issues/157) |
+| [#183](https://github.com/tensorbee/rdocx/pull/183) | `main` | `fix/toc-rebuild-unbound-word-prefix` / `1bed176b32` | green | none | conflict | - | #193 (`crates/rdocx-oxml/src/text.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159) |
+| [#184](https://github.com/tensorbee/rdocx/pull/184) | `main` | `fix/compare-producer-noise` / `83b92bbf69` | green | none | conflict | - | #211 (`crates/rdocx-oxml/src/placeholder.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159), [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#185](https://github.com/tensorbee/rdocx/pull/185) | `main` | `fix/rewritten-part-roots-and-comments-part` / `88a4838704` | green | none | conflict | - | #193 (`crates/rdocx/src/document.rs`) | F-X137 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#190](https://github.com/tensorbee/rdocx/pull/190) | `main` | `fix/compare-diagnostics-instead-of-refusals` / `4e0be1e8ea` | green | none | conflict | #184 | #211 (`crates/rdocx-oxml/src/placeholder.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159), [160](https://github.com/tensorbee/rdocx/issues/160), [161](https://github.com/tensorbee/rdocx/issues/161) |
+| [#191](https://github.com/tensorbee/rdocx/pull/191) | `main` | `fix/comment-anchoring-run-index` / `573d8c670a` | green | none | conflict | #179 | #211 (`crates/rdocx/src/document.rs`) | F-X138 | [163](https://github.com/tensorbee/rdocx/issues/163), [172](https://github.com/tensorbee/rdocx/issues/172) |
+| [#193](https://github.com/tensorbee/rdocx/pull/193) | `main` | `fix/table-row-identity-attributes` / `7a8841fbcb` | green | none | conflict | #183 | #211 (`crates/rdocx-oxml/src/footnotes.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159) |
+| [#195](https://github.com/tensorbee/rdocx/pull/195) | `main` | `fix/replace-reaches-content-controls` / `bb76c4bd35` | green | none | conflict | #184 + #180 | #211 (`crates/rdocx/src/document.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#197](https://github.com/tensorbee/rdocx/pull/197) | `main` | `fix/template-saved-as-document-content-type` / `8cdfd4a913` | green | none | conflict | - | #263 (`crates/rdocx/src/document.rs`) | F-X137 | - |
+| [#198](https://github.com/tensorbee/rdocx/pull/198) | `main` | `feat/cli-compare-options-comment-dates` / `ff24553e60` | green | none | conflict | - | #263 (`crates/rdocx/src/document.rs`) | F-X139 | [161](https://github.com/tensorbee/rdocx/issues/161) |
+| [#202](https://github.com/tensorbee/rdocx/pull/202) | `main` | `fix/replace-reaches-notes-and-tracked-insertions` / `5c3d81cf90` | green | none | conflict | #195 | #211 (`crates/rdocx-oxml/src/footnotes.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#205](https://github.com/tensorbee/rdocx/pull/205) | `main` | `fix/comparison-marker-unit-boundaries` / `7704245c99` | green | none | conflict | - | #211 (`crates/rdocx-oxml/src/text.rs`) | F-X139 | [161](https://github.com/tensorbee/rdocx/issues/161) |
+| [#210](https://github.com/tensorbee/rdocx/pull/210) | `main` | `fix/word-text-boxes-read-and-counted-once` / `7d8e03b7d1` | green | none | conflict | #195 | #211 (`crates/rdocx/src/document.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#211](https://github.com/tensorbee/rdocx/pull/211) | `main` | `fix/text-inside-simple-fields-smart-tags-custom-xml` / `bce7ebcd26` | green | none | conflict | #202 | #202 (`crates/rdocx-oxml/src/footnotes.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
+| [#241](https://github.com/tensorbee/rdocx/pull/241) | `main` | `fix/word-section-width-per-paragraph` / `09dd97d614` | green | none | conflict | - | #263 (`crates/rdocx-layout/src/engine.rs`) | F-X162 | - |
+| [#242](https://github.com/tensorbee/rdocx/pull/242) | `main` | `fix/word-plain-line-fit-hangs-trailing-space` / `14358319b4` | green | none | conflict | #222, already integrated | #263 (`crates/rdocx/src/document.rs`) | F-X163 | [226](https://github.com/tensorbee/rdocx/issues/226) |
+| [#251](https://github.com/tensorbee/rdocx/pull/251) | `main` | `fix/rewritten-parts-keep-word-layout` / `2ae5d6189f` | green | none | conflict | - | #193 (`crates/rdocx-oxml/src/footnotes.rs`) | F-X161 | [245](https://github.com/tensorbee/rdocx/issues/245) |
+| [#252](https://github.com/tensorbee/rdocx/pull/252) | `main` | `fix/rpptx-added-shapes-get-the-theme-style` / `966b83ae7c` | green | none | conflict | - | #178 (`crates/rpptx/src/odp.rs`) | F-X164 | [244](https://github.com/tensorbee/rdocx/issues/244) |
+| [#256](https://github.com/tensorbee/rdocx/pull/256) | `main` | `feat/revision-view-python-cli` / `ad088becbf` | green | none | conflict | - | #198 (`crates/rdocx-cli/src/main.rs`) | F-X165 | [253](https://github.com/tensorbee/rdocx/issues/253) |
+| [#257](https://github.com/tensorbee/rdocx/pull/257) | `main` | `fix/compare-changed-picture` / `e6562e7821` | green | none | conflict | - | #211 (`crates/rdocx/src/document.rs`) | F-X166 | [254](https://github.com/tensorbee/rdocx/issues/254) |
+| [#258](https://github.com/tensorbee/rdocx/pull/258) | `main` | `fix/compare-final-table-and-paragraph` / `42bd34f231` | green | none | conflict | - | #261 (`crates/rdocx/src/revision.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) |
+| [#259](https://github.com/tensorbee/rdocx/pull/259) | `main` | `fix/html-markdown-export-tracked-changes` / `5bc41cb280` | green | none | conflict | - | #263 (`crates/rdocx-html/src/lib.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
+| [#260](https://github.com/tensorbee/rdocx/pull/260) | `main` | `fix/reject-paragraph-property-change-keeps-mark` / `39a9c9d97b` | green | none | conflict | - | #261 (`crates/rdocx/src/revision.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) (dependency) |
+| [#261](https://github.com/tensorbee/rdocx/pull/261) | `main` | `fix/compare-final-paragraph-keeps-properties` / `cdfcefbe95` | green | none | conflict | #258 + #260 | #260 (`crates/rdocx/src/revision.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) |
+| [#262](https://github.com/tensorbee/rdocx/pull/262) | `main` | `fix/accepted-view-drops-deleted-paragraphs` / `32a12735ac` | green | none | conflict | #259 | #193 (`crates/rdocx/src/document.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
+| [#263](https://github.com/tensorbee/rdocx/pull/263) | `main` | `fix/accepted-view-drops-deleted-rows` / `6252b10a8d` | green | none | conflict | - | #259 (`crates/rdocx-html/src/lib.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
+
+The 19 older open heads, #174 through #211 in the table, predate the
+completed S76 integration commits. The S76 AS_BUILT entries explicitly list
+every one of these PRs and say that unique behavior commits were replayed while
+measurement-only tails and duplicate ancestors were omitted. The integration
+commits below are ancestors of the current sprint branch, and GitHub reports no
+later revision to these PR heads. This is behavioral adoption, not identical
+patch text. Their final disposition is superseded by the integrated work after
+the combined S84 gates pass. Do not replay their stale branches.
+
+| Older PRs | Current disposition | Integrated evidence | Final check |
+|---|---|---|---|
+| #174, #178, #182, #185, #197 | Behavior integrated, archive measurement tails omitted | `26b3f880`, F-X137 in `AS_BUILT.md` | CLI, package and save regressions on final main |
+| #177, #179, #180, #191, #195, #202, #210, #211 | Behavior integrated, duplicate ancestors and measurement tails omitted | `c8975fb4`, F-X138 in `AS_BUILT.md` | Word story, replacement and Issue 160 matrix on final main |
+| #183, #184, #190, #193, #198, #205 | Behavior integrated, measurement tails omitted | `992930ce`, F-X139 in `AS_BUILT.md` | Identity, comparison and CLI regressions on final main |
+
+If a final gate exposes an omitted behavior, reconcile it under an approved
+F-ID and revise this disposition before any PR closes. Contributor closure
+comments must name the adopted integration commit and the final test evidence.
+
+For pending work, review and replay #251 first, then #241, then #242, with
+separate hash baseline commits and deterministic render evidence. #242 includes
+#222, already integrated. Review #252 after its already integrated presentation
+style prerequisites. Review #256 before the comparison and accepted-view set.
+Then review #257, #258, #260, #261 in that order, with #261 depending on both
+#258 and #260. Review #259, #262, #263 in that order, with #262 stacked on
+#259. Rebase each head onto the reviewed prefix and reconcile shared files
+against both approved plans. PR #195 also carries #180's code, so its older
+stack must be compared incrementally. PR #257's comment supplies Word for Mac
+picture evidence, while #260's comment explains #261's marker-order dependency.
+
+The current conflicts require manual semantic reconciliation in
+`rdocx-oxml` serializers, `rdocx-layout` line and section code,
+`rdocx/src/comparison.rs`, accepted-view exporters, shared regression test
+entrypoints and their HLD sections. Recheck the exclusive `hash_baseline.json`
+updates from #251, #241 and #242 one at a time. #242 also changes the golden
+pixel manifest. No current head CI job is failing. Missing GitHub reviews,
+conflicting bases, and the untested combined result block direct PR merges.
+
+| Open issue | PR coverage | Remaining acceptance and closure evidence | F-ID |
+|---|---|---|---|
+| [#158](https://github.com/tensorbee/rdocx/issues/158) | Earlier contribution waves, #251 and #242 | Keep both SHA-bound fixtures, the 18 by 7 identity and 11 by 8 producer matrices, and both complete workflows green on integrated main. Close only after #160 and #226 and all child criteria pass. | F-X169, F-X168 |
+| [#160](https://github.com/tensorbee/rdocx/issues/160) | Earlier #177, #180, #184, #185, #190, #195, #202, #210, #211 and #251 | Recheck every body walker location, packed fields, no-op comments bytes, `mc:Ignorable` binding, and all 11 by 8 producer cells on serialized output after #251. | F-X161, F-X168 |
+| [#226](https://github.com/tensorbee/rdocx/issues/226) | Integrated #222 and pending #242 | Prove plain and explicit `w:rtl=false` line breaks at 1.70 and 2.10 inches, with hanging space and no punctuation or space at line start, against pinned Word or LibreOffice output. | F-X163, F-X168 |
+| [#244](https://github.com/tensorbee/rdocx/issues/244) | #252 | Added shape has python-pptx's `p:style`, visible fill and line in rpptx, LibreOffice and PowerPoint, reopens in python-pptx, and accepts theme effect index zero. | F-X164, F-X168 |
+| [#245](https://github.com/tensorbee/rdocx/issues/245) | #251 | Edited package keeps untouched parts and regions, compact rewritten XML, one root `w` declaration, valid namespaces and the individually reviewed 20-entry OOXML hash delta. | F-X161, F-X168 |
+| [#253](https://github.com/tensorbee/rdocx/issues/253) | #256, related #259, #262, #263 | Python PDF and page render plus both CLI paths select tracked or accepted view, default accepted, reject bad selectors, and give old plus new text versus new only. Check accepted exporters after the follow-ups. | F-X165, F-X167, F-X168 |
+| [#254](https://github.com/tensorbee/rdocx/issues/254) | #257 | All three picture cases work at run and word granularities, retain both media parts, and accept or reject to the correct image, caption and size. Repeat the contributor's Word for Mac check on the integrated result. | F-X166, F-X168 |
+| [#255](https://github.com/tensorbee/rdocx/issues/255) | #258, #260, #261 | All five final-table pairs work at run and word granularities, accept and reject to exact paragraphs, tables and properties, and open in Word with inserted or deleted table marks. | F-X166, F-X168 |
+
+The 3 October refresh found [#264](https://github.com/tensorbee/rdocx/issues/264),
+a new open feature request with no PR. A [3 October response](https://github.com/tensorbee/rdocx/issues/264#issuecomment-5967685523)
+explains the active S84 implementation and keeps the issue open. `StyleBuilder` and
+`Document` already create, update and manage styles, but simple style formatting
+still requires raw `CT_PPr` and `CT_RPr` values. F-X170 owns a focused facade
+for common paragraph and run settings, with a save and reopen example. F-X168
+must verify the API before closing #264. The PR count and all recorded heads
+remain unchanged at 31.
+
+The later 3 October refresh found [PR #265](https://github.com/tensorbee/rdocx/pull/265),
+a draft alternate to PR #241. It targets `main` from
+`fix/mixed-section-measure` at `177dd7cbc4`, has no CI jobs or submitted
+reviews, and GitHub reports it mergeable but blocked as a draft. It overlaps
+`crates/rdocx-layout/src/engine.rs` with F-X162 and PR #241, with no stacked
+dependency. Its production section selection is already covered by F-X162's
+`main_story_item_sections` and the section-width tests. F-X168 will adopt the
+new multipage, mixed-orientation table and content-control test on the
+integrated implementation, run it under deterministic fonts, and cite the
+combined gate before closing #265 as superseded. This makes 32 open PRs and
+nine open issues at the latest refresh.
+It addresses no open issue directly.
+
+| New open issue | PR coverage | Remaining acceptance and closure evidence | F-ID |
+|---|---|---|---|
+| [#264](https://github.com/tensorbee/rdocx/issues/264) | None | Show convenient style creation and management through the existing `Document` surface, configure common paragraph and run formatting without constructing `CT_PPr` or `CT_RPr`, and prove that an applied style survives save and reopen. | F-X170, F-X168 |
+
+An issue without a direct PR is #158, the umbrella acceptance contract. All
+eight issues from the 2 October intake stay open until every criterion passes on integrated main. The
+S84 consolidation exceeds one normal sprint. F-X169 records live intake,
+F-X161 through F-X167 and F-X170 implement the remaining slices, and F-X168 closes the
+evidence ledger last.
+Each F-ID requires focused tests, applicable oracle and risk checks, scoped
+verification and a zero-finding microscope. After all increments integrate,
+one `/verify --full`, the hash harness and a clean `/sprint-review` precede
+`/close-sprint`. The final issue closure check uses both full fixture workflows
+and matrices, binding and CLI checks, deterministic render comparisons and the
+combined hash baseline. Close every remaining PR and issue after the reviewed
+result reaches main and its hosted CI gate passes. The S84 main push exposed a
+missing pinned LibreOffice setup in the macOS Python job. F-X171 repairs that
+hosted gate before the prepared closures are posted.
+
+#### Sprint S85, Hosted CI repair and contribution closure
+
+**Goal**: restore the required hosted CI gate on the S84 main result, then
+reconcile all 32 reviewed PRs and nine issue contracts against the green
+integrated result. Keep the published `s84` tag fixed and start the planned
+feature work in S86.
 
 | F-ID | Title | Size |
 |------|-------|------|
-| F-X167 | Accepted-view exporters and readers | L |
-| F-X168 | Current issue and contribution closure evidence | M |
+| F-X171 | Pin LibreOffice for macOS Python acceptance | S |
 
-F-X167 reviews PR 259 after PR 256 and the content-control exporters in
-F-X151. It then reviews PR 262 and PR 263 against the same accepted-view
-model. Its Python bindings CI failure blocks integration until repaired.
-F-X168 audits all 30 issues in the 1 October snapshot, including new Issues
-243 through 247 and 253 through 255. It closes no issue merely because a PR
-was integrated. Any criterion without evidence on main remains open with a
-named follow-up F-ID. The S76 to S88 repair programme exceeds a normal sprint
-and is split into verified whole-number sprint boundaries before feature work
-resumes at S89.
+The S84 local full gate and manual viewer evidence passed. The hosted
+presentation binding job failed only because it had no `soffice` executable.
+Install the exact reviewed LibreOffice image on that job, verify its digest and
+build identity, and rerun the full Python suite and aggregate CI gate. Close
+the S84 PR and issue queue only after `main` is green. This one-story repair
+boundary avoids moving the already published `s84` tag.
 
-#### Live contribution and issue inventory, 1 October 2026
-
-GitHub reports 77 open PRs and 30 open issues in this snapshot. Every PR
-still targets `main`, and none has a submitted GitHub review or an inline
-review thread. CI is the latest head rollup, not an integrated gate. Forty
-heads are marked conflicting against `main`. Every listed PR remains open on
-GitHub, including the S76 and S77 contributions already replayed locally.
-A PR marked `*` appears to cover a narrow issue implementation claim, but
-issue closure still requires its complete acceptance evidence on main.
-
-| PR | Base | Head branch and SHA | CI | Review | Mergeability | Stack | Source overlap | F-ID | Issues |
-|---|---|---|---|---|---|---|---|---|
-| [#173](https://github.com/tensorbee/rdocx/pull/173) | `main` | `fix/rpptx-run-text-keeps-handles` / `4185465d08` | SUCCESS | none | MERGEABLE | - | #189 (2, `crates/rpptx-py/src/text.rs`), #208 (2, `crates/rpptx-py/src/text.rs`), #209 (2, `crates/rpptx-py/src/text.rs`) | F-X142 | [167](https://github.com/tensorbee/rdocx/issues/167)* |
-| [#174](https://github.com/tensorbee/rdocx/pull/174) | `main` | `fix/cli-output-overwrite-and-closed-pipe` / `0f108ffb90` | SUCCESS | none | CONFLICTING | - | #197 (4, `crates/rdocx-cli/src/commands.rs`), #186 (3, `crates/rdocx-cli/src/commands.rs`), #198 (3, `crates/rdocx-cli/src/commands.rs`) | F-X137 | [156](https://github.com/tensorbee/rdocx/issues/156)*, [166](https://github.com/tensorbee/rdocx/issues/166)* |
-| [#175](https://github.com/tensorbee/rdocx/pull/175) | `main` | `fix/rpptx-pdf-backgrounds-and-optional-gradient-attributes` / `4e3ff0a578` | SUCCESS | none | CONFLICTING | - | #178 (1, `crates/rpptx/tests/integration.rs`), #188 (1, `crates/rpptx/tests/integration.rs`), #189 (1, `crates/rpptx/tests/integration.rs`) | F-X140 | [170](https://github.com/tensorbee/rdocx/issues/170)* |
-| [#176](https://github.com/tensorbee/rdocx/pull/176) | `main` | `feat/python-compare-options` / `4154be9c0c` | FAILURE (Presentation fidelity, CI gate) | none | CONFLICTING | - | #179 (4, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #186 (4, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #187 (4, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X141 | [161](https://github.com/tensorbee/rdocx/issues/161), [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#177](https://github.com/tensorbee/rdocx/pull/177) | `main` | `fix/body-readers-reach-content-controls` / `367c48ace8` | SUCCESS | none | CONFLICTING | - | #263 (4, `crates/rdocx-cli/tests/integration.rs`), #178 (3, `crates/rdocx/src/document.rs`), #185 (3, `crates/rdocx-cli/tests/integration.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#178](https://github.com/tensorbee/rdocx/pull/178) | `main` | `fix/atomic-library-save` / `4e582fcb09` | SUCCESS | none | CONFLICTING | - | #229 (6, `crates/rdocx/src/document.rs`), #193 (5, `crates/rdocx/src/document.rs`), #233 (5, `crates/oxml-opc/src/package.rs`) | F-X137 | [164](https://github.com/tensorbee/rdocx/issues/164)* |
-| [#179](https://github.com/tensorbee/rdocx/pull/179) | `main` | `fix/direct-body-index-coordinates` / `128e61bdee` | FAILURE (Test, Word fidelity, CI gate, CI gate) | none | CONFLICTING | - | #191 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #194 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #186 (6, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X138 | [163](https://github.com/tensorbee/rdocx/issues/163) |
-| [#180](https://github.com/tensorbee/rdocx/pull/180) | `main` | `fix/text-box-rewrite-keeps-all-children` / `242e9984b3` | SUCCESS | none | CONFLICTING | - | #184 (2, `crates/rdocx-oxml/src/placeholder.rs`), #190 (2, `crates/rdocx-oxml/src/placeholder.rs`), #193 (2, `crates/rdocx-oxml/src/placeholder.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#181](https://github.com/tensorbee/rdocx/pull/181) | `main` | `feat/rpptx-py-facade-basics` / `c73ac59d8d` | SUCCESS | none | MERGEABLE | - | #231 (7, `crates/rpptx-py/python/rpptx/__init__.py`), #219 (5, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #189 (4, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X142 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#182](https://github.com/tensorbee/rdocx/pull/182) | `main` | `fix/story-splice-namespace-facts` / `46c128e3c9` | SUCCESS | none | CONFLICTING | - | #179 (3, `crates/rdocx-py/tests/test_core.py`), #186 (3, `crates/rdocx-py/tests/test_core.py`), #191 (3, `crates/rdocx-py/tests/test_core.py`) | F-X137 | [157](https://github.com/tensorbee/rdocx/issues/157) |
-| [#183](https://github.com/tensorbee/rdocx/pull/183) | `main` | `fix/toc-rebuild-unbound-word-prefix` / `1bed176b32` | SUCCESS | none | CONFLICTING | - | #193 (5, `crates/rdocx-oxml/src/drawing.rs`), #191 (4, `crates/rdocx-oxml/src/text.rs`), #220 (3, `crates/rdocx-oxml/src/text.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159) |
-| [#184](https://github.com/tensorbee/rdocx/pull/184) | `main` | `fix/compare-producer-noise` / `83b92bbf69` | SUCCESS | none | CONFLICTING | - | #190 (3, `crates/rdocx-oxml/src/placeholder.rs`), #193 (3, `crates/rdocx-oxml/src/placeholder.rs`), #195 (3, `crates/rdocx-oxml/src/placeholder.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159), [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#185](https://github.com/tensorbee/rdocx/pull/185) | `main` | `fix/rewritten-part-roots-and-comments-part` / `88a4838704` | SUCCESS | none | CONFLICTING | - | #193 (5, `crates/rdocx-oxml/src/comments.rs`), #211 (5, `crates/rdocx-cli/src/commands.rs`), #263 (5, `crates/rdocx-cli/src/commands.rs`) | F-X137 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#186](https://github.com/tensorbee/rdocx/pull/186) | `main` | `feat/story-revisions-listing` / `a83d62911c` | SUCCESS | none | CONFLICTING | - | #191 (8, `crates/rdocx-cli/src/main.rs`), #220 (8, `crates/rdocx-cli/src/commands.rs`), #194 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X143 | [165](https://github.com/tensorbee/rdocx/issues/165)* |
-| [#187](https://github.com/tensorbee/rdocx/pull/187) | `main` | `feat/py-tables-and-sections` / `16ce6fbf82` | SUCCESS | none | CONFLICTING | - | #201 (8, `crates/rdocx-py/python/rdocx/__init__.py`), #203 (8, `crates/rdocx-py/python/rdocx/__init__.py`), #194 (6, `crates/rdocx-py/python/rdocx/__init__.py`) | F-X141 | [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#188](https://github.com/tensorbee/rdocx/pull/188) | `main` | `fix/pdf-tounicode-ligatures` / `2da774a518` | SUCCESS | none | CONFLICTING | - | #197 (2, `crates/rdocx/tests/integration_test.rs`), #201 (2, `crates/rdocx/tests/integration_test.rs`), #203 (2, `crates/rdocx/tests/integration_test.rs`) | F-X140 | [171](https://github.com/tensorbee/rdocx/issues/171)* |
-| [#189](https://github.com/tensorbee/rdocx/pull/189) | `main` | `feat/rpptx-py-tables-crop-zorder-hyperlinks` / `6509eaf8da` | SUCCESS | none | CONFLICTING | - | #208 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #209 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #219 (11, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X142 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#190](https://github.com/tensorbee/rdocx/pull/190) | `main` | `fix/compare-diagnostics-instead-of-refusals` / `4e0be1e8ea` | SUCCESS | none | CONFLICTING | 184 | #184 (3, `crates/rdocx-oxml/src/placeholder.rs`), #193 (3, `crates/rdocx-oxml/src/placeholder.rs`), #195 (3, `crates/rdocx-oxml/src/placeholder.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159), [160](https://github.com/tensorbee/rdocx/issues/160), [161](https://github.com/tensorbee/rdocx/issues/161) |
-| [#191](https://github.com/tensorbee/rdocx/pull/191) | `main` | `fix/comment-anchoring-run-index` / `573d8c670a` | SUCCESS | none | CONFLICTING | 179 | #220 (11, `crates/rdocx-cli/src/main.rs`), #186 (8, `crates/rdocx-cli/src/main.rs`), #179 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X138 | [163](https://github.com/tensorbee/rdocx/issues/163), [172](https://github.com/tensorbee/rdocx/issues/172) |
-| [#192](https://github.com/tensorbee/rdocx/pull/192) | `main` | `feat/rpptx-effective-placeholder-geometry` / `1bc3aab6b3` | SUCCESS | none | CONFLICTING | - | #219 (7, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #234 (7, `crates/rpptx-layout/src/context.rs`), #189 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X142 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#193](https://github.com/tensorbee/rdocx/pull/193) | `main` | `fix/table-row-identity-attributes` / `7a8841fbcb` | SUCCESS | none | CONFLICTING | 183 | #202 (9, `crates/rdocx-oxml/src/content_control.rs`), #211 (9, `crates/rdocx-oxml/src/content_control.rs`), #195 (8, `crates/rdocx-oxml/src/content_control.rs`) | F-X139 | [159](https://github.com/tensorbee/rdocx/issues/159) |
-| [#194](https://github.com/tensorbee/rdocx/pull/194) | `main` | `feat/py-bookmarks-fields-stories-replace-render` / `92f36ed484` | SUCCESS | none | CONFLICTING | 179 | #203 (8, `crates/rdocx-py/python/rdocx/__init__.py`), #179 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #186 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X141 | [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#195](https://github.com/tensorbee/rdocx/pull/195) | `main` | `fix/replace-reaches-content-controls` / `bb76c4bd35` | SUCCESS | none | CONFLICTING | 184 | #202 (9, `crates/rdocx-cli/tests/integration.rs`), #210 (9, `crates/rdocx-cli/tests/integration.rs`), #211 (9, `crates/rdocx-cli/tests/integration.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#196](https://github.com/tensorbee/rdocx/pull/196) | `main` | `fix/rpptx-duplicate-paragraph-properties` / `636de9828d` | SUCCESS | none | CONFLICTING | - | #197 (2, `crates/rpptx-cli/tests/integration.rs`), #201 (2, `crates/rpptx-cli/tests/integration.rs`), #203 (2, `crates/rpptx-cli/tests/integration.rs`) | F-X140 | - |
-| [#197](https://github.com/tensorbee/rdocx/pull/197) | `main` | `fix/template-saved-as-document-content-type` / `8cdfd4a913` | SUCCESS | none | CONFLICTING | - | #201 (5, `crates/rdocx/src/document.rs`), #203 (5, `crates/rdocx/src/document.rs`), #174 (4, `crates/rdocx-cli/src/commands.rs`) | F-X137 | - |
-| [#198](https://github.com/tensorbee/rdocx/pull/198) | `main` | `feat/cli-compare-options-comment-dates` / `ff24553e60` | SUCCESS | none | CONFLICTING | - | #186 (5, `crates/rdocx-cli/src/commands.rs`), #204 (5, `crates/rdocx-cli/src/commands.rs`), #220 (5, `crates/rdocx-cli/src/commands.rs`) | F-X139 | [161](https://github.com/tensorbee/rdocx/issues/161) |
-| [#199](https://github.com/tensorbee/rdocx/pull/199) | `main` | `fix/keep-with-next-chains` / `45999729f6` | SUCCESS | none | CONFLICTING | - | #237 (4, `crates/rdocx-layout/src/engine.rs`), #225 (3, `crates/rdocx-layout/src/engine.rs`), #232 (3, `crates/rdocx-layout/src/paginator.rs`) | F-X140 | - |
-| [#200](https://github.com/tensorbee/rdocx/pull/200) | `main` | `fix/restart-before-first-changed-block` / `3d9e5e7e67` | SUCCESS | none | CONFLICTING | - | #193 (1, `crates/rdocx-layout/src/engine.rs`), #199 (1, `crates/rdocx-layout/src/engine.rs`), #201 (1, `crates/rdocx-layout/src/engine.rs`) | F-X140 | - |
-| [#201](https://github.com/tensorbee/rdocx/pull/201) | `main` | `feat/py-paragraph-text-style-check-core-properties` / `ca1f1be9d0` | SUCCESS | none | CONFLICTING | - | #203 (16, `crates/oxml-core/src/core_properties.rs`), #187 (8, `crates/rdocx-py/python/rdocx/__init__.py`), #191 (7, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X141 | [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#202](https://github.com/tensorbee/rdocx/pull/202) | `main` | `fix/replace-reaches-notes-and-tracked-insertions` / `5c3d81cf90` | SUCCESS | none | CONFLICTING | 195 | #211 (11, `crates/rdocx-cli/tests/integration.rs`), #193 (9, `crates/rdocx-oxml/src/content_control.rs`), #195 (9, `crates/rdocx-cli/tests/integration.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#203](https://github.com/tensorbee/rdocx/pull/203) | `main` | `feat/py-styles-numbering-and-default-styles` / `0bbfcc172a` | SUCCESS | none | CONFLICTING | 201 | #201 (16, `crates/oxml-core/src/core_properties.rs`), #187 (8, `crates/rdocx-py/python/rdocx/__init__.py`), #194 (8, `crates/rdocx-py/python/rdocx/__init__.py`) | F-X141 | [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#204](https://github.com/tensorbee/rdocx/pull/204) | `main` | `feat/cli-text-every-story-and-stricter-validate` / `782e5de22a` | SUCCESS | none | CONFLICTING | 198 | #186 (5, `crates/rdocx-cli/src/commands.rs`), #198 (5, `crates/rdocx-cli/src/commands.rs`), #220 (5, `crates/rdocx-cli/src/commands.rs`) | F-X143 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#205](https://github.com/tensorbee/rdocx/pull/205) | `main` | `fix/comparison-marker-unit-boundaries` / `7704245c99` | SUCCESS | none | CONFLICTING | - | #193 (3, `crates/rdocx-oxml/src/text.rs`), #195 (3, `crates/rdocx-oxml/src/text.rs`), #202 (3, `crates/rdocx-oxml/src/text.rs`) | F-X139 | [161](https://github.com/tensorbee/rdocx/issues/161) |
-| [#206](https://github.com/tensorbee/rdocx/pull/206) | `main` | `fix/rpptx-added-pictures-have-a-geometry` / `1a68d66990` | SUCCESS | none | MERGEABLE | - | #219 (2, `crates/rpptx-oxml/src/picture.rs`), #175 (1, `crates/rpptx/tests/integration.rs`), #178 (1, `crates/rpptx/tests/integration.rs`) | F-X140 | - |
-| [#207](https://github.com/tensorbee/rdocx/pull/207) | `main` | `fix/rpptx-added-connectors-have-a-line` / `2a236a4ec5` | SUCCESS | none | CONFLICTING | - | #234 (7, `crates/rpptx-layout/src/context.rs`), #252 (5, `crates/rpptx-layout/src/context.rs`), #219 (4, `crates/rpptx-oxml/src/connector.rs`) | F-X140 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#208](https://github.com/tensorbee/rdocx/pull/208) | `main` | `feat/rpptx-populate-group-shapes` / `3daa325e2a` | SUCCESS | none | CONFLICTING | 189 | #189 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #209 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #219 (11, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X142 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#209](https://github.com/tensorbee/rdocx/pull/209) | `main` | `feat/rpptx-table-rows-and-columns` / `149d3170be` | SUCCESS | none | CONFLICTING | 189 | #189 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #208 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #219 (11, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X142 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#210](https://github.com/tensorbee/rdocx/pull/210) | `main` | `fix/word-text-boxes-read-and-counted-once` / `7d8e03b7d1` | SUCCESS | none | CONFLICTING | 195 | #195 (9, `crates/rdocx-cli/tests/integration.rs`), #202 (9, `crates/rdocx-cli/tests/integration.rs`), #211 (9, `crates/rdocx-cli/tests/integration.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#211](https://github.com/tensorbee/rdocx/pull/211) | `main` | `fix/text-inside-simple-fields-smart-tags-custom-xml` / `bce7ebcd26` | SUCCESS | none | CONFLICTING | 202 | #202 (11, `crates/rdocx-cli/tests/integration.rs`), #193 (9, `crates/rdocx-oxml/src/content_control.rs`), #195 (9, `crates/rdocx-cli/tests/integration.rs`) | F-X138 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#212](https://github.com/tensorbee/rdocx/pull/212) | `main` | `feat/py-hyperlink-retarget-and-picture-resize` / `45d609c0ee` | SUCCESS | none | CONFLICTING | - | #179 (6, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #186 (6, `crates/rdocx-py/python/rdocx/_rdocx.pyi`), #191 (6, `crates/rdocx-py/python/rdocx/_rdocx.pyi`) | F-X141 | [168](https://github.com/tensorbee/rdocx/issues/168) |
-| [#214](https://github.com/tensorbee/rdocx/pull/214) | `main` | `fix/pdf-with-fonts-bundled-fallback` / `0a0a3d37f8` | SUCCESS | none | MERGEABLE | - | #177 (2, `crates/rdocx/src/document.rs`), #178 (2, `crates/rdocx/src/document.rs`), #179 (2, `crates/rdocx/src/document.rs`) | F-X151 | - |
-| [#218](https://github.com/tensorbee/rdocx/pull/218) | `main` | `fix/rpptx-body-properties-keep-unmodelled-attributes` / `9667f239df` | SUCCESS | none | MERGEABLE | - | #175 (1, `crates/rpptx/tests/integration.rs`), #178 (1, `crates/rpptx/tests/integration.rs`), #188 (1, `crates/rpptx/tests/integration.rs`) | F-X154 | [215](https://github.com/tensorbee/rdocx/issues/215)* |
-| [#219](https://github.com/tensorbee/rdocx/pull/219) | `main` | `feat/rpptx-shape-click-hyperlinks` / `68772f6b8d` | none | none | CONFLICTING | 189 | #189 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #208 (11, `crates/rpptx-oxml/src/shape_tree.rs`), #209 (11, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X155 | [169](https://github.com/tensorbee/rdocx/issues/169), [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#220](https://github.com/tensorbee/rdocx/pull/220) | `main` | `feat/word-cli-anchor-numbering-run-remove` / `b5c0b2bece` | SUCCESS | none | MERGEABLE | - | #191 (11, `crates/rdocx-cli/src/main.rs`), #211 (9, `crates/rdocx-cli/src/commands.rs`), #186 (8, `crates/rdocx-cli/src/commands.rs`) | F-X153 | [163](https://github.com/tensorbee/rdocx/issues/163), [168](https://github.com/tensorbee/rdocx/issues/168), [172](https://github.com/tensorbee/rdocx/issues/172) |
-| [#221](https://github.com/tensorbee/rdocx/pull/221) | `main` | `feat/rpptx-line-dash-and-ends` / `66d80e3d0a` | SUCCESS | none | MERGEABLE | - | #189 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #208 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #209 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X155 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#222](https://github.com/tensorbee/rdocx/pull/222) | `main` | `fix/rpptx-line-pitch-and-line-breaks` / `7490f2eb3f` | SUCCESS | none | MERGEABLE | - | #242 (8, `crates/oxml-layout/src/font.rs`), #237 (6, `crates/oxml-layout/src/line.rs`), #225 (4, `crates/oxml-layout/src/font.rs`) | F-X146 | [162](https://github.com/tensorbee/rdocx/issues/162), [226](https://github.com/tensorbee/rdocx/issues/226) |
-| [#223](https://github.com/tensorbee/rdocx/pull/223) | `main` | `fix/rpptx-text-frame-line-feeds-make-paragraphs` / `80e1e1b1af` | SUCCESS | none | MERGEABLE | - | #209 (5, `crates/oxml-drawing/src/text/mod.rs`), #233 (4, `crates/oxml-drawing/src/text/mod.rs`), #252 (4, `crates/rpptx-py/tests/test_documented_examples.py`) | F-X154 | [216](https://github.com/tensorbee/rdocx/issues/216)* |
-| [#224](https://github.com/tensorbee/rdocx/pull/224) | `main` | `feat/rpptx-shape-shadow` / `0436254c30` | SUCCESS | none | MERGEABLE | - | #189 (8, `crates/rpptx-oxml/src/shape_tree.rs`), #208 (8, `crates/rpptx-oxml/src/shape_tree.rs`), #209 (8, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X155 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#225](https://github.com/tensorbee/rdocx/pull/225) | `main` | `fix/word-line-height-leading` / `c98af87d0a` | SUCCESS | none | MERGEABLE | - | #237 (6, `crates/rdocx-layout/src/convert.rs`), #242 (6, `crates/oxml-layout/src/font.rs`), #222 (4, `crates/oxml-layout/src/font.rs`) | F-X146 | [162](https://github.com/tensorbee/rdocx/issues/162) |
-| [#228](https://github.com/tensorbee/rdocx/pull/228) | `main` | `fix/compare-after-toc-rebuild` / `a41737a43c` | SUCCESS | none | MERGEABLE | - | #186 (3, `crates/rdocx/src/comparison.rs`), #258 (3, `crates/rdocx/src/comparison.rs`), #260 (3, `crates/rdocx/src/comparison.rs`) | F-X151 | [161](https://github.com/tensorbee/rdocx/issues/161) |
-| [#229](https://github.com/tensorbee/rdocx/pull/229) | `main` | `fix/exporters-reach-content-controls` / `fccb29599d` | SUCCESS | none | MERGEABLE | - | #178 (6, `crates/rdocx/src/document.rs`), #193 (6, `crates/rdocx-oxml/src/text.rs`), #263 (6, `crates/rdocx-html/src/emitter.rs`) | F-X151 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#230](https://github.com/tensorbee/rdocx/pull/230) | `main` | `feat/rpptx-auto-shape-type` / `1282242fe8` | SUCCESS | none | MERGEABLE | - | #189 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #192 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #208 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X155 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#231](https://github.com/tensorbee/rdocx/pull/231) | `main` | `feat/rpptx-scoped-try-replace-text` / `6e2b745724` | none | none | CONFLICTING | 181 | #219 (8, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #181 (7, `crates/rpptx-py/python/rpptx/__init__.py`), #189 (7, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X156 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#232](https://github.com/tensorbee/rdocx/pull/232) | `main` | `fix/border-styles-and-header-namespaces` / `322f6efc73` | SUCCESS | none | MERGEABLE | - | #185 (3, `crates/rdocx-layout/src/table.rs`), #199 (3, `crates/rdocx-layout/src/paginator.rs`), #237 (3, `crates/rdocx-layout/src/paginator.rs`) | F-X151 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#233](https://github.com/tensorbee/rdocx/pull/233) | `main` | `fix/never-save-characters-xml-cannot-carry` / `7bde695c2f` | SUCCESS | none | MERGEABLE | - | #178 (5, `crates/oxml-opc/src/package.rs`), #209 (4, `crates/oxml-drawing/src/text/mod.rs`), #223 (4, `crates/oxml-drawing/src/text/mod.rs`) | F-X151 | - |
-| [#234](https://github.com/tensorbee/rdocx/pull/234) | `main` | `feat/rpptx-shapes-without-theme-effect` / `b67a371872` | none | none | CONFLICTING | 207 | #219 (8, `crates/rpptx-oxml/src/connector.rs`), #224 (8, `crates/rpptx-oxml/src/shape_tree.rs`), #189 (7, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X155 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#235](https://github.com/tensorbee/rdocx/pull/235) | `main` | `feat/rpptx-import-slide` / `1b6618234c` | SUCCESS | none | MERGEABLE | - | #192 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #219 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`), #231 (6, `crates/rpptx-py/python/rpptx/_rpptx.pyi`) | F-X156 | [217](https://github.com/tensorbee/rdocx/issues/217) |
-| [#236](https://github.com/tensorbee/rdocx/pull/236) | `main` | `fix/rdocx-diff-every-story` / `13e662c2c4` | SUCCESS | none | MERGEABLE | - | #186 (4, `crates/rdocx-cli/src/commands.rs`), #198 (4, `crates/rdocx-cli/src/commands.rs`), #204 (4, `crates/rdocx-cli/src/commands.rs`) | F-X152 | [227](https://github.com/tensorbee/rdocx/issues/227)* |
-| [#237](https://github.com/tensorbee/rdocx/pull/237) | `main` | `fix/tab-stops-and-numbered-toc-entries` / `87812ac28a` | SUCCESS | none | MERGEABLE | - | #242 (8, `crates/oxml-layout/src/line.rs`), #222 (6, `crates/oxml-layout/src/line.rs`), #225 (6, `crates/rdocx-layout/src/convert.rs`) | F-X146 | [162](https://github.com/tensorbee/rdocx/issues/162) |
-| [#238](https://github.com/tensorbee/rdocx/pull/238) | `main` | `feat/rpptx-builtin-table-styles` / `512c10ab99` | SUCCESS | none | MERGEABLE | - | #192 (3, `crates/rpptx-layout/src/context.rs`), #207 (2, `crates/rpptx-layout/src/context.rs`), #209 (2, `crates/oxml-drawing/src/table.rs`) | F-X156 | [169](https://github.com/tensorbee/rdocx/issues/169) |
-| [#239](https://github.com/tensorbee/rdocx/pull/239) | `main` | `fix/run-text-around-a-complex-field` / `0350108f06` | FAILURE (Python bindings (rdocx), CI gate) | none | MERGEABLE | - | #193 (4, `crates/rdocx-oxml/src/text.rs`), #202 (4, `crates/rdocx-oxml/src/revision.rs`), #211 (4, `crates/rdocx-oxml/src/revision.rs`) | F-X151 | [160](https://github.com/tensorbee/rdocx/issues/160) |
-| [#240](https://github.com/tensorbee/rdocx/pull/240) | `main` | `fix/new-documents-open-in-word` / `c40f08b9ce` | SUCCESS | none | MERGEABLE | - | #185 (2, `crates/rdocx/src/document.rs`), #187 (2, `crates/rdocx/src/document.rs`), #193 (2, `crates/rdocx/src/document.rs`) | F-X159 | - |
-| [#241](https://github.com/tensorbee/rdocx/pull/241) | `main` | `fix/word-section-width-per-paragraph` / `09dd97d614` | SUCCESS | none | MERGEABLE | - | #193 (2, `crates/rdocx-layout/src/engine.rs`), #199 (2, `crates/rdocx-layout/src/engine.rs`), #225 (2, `crates/rdocx-layout/src/engine.rs`) | F-X162 | - |
-| [#242](https://github.com/tensorbee/rdocx/pull/242) | `main` | `fix/word-plain-line-fit-hangs-trailing-space` / `14358319b4` | SUCCESS | none | MERGEABLE | - | #222 (8, `crates/oxml-layout/src/font.rs`), #237 (8, `crates/oxml-layout/src/line.rs`), #225 (6, `crates/oxml-layout/src/font.rs`) | F-X163 | [226](https://github.com/tensorbee/rdocx/issues/226) |
-| [#248](https://github.com/tensorbee/rdocx/pull/248) | `main` | `fix/style-edits-on-repeated-style-ids` / `ef84405732` | SUCCESS | none | MERGEABLE | - | #185 (3, `crates/rdocx/src/document.rs`), #203 (3, `crates/rdocx/src/document.rs`), #225 (3, `crates/rdocx/src/document.rs`) | F-X160 | [243](https://github.com/tensorbee/rdocx/issues/243) |
-| [#249](https://github.com/tensorbee/rdocx/pull/249) | `main` | `fix/repeated-drawing-ids-in-one-part` / `76ea8df373` | SUCCESS | none | MERGEABLE | - | #191 (4, `crates/rdocx-py/tests/test_core.py`), #193 (4, `crates/rdocx-py/tests/test_core.py`), #179 (3, `crates/rdocx-py/tests/test_core.py`) | F-X160 | [247](https://github.com/tensorbee/rdocx/issues/247) |
-| [#250](https://github.com/tensorbee/rdocx/pull/250) | `main` | `fix/decimal-twips-measurements-on-read` / `c25639a647` | SUCCESS | none | MERGEABLE | - | #185 (3, `crates/rdocx-cli/tests/integration.rs`), #193 (2, `crates/rdocx-oxml/src/document.rs`), #197 (2, `crates/rdocx-cli/tests/integration.rs`) | F-X160 | [246](https://github.com/tensorbee/rdocx/issues/246) |
-| [#251](https://github.com/tensorbee/rdocx/pull/251) | `main` | `fix/rewritten-parts-keep-word-layout` / `2ae5d6189f` | SUCCESS | none | MERGEABLE | - | #193 (6, `crates/rdocx-oxml/src/document.rs`), #202 (5, `crates/rdocx-oxml/src/footnotes.rs`), #211 (5, `crates/rdocx-oxml/src/footnotes.rs`) | F-X161 | [245](https://github.com/tensorbee/rdocx/issues/245) |
-| [#252](https://github.com/tensorbee/rdocx/pull/252) | `main` | `fix/rpptx-added-shapes-get-the-theme-style` / `966b83ae7c` | SUCCESS | none | MERGEABLE | - | #234 (6, `crates/rpptx-layout/src/context.rs`), #207 (5, `crates/rpptx-layout/src/context.rs`), #224 (5, `crates/rpptx-oxml/src/shape_tree.rs`) | F-X164 | [244](https://github.com/tensorbee/rdocx/issues/244) |
-| [#256](https://github.com/tensorbee/rdocx/pull/256) | `main` | `feat/revision-view-python-cli` / `ad088becbf` | SUCCESS | none | MERGEABLE | - | #186 (7, `crates/rdocx-cli/src/commands.rs`), #191 (6, `crates/rdocx-cli/src/main.rs`), #220 (6, `crates/rdocx-cli/src/commands.rs`) | F-X165 | [253](https://github.com/tensorbee/rdocx/issues/253) |
-| [#257](https://github.com/tensorbee/rdocx/pull/257) | `main` | `fix/compare-changed-picture` / `e6562e7821` | SUCCESS | none | MERGEABLE | - | #186 (4, `crates/rdocx-py/tests/test_core.py`), #193 (4, `crates/rdocx-py/tests/test_core.py`), #179 (3, `crates/rdocx-py/tests/test_core.py`) | F-X166 | [254](https://github.com/tensorbee/rdocx/issues/254) |
-| [#258](https://github.com/tensorbee/rdocx/pull/258) | `main` | `fix/compare-final-table-and-paragraph` / `42bd34f231` | SUCCESS | none | MERGEABLE | - | #186 (3, `crates/rdocx/src/comparison.rs`), #228 (3, `crates/rdocx/src/comparison.rs`), #260 (3, `crates/rdocx/src/comparison.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) |
-| [#259](https://github.com/tensorbee/rdocx/pull/259) | `main` | `fix/html-markdown-export-tracked-changes` / `5bc41cb280` | FAILURE (Python bindings (rdocx), CI gate) | none | MERGEABLE | - | #263 (6, `crates/rdocx-cli/tests/integration.rs`), #229 (5, `crates/rdocx-html/src/emitter.rs`), #177 (3, `crates/rdocx-cli/tests/integration.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
-| [#260](https://github.com/tensorbee/rdocx/pull/260) | `main` | `fix/reject-paragraph-property-change-keeps-mark` / `39a9c9d97b` | SUCCESS | none | MERGEABLE | - | #186 (3, `crates/rdocx/src/comparison.rs`), #228 (3, `crates/rdocx/src/comparison.rs`), #258 (3, `crates/rdocx/src/comparison.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) (dependency) |
-| [#261](https://github.com/tensorbee/rdocx/pull/261) | `main` | `fix/compare-final-paragraph-keeps-properties` / `cdfcefbe95` | SUCCESS | none | MERGEABLE | 258 + 260 | #186 (3, `crates/rdocx/src/comparison.rs`), #228 (3, `crates/rdocx/src/comparison.rs`), #258 (3, `crates/rdocx/src/comparison.rs`) | F-X166 | [255](https://github.com/tensorbee/rdocx/issues/255) |
-| [#262](https://github.com/tensorbee/rdocx/pull/262) | `main` | `fix/accepted-view-drops-deleted-paragraphs` / `32a12735ac` | SUCCESS | none | MERGEABLE | 259 | #193 (4, `crates/rdocx-layout/src/engine.rs`), #185 (3, `crates/rdocx-oxml/src/document.rs`), #225 (3, `crates/rdocx-layout/src/engine.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
-| [#263](https://github.com/tensorbee/rdocx/pull/263) | `main` | `fix/accepted-view-drops-deleted-rows` / `6252b10a8d` | SUCCESS | none | MERGEABLE | - | #229 (6, `crates/rdocx-html/src/emitter.rs`), #259 (6, `crates/rdocx-cli/tests/integration.rs`), #185 (5, `crates/rdocx-cli/src/commands.rs`) | F-X167 | [253](https://github.com/tensorbee/rdocx/issues/253) (follow-up) |
-
-Review PRs 190 after 184, 191 and 194 after 179, 193 after 183, 195
-after 184, 202 and 210 after 195, 211 after 202, 203 after 201, 204
-after 198, 208 and 209 after 189, 219 after 189, 231 after 181, 234
-after 207, 242 after 222, 261 after 258 and 260, and 262 after 259.
-Replay only the incremental commits from each stack, reconcile overlapping
-source and test files against both approved designs, and rerun CI on the
-rebased integrated prefix.
-
-Current failing heads are PR 176 (Presentation fidelity), PR 179 (Test and
-Word fidelity), and PRs 239 and 259 (rdocx Python bindings). PRs 219, 231
-and 234 have no CI rollup. PRs 206 and 222 now report success. PR 214's
-comment identifies a conflicting font-dir assertion introduced by PR 194.
-PR 257's comment supplies Word for Mac comparison evidence, and PR 260's
-comment identifies the resolution dependency for PR 261. The four newer
-baseline-changing PRs 240, 251, 241 and 242 have separate sprint gates.
-
-| Issue | PR coverage | Remaining acceptance and closure evidence | F-ID |
-|---|---|---|---|
-| [#156](https://github.com/tensorbee/rdocx/issues/156) | #174 | Every writing CLI refuses input-as-output and existing output without `--force`, with byte-identical files after refusal. | F-X137 |
-| [#157](https://github.com/tensorbee/rdocx/issues/157) | #182 | `add_picture` succeeds on the report fixture and default-namespace plus inline-control matrix rows. | F-X144 |
-| [#158](https://github.com/tensorbee/rdocx/issues/158) | Many partial PRs | Keep both attached fixtures, 18 by 7 and 11 by 8 matrices, and both end-to-end workflows as repeatable acceptance gates. Close only after every child issue has evidence. | F-X149, F-X158, F-X150 |
-| [#159](https://github.com/tensorbee/rdocx/issues/159) | #183, #184, #190, #193 | Run all identity rows through all seven operations. Preserve row identities and avoid identity-only revisions or refusals. | F-X144 |
-| [#160](https://github.com/tensorbee/rdocx/issues/160) | #177, #180, #184, #185, #190, #195, #202, #204, #210, #211, #229, #232, #239, #251 | Run every producer cell, all body walker locations including images and related stories, packed fields, unchanged comments bytes, and valid `mc:Ignorable`. | F-X144, F-X151, F-X161 |
-| [#161](https://github.com/tensorbee/rdocx/issues/161) | #176, #190, #198, #205, #228 | Prove Python and CLI option parity, Word and Character granularity, edited-side comment changes, rebuilt TOCs and correct marker order. | F-X145 |
-| [#162](https://github.com/tensorbee/rdocx/issues/162) | #222, #225, #237 | Pin four-family pitch at two sizes and 240 or 264 spacing. Confirm the inline picture height and report caption against Word PDF. | F-X146 |
-| [#163](https://github.com/tensorbee/rdocx/issues/163) | #179, #191, #220 | Prove direct body coordinates after tables in Rust, Python and CLI for split, bookmarks and comments. | F-X138, F-X153 |
-| [#164](https://github.com/tensorbee/rdocx/issues/164) | #178 | Prove failed saves retain old DOCX and PPTX bytes, links and modes. | F-X137 |
-| [#165](https://github.com/tensorbee/rdocx/issues/165) | #186 | List revisions in body, cells, headers, footers and notes with accept/reject parity in Rust, Python and CLI. | F-X143 |
-| [#166](https://github.com/tensorbee/rdocx/issues/166) | #174 | Both CLIs exit cleanly after a closed pipe without panic. | F-X137 |
-| [#167](https://github.com/tensorbee/rdocx/issues/167) | #173 | All slide and shape handles remain usable after Python `Run.text` changes. | F-X142 |
-| [#168](https://github.com/tensorbee/rdocx/issues/168) | #176, #187, #194, #201, #203, #212, #220, #248 | Run every table, style, section, bookmark, field, rich story, replacement, rendering, paragraph, hyperlink, picture, XML and anchored-comment checklist example. Finish gaps or record an allowed scope decision with fallback. | F-X141, F-X147, F-X153, F-X160 |
-| [#169](https://github.com/tensorbee/rdocx/issues/169) | #181, #189, #192, #208, #209, #219, #238 | Run every slide, table, crop, z-order, layout, hyperlink, comment, geometry and built-in style checklist example on the deck. Finish gaps or record an allowed scope decision with fallback. | F-X142, F-X148, F-X156 |
-| [#170](https://github.com/tensorbee/rdocx/issues/170) | #175 | PDF backgrounds match PNG, missing gradient angle or path opens and renders, and round trips keep omitted attributes omitted. | F-X140, F-X158 |
-| [#171](https://github.com/tensorbee/rdocx/issues/171) | #188 | `pdftotext` returns all bundled regular and bold family text including ligatures. Review the hash delta. | F-X140 |
-| [#172](https://github.com/tensorbee/rdocx/issues/172) | #191, #220 | Anchor exact inline-control text through Python `add_comment`, `add_story_comment` and CLI `comment add`. Refuse unrepresentable ranges. | F-X138, F-X153 |
-| [#215](https://github.com/tensorbee/rdocx/issues/215) | #218 | Unedited text bodies keep every unmodelled `a:bodyPr` attribute after another shape changes. | F-X154 |
-| [#216](https://github.com/tensorbee/rdocx/issues/216) | #223 | Assigned `\n` creates paragraphs, `\v` creates breaks, and layout and render survive producer line feeds. | F-X154 |
-| [#217](https://github.com/tensorbee/rdocx/issues/217) | #207, #219, #221, #224, #230, #231, #234, #235 | Complete all six shadow, theme effect, line end, preset geometry, slide import and scoped replacement items. Reopen in python-pptx, validate, and compare LibreOffice and rpptx renders per item. | F-X155, F-X156, F-X157 |
-| [#226](https://github.com/tensorbee/rdocx/issues/226) | #222, #242 | UAX 14 breaks for plain and explicit `w:rtl=false` runs, with hanging trailing space and Word or LibreOffice line parity at both supplied widths. | F-X146, F-X163 |
-| [#227](https://github.com/tensorbee/rdocx/issues/227) | #236 | Diff locates cell and related-story text changes and counts one changed paragraph once. Decide optional machine-readable output separately. | F-X152 |
-| [#243](https://github.com/tensorbee/rdocx/issues/243) | [#248](https://github.com/tensorbee/rdocx/pull/248) | Repeated IDs and multiple table defaults from reporter comment accepted by all style mutations with first definition/default authoritative, reject new defects. | F-X160 |
-| [#244](https://github.com/tensorbee/rdocx/issues/244) | [#252](https://github.com/tensorbee/rdocx/pull/252) | Visible added shape with python-pptx p:style, theme-effect index zero, render and reopen in rpptx, LibreOffice and PowerPoint. | F-X164 |
-| [#245](https://github.com/tensorbee/rdocx/issues/245) | [#251](https://github.com/tensorbee/rdocx/pull/251) | Compact rewritten part, one root w namespace, unchanged regions, reviewed 20-entry OOXML hash delta. | F-X161 |
-| [#246](https://github.com/tensorbee/rdocx/issues/246) | [#250](https://github.com/tensorbee/rdocx/pull/250) | Every decimal integer measurement and part rounds half away from zero, malformed values report element and attribute, untouched bytes preserved. | F-X160 |
-| [#247](https://github.com/tensorbee/rdocx/issues/247) | [#249](https://github.com/tensorbee/rdocx/pull/249) | Repeated drawing IDs open in Python/CLI, new drawing ID unique, save and reopen, with no-op bytes preserved. | F-X160 |
-| [#253](https://github.com/tensorbee/rdocx/issues/253) | [#256](https://github.com/tensorbee/rdocx/pull/256), [#259](https://github.com/tensorbee/rdocx/pull/259), [#262](https://github.com/tensorbee/rdocx/pull/262), [#263](https://github.com/tensorbee/rdocx/pull/263) are related accepted-view follow-ups | Python and CLI tracked/accepted selector, bad-value handling, pdftotext old+new vs new only, integrated binding/CLI gates. | F-X165, F-X167 |
-| [#254](https://github.com/tensorbee/rdocx/issues/254) | [#257](https://github.com/tensorbee/rdocx/pull/257) | Three image-change cases at both granularities, accept/reject media and captions, Word evidence, integrated gate. | F-X166 |
-| [#255](https://github.com/tensorbee/rdocx/issues/255) | [#258](https://github.com/tensorbee/rdocx/pull/258), [#260](https://github.com/tensorbee/rdocx/pull/260), [#261](https://github.com/tensorbee/rdocx/pull/261) | Five former failures compare, accept/reject paragraphs, tables and properties, Word opens and displays inserted/deleted table. | F-X166 |
-
-Every issue stays open until every criterion passes on integrated main.
-F-X150 audits the original 22-issue snapshot, and F-X168 audits all 30 issues
-in this snapshot. Each sprint runs scoped story checks and microscope review,
-then one combined `/verify --full` and `/sprint-review` at its closure.
-Deterministic fonts, pinned viewer versions, the hash harness and manual Word
-or PowerPoint checks apply where stated. Only `/close-sprint` may merge to
-`main`, tag a sprint or reconcile contributed PRs and issues with human-written
-thanks and criterion evidence.
-
-#### Sprint S89, Rich related-story foundations
+#### Sprint S86, Rich related-story foundations and unified releases
 
 **Goal**: establish rich header, footer, and note authoring on the existing
-story model, while removing repeated canonical-prefix rebinding from retained
-elements. Complete the footnote substrate before extending it to endnotes.
+story model, remove repeated canonical-prefix rebinding from retained
+elements, and prepare and publish one combined CLI and Python release per
+family for Issue 266.
 
 | F-ID | Title | Size |
 |------|-------|------|
@@ -1932,16 +1911,56 @@ elements. Complete the footnote substrate before extending it to endnotes.
 | F-271 | Uniform rich header and footer editing | L |
 | F-272 | Rich footnote authoring | L |
 | F-273 | Rich endnote authoring | L |
+| F-X172 | Unified release artifacts and provenance | L |
+| F-X173 | Prepare unified rpptx 0.13.0 family | M |
+| F-X174 | Prepare unified rdocx 0.15.0 family | M |
 
 F-X133 is independent and may proceed alongside F-271. F-272 establishes
 the note-authoring model that F-273 extends. The other 11 stories from the
-original S76 inventory move together to S90 in dependency order.
+original S76 inventory move together to S87 in dependency order. Issue 266
+adds a release pipeline story followed by the incubating and stable release
+preparations. After `/close-sprint` merges the reviewed result to `main`, each
+tag requires its own final approval at that merge SHA.
 
-#### Sprint S90, Related-story completion, fields, and stable templating
+#### Sprint S87, Release archive evidence repair
 
-**Goal**: complete note policy, cross-story ranges, fragment transactions,
-and glossary authoring, then build the field-driven navigation and stable
-templating structures that depend on them.
+**Goal**: repair the Linux package footprint checks exposed by the S86 main
+CI run, then verify a clean release source for both Issue 266 families. The
+previously planned related-story work moves to S88 because publication must
+follow a reviewed green main merge.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X175 | Refresh CLI archive evidence after release hardening | S |
+
+The repair updates the two CLI archive measurements after the reviewed Windows
+stack correction. Hosted CI, local package evidence, the full gate and a clean
+sprint review must pass before `/close-sprint S87`. The two family publications
+then follow through separate `/release` approvals at the S87 main merge SHA.
+
+#### Sprint S88, Release inventory and version repair
+
+**Goal**: repair the tag-only asset inventory failure before either registry
+publishes Issue 266 packages. Preserve the failed `rpptx-v0.13.0` tag, prepare a
+new PowerPoint version and the stable Word version from a reviewed main merge,
+and run a build-only rehearsal and the complete gate before fresh approvals.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X176 | Repair unified release inventory and respin PowerPoint | M |
+
+The tag workflow's publication dry run does not retain `.crate` archives on a
+fresh target directory. F-X176 checks the unpacked package inventory instead,
+adds a clean-target regression, refreshes version carriers and notes, and
+proves both selected release families before `/close-sprint S88`. The related
+story wave moves to S89 so publication follows this focused repair.
+
+#### Sprint S89, Related stories and safe fragment reuse
+
+**Goal**: complete note separators and numbering policy, cross-story range
+markers, deterministic fragment dependency remapping, and public glossary
+creation. These four stories establish the shared story and package semantics
+needed by later fields, templates, forms, and collaboration work.
 
 | F-ID | Title | Size |
 |------|-------|------|
@@ -1949,46 +1968,938 @@ templating structures that depend on them.
 | F-275 | Cross-story bookmarks, ranges, and annotations | L |
 | F-276 | Complete fragment conflict and dependency policy | L |
 | F-277 | Glossary and building-block creation | L |
+| F-X177 | Accept unified fontdb source features | S |
+
+F-274 closes the note policy left by rich footnotes and endnotes. F-275 makes
+paired markers valid across stories. F-276 then remaps a full fragment's
+conflicting dependencies without dangling IDs, and F-277 uses that transaction
+for building-block insertion. The sprint gate includes save-reopen checks for
+relationships and untouched XML. This wave moved from S87 through S88 to leave
+room for the release repairs.
+The user added PR 269 during S89. F-X177 preserves downstream fontdb feature
+unification and uses a separate wave between F-276 and F-277 because archive
+evidence and HLD files are shared. The four authoring contracts retain their
+dependency order.
+
+#### Sprint S90, Fields, pagination, and navigation
+
+**Goal**: provide a complete field construction surface and deterministic
+field results across stories, then compose captions, cross-references, indexes,
+bounded native citations and bibliography results.
+
+| F-ID | Title | Size |
+|------|-------|------|
 | F-278 | General simple and complex field builder | L |
 | F-279 | Pagination field materialization across stories | L |
 | F-280 | Captions, sequences, and complete cross-references | M |
 | F-281 | Indexes and tables of figures and authorities | L |
 | F-282 | Citations and bibliography authoring | L |
+| F-X179 | Correct multi-paragraph comment threads from PR 271 | S |
+| F-X180 | Correct cell nil and none border precedence | S |
+| F-X181 | Ignore page and column breaks inside table cells | S |
+| F-X182 | Honor direct table alignment | M |
+| F-X183 | Correct table margins and legacy positioning | M |
+| F-X184 | Safe comment ownership during content removal | L |
+| F-X185 | Expose comment anchor text and story location | M |
+| F-X186 | Move comment anchors without losing threads | M |
+| F-X187 | Scoped paragraph and cell text replacement | M |
+| F-X188 | Preserve comment ownership when replacing or removing whole stories | L |
+| F-X190 | Preserve cached text in multi-run complex field story snapshots | M |
+| F-X191 | Ignore namespace declarations in numbering reader completeness | S |
+| F-X189 | Prepare Word 0.16.0 and PowerPoint 0.14.0 families | L |
+
+F-278 is the field substrate. F-279 uses the S89 note policy, and F-280 uses
+S89 range markers. F-281 follows the field, pagination, and caption work.
+F-282 follows F-278 and delivers its revised measured-subset contract.
+F-283 carries the composed numbering and navigation result to S91. The S90
+gate checks delivered field caches and page targets against pinned Word controls.
+F-X178 is carried out of the S90 execution at the user's instruction to leave
+Issue 264 alone. Its backlog row remains pending for separate work. F-282
+covers the measured native source-authoring and formatter subset. F-X192 owns the
+remaining full catalogue work in S91. F-283 is carried to S91.
+
+F-X179 integrates PR 271 only after every Issue 270 criterion passes. It has
+no dependency and preserves Issue 264 and F-X178 for separate work.
+
+The user added Issues 272 and 273 with PRs 274 and 275 during S90.
+F-X180 and F-X181 validate each full issue before accepting its contribution.
+Their source and regression files overlap F-282 and F-283. Pause F-282 at a
+saved checkpoint, run these independent fixes in separate waves, then resume
+the bounded F-282 contract. F-283 is carried to S91. Source and Cargo ownership never overlap. Reconcile both
+approved contracts at integration and check table geometry and bibliography
+output. Issue 264 remains excluded.
+
+
+Newly opened Issues 277 and 276 add F-X182 and F-X183. Run direct alignment
+before legacy positioning, with F-X182 completed at a scoped dependency
+checkpoint before F-X183 starts. Keep F-282 paused through these exclusive
+source and hash-baseline waves, then resume its bounded S90 contract. F-283 is carried to S91. Each rendering
+delta is separately declared and reviewed. Issue 264 remains excluded.
+PR 279 supplies F-X182. PR 280 is stacked on it and supplies F-X183, including new Issue 278 for unset side margins. Validate both complete issue sets before contributor disposition.
+
+
+Issue [281](https://github.com/tensorbee/rdocx/issues/281), raised by `hadim`,
+adds roadmap feedback to this sprint intake. Record its unified CLI/Python
+workflow, template filling, preservation-safe edits and rendering needs in the
+existing F-184 decision at S99. The [maintainer response](https://github.com/tensorbee/rdocx/issues/281#issuecomment-6058792996)
+answers scheduling and staged-delivery questions and requests concrete workflows
+and preservation needs. Keep the discussion open for the F-184 decision. S90 delivers the documented
+assessment, while spreadsheet implementation retains its affirmative decision
+barrier.
+
+Issues [282](https://github.com/tensorbee/rdocx/issues/282), [283](https://github.com/tensorbee/rdocx/issues/283), [284](https://github.com/tensorbee/rdocx/issues/284) and [285](https://github.com/tensorbee/rdocx/issues/285), reported by `hadim`, add F-X184 through F-X187. The intake was read against canonical 0a775842a8fd12f088bf4f2b3d0a049ddc3e976b. All four were opened on 2026-10-08 at 13:35 UTC and have no matching contribution PR at intake. Subsequent [PR 286](https://github.com/tensorbee/rdocx/pull/286), by `hadim`, targets Issue 285 at head `08361f6af99110cbae71bf9f0498a12feadc01db` and is included in F-X187 contribution assessment. Its patch must satisfy the approved scope and integrated verification before acceptance or closure. Their approved plans retain the complete issue criteria. Issue numbers 282 and 283 are distinct from existing feature IDs F-282 and F-283.
+
+Pause F-282 only at an explicit saved external checkpoint. Run F-X184, F-X185, F-X186 and F-X187 in exclusive waves 11, 12, 13 and 14, respectively. F-X184 uses completed F-X179 and F-271. Complete each formal dependency before starting its consumer. F-X187 has no formal dependency but follows F-X186 because document, comment, binding and existing test entrypoints overlap. These waves exclusively own shared source, Cargo execution and HLD edits. Resume the revised measured-subset F-282 contract afterward. Remaining bibliography work is F-X192 in S91, and F-283 is carried to S91. Draft batch planning does not waive implementation barriers or the final integrated full gate. Issue 264 and F-X178 remain excluded. GitHub closure waits for verified sprint close and complete issue acceptance.
+
+Subsequent [PR 287](https://github.com/tensorbee/rdocx/pull/287), by Hadrien
+Mary (`hadim`), targets Issues 282, 283 and 284 at immutable head
+`e4b216934eb3abc58ea1a42d72a902f90aa8e120`, based on
+`20888b7a2c636e322ad23dc611f494beaac1c09b`. It is included in F-X184 through
+F-X186 contribution assessment. Existing F-X184 acceptance retains atomic
+partial-cut and fragment-detach refusal. Assess reusable anchor projection,
+typed binding and movement changes against the full F-X185 and F-X186 plans,
+without replacing the completed ownership protections or accepting the PR's
+stated note and header removal gaps. The stacked F-X179 contribution is
+already integrated. Read the exact contribution and preserve contributor
+attribution, with PR reconciliation only after complete integrated acceptance
+at verified sprint close. No additional F-ID or scope reduction is introduced.
+
+Issues [288](https://github.com/tensorbee/rdocx/issues/288) and
+[289](https://github.com/tensorbee/rdocx/issues/289), reported by `hadim` on
+2026-10-08 at 16:18 UTC, are included in S90 acceptance assessment. Issue288
+covers note removal, all header and footer replacement variants, shared story
+references and building-block removal with complete comment thread and
+companion preservation or atomic refusal. Compare every criterion with the
+completed F-X184 implementation and add any missing implementation and tests
+through the feature lifecycle before acceptance. Issue289 requires nested
+block-control paragraph snapshots to carry accepted text and XML, including
+comment anchor endpoints and other checked two-segment path consumers. Assess
+it under F-X185's existing checked paragraph snapshot contract. Nested
+paragraph enumeration is optional in that issue and does not change the
+ordinary story inventory contract. Neither issue is closed from similarity to
+an existing fix. Exact integrated evidence and full issue acceptance remain
+required. The seven observed PR heads remain unchanged. Issue264 remains
+excluded.
+
+Issue292 is included in F-X188 with documented comment omission from
+building-block transfers and physical glossary/main owner isolation.
+The user corrected the exclusion to Issue281, which remains open for F-184.
+Issue291 is included through F-X190, whose planned, verified multi-run field
+snapshot correction runs in exclusive wave16 after F-X188 and before F-282 resumes. Issue264 remains
+excluded. Assess updated stacked contributions selectively against complete
+issue acceptance before merging or closing any record.
+
+F-X188 owns exclusive wave15 after F-X187 and before F-282
+resumes under its revised measured-subset contract. Its approved Issue288 contract completes the remaining replacement,
+glossary and shared-reference ownership work. Issue289 is part of F-X185.
+
+The user approved F-X189 for new Word0.16.0 and shared/PowerPoint0.14.0
+release preparation. Existing unified versions are published at S88 and their
+tags remain immutable. Run exclusive wave18 only after all included S90
+implementation dependencies complete, including the revised F-282 measured
+subset and F-X191. Prepare exact carriers, reviewed family notes and authenticated
+contribution inventories over each complete previous-tag range, including
+S89. Current local package/binding evidence precedes final integrated full
+verification and review. The final reviewed and pushed sprint SHA must pass
+the hosted build-only rehearsal before close. Publication follows close
+through separate final exact-main-SHA approvals for each family, with shared
+packages published before their new Word consumers. This is a user-approved
+release preparation boundary, not completion of M24 or a1.0 decision.
+Issue264 remains excluded and Issue281 remains open for F-184.
+
+S90 contribution intake is frozen by the user at PR293. Do not search for
+or add later issues or pull requests to this sprint. Finish the existing
+measured bibliography, numbering reader and release preparation scope.
+Remaining catalogue work and unfinished navigation move to S91.
+Issues264 and281 remain open.
+
+PR [293](https://github.com/tensorbee/rdocx/pull/293), contributed by Pedro
+Assumpcao (`pedroassumpcao`) at head
+`fd112a7ac3333709f62746b7065c5cc1b4be0eed`, adds F-X191. The user approved
+its workflow records. Exclusive wave17 corrects the namespace-only numbering
+reader flag while preserving declarations, foreign attributes, opaque children
+and the separate authoring completeness contract. It has no formal dependency,
+but shared source and Cargo ownership remain exclusive. Complete F-X191 before
+F-X189 in wave18. Assess only the reader fix and focused tests, preserving
+current archive policy rather than adopting contributor platform overrides.
+Issue264 remains excluded and Issue281 stays open. PR disposition waits for
+complete integrated acceptance at verified sprint close.
+
+The user moved remaining bibliography work to F-X192 in S91 and explicitly
+carried F-283 to S91 to publish completed S90 work. F-282 must satisfy its
+revised measured-subset design, actual admission and atomic refusal contracts,
+independent review and scoped gates. Its current 210-of-223 dense APA checkpoint
+is not full catalogue parity. F-X189 depends on completed revised F-282 and
+F-X191, not the carried S91 stories. Final integrated verification, sprint
+review, package checks and exact-SHA publication approval remain required.
+
+#### Sprint S91, Contribution repairs
+
+**Local checkpoint, 2026-10-15**: all29 top-level stories and four delivery
+children are complete. A release-workflow amendment qualifies the exact37
+Word and41 PowerPoint bare-wheel priority checks after the prior local review. The final local full gate passes, including778 Word
+and854 PowerPoint Python cases,104 font cases within those suites, the
+separate native-eight check,49 matching hashes,22 verified archives, README
+and supply-chain checks. The unchanged100-script report qualifies95 correct
+files, all42 hard gates,51 native clauses and24 documentation examples. Its
+five documented non-successes remain in the denominator. Historical missing
+oracle cases are uncredited. Integrated sprint reviewpass3 is clean. Hosted build
+rehearsal, main merge, publication of both families and humanized issue/PR
+reconciliation retain their separate gates. Discussion264/281 stay open.
+The S92 carryovers remain deferred. AS_BUILT records the actual evidence.
+
+**Goal**: finish completed stories and all included issue/PR repairs. The user
+parks the separate S90 bibliography and navigation carryovers at S92. Intake
+is closed at forty issues and thirty PRs, excluding only the requirements
+discussions264 and281.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X193 | Preserve semantic mark highlights through nested HTML runs | S |
+| F-X194 | Complete Python table text and indentation APIs | M |
+| F-X195 | Honor caller fonts and variable styles across render paths | L |
+| F-X196 | Validate visible paragraph content without false empty warnings | S |
+| F-X197 | Unify Python colour inputs and font colour formats | L |
+| F-X198 | Preserve alternate text-box copies during scoped replacement | M |
+| F-X199 | Model namespace-qualified empty table cell margins | S |
+| F-X200 | Complete Python Word formatting and list parity | L |
+| F-X201 | Complete Python section stories and page authoring | L |
+| F-X202 | Complete Word tables pictures and internal links | L |
+| F-X203 | Complete Python Word document operations and validation | L |
+| F-X204 | Complete shared CLI one-shot editing commands | L |
+| F-X205 | Complete Python PowerPoint text fill and export parity | L |
+| F-X206 | Complete PowerPoint shape authoring and live handles | L |
+| F-X207 | Persist PowerPoint autofit and implement fit_text | L |
+| F-X208 | Author PowerPoint footer fields themes and transitions | L |
+| F-X209 | Edit PowerPoint masters layouts and themes | L |
+| F-X210 | Extend metric-compatible fonts and bullet fallbacks | L |
+| F-X211 | Complete Python script compatibility and safe XML access | L |
+| F-X212 | Align native accessibility with visible paragraph content | M |
+| F-X213 | Preserve TOC entry boundary paragraphs during rebuild | M |
+| F-X214 | Bound recursive PowerPoint parsing and traversal | L |
+| F-X215 | Create charts in Python and replace existing chart data | L |
+| F-X216 | Import complete slides and merge decks with source formatting | L |
+| F-X217 | Import HTML and Markdown through public Word surfaces | L |
+| F-X218 | Export presentations as semantic HTML and Markdown | L |
+| F-X220 | Embed fonts through both native and public package families | L |
+| F-X221 | Prepare Word 0.16.1 and PowerPoint 0.14.1 patch releases | L |
+| F-X222 | Restore linear Word story range inventory and empty owners | M |
+
+**Current delivery checkpoint**: twenty-six of twenty-nine active stories are
+completed and integrated, F-X193 through F-X210, F-X212, F-X213, F-X214, F-X215, F-X217, F-X218, F-X220 and F-X222. Remaining issue and PR repairs follow
+completed dependencies and exclusive source boundaries. CURRENT_SPRINT.md
+records active owners and execution states. F-X192 and F-283 remain at S92 with their contracts,
+dirty worker work, reviews and required evidence retained. Standalone authoring
+work remains in later sprints. No design question remains outstanding.
+
+F-X209 completes its reviewed scoped integration in7349282b. Part-owned master,
+layout and theme edits pass native PowerPoint and LibreOffice acceptance, current
+installed logo and typing checks, verified archives and finite measurement policy.
+Independent integration review30 preserves completed Word contracts. The composed
+six-crate native and binding check and all49 approved hashes pass.
+
+F-X203 completes its reviewed scoped integration in4d992a37. Native and binding
+all-target/all-feature checks, exact chart paint, all49 hashes, source-qualified
+archive metadata and all21 Rust README cases pass. Original failures and their
+qualified successors remain evidence. Its document operations and native
+Markdown, fresh Word-compatible settings, story tabs/breaks and checkbox repairs
+address the frozen issue and PR slices without duplicating contributor work.
+Final full sprint verification, review and GitHub closure remain due.
+
+F-X200 and F-X207 complete their scoped integration checkpoint with seven
+actual composed checks, including both exact native regressions and all49
+approved hashes. F-X200 owns the two reviewed Word XML namespace changes.
+All other completed providers retain their qualified acceptance. The durable
+resolution evidence is in AS_BUILT.md and the current status is in
+CURRENT_SPRINT.md and BACKLOG.md. Final integrated full verification,
+sprint review and verified sprint close remain outstanding. No GitHub issue
+or PR closure is claimed by scoped completion.
+
+**Frozen resolution scope, intake closed by the user**: all included issues and
+PRs remain in S91, except [Issue264](https://github.com/tensorbee/rdocx/issues/264)
+and [Issue281](https://github.com/tensorbee/rdocx/issues/281). Keep those two
+requirements discussions open. The latest inventory contains forty open issues
+and twenty-eight PRs, thirty-eight included issues after exclusions. The previous
+nineteen PRs and twenty-six included issues retain their existing owners below.
+Issue339 andPR342 extend F-X203 all-story text acceptance. Issue340 andPR341
+are assigned to approved F-X213, a bounded TOC rebuild repair separate from
+the parked full F-283 contract. Immutable source and review assessment is
+complete. Correct identified preservation gaps before adoption and prove
+acceptance locally.
+Reconcile only frozen records at implementation, integration and final close
+checkpoints. Intake stays closed. Matching issues and PRs share one acceptance
+owner and implementation.
+The 2026-10-11 09:50:39 UTC refresh found no new records. PR342 advanced
+to `9fd0b8da374b8c641e7ab89c0bd3d76bd2f4519a`. Its updated contribution
+remains assigned to F-X203. Its immutable update has been assessed against
+the existing approved contract, with remaining acceptance controls retained.
+All thirty-eight included issues and twenty-eight PRs have the acceptance
+owners in this resolution map. The 2026-10-12 02:53:59 UTC refresh found no
+new or changed records.
+The 2026-10-11 18:43 UTC refresh found no additions or changed PR heads.
+
+| Included issues | Included PRs | S91 acceptance owners | Resolution work |
+|---|---|---|---|
+| No linked issue | [294](https://github.com/tensorbee/rdocx/pull/294) | F-X193 | Semantic HTML highlights, completed. |
+| [295](https://github.com/tensorbee/rdocx/issues/295), [300](https://github.com/tensorbee/rdocx/issues/300) | [317](https://github.com/tensorbee/rdocx/pull/317) | F-X194 | Cell text frames and signed removable table indentation, completed with scoped acceptance. |
+| [296](https://github.com/tensorbee/rdocx/issues/296), [297](https://github.com/tensorbee/rdocx/issues/297) | [315](https://github.com/tensorbee/rdocx/pull/315) | F-X195 | Caller fonts and variable styles across layout and output, completed with scoped acceptance. |
+| [298](https://github.com/tensorbee/rdocx/issues/298) | [317](https://github.com/tensorbee/rdocx/pull/317) | F-X196, F-X212 | CLI validation and native accessibility complete with scoped acceptance. |
+| [299](https://github.com/tensorbee/rdocx/issues/299) | [317](https://github.com/tensorbee/rdocx/pull/317) | F-X197 | Shared Python colour inputs and font colour formats, completed with scoped acceptance. |
+| [301](https://github.com/tensorbee/rdocx/issues/301) | [317](https://github.com/tensorbee/rdocx/pull/317) | F-X198, F-X202 | Atomic refusal and synchronized admitted alternate-copy editing completed with scoped acceptance. |
+| No linked issue | [302](https://github.com/tensorbee/rdocx/pull/302) | F-X199 | Qualified empty cell margins, completed. |
+| [303](https://github.com/tensorbee/rdocx/issues/303), [321](https://github.com/tensorbee/rdocx/issues/321) | [320](https://github.com/tensorbee/rdocx/pull/320), [336](https://github.com/tensorbee/rdocx/pull/336) | F-X200, consumes F-X197 | Word formatting, lists and native shared numbering counters, completed with scoped acceptance. |
+| [304](https://github.com/tensorbee/rdocx/issues/304) | [328](https://github.com/tensorbee/rdocx/pull/328), [343](https://github.com/tensorbee/rdocx/pull/343) | F-X201 | Section stories and page authoring, including checked related-story picture media ownership, completed with scoped acceptance. |
+| [305](https://github.com/tensorbee/rdocx/issues/305) | [322](https://github.com/tensorbee/rdocx/pull/322), [343](https://github.com/tensorbee/rdocx/pull/343) | F-X202, consumes F-X194 and F-X198 | Word tables, pictures, internal links and alternate-copy synchronization, with atomic related-story Run picture insertion, completed with scoped acceptance. |
+| [306](https://github.com/tensorbee/rdocx/issues/306), [332](https://github.com/tensorbee/rdocx/issues/332), [334](https://github.com/tensorbee/rdocx/issues/334), [339](https://github.com/tensorbee/rdocx/issues/339) | [325](https://github.com/tensorbee/rdocx/pull/325), [342](https://github.com/tensorbee/rdocx/pull/342), [354](https://github.com/tensorbee/rdocx/pull/354) | F-X203 | Document operations, validation, Markdown emphasis and list/table boundaries, fresh Word-compatible settings, qualified all-story tabs/breaks and atomic visible control replacement, completed with scoped acceptance. |
+| [307](https://github.com/tensorbee/rdocx/issues/307) | [330](https://github.com/tensorbee/rdocx/pull/330) | F-X204 | Shared CLI editing commands after their API providers. |
+| [308](https://github.com/tensorbee/rdocx/issues/308) | [318](https://github.com/tensorbee/rdocx/pull/318) | F-X205, consumes F-X194 and F-X197 | PowerPoint text, fill, properties, media and export parity, completed with scoped acceptance. |
+| [309](https://github.com/tensorbee/rdocx/issues/309), [323](https://github.com/tensorbee/rdocx/issues/323) | [326](https://github.com/tensorbee/rdocx/pull/326), [335](https://github.com/tensorbee/rdocx/pull/335), [317](https://github.com/tensorbee/rdocx/pull/317) | F-X206 | Shape authoring, live handles, group transforms and diagnosed member-local render recovery, completed with scoped acceptance. |
+| [310](https://github.com/tensorbee/rdocx/issues/310) | [329](https://github.com/tensorbee/rdocx/pull/329) | F-X207 | Autofit and fit_text with shared font measurement, completed with scoped acceptance. |
+| [311](https://github.com/tensorbee/rdocx/issues/311) | [324](https://github.com/tensorbee/rdocx/pull/324) | F-X208 | Footer fields, themes and transitions, completed with scoped acceptance. |
+| [312](https://github.com/tensorbee/rdocx/issues/312) | [327](https://github.com/tensorbee/rdocx/pull/327) | F-X209 | Masters, layouts and themes, completed with scoped acceptance. |
+| [313](https://github.com/tensorbee/rdocx/issues/313) | [319](https://github.com/tensorbee/rdocx/pull/319) | F-X210, consumes F-X195 | Metric-compatible fonts and bullet fallbacks, including the approved 3968-byte checkbox subset, completed with scoped acceptance. |
+| [314](https://github.com/tensorbee/rdocx/issues/314) | Contributions above | All applicable S91 owners | Umbrella checklist, each provider credited once. |
+| [316](https://github.com/tensorbee/rdocx/issues/316), [331](https://github.com/tensorbee/rdocx/issues/331), [337](https://github.com/tensorbee/rdocx/issues/337) | [333](https://github.com/tensorbee/rdocx/pull/333), [336](https://github.com/tensorbee/rdocx/pull/336), [338](https://github.com/tensorbee/rdocx/pull/338) | F-X211, consumes completed providers | Frozen script corpus, safe XML, residual handles and bounded native control/text-box parsing. |
+| [340](https://github.com/tensorbee/rdocx/issues/340) | [341](https://github.com/tensorbee/rdocx/pull/341) | F-X213 | Entry-owned and single-paragraph TOC rebuild, retained opaque properties and namespace closure, completed with scoped acceptance. |
+| [344](https://github.com/tensorbee/rdocx/issues/344) | [355](https://github.com/tensorbee/rdocx/pull/355) | F-X214 | Bounded PowerPoint parsing and traversal, completed with scoped acceptance. |
+| [345](https://github.com/tensorbee/rdocx/issues/345), [346](https://github.com/tensorbee/rdocx/issues/346) | [356](https://github.com/tensorbee/rdocx/pull/356) | F-X215 | Python chart creation and preservation-aware data replacement, approved pending implementation. |
+| [347](https://github.com/tensorbee/rdocx/issues/347), [348](https://github.com/tensorbee/rdocx/issues/348), [349](https://github.com/tensorbee/rdocx/issues/349) | [357](https://github.com/tensorbee/rdocx/pull/357) | F-X216 | Complete slide graph import, source formatting and deck merge, completed and integrated locally, scoped acceptance qualified. Remote resolution follows final verification and publication. |
+| [350](https://github.com/tensorbee/rdocx/issues/350), [351](https://github.com/tensorbee/rdocx/issues/351) | [359](https://github.com/tensorbee/rdocx/pull/359) | F-X217 | Public Word HTML and CommonMark import, completed with scoped installed, CLI and native Word open/save/reopen/render acceptance. Remote closure follows verified sprint close. |
+| [352](https://github.com/tensorbee/rdocx/issues/352), [353](https://github.com/tensorbee/rdocx/issues/353) | [358](https://github.com/tensorbee/rdocx/pull/358) | F-X218 | Semantic presentation HTML and Markdown export, approved pending completed F-X205 and F-X206. |
+
+PR343 entered at `c6a78f683f327be8d7674af509874f74945080f3`, based directly
+on main `733ce6f7b2b816c5760692abf5c99d68b29ae897`. Its full immutable
+contribution is assessed at /private/tmp/S91-PR343-intake/assessment.md.
+Reuse checked native story-media allocation and lookup under F-X201, then
+compose actual Run picture insertion under F-X202. Its tests cover embedded
+relationships, not drawing insertion or rendering. Preserve current owner
+identity and validate stale, foreign and unsupported runs before one staged
+allocation and insertion, with no orphan media after refusal. Required note,
+cell, text-box, namespace, saved drawing and native render controls remain.
+Do not transplant contributor archive measurements or count shared work twice.
+
+PR317 spans several owners and is reconciled once across their accepted
+slices. PR326 and PR335 share group-transform changes, adopted once in F-X206.
+New PR336, head `c6ab986008782e8a376a9cdd0bda2afd4847cf47`, closes Issues331
+and321. Parsing belongs to F-X211 and numbering to F-X200. Its additional
+inline-wrapper and cross-control nesting policy has been assessed. Preserve
+the approved qualified256 control limit and native per-level numbering
+contract. Do not adopt the additional64-wrapper refusal or incomplete
+numbering restart shortcuts. Reuse only conforming changes and verify locally. It creates
+no duplicate F-ID. Contribution claims do not replace local test evidence.
+
+PR336 advanced to `935ac165afcd29d34454568ba3b2287a4bac52dc` at the
+2026-10-10 07:27:15 UTC refresh. Incremental source assessment is complete.
+Its proposed64-control and512-element revision limits do not supersede the
+approved contract by intake. Relative REF changes must be reconciled with
+F-X200 and F-283 once, retaining numbering and navigation ownership.
+
+F-X192 and F-283 move to S92 at the user's instruction. Their full contracts
+and existing work are preserved. F-X200 remains in S91 and provides the
+authoritative numbering prerequisite for later F-283 work.
+
+**Approved execution order**: wave 1 is complete. Wave 2 is F-X194, F-X212 and the disjoint core-font phase of F-X195.
+CLI and binding wiring waits for existing file owners. Wave 3 is F-X197,
+wave 4 completes F-X195 wiring, wave 5 F-X210, wave 6 F-X206,
+wave 7 F-X200 and F-X207, wave 8 F-X201 and F-X208, wave 9 F-X203,
+wave 10 F-X205, wave 11 F-X202 and F-X209, wave 12 is deferred with F-283, wave 13 F-X204,
+and wave 14 F-X211. Independent wave 15 is F-X213 after completed F-279.
+Its field.rs, regression_test.rs and test_core.py leases serialize against
+F-X200 and F-X206 edits and integration. It may prepare in a separate worker
+while F-X195 owns Cargo and the shared installed environment. F-X192's bibliography evidence barrier applies in S92. Parallel members require completed dependencies and disjoint file
+leases. Cargo and hash-baseline changes remain serialized.
+
+The following paragraphs retain historical intake checkpoints. This current
+coverage table and execution order supersede their older inventory counts,
+PR draft descriptions and preliminary sequencing. Keep delivery status current
+within the current rolling inventory. Close an issue only after its full acceptance is proved
+at verified sprint close. Reconcile unmerged contributor PRs explicitly as
+integrated or superseded against actual delivery evidence.
+
+The 2026-10-09 intake includes [PR294](https://github.com/tensorbee/rdocx/pull/294)
+and Issues [295](https://github.com/tensorbee/rdocx/issues/295),
+[296](https://github.com/tensorbee/rdocx/issues/296),
+[297](https://github.com/tensorbee/rdocx/issues/297),
+[298](https://github.com/tensorbee/rdocx/issues/298),
+[299](https://github.com/tensorbee/rdocx/issues/299) and
+[300](https://github.com/tensorbee/rdocx/issues/300). These are all open records
+at intake except the explicitly excluded Issues264 and281. PR294, by
+`pedroassumpcao`, is assessed at head
+`63cd119dcb8fa9c367bf93141f79780db7f64886`. Issues295 through300 are reported
+by `hadim`. Contribution acceptance requires the full story contract and
+integrated evidence, not adoption of a PR's test claims.
+
+F-X194 groups the two Python table API gaps, Issues295 and300, while retaining
+separate save/reopen and render controls for each family. F-X195 groups the
+caller-font and variable-instance reports, Issues296 and297, because all text
+measurement and output paths must agree on the chosen face and instance.
+The grouping does not reduce either issue's acceptance criteria.
+
+Use the approved execution order above and the canonical sprint run state.
+Complete formal prerequisites before starting their consumers. Shared source,
+bindings, tests and the hash baseline have one owner at a time. New stories require approved designs, scoped gates and clean
+microscope reviews. The original nine-story estimate was 23 to 29 developer-days. The expanded
+twenty-two-story scope requires a new estimate after detailed design, not an
+unchanged two-week duration. The inserted boundary moves the previous S91
+through S104 to S92 through S105. S90 delivered history remains intact.
+
+Issues264 and281 are excluded from S91. F-X178 remains pending at S92 and
+requires a separate scope decision. Issue281 remains open for F-184 at S96.
+No spreadsheet implementation or publication is authorized by this intake.
+S90's intake freeze remains its completed delivery boundary.
+
+**Current contribution intake**: rolling S91 intake is open at the user's
+latest instruction. The 2026-10-11 10:56:28 UTC refresh contains twenty-two
+open PRs and twenty-eight included open issues, excluding discussion Issues264
+and281. New PR343 joins F-X201 and F-X202 without a duplicate story.
+All included records have acceptance owners in the current resolution map.
+Fold later contributions into their existing owner where applicable, preserving
+complete acceptance and avoiding duplicate work. The earlier2026-10-10 freeze
+is superseded. Bibliography F-X192 and navigation F-283 remain parked in S92.
+
+Reuse each already assessed immutable contribution once, across its mapped
+owners. Retain contributor attribution, linked issues, exact accepted heads
+and locally verified evidence. Complete uncovered acceptance under the
+approved designs. An integrated source change still requires its affected
+feature gate and independent review. Final verification and sprint review
+must cover the actual completed integrated result before close.
+
+**Sprint gate**: complete all twenty-one active contribution-repair stories
+and their included issue and PR acceptance. This includes HTML mark inheritance,
+editable Python table text and signed indentation, matching caller-font layout
+and renders including variable bold/italic, content-aware empty-paragraph
+diagnostics, consistent Python colours and the bounded TOC entry repair.
+Bibliography F-X192 and navigation F-283 retain their full contracts in S92.
+Verify installed bindings, round trips, native rendering controls and declared
+hash deltas. Run the full integrated gate and sprint review once over the
+completed result. Reconcile GitHub records only at verified sprint close.
+
+Issue [301](https://github.com/tensorbee/rdocx/issues/301), by `hadim`, entered
+at the opening refresh and adds F-X198 for alternate text-box ownership. It
+follows completed F-X187 and runs in its own exclusive wave. This expands the
+initial seven-story intake to eight without weakening acceptance or carrying
+new scope away from this sprint.
+
+[PR302](https://github.com/tensorbee/rdocx/pull/302), by `pedroassumpcao`, entered
+the rolling refresh on 2026-10-09 at head
+`30e4a93df7549990c5838da9c95866d19f1247b0`, based on
+`733ce6f7b2b816c5760692abf5c99d68b29ae897`. It is a draft with no linked issue
+or discussion at assessment. F-X199 adopts its narrow qualified empty-cell
+margin correction and tests, then verifies preservation and public save/reopen
+locally. This is independent scope, not a duplicate of the table authoring
+or validation issues.
+
+Wave 1 permits separate source worktrees for F-X193, F-X198 and F-X199.
+Their source and test file sets are disjoint when F-X198 retains its approved
+regression_test.rs boundary. Shared HLD completion edits, delivery records and
+integration are serialized. Cargo commands queue against one shared target.
+F-X194 follows wave 1 because its native evidence uses integration_test.rs and
+regression_test.rs. Later source conflicts remain exclusive, and the exclusive
+hash baseline retains its designated owner. Independent draft and review work
+can continue while implementation and Cargo resources are occupied.
+
+**Expanded intake, 2026-10-09**: Issues303 through313 are included as
+F-X200 throughF-X210, respectively. Issue314 is their umbrella checklist and
+adds no duplicate implementation story. The new open PR inventory still
+contains only PR294 and PR302 at their already assessed heads. Preserve the
+existing four active workers and their evidence while drafting the added scope.
+The issue-specific HLD14 contracts retain all requested acceptance. No work
+is silently deferred from S91. Designs must map shared criteria to the existing
+F-ID first, with later contributor PRs attached to that owner.
+
+F-X200 reuses F-X197 colours. F-X202 reuses F-X194 indentation and F-X198
+physical alternate safety, then adds the synchronized editing demanded by
+Issue301. The latest Issue305 body delegates Issue300 and Issue301 to those
+existing owners. F-X203 reuses F-X196 and F-X201 validation. F-X205 reuses F-X194 and
+F-X197. F-X207 consumes caller-font measurement from F-X195. F-X210 contains
+only the new metric-compatible face, diagnostics and bullet mapping criteria
+from Issue313. Its caller-font and variable-font acceptance remains F-X195.
+F-X209 follows F-X208 as explicitly required by Issues312 and311. F-X204 CLI
+commands follow their Python-visible API providers, and do not duplicate the
+footer/inspection CLI owned by F-X208. Record detailed file conflicts and
+waves before claiming any added worker. All new stories are provisionally L,
+with measured estimates pending design. The optional font pack needs a design
+decision before adding any new crate or distribution. No publication is part
+of this sprint.
+
+
+PR [315](https://github.com/tensorbee/rdocx/pull/315) entered the next rolling
+refresh at immutable head `af388f255d3b178aaa0aef03313034b815c71eb2`. It closes
+Issues296 and297 and belongs to existing F-X195, with Issue313 crediting that
+same implementation. No new story is created. Read the complete changed
+files, comments and reviews before claiming font work. Reuse accepted loader,
+render-path and instance changes, then implement uncovered approved criteria.
+Its stated omissions include synthetic italic, bundled variable instances and
+caller-font handout/PDF-A paths. Its fallback on subset failure, directory
+precedence and synthesis geometry must be reconciled against the approved
+plan. Contributor gate claims are not local evidence. Archive measurements
+will be generated from actual integrated source.
+
+Issue [316](https://github.com/tensorbee/rdocx/issues/316) adds F-X211 for
+roughly100 first-draft Python scripts with per-area CI success metrics,
+validated element XML read/replace across the requested owners, remaining
+stable handles, operation-named invalidation and actionable-error audits.
+Known font, link, section and selected handle repairs remain with their
+existing F-IDs. Measure the integrated provider result once and avoid a
+second implementation of those fixes.
+
+PR [317](https://github.com/tensorbee/rdocx/pull/317), head
+`3d056f46e97e9cc1caf2969b5096eeb6775a5fa0`, attaches to existing
+F-X194/F-X196/F-X197/F-X198 for Issues295/298/299/300/301. Its tcPr anchor
+belongs to F-X206 and paired success informs F-X202. Assess the full patch
+against these contracts. Its added native accessibility behavior and
+three-key feature_showcase delta belong to F-X212 under a separate labelled
+reviewed scope.
+No contributor test, archive or baseline record substitutes for local gates.
+
+The 2026-10-10 13:26 UTC rolling refresh retains 19 open PRs and 26 included
+issues, excluding #264 and #281. PR #294 advanced to
+81494509dc27cbcdd3c6d31067089175cdc2313f with archive measurement changes
+only. Authenticated HTML production matches completed F-X193 exactly.
+Its later description update adds validation notes without changing source.
+Retain the integrated tests and locally verified archive measurements, with
+no reopened story or duplicate work. S91 remains six completed, three in
+progress and thirteen approved. Final integrated verification and review
+remain pending.
+
+The 2026-10-10 15:05 UTC refresh retains 19 open PRs and 26 included
+issues. No PR head advanced or new included record appeared. Issue264 has
+only a timestamp update and remains excluded with Issue281. PR338 remains
+assigned to F-X211 for Issue337, with stacked PR336 changes assigned once
+across F-X211 and F-X200.
+
+F-X197 installed scope passed all155 Word and497 PowerPoint cases, both
+strict typing checks and both recursive stub checks. The full Word suite
+then passed353 cases and failed one old malformed-colour error assertion.
+Its two legacy border and shading expectations have been migrated to the
+approved ValueError contract and independently reviewed with zero findings.
+The corrected scoped rerun passed all652 cases and both families' typing
+and stub checks. The complete Word and PowerPoint suites are running.
+Remaining risk riders and formal completion are pending. F-X195 native
+revision controls are prepared and independently reviewed, with native
+execution and Python
+consumer wiring still required. Full bibliography acceptance remains F-X192.
+S91 remains six completed, three in progress and thirteen approved stories.
+Final integrated verification, sprint review and closure remain pending.
+
+#### Sprint S91.1, Release runtime and CI repairs
+
+The S91 progress notes above are historical. S91 delivered29 of39
+top-level planned stories and four child deliveries,33 completed entries,
+with ten top-level carryovers retained in S92. The immutable main merge and
+s91 tag are eb79c31155d8e38f9f7f0c6d3b2753c0b66ea83e. Release publication
+and contributed-record reconciliation remain pending corrective S91.1.
+
+**Goal**: Repair the release blockers exposed by main CI38662802341 and the original corpus-in-CI acceptance gap, then requalify the prepared Word0.16.1 and shared/PowerPoint0.14.1 families. Preserve S91's main merge and annotated tag. Contributor intake stays frozen at40 issues and30 PRs, with264/281 excluded and open.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X224 | Repair hosted release tool and stack routing | M |
+| F-X225 | Keep DrawingML text-style parsing within the default WASM stack | M |
+| F-X226 | Release superseded relationships after checked PowerPoint XML edits | M |
+| F-X227 | Execute the unchanged first-draft compatibility corpus in owner CI | L |
+
+F-X224 through F-X226 were implemented in parallel with serialized shared-file leases and integrated atb3b2163482ae42f68a66594ab2064481bd7b406b. F-X227 delivers the original corpus-in-CI acceptance atsource215 through actual owner CI38702668217 and its aggregate gate. The reviewed native input revision, trusted-job admission and finite cleanup preserve the original scripts and their95/100 qualified result with five no-credit cases. No new intake, production module, dependency, public API or font asset is added by these corrective stories.
+
+Corrected primary CI38708235000 is SUCCESS at6d7c7da729e0ecb34252e821341f22844e37a9fd, receiptad03f29ef28fe9a5174cdb7cb30a8811c4cb25fa237eac4df1b8a0d63d388792. The exact-source215 build-only rehearsal38696969789 and local source-qualified verification remain actual evidence with their original source identities. The complete relevant source/body/mode and artifact bridge supports reuse of unchanged consumers, not a claim of new current executions. F-X224 separately propagates three omitted external raster expectations from the existing F-X210 delta. All49 accepted product hashes and four unrelated raster expectations remain unchanged.
+
+Final reviewed-source full verification and clean sprint review remain due. Only normal close may merge main and create the S91.1 tag. Release requires actual clean-main full verification, exact reviewed-tree comparison, successful registries and the separate final approval. Publication and the70 humanized release-bound comments remain pending. Discussions264 and281 stay open. The original S91 merge/tag and all failed evidence remain immutable. The user-approved Issue360 delivery boundary retains skill PR37 upstream merge as an external follow-up after publication.
+
+S91 is merged and tagged at eb79c31155d8e38f9f7f0c6d3b2753c0b66ea83e. Its exact-source build-only rehearsal38659673259 passed. The subsequent primary CI identified missing native HarfBuzz preparation, a missing native animation stack setting and default-WASM parser stack exhaustion. Its full PowerPoint binding suite additionally exposed superseded chart relationships after checked XML replacement, which F-X226 repairs without weakening save validation. Original failures remain retained. Publication and the70 release-bound humanized comments wait for the corrected exact main merge, complete source-qualified package and installed verification, clean review, hosted rehearsal and verified registries. Existing publisher roles and current registry/tag facts remain mandatory. The user's standing publication authorization remains scoped to these two prepared families.
+
+**Gate**: All corrective regressions and the existing unmodified deciding cases pass, with zero independent review findings. The complete integrated gate, actual native/installed oracle riders, all selected primary CI jobs and both-family exact-SHA build-only rehearsal pass before normal close. Final release runs its read-only gate on the new exact main merge. No larger WASM stack, skipped required case, manufactured evidence or moved tag is allowed. Bibliography, navigation, standalone authoring and the existing followups remain in S92.
+
+All four corrective stories have scoped completion records. Final full
+verification of the reviewed sprint commit, clean sprint review, exact-main
+verification and both family publications remain due. The70-record comment
+inventory requires acceptance-aware decisions, including leaving advanced
+PR359 open for the separately planned PowerPoint HTML import residual.
+Discussions264,281 and377 remain open. Future replanning in the primary
+worktree is separate from this frozen publication source.
+
+#### Sprint S92, Contribution and issue repairs
+
+**Goal**: resolve the new contribution and issue repairs without expanding the
+frozen S91.1 publication scope. Six stories total 15 to 18 developer-days after the explicit Issue378 intake.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X228 | Qualify faster CI without weakening gates | M |
+| F-X178 | Clearable direct run formatting setters | S |
+| F-X229 | Repair comparison reconstruction correctness | L |
+| F-X230 | Group comparison changes for readable revisions | M |
+| F-X231 | Preserve PowerPoint HTML import whitespace | M |
+| F-X237 | Restore linear Python table owner inventory | L |
+
+Integrate F-X228 from PR376 first, with actual current-head CI evidence.
+F-X178 resolves Issue364 using the existing story, implementing only the
+remaining width-scale and position reset forms. It does not close Issue264.
+F-X229 addresses Issues368 through371 using PR374's correctness commits.
+F-X230 follows its completion and separately addresses Issue372 using the
+comparison-grouping commit. F-X231 consumes the advanced PR359 PowerPoint
+HTML import changes. Qualify its already equivalent Word changes once.
+Semantic export Issues352 and353 and PR358 retain their existing acceptance.
+
+CI, setters and HTML import can proceed in separate worktrees. Comparison
+correctness precedes grouping. Lease shared native sources and integration
+test entrypoints explicitly. Rebase or extract minimal contributor commits
+against the published S91.1 result. Resolve conflicts manually against both
+contracts. Do not merge stacked donor branches wholesale or duplicate fixes.
+
+Issue378 was explicitly added during execution on2026-10-15. F-X237 repairs the Python table-owner inventory and revision-route performance regression with exact preservation and same-host timing gates. It is independent of comparison grouping and shares only measured package carriers at integration. Issue316 receives no additional implementation scope here.
+
+#### Sprint S93, Rendering and remaining issue repairs
+
+**Goal**: finish the remaining issue acceptance with independent rendering and
+conversion evidence, preserve chart-data revisions and repair chart legend
+placement. Seven stories total 21 to 27 developer-days.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X232 | Render legal revisions and qualify checked XML repros | L |
+| F-X233 | Repair paragraph border geometry | M |
+| F-X234 | Preserve supported LaTeX conversion structure | M |
+| F-X235 | Qualify equation layout against native Word | L |
+| F-X236 | Measure public setter inlining before changing policy | S |
+| F-X245 | Preserve chart data changes in Word comparison | L |
+| F-X246 | Honor chart legend position and overlay during rendering | L |
+
+F-X232 assesses PR375 for Issue373. Reuse delivered namespace and checked-XML
+providers, then qualify the exact header/footer repros. Legal revision colours
+and double underline remain uncovered. Review public rendering-type changes
+as compatibility decisions before implementation. F-X233 diagnoses Issue366
+with the user-approved inferred 15 point sz120 and raw15 sz15 controls while
+retaining the missing-original limitation. F-X234 and then F-X235
+resolve Issue365's conversion and layout halves. F-X236 resolves Issue367
+through a measured cross-crate decision, with selective changes only if useful.
+
+Legal revision and border painting share paginator resources and integrate
+serially. Conversion completion precedes equation layout acceptance. Only one
+story may own the deterministic baseline in each wave. Expected product and
+independent raster changes require separate attribution and review. These
+estimates are developer effort, not elapsed-time promises. Split any further expanded
+contract rather than weakening its gates.
+
+##### Repair intake, coverage and closure gates
+
+The read-only GitHub snapshot at 2026-10-15 09:59 UTC contains 33 open PRs and
+53 issues. Issues264,281 and377 remain open conversations. The forty previously
+included issues retain their existing acceptance owners and publication gates.
+The ten new issues map as follows. A merged related PR alone closes none.
+
+| Issue or contribution | Acceptance owner | Remaining work and required evidence |
+|---|---|---|
+| Issue364 | F-X178 | Set, clear and save/reopen width-scale and position. Explicit false and no-rPr-on-None controls for the full existing setter contract |
+| Issue365 | F-X234, F-X235 | Exact supplied formula structure, symbol and spacing loss diagnostics, independent native geometry and raster controls |
+| Issue366 | F-X233 | Inspect saved size/space and independently qualify width, clearance, flow and joins using the approved inferred 15 point sz120 and raw15 sz15 controls. Original input remains unavailable, so exact-original reproduction is unclaimed |
+| Issue367 | F-X236 | Cross-crate non-LTO benchmark and compiler evidence supporting selective inline annotations or a documented disposition |
+| Issues368,369,370,371, PR374 correctness | F-X229 | Hyperlink paragraph insertion/deletion, edits adjacent to tables, empty paragraph properties and trailing or line-break-only deletion. Accept-all/reject-all reconstruction and save/reopen |
+| Issue372, PR374 grouping | F-X230 | Readable word/character groups without crossing fields, opaque XML, comments, bookmarks, hyperlinks or formatting boundaries |
+| Issue373, PR375 | F-X232 | Legal revision preset and double underline, immutable stored formatting, cache identity, public surface parity and exact checked-XML owner/namespace repros |
+| Advanced PR359 | F-X231 | PowerPoint emphasis-edge spaces, repeated span-boundary spaces and NBSP. Qualify equivalent Word cases without reimplementation |
+| Advanced PR357 | Existing F-X216 | Current unsaved-source branding and staged source/destination regression qualification. No demonstrated new implementation residual |
+| PR376 | F-X228 | Current integrated CI, unchanged suites and oracles, preserved binding profile and native setup |
+
+All 33 donor PRs target main at the recorded base
+`733ce6f7b2b816c5760692abf5c99d68b29ae897`. Thirty-two conflict, while PR376
+is mergeable at the snapshot. None has a submitted GitHub review or inline
+review thread. All issue bodies, PR comments and current revisions were read.
+Thirty-one aggregate checks are green. PR357 and PR376 fail the old Word
+story-inventory scaling test, with measured ratios 3.67 and 3.83. F-X222's
+integrated provider repair requires current-head evidence, not a weaker limit.
+Contributor CI is provenance, not the integrated sprint gate.
+
+PR374 head `3d7a3c9b703042b5ad53e586b94fe01eb843daf0` separates correctness
+from grouping commit `7ebb5120aceee40d765a408faf19e1fa4bcc1724`.
+PR375 head `0c608f7a2a1d5a9f8391a4de1dfed661df6e105a` inherits PR328 and
+PR333 changes. Extract only uncovered work. PR376 head is
+`4cd93af075ddfd2ad6ccd394d7d91fc26e1fa571`.
+PR359 advanced to `e974ea2240691c0de581efa172ba8c88a77c054b` and contains
+PR354. PR357 advanced to `57011087f7d34f28a09f1217afdacf3dc64f0aa0`.
+Do not close advanced PR359 on the strength of the frozen release alone.
+
+Previously assessed stacks retain their current owners: PR324 before327,
+PR325 before330, PR336 before338 and PR354 before359. PR328 and333 overlap
+PR375. Preserve accepted fixes and qualify combined imports, namespace owners,
+formatting, comparison and rendering after reconciliation. Read current heads
+and comments again at implementation and final closure, without silently
+expanding either sprint's approved scope.
+
+Each story requires design, scoped verification and zero-finding microscope.
+The integrated result requires the full /verify gate and sprint review,
+including installed bindings, applicable native/oracle controls and explained
+deterministic hash/raster deltas. Only /close-sprint may merge to main.
+Only /release may publish at its separately approved reviewed SHA. Close PRs
+and issues only after all their criteria and publication requirements pass.
+No issue is complete merely because its provider was integrated.
+
+##### Prospective sprint numbering
+
+S91.1's completed scope, branch and release records retain their original IDs.
+S92 is the active repair sprint, and S93 remains planned. Earlier S92 throughS95
+feature targets now map to S94 throughS97. The external Word benchmark sprint
+added in the parallel planning session moves from S96 to S98 with F-313
+throughF-318 intact. The conditional Excel programme moves from S97 throughS106
+to S99 throughS108. Historical records, tags, completed plans and frozen release
+notes retain their original IDs. Their earlier future-target references are
+superseded by this prospective map. Active CURRENT_SPRINT is replaced only by
+/sync-sprint after the current sprint closes. Issue281's go/no-go remains F-184
+at S99. Issue377 stays open through its separately planned benchmark work.
+
+##### Issue379 through Issue381 intake, 2026-10-15
+
+Issues379,380 and381 arrived after the snapshot above and no S92 or S93
+story owns them. They get two new sprints instead of enlarging S93. S94 takes
+Issues379 and380 as Python and CLI parity work. S96 takes Issue381 directly
+after the forms sprint, because fillable PDF fields reuse its control model.
+The map above shifts again. Template and form work moves from S94 to S95,
+collaboration from S95 to S97, drawings from S96 to S98 and the M24 end gate
+from S97 to S99. The benchmark sprint moves from S98 to S100 with F-313
+through F-318 intact. The conditional Excel programme moves from S99 through
+S108 to S101 through S110, and Issue281's go/no-go is F-184 at S101.
+
+##### Issue382 and Issue383 intake, 2026-10-15
+
+The user requested that new work without a current or future sprint owner join
+S93. A live GitHub check found 12 open issues and one open PR. The only
+unassigned reports are [Issue382](https://github.com/tensorbee/rdocx/issues/382)
+and [Issue383](https://github.com/tensorbee/rdocx/issues/383), with no follow-up
+comments at intake. Both are now included as pending L stories. The existing
+five S93 contracts and all future sprint assignments remain in place.
+
+| Issue | Acceptance owner | Required evidence |
+|---|---|---|
+| Issue382 | F-X245 | Chart-only changes at word and run granularity, chart-plus-text changes and unchanged-chart controls. Save/reopen, accept-all and reject-all reproduce the correct chart parts, embedded workbook and surrounding text |
+| Issue383 | F-X246 | Word and PowerPoint default, bottom and left renders differ with no legend/plot overlap for absent or false overlay. Qualify right, left, top, bottom and top-right positions, true overlay and hidden legends against independent native evidence |
+
+F-X245 follows completed F-X229 and F-X230 and preserves their reconstruction
+and grouping controls. F-X246 leases shared chart model and rendering carriers
+across both formats. Keep baseline ownership exclusive and attribute chart
+raster changes separately from revision, paragraph and equation changes.
+Design both stories before implementation. The expanded seven-story wave is
+estimated at 21 to 27 developer-days, not an elapsed-time promise.
+
+PR375 is already owned by F-X232. Issues365,366,367 and373 are already in S93.
+Issues379,380 and381 retain S94 and S96 owners. Issue281 retains the F-184
+spreadsheet decision at S101, Issue377 retains S100 benchmark work, and
+Issue264 remains an open requirements discussion with its delivered F-X170
+subset and existing broader style contracts. No duplicate story or automatic
+closure is created for these records.
+
+#### Sprint S94, Python and CLI parity
+
+**Goal**: let first-draft python-docx and python-pptx scripts and the Rust-only
+signing and form surfaces work from Python and the CLI, and complete the
+finite 73 input LaTeX conversion follow-up to Issue365. The four parity stories
+reuse existing native document semantics. F-X247 separately designs any bounded
+conversion representation change. Five stories total 14 to 19 developer-days.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X238 | Restore python-docx Word names from the first-draft corpus | L |
+| F-X239 | python-pptx notes names and refusal of silent zero values | M |
+| F-X240 | Python and CLI signing and signature verification | M |
+| F-X241 | Python and CLI form reading and filling | M |
+| F-X247 | Preserve the common LaTeX inputs reported in Issue365 | L |
+
+| Issue | Acceptance owner | Remaining work and required evidence |
+|---|---|---|
+| Issue379 Word names and divergences | F-X238 | Every listed Word name works as in python-docx 1.2.0 or fails with an error naming the rdocx alternative. The PR333 corpus runner at `193819ca` reports these results separately from the F-X211 corpus |
+| Issue379 PowerPoint names and unit refusals | F-X239 | Notes slide names, `MSO_THEME_COLOR_INDEX` and the five assignments that now save zero raise before they change the document, naming the unit to use |
+| Issue380 signing | F-X240 | Python and CLI sign and verify for docx and pptx. A changed part fails verification by name. Wheels and CLI builds enable `digital-signatures` with dependency, licence and size gates |
+| Issue380 forms | F-X241 | Python form reading and filling and `rdocx fill --values`. Every control type and a legacy text field read back after save and reopen |
+| Issue365 broader conversion follow-up | F-X247 | Preserve the exact 73 input matrix and original observer diagnostics, with a separately corrected summary label. Prove normalized structure, actual pinned Pandoc comparison, save/reopen and independently qualified new render semantics. The issue remains open for this scope |
+
+F-X238 and F-X239 share the Python binding sources and integrate serially.
+F-X240 and F-X241 wrap existing Rust functions and may proceed in parallel
+with them once binding entrypoints are leased. Enabling `digital-signatures`
+in published artefacts is a packaging decision reviewed at design, not a
+default change for the Rust crates. F-X247 follows the completed S93 bounded
+conversion/layout repairs and shares Word facade, binding test and oracle
+carriers only through explicit leases. Its pending follow-up does not expand
+S93 acceptance. The S95 through S95.4 programme separately includes new
+Issue384 and Issue385 repairs and the eleven existing carryovers.
+
+#### Sprint S95, New validation, form and rendering repairs
+
+**Goal**: prioritize the new Issue384 and Issue385 repairs after S94 closes.
+Five stories total 10 to 15 developer-days. S95 does not close the whole Issue385
+union, whose remaining authoring and PowerPoint admission work is in S95.1.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X248 | Validate identified paragraphs inside block content controls | M |
+| F-X249 | Set typed content control values as Word does | M |
+| F-X251 | Refuse invalid Word values before publication | M |
+| F-X252 | Refuse newly invalid Word raw XML atomically | M |
+| F-X253 | Honor imported chart types and hidden master shapes | M |
+
+#### Sprint S95.1, Remaining everyday APIs and native interoperability
+
+**Goal**: complete the remaining Issue385 repairs and the two bounded native
+interoperability carryovers. Four stories total 12 to 16 developer-days.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X250 | Complete everyday Word chart equation list and note APIs | L |
+| F-X254 | Refuse invalid PowerPoint values XML and empty edits | L |
+| F-X219 | Qualify full-range text watermark interoperability | M |
+| F-X223 | Qualify native Word embedded multi-face interoperability | M |
+
+#### Sprint S95.2, Bibliography, navigation and template carryovers
+
+**Goal**: resume F-X192 and F-283 and establish the stable template grammar.
+Three stories provisionally total 12 to 15 developer-days. F-X192 has a partial
+registered worker, not an absent disposable worktree. Preserve its surviving
+files, Git metadata/index/branch and native evidence before an authenticated
+resume. Missing original unstaged source and the exact unresolved whole-feature
+findings require a recovery/design checkpoint. This estimate is provisional
+until that uncertainty is resolved, not a claim of exact old source recovery.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X192 | Complete the remaining Word bibliography catalogue | L |
 | F-283 | Complete numbering-aware navigation fields | L |
 | F-284 | Stable container-wide template grammar | L |
 
-F-274 composes the S89 note families with section policy. F-276 follows the
-related-story work, and F-277 uses its transactional remapping. F-278 is the
-shared field construction substrate after those stories. F-283 integrates
-numbering only after the other navigation structures are complete. F-284
-freezes the template grammar against the completed container and fragment
-model. This 11-story wave is intentionally larger than the usual sprint
-cadence. Reassess its capacity and split it again before implementation if
-the dependency work cannot be completed within one sprint.
+F-283 consumes completed F-X200 numbering without duplicate work. F-284 retains
+the existing S89 fragment-transaction foundation. Issues264 and281 remain open
+under their current contracts, not new repair acceptance.
 
-#### Sprint S91, Content controls, forms, and data binding
+#### Sprint S95.3, Content control foundations and typed values
 
-**Goal**: create rather than only fill modern and legacy forms, including
-repeating controls, custom XML bindings, and mail-merge package state.
+**Goal**: author the control lifecycle before typed values and XML bindings.
+Three stories total 12 to 15 developer-days.
 
 | F-ID | Title | Size |
 |------|-------|------|
 | F-285 | Content control creation and lifecycle | L |
 | F-286 | Rich, repeating, and typed content controls | L |
 | F-287 | Custom XML stores and data binding authoring | L |
+
+Complete and integrate F-285 through its scoped dependency-prefix checkpoint
+before starting F-286 or F-287. Their shared source/resource leases may require
+serial implementation even though neither formally depends on the other.
+F-X249's bounded existing-control fill repair does not replace these authoring
+contracts.
+
+#### Sprint S95.4, Complete form and mail-merge authoring
+
+**Goal**: compose legacy fields and modern forms, and author mail-merge data.
+Three stories total 8 to 11 developer-days.
+
+| F-ID | Title | Size |
+|------|-------|------|
 | F-288 | Legacy form field creation | M |
 | F-289 | Modern Word form authoring | L |
 | F-290 | Mail-merge package and data-source authoring | M |
 
-The generic control lifecycle precedes typed controls and bindings. F-289 is
-the composed form gate. Mail merge remains offline by default and never treats
-unavailable external data as an empty successful result.
+Complete and integrate F-288 through its scoped dependency-prefix checkpoint
+before F-289. Its F-285 through F-287 prerequisites complete in S95.3. F-290
+keeps its existing dependencies and may proceed only under distinct leases.
+Public-created forms/templates require save/reopen and explicit diagnostics for
+unavailable external mail-merge data. S96 follows the completed form programme.
 
-#### Sprint S92, Collaboration authoring
+The five boundaries contain eighteen stories, seven new cross-cutting repairs
+and eleven existing stories, totalling54to72developer-days. These are effort
+ranges, not elapsed-time promises. Every boundary retains the normal complete
+integrated gate and sprint review. Only the selected S95 opens after S94 closes.
+Later fractional boundaries open sequentially, without renumbering S96 through
+S110 or claiming future completion. Update any carried plan's current schedule
+through ordinary design/revision before its claim, preserving prior reviews.
+
+Restore the missing historical native PowerPoint timeline movie/frame and
+SmartArt PNG oracle inputs as later fixture infrastructure. Their four existing
+missing-input checks remain explicitly uncredited in S91. Regeneration must
+use actual independent producer output, with a separate infrastructure design
+when resumed. This is not extra unestimated acceptance inside these eighteen
+stories and does not waive current source, schema or rendering gates.
+
+##### New issue acceptance ownership
+
+Issue384 and Issue385 were created on2026-10-16 against main3a3b0de8. Preserve
+original bodies and the linked reporter tests at immutable skills commit
+`91a57108f13877cfb6179a70077d425d6ebf098b`. The [Word tests](https://github.com/hadim/rdocx-skills/blob/91a57108f13877cfb6179a70077d425d6ebf098b/tests/test_docx_everyday.py)
+and [PowerPoint tests](https://github.com/hadim/rdocx-skills/blob/91a57108f13877cfb6179a70077d425d6ebf098b/tests/test_pptx.py)
+are source-generated strict expected-failure controls. Establish fresh RED on
+final integrated S94. Retain the unchanged original strict run and its raw
+`XFAIL` and `XPASS(strict)` outcomes, without changing or removing markers or
+labelling that original run green. Separately execute the unchanged test bodies
+and checks, for example with pytest `--runxfail`, and qualify their actual
+outcomes with independent semantic/atomicity observers. Label these executions
+separately. Do not treat old main observations as fresh current-source failures
+or hide the original strict-run outcomes when claiming repaired behavior.
+
+| Issue criterion | Owner | Required outcome |
+|---|---|---|
+| [384](https://github.com/tensorbee/rdocx/issues/384), block SDT paragraph identifiers | F-X248 | CLI and both Python validation routes succeed, paraId/textId survive save/reopen, real owner mismatches still refuse |
+| [385](https://github.com/tensorbee/rdocx/issues/385), Word chart read-back | F-X250 | Reopened document charts expose type, categories and series values |
+| 385, Word content control values | F-X249 | Remove placeholder flag, write fullDate, map declared list value/display text, refuse invalid choice and missing individual selector, CLI agrees |
+| 385, Word display equations | F-X250 | display=True stores m:oMathPara and inspection reports display |
+| 385, Word values accepted silently | F-X251 | Refuse wrong save format, duplicate tab, header page break, malformed language and nameless font before publication |
+| 385, Word list numbering | F-X250 | Restart flag, explicit restart at5 and bullet-level font survive reopen |
+| 385, Word notes | F-X250 | Styled foot/endnote references and remove-by-id after unrelated edits |
+| 385, Word raw XML | F-X252 | Reject newly invalid w: child and non-Ignorable foreign child atomically, preserve valid extensions |
+| 385, PowerPoint chart type | F-X253 | Four known imported subtypes map correctly, genuinely unknown type returns None |
+| 385, PowerPoint values accepted silently | F-X254 | Refuse wrong save format, out-of-range size, both flips on table/chart frames and unavailable style |
+| 385, PowerPoint raw XML | F-X254 | Four invalid owner mutations refuse atomically and validation diagnoses malformed imported inputs |
+| 385, master shapes in renders | F-X253 | PDF, PNG, convert and render omit hidden master shapes with native evidence and sensitive logo controls |
+| 385, replace --map | F-X254 | Each zero-match pair without expect refuses without output, preserve explicit expect0 |
+| 385, CLI font existing-output wording | F-X251 Word, F-X254 PowerPoint | Both stop recommending unavailable --force, preserve no-overwrite |
+| 385, CLI absent font removal | F-X254 | rpptx font remove exits nonzero and publishes no pretend removal |
+
+Issue385 remains open until the union passes, including its two CLI points.
+The linked tests also include Issue379 names and spacing controls already owned
+by F-X238/F-X239. Do not duplicate those or F-X240 signing/F-X241 five-kind
+inventory and existing-value fill wrappers. F-X249 deliberately adds typed
+native semantics that F-X241 deferred, including placeholder, date and list
+metadata, with exact compatibility decisions at design. F-X250 reuses existing
+native note removal and OfficeMath carriers. Issue365's finite conversion and
+historical fidelity limits remain unchanged.
+
+Formal dependencies in HLD14 identify existing real providers. Scheduling
+waves and leases are separate constraints, not invented dependency edges.
+F-X248 Word validation and F-X253 PowerPoint paint may support independent
+source/oracle preparation. Derive conflict-free implementation waves only after
+actual approved plans identify every shared file and resource. Both may write
+`scripts/readme_doctests.py` and the affected README catalogue, so different
+product families alone do not establish parallel implementation safety.
+Serialize all same-file, catalogue and baseline writes under explicit leases.
+PowerPoint chart/admission stories also share binding carriers. Keep one writer
+per source worktree/F-ID, one numeric archive/README catalogue writer and one
+deterministic baseline owner. Root coordinates native Word/PowerPoint captures.
+Preserve all checked owner, opaque XML, schema order and atomic publication
+contracts. Intentional paint/admission compatibility changes require explicit
+design and labelled expected-delta commits. Optional Issue377 badge, Issue281
+spreadsheet demand and broader Issue264 discussion are not added stories.
+
+#### Sprint S96, Fillable PDF forms
+
+**Goal**: export Word form controls as fillable AcroForm fields with an empty
+signature field, behind an opt-in option, while PDF/A and PDF/UA output stay
+valid. Three stories total about 13 developer-days.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-X242 | Form control geometry and AcroForm field model | L |
+| F-X243 | Field appearance streams, full-font resources and conformance | L |
+| F-X244 | Signature field, bindings and CLI option | M |
+
+Issue381 is accepted only when all three stories pass. F-X242 makes layout
+report each control's rectangle and maps text, rich text, checkbox,
+drop-down, combo box and date controls and legacy fields to field types and
+unique names. F-X243 writes an appearance stream for every widget, a field
+font that covers typed input, and `/Form` structure elements in tagged
+output. F-X244 adds the empty `/Sig` field and the option across Rust, Python
+and `rdocx convert`. Output without the option stays byte identical. Signing
+the PDF itself remains out of scope. The stories run in order because each
+builds on the previous field model.
+
+#### Sprint S97, Collaboration authoring
 
 **Goal**: create complete Word revisions, comments, permission ranges, and
-comparison results rather than limiting the facade to existing-content
-inspection and resolution.
+comparison results, with caller-controlled identity and time instead of
+ambient state.
 
 | F-ID | Title | Size |
 |------|-------|------|
@@ -1999,11 +2910,14 @@ inspection and resolution.
 | F-295 | Comparison output as complete revisions | L |
 | F-296 | Collaboration identity and deterministic time policy | M |
 
-F-291 establishes revision ownership. F-292 and F-293 can then proceed in
-parallel. F-295 composes the complete model, and F-296 closes ambient identity
-and clock inputs before the sprint gate.
+F-291 establishes revision ownership. F-292 and F-293 then cover property,
+move, and comment records across stories. F-294 uses the S95.4 form and
+protection surface. F-295 composes complete comparison revisions, and F-296
+closes identity and clock inputs. The sprint gate covers Word differential
+results, accept and reject views, and byte-identical output in deterministic
+mode.
 
-#### Sprint S93, Drawings, diagrams, and embedded content
+#### Sprint S98, Drawings, diagrams, and embedded content
 
 **Goal**: complete the visible and packaged Word object surface across every
 valid insertion point without raw compatibility wrappers or executable payload
@@ -2023,7 +2937,7 @@ F-297 through F-302 build independent object families on the shared
 relationship model. F-303 is their integrated deterministic layout and render
 gate.
 
-#### Sprint S94, Package extensibility and modern DOCX end gate
+#### Sprint S99, Package extensibility and modern DOCX end gate
 
 **Goal**: close package extension, accessibility, conformance, determinism,
 resource, binding, documentation, and stability boundaries for modern DOCX
@@ -2038,15 +2952,60 @@ authoring.
 | F-308 | Fully modeled and losslessness diagnostics | L |
 | F-309 | Strict, transitional, and repair-free conformance | L |
 | F-310 | Determinism, resource limits, bindings, and stability gate | L |
+| F-311 | Positioned paragraph frame placement | M |
+| F-312 | Run visual effect render projection | L |
 
 Package ownership precedes extension and executable-compatibility surfaces.
 F-308 consumes every modeled family, F-309 validates its output, and F-310 is
-the milestone-wide public API and operational gate. A 1.0 decision remains
+the milestone-wide public API and operational gate. F-311 and F-312 close the
+remaining positioned-paragraph and run-effect render checks. A 1.0 decision remains
 separate from completing this sprint.
+
+### M20, Fidelity at scale, external Word benchmark
+
+#### Sprint S100, External Word benchmark fidelity
+
+**Goal**: measure Word PDF conversion against the external
+[`neurotic_docx_bench`](https://github.com/jandira-tech/neurotic_docx_bench)
+oracles from [Issue 377](https://github.com/tensorbee/rdocx/issues/377), close
+the largest measured gaps, and lead every converter not affiliated with the
+benchmark author.
+
+| F-ID | Title | Size |
+|------|-------|------|
+| F-313 | External Word benchmark reproduction loop | S |
+| F-314 | Benchmark conversion failures and startup latency | M |
+| F-315 | Word tracked-change markup print view | L |
+| F-316 | Word comment and revision balloon pane | L |
+| F-317 | Benchmark pagination and layout fidelity wave | L |
+| F-318 | Benchmark release, adapter update and README badge | M |
+
+The 2026-10-14 cohort ranks rdocx 0.16.0 eighth of ten at an ITT median of
+45.90 over 400 documents. The leader is the author-affiliated jubarte at 82.45,
+and the best unaffiliated converter is Wordcraft 0.7.0 at 53.82. Three causes
+dominate. Word's oracle exports 300 of the 400 documents with all markup and a
+balloon pane, while `rdocx convert` renders the accepted view at full width.
+The page count differs on 111 documents against 12 for jubarte. Clean
+documents still trail jubarte by about 23 points.
+
+F-313 runs the benchmark's own scorer locally against its pinned Word PDFs and
+records a per-document baseline. The benchmark corpus stays outside the
+repository because ODC-By does not license the individual files. F-314 fixes
+the three conversion failures and measures process startup. F-315 and F-316
+add an opt-in markup view, so default output and hash baselines do not move.
+F-317 triages the worst documents into root-cause clusters and fixes the
+largest. Each fix must also hold on the F-197 Word SSIM harness, so the work
+does not overfit one Word build and one scorer. F-318 prepares the release,
+asks the benchmark maintainer to pass the markup flag and rerun, and adds the
+README badge from the Issue 377 options. Publication still requires `/release`
+and its separate final approval.
+
+Overtaking jubarte is a stretch goal, not this sprint's gate. Further
+fidelity waves follow from F-317's cluster list as separately planned work.
 
 ### M19, Advanced spreadsheets
 
-#### Sprint S95, Spreadsheet decision, corpus and core model
+#### Sprint S101, Spreadsheet decision, corpus and core model
 
 **Goal**: decide whether a material Rust ecosystem gap still exists, then build
 the ownership model only if that decision is affirmative.
@@ -2058,12 +3017,46 @@ the ownership model only if that decision is affirmative.
 | F-185 | Workbook and worksheet model | L |
 
 F-184 is a true go or no-go gate. It reassesses Calamine,
-`rust_xlsxwriter`, `umya-spreadsheet`, `xls`, and any credible successor at S95,
+`rust_xlsxwriter`, `umya-spreadsheet`, `xls`, and any credible successor at S101,
 then classifies each proposed feature as preserved, modeled and editable, or
 executable. If the ecosystem provides the complete required lifecycle by then,
 M19 is archived rather than implemented.
 
-#### Sprint S96, Styles, tables and structured references
+[Issue 281](https://github.com/tensorbee/rdocx/issues/281) supplies user demand
+for a unified CLI/Python workflow, template filling, preservation-safe edits
+and rendering. Include integration, installation and maintenance costs in
+F-184, including reuse of a maintained engine behind a consistent facade.
+S101 through S104 stage reading and loss-aware editing before calculation and
+pivots. Rendering and distribution retain the S110 boundary. An earlier
+distributable reader/editor requires a reviewed roadmap and release decision.
+
+The reporter's [follow-up](https://github.com/tensorbee/rdocx/issues/281#issuecomment-6063901190)
+defines a Google Sheets review workflow: read and change cell text, edit a
+shared-formula column and preserve reviewer comments. Ordinary spreadsheet
+reading is already covered in that workflow. The differentiators are one
+CLI/Python shape and installation, Rust performance and safety, loss-aware
+editing and later rendering without Excel. The requested first cut preserves
+all unmodeled parts, including threaded comments and `commentsmeta*`, data
+validation, conditional formatting and defined names. It reads values and
+types, shared strings, formats and styles, merged ranges, formulas and cached
+results. Edits include values, formulas and styles, rows and columns, sheets,
+widths and heights, frozen panes and auto-filters, with atomic output. Shared
+formula structure must survive. The decision must choose explicit stale-cache
+invalidation and recalculate-on-load, or a separately bounded evaluator for
+arithmetic, references, SUM, AVERAGE, MIN, MAX and IF. Chart authoring is not a
+requested first-cut need. Rendering is a desired second step. These are inputs
+to F-184, not S90 implementation or an approved earlier release boundary.
+
+The [maintainer commitment](https://github.com/tensorbee/rdocx/issues/281#issuecomment-6064533994)
+confirms preservation tests and the review workflow first, then reading and
+styled edits with explicit stale-cache handling. A bounded evaluator and
+rendering follow, with chart authoring deferred. Pivot refresh, Power Query
+and scripting remain longer-term goals. F-184 must reconcile the scheduled
+stories and any proposed reader/editor distribution boundary with that order
+before approving implementation. S90 records this direction without claiming
+that the conditional spreadsheet programme or an earlier release is approved.
+
+#### Sprint S102, Styles, tables and structured references
 
 **Goal**: model the indexed formatting and structured data semantics that
 ordinary business workbooks rely on.
@@ -2078,7 +3071,7 @@ F-189 lands here because structured table references are part of the formula
 grammar rather than a string convention. The sprint does not yet calculate
 formulas.
 
-#### Sprint S97, Advanced worksheet objects
+#### Sprint S103, Advanced worksheet objects
 
 **Goal**: cover the visible and interactive worksheet surface before the
 streaming package boundary freezes it.
@@ -2091,7 +3084,7 @@ This includes comments, hyperlinks, rich text, drawings, grouping, panes,
 sparklines, page breaks, and modern image cells. External content stays offline
 unless an explicit bounded policy allows retrieval.
 
-#### Sprint S98, Streaming read and write
+#### Sprint S104, Streaming read and write
 
 **Goal**: prove that advanced workbooks remain bounded at the package boundary.
 
@@ -2104,7 +3097,7 @@ Both carry an asserted memory ceiling rather than a hoped-for one. A 100 MB
 fixture is the gate, not a smoke test. Unsupported package parts and
 relationships remain attached through unrelated typed edits.
 
-#### Sprint S99, Calculation and sheet features
+#### Sprint S105, Calculation and sheet features
 
 **Goal**: calculate ordinary and modern formulas, then expose the features that
 depend on their results.
@@ -2120,7 +3113,7 @@ including dynamic arrays, spill ranges, and structured references. Unsupported
 functions retain cached values with diagnostics. F-191 reuses `oxml-chart`
 rather than creating a spreadsheet-only chart engine.
 
-#### Sprint S100, Pivots and the Data Model boundary
+#### Sprint S106, Pivots and the Data Model boundary
 
 **Goal**: move PivotTables from opaque preservation to typed local refresh and
 define the boundary around proprietary analytical models.
@@ -2136,7 +3129,7 @@ and visible cells. Slicers and pivot charts follow that refresh. OLAP, Power
 Pivot, VertiPaq, and DAX state is preserved and inspectable but is not executed
 under this milestone.
 
-#### Sprint S101, Power Query language and package model
+#### Sprint S107, Power Query language and package model
 
 **Goal**: understand and evaluate M independently of external data access.
 
@@ -2149,7 +3142,7 @@ refresh metadata. The language boundary covers the pure transformations needed
 by the corpus before credentials, connectors, or network policy enter the
 runtime.
 
-#### Sprint S102, Power Query execution
+#### Sprint S108, Power Query execution
 
 **Goal**: refresh a bounded, useful connector set without weakening privacy or
 offline determinism.
@@ -2163,7 +3156,7 @@ privacy levels, source combination, timeouts, byte limits, caching, and query
 folding are explicit contracts. Proprietary and tenant-bound connectors remain
 preserved with diagnostics.
 
-#### Sprint S103, Office Scripts-compatible automation
+#### Sprint S109, Office Scripts-compatible automation
 
 **Goal**: automate the same workbook model through a versioned and sandboxed
 TypeScript surface.
@@ -2178,7 +3171,7 @@ not pretend to provide OneDrive, SharePoint, Power Automate, or Microsoft tenant
 identity. It does provide bounded workbook, range, table, chart, pivot, and
 query automation with atomic failure.
 
-#### Sprint S104, Rendering, distribution and advanced end gate
+#### Sprint S110, Rendering, distribution and advanced end gate
 
 **Goal**: close M19 as a headless advanced spreadsheet engine rather than a
 file-format crate.
@@ -2208,12 +3201,13 @@ at the fully verified SHA.
 | End of S64, M21 | Incubating `rpptx` family. Publish the stable family too only when the reviewed dependency diff requires new shared pins. | Collaboration, security, timing, media, SmartArt, ODP, handouts, HTML import, and PDF import form one complete presentation-depth boundary. |
 | End of S69, M22 | Stable `rdocx` family at v0.13.0 through F-X078. Publish the incubating shared family first only if a shared crate version or stable dependency pin moved. | OfficeMath, fields, dynamic TOC, automation, comparison, embedded content, and modern package variants complete the planned Word-depth boundary. |
 | End of S73, M23 | Stable `rdocx` family after the five-document public-API-only conformance gate passes. | This is the first boundary where the reference business documents can be authored from `Document::new()` without raw XML or a base template. |
-| End of S94, M24 | Stable `rdocx` family after the modern Word authoring capability matrix is closed. Publish the incubating shared family first only if a shared crate version or stable dependency pin moved. | This boundary completes the planned modern DOCX authoring surface, lossless extensibility, accessibility, strict-package, determinism, binding, and stability gates. |
-| End of S104, conditional M19 | The new `rxlsx` distribution family defined by F-195, plus only the existing families whose reviewed dependency pins moved. | F-195 is the first point where the conditional spreadsheet programme has a complete facade, CLI, WASM, Python, rendering, and advanced lifecycle gate. |
+| End of S99, M24 | Stable `rdocx` family after the modern Word authoring capability matrix is closed. Publish the incubating shared family first only if a shared crate version or stable dependency pin moved. | This boundary completes the planned modern DOCX authoring surface, lossless extensibility, accessibility, strict-package, determinism, binding, and stability gates. |
+| End of S100, external benchmark | Stable `rdocx` family carrying the opt-in markup view and the benchmark fidelity fixes. Publish the incubating shared family first only if a shared crate version or stable dependency pin moved. | The benchmark maintainer reruns released versions only, so the measured gains need a published family behind them. |
+| End of S110, conditional M19 | The new `rxlsx` distribution family defined by F-195, plus only the existing families whose reviewed dependency pins moved. | F-195 is the first point where the conditional spreadsheet programme has a complete facade, CLI, WASM, Python, rendering, and advanced lifecycle gate. |
 
 No intermediate sprint publishes merely because one subsystem compiles. A
 security fix may still justify a separately planned patch release, but ordinary
-feature work waits for the next boundary above. If F-184 archives M19, the S104
+feature work waits for the next boundary above. If F-184 archives M19, the S110
 boundary disappears with the programme and no spreadsheet release namespace is
 created.
 
@@ -2307,3 +3301,319 @@ Future breadth must preserve the properties that distinguish this workspace:
   one implementation per document family.
 - Offline operation by default, with network access isolated behind explicit
   adapters.
+
+Cross-sprint semantic prerequisite: complete F-X200 in S91 before F-283 in S92. The authenticated
+Word numbering controls require an explicitly reviewed revision to the old
+independent-numId contract. Navigation consumes that final authoritative
+result once, preserving source identity and proving its own field switches.
+
+PR [318](https://github.com/tensorbee/rdocx/pull/318) entered rolling intake at
+immutable head b1aa842bf531a65c70a49d4ef282033d26e64020, based on733ce6f7.
+It closes Issue308 and is attached to existing F-X205. It contributes text,
+fill, table, metadata, media and export binding surfaces plus the existing
+16:9 template repair. Its stated App/custom-property omission remains part
+of F-X205 acceptance. Shared colours retain F-X197 ownership, cell text
+retains F-X194 ownership and structural-handle improvements retain F-X211
+ownership. Assess all24 changed files and the actual native template before
+reuse. Contributor tests, archive values and artifact hashes are claims to
+verify locally, not completed sprint evidence. No additional F-ID or asset
+inventory is created by this contribution.
+
+## Rolling contribution reconciliation, 2026-10-09
+
+PR [319](https://github.com/tensorbee/rdocx/pull/319), immutable head
+`9a36bc966d1e12e4e9e2f38b777889bd687c5dd9`, closes Issue313 and attaches
+to existing F-X210. Caller fonts and variable instances remain F-X195 and
+PR315. Its proposed four modified static Gelasio faces and new Noto Sans
+Symbols2 subset differ from the explicitly approved eight-file inventory.
+Capture and assess their sources, license terms, metrics, glyph mappings,
+italic selection and diagnostic lifecycle before selecting any contribution.
+The existing asset approval does not authorize that different inventory.
+Its twelve claimed rendering deltas are contribution evidence, not accepted
+local baselines. Root retains exclusive baseline ownership.
+
+PR [320](https://github.com/tensorbee/rdocx/pull/320), immutable head
+`252acccbba9adab9264cfb109c4b1d720ed79d4a`, closes Issue303 and attaches
+to existing F-X200. Its colours remain F-X197. Assess its tri-state setters,
+tab ownership and enums, defaults preservation, list helpers and installed
+binding behavior against the full approved contract before reuse. Its body
+explicitly leaves native shared numbering counters unchanged.
+
+Issue [321](https://github.com/tensorbee/rdocx/issues/321) therefore maps to
+that same F-X200, which already owns the native shared-definition counter
+change and its authenticated Word evidence. It adds no duplicate F-ID or
+second implementation. Its explicit two-instance continuation, first-use
+startOverride and sub-level restart criteria are covered by the same native
+state contract and require local regressions and explained sample changes.
+F-283 retains its F-X200 completion prerequisite. Do not close Issue303 or
+Issue321 based only on the contributor's narrower binding patch.
+
+The refreshed intake contains seven open PRs and23 open issues. Issues264
+and281 remain excluded. Contributor test, measurement and baseline claims
+never substitute for local verification.
+
+## Next rolling refresh, 2026-10-09
+
+PR [322](https://github.com/tensorbee/rdocx/pull/322), immutable head
+`6b5e2e352047357299d1f366f807f4661037430e`, closes Issue305 and attaches
+to existing F-X202. Its table grid edits, pictures, links and handle policy
+are contribution input for the full existing contract. Its explicit nested
+table exclusions and main-document-only picture inventory do not satisfy
+all qualified owners automatically. Indentation remains F-X194. Successful
+alternate-copy text replacement remains F-X202 after F-X198 safety, reusing
+the separately captured PR317 slice. Stable-handle residuals remain F-X211.
+No new F-ID is created, and contributor gates are not local evidence.
+
+PR318 advanced from the retained assessed b1aa842 head to
+`bfdd6ab732e8c0003ea8c6110e3c891fb098d5b3`. The immutable comparison shows
+one new commit changing only the PowerPoint chart artifact SHA in a Word
+native test. Complete changed source, Git OID/bytes/SHA and refreshed reviews
+are captured independently. Keep the prior assessment, with this addition
+attached to F-X205's template acceptance. Measure the actual locally authored
+artifact after adopting approved geometry. Do not copy the contributor's
+expected hash or rewrite immutable cross-viewer acceptance evidence.
+
+This refresh has eight open PRs and23 open issues, with all scope linked to
+existing owners. Issues264 and281 remain excluded.
+
+## Advanced contribution heads reconciled, 2026-10-10
+
+The09:01:30UTC refresh retained18 open PRs and26 included issues. Issues264
+and281 remain excluded. Root authenticated complete manifests and237 source
+records and inspected exact deltas for PR318 at4fc65a5, PR328 at381f766 and
+PR333 atb228d5d. They remain F-X205/Issue308, F-X201/Issue304 and
+F-X211/Issue316 respectively. Existing plans now include spacing boundary and
+atomicity controls, default story styles, and qualified XML context controls.
+No duplicate story, contributor gate credit or completion is created. Full
+immutable heads and evidence are recorded in those three canonical plans.
+
+## PR338 and further PR333 head intake
+
+The09:35:24UTC refresh contains19 open PRs and26 included issues. Issues264
+and281 remain excluded. NewPR338 atc189dbd73b9a61543ed64a03d2305d0017bbf498
+closes existing Issue337 and joins F-X211, including its stacked PR336 work
+once. PR333 advanced to193819ca0a1dcf3415017c0be1186fe8df6bcb86 and retains
+F-X211/Issue316. Root authenticated255 source records and inspected exact
+incremental deltas. Complete source assessment is retained in the existing
+F-X211 plan. Intake grants no contributor gate credit or arbitrary new nesting
+policy. The approved256 control policy and complete textbox resource,
+namespace, discovery and public compatibility acceptance remain mandatory.
+
+## S91 intake and verification checkpoint, 2026-10-10 11:43UTC
+
+The latest read-only GitHub refresh at11:25:57UTC found no additional or changed
+records. All19 PRs and26 included issues remain mapped above, with Issues264
+and281 excluded. PR338 and PR333 source assessment is complete in F-X211's
+existing plan. Assessment does not close their acceptance gates.
+
+F-X194 is completed and integrated with authenticated native, installed
+Python, typing, WASM, verified22 package, unchanged49-entry hash and141 policy
+gates. Two publication-dependent policy cases remain skipped. Its integrated
+source exactly matches the independently reviewed worker.
+
+F-X212 has clean semantic, hash attribution, lint, HLD and carrier reviews.
+Actual checks cover521 native unit tests,365 integration tests across the
+original run and qualified retries,2331 regressions,2 doctests,3 CLI unit
+tests and68 CLI integrations. Original failures remain recorded. Its updated
+hash check matches all49 entries, with exactly the three approved audit keys
+changed from the prior baseline. Verified22 packaging is running and policy
+checks remain. No scoped completion or final sprint gate is claimed.
+
+F-X197's three review findings are resolved and independent pass2 is clean.
+Compiled support, fresh installed bindings, rendering, typing and remaining
+scoped gates are pending. F-X195's core/provider source reviews are clean,
+with runtime gates and remaining facade/provider wiring pending. F-X192 is
+claimed for isolated own-locale regression preparation after completed F-282.
+Its portable comparator and APA key authority remain technical barriers.
+
+Five stories are completed and integrated, four are in progress and thirteen
+remain approved. Final integrated verification, sprint review and close
+preflight remain outstanding. The sprint is not ready for close.
+
+## S91 TOC repair integration checkpoint, 2026-10-11
+
+F-X213 is scoped-verified and integrated at4b5eb59b. Issue340 andPR341
+acceptance passes for entry-owned TOC rebuild, opaque properties, namespace
+closure, repeated rebuild and save/reopen. Independent integration pass17
+is clean. Native and installed controls, typing, bothWASM, unchanged49
+hashes, policy, verified22 archives, docs and README consumers pass.
+The worker handoff is consumed. Its branch and scoped evidence remain
+available. Final integrated sprint verification, review and delivery ledgers
+remain due, so this feature is reviewed rather than counted completed.
+Eight stories are completed, one is integrated and reviewed, four are
+running, and eight approved stories await their prerequisite checkpoints.
+GitHub reconciliation follows the sprint-close workflow. Issues264 and281
+remain excluded and open.
+
+## S91 rolling intake, 2026-10-11 18:56UTC
+
+Authoritative GitHub refresh /private/tmp/S91-intake-refresh-20261011T185631Z
+contains40 open issues and22 open PRs. New Issues344 through353 enter S91.
+Issues264 and281 remain excluded and open, including the changed discussion281.
+No existing PR head changed. The included total is38 issues and22 PRs.
+
+| Issues | Acceptance owner | Required resolution |
+|--------|------------------|---------------------|
+| 344 | F-X214 | Bound recursive PowerPoint parsing and traversal |
+| 345 and346 | F-X215 | Create charts in Python and replace existing chart data |
+| 347,348 and349 | F-X216 | Import complete slides and merge decks with source formatting |
+| 350 and351 | F-X217 | Import HTML and Markdown through public Word surfaces |
+| 352 and353 | F-X218 | Export presentations as semantic HTML and Markdown |
+
+All original acceptance owners remain. This intake adds five stories, not
+duplicate implementations in the existing Python or CLI stories. Reuse native
+providers and contributor slices once. Twenty-six active stories now comprise
+eight completed, one integrated and reviewed, four running, eight approved
+pending and five registered for design. No new implementation starts before
+approved contracts and completion of its actual prerequisites.
+
+## New intake wave admission, 2026-10-11
+
+All five new issue designs are approved. The user approved the exact
+pulldown-cmark0.13.4 parser dependency for F-X217. ROOT adopted the explicit
+depth32 policy for F-X214, existing supported chart-data scope for F-X215,
+transactional graph/section/default import options for F-X216, canonical
+CommonMark round-trip/template policy for F-X217 and semantic export/resource
+options for F-X218. No draft blocks these plans.
+
+| Wave | Story | Prerequisite and resource boundary |
+|------|-------|------------------------------------|
+| 16 | F-X214 | No feature dependency, shape-tree/layout/renderer carriers wait for the F-X206 and F-X207 source checkpoint |
+| 17 | F-X215 | Completed F-X197 and F-X206, charts/Word/PPT shared authoring carriers exclusive |
+| 18 | F-X216 | Completed F-X206 and F-X215, graph import/PPT/CLI carriers exclusive |
+| 19 | F-X217 | Completed F-X200 and F-X203, Word import/outbound/binding/CLI carriers exclusive |
+| 20 | F-X218 | Completed F-X205 and F-X206, PPT semantic export/binding/CLI carriers exclusive |
+
+Hash baseline remains ROOT-exclusive. Ordinary implementation never runs
+concurrently in a shared source, test, manifest or HLD owner. Final full
+verification and review cover the integrated26-story result.
+
+## Rolling intake, PR354
+
+The 2026-10-11 19:57 UTC refresh found [PR354](https://github.com/tensorbee/rdocx/pull/354) at head5a2c657eb705ab53048ab5d4e729b9014d6e0c0e. Its compatibility-mode and CommonMark export fixes address Issues332 and334 already assigned to F-X203. Reuse this contribution within that existing story, with no duplicate implementation owner. The exact retrieved patch is c4814b20267e16c75dd36a972a0e87eb7b8e2c07a3889614315125fc2a2f9b0d at /private/tmp/S91-PR354-intake/diff.patch. Read-only contribution assessment is complete at /private/tmp/S91-PR354-intake/assessment.md, SHA7c7dab495057d1bcc0920e94af90231c6aaab76c068f3b1e6780f46c8807d19a. Consumer reconciliation remains pending. Preserve original edge whitespace and terminal hard breaks, retain field boundaries, and change list state only for emitted nonempty table output. Reuse the constructor and Markdown hunks without copying contributor archive numbers. The approved original issue acceptance remains required, including cases the PR explicitly leaves out. Contributor results do not waive local pinned oracle or output-delta review gates.
+
+Intake now contains40 open issues and23 open PRs. Issues264 and281 remain excluded discussion records. No issue or existing PR head changed in this refresh. This intake does not mark F-X203 implemented or complete.
+
+## Rolling intake, PR355
+
+The 2026-10-11 20:23 UTC refresh found [PR355](https://github.com/tensorbee/rdocx/pull/355) at head4005c4e51c3e2ce00d9c14dde1a2163fcaf8c5c1. It fixes Issue344 and joins the existing approved F-X214 parsing and traversal story. The exact contributor patch is7546f000296c4e6fedde1e7d860faea81ed2ebb145f432010b0e33d3d8e3fa4a in /private/tmp/S91-PR355-intake/diff.patch. Reuse its parser and regression work after reconciling the approved depth32 contract, URI ownership, mixed cycles, source retention and authored traversal safety. The donor depth16 limit and reported gates do not replace the approved acceptance or local verification. Read-only contribution assessment is in progress.
+
+There are24 open PRs and38 included open issues. Discussion issues264 and281 remain excluded. No existing PR head changed. This intake adds no duplicate story and marks no implementation complete.
+
+PR355 contribution assessment is complete at /private/tmp/S91-PR355-intake/assessment.md, SHAf8c78341918d25fe20908a0e1845eae23c0cc36f1d6c0ba7601e243b5246a15e. Reuse the same-reader parser mechanisms, iterative condition-target walk, empty timing-node error and eight contributor tests. Reconcile the donor local-name counting and omitted empty owners, recursive parsing and nested raw copies, depth16 policy, and incomplete grouping/manual-tree traversal guards with the approved F-X214 contract. No contributor archive measurements or reported test results are adopted as local evidence. Implementation remains at its existing exclusive source boundary.
+
+## Rolling intake, PR356, PR357 and PR358
+
+The 2026-10-11 20:46:45 UTC refresh captured three new PRs and no new or changed issues or existing PR heads.
+
+[PR356](https://github.com/tensorbee/rdocx/pull/356) at head e82a2c0c0492517d918c48ee0bde93d291e1b369 joins existing approved F-X215 for Issues 345 and 346, charts creation and data replacement. Its exact captured patch is a15fdd633c8ab55446a7e63cf6c50036f9ed172701a6c044fb649c1c0d75837b at /private/tmp/S91-PR356-intake/diff.patch. Read-only contribution assessment is complete at /private/tmp/S91-PR356-intake/assessment.md, SHA eb542fe436252ded0f2ab12e999abf5723ae1f73429279af166b25f09f6b9a56. Reuse chart projection/data checks and creation/replacement tests. Reconcile workbook and raw ChartML preservation, shared chart ownership, qualified relationship lookup and prepared binding publication. Localize types into the approved existing carriers. Native Office and full local acceptance remain due. Reuse qualifying contributor code and tests within the original approved acceptance and existing carriers. Contributor test claims, archive measurements, omitted acceptance and new product files do not replace local verification or grant additional structural approval. Implementation retains its dependency and exclusive source boundaries.
+
+[PR357](https://github.com/tensorbee/rdocx/pull/357) at head 16ee45f3b7d521edb344c4d59105654907bf8a97 joins existing approved F-X216 for Issues 347, 348 and 349, complete slide import, source formatting and deck merge. Its exact captured patch is d1203c60f78a383f36b4f9cf6986fef08abc9b45fe9da40b08daed8133702b62 at /private/tmp/S91-PR357-intake/diff.patch. Read-only contribution assessment is complete at /private/tmp/S91-PR357-intake/assessment.md, SHA b8670bafe72fb39a1d15e39c5c55a9f364b81a39a4c587960607450e77d3eb8b. Reuse graph copying, source-format comparison and graph/merge controls. Complete classic comments, batch-wide sharing, duplicate selection/map rejection, qualified comment identity/remapping, sections and transactional returned handles. Preserve the approved diagnostics and source-format contract. Reuse qualifying contributor code and tests within the original approved acceptance and existing carriers. Contributor test claims, archive measurements, omitted acceptance and new product files do not replace local verification or grant additional structural approval. Implementation retains its dependency and exclusive source boundaries.
+
+[PR358](https://github.com/tensorbee/rdocx/pull/358) at head 649fa8ed6be75624ea5c1c82433c5a02c935fa89 joins existing approved F-X218 for Issues 352 and 353, semantic Markdown and HTML export. Its exact captured patch is dcf904ae0f6001e4ebfdbe83f28421394604e5fb4b62f728715efc0314dbbb45 at /private/tmp/S91-PR358-intake/diff.patch. Read-only contribution assessment is complete at /private/tmp/S91-PR358-intake/assessment.md, SHA 6fd0fb900c70ad64a58d099166d5937741ccb26f2fd0e55f1c5815c36334a346. Reuse source-order traversal, escaping and inline semantic-output tests. Complete inherited bullet/run semantics, usable Markdown images, safe embedded/adjacent assets, internal links and diagnostics. Use the approved existing exporter carriers and retain full source-authority and validator acceptance. Reuse qualifying contributor code and tests within the original approved acceptance and existing carriers. Contributor test claims, archive measurements, omitted acceptance and new product files do not replace local verification or grant additional structural approval. Implementation retains its dependency and exclusive source boundaries.
+
+The current intake contains 27 open PRs and 40 open issues, of which 38 are included. Discussion issues 264 and 281 remain excluded and must stay open. These contributions add no duplicate story and do not mark an implementation complete. Exact refresh evidence is /private/tmp/S91-intake-refresh-20261011T204644Z/receipt.json.
+
+## Rolling intake, PR359
+
+The 2026-10-11 21:07:23 UTC refresh found [PR359](https://github.com/tensorbee/rdocx/pull/359) at head 7567b4031cc2c247a74ebb61b45cf5ee367f739c. It joins existing approved F-X217 for Issues 350 and 351, Word HTML and Markdown import. Exact patch c6fe3fd750a6ec23391626b161ee6b2a92eff28a244cae904510e6337733ff4f is captured at /private/tmp/S91-PR359-intake/diff.patch. Contribution assessment is complete at /private/tmp/S91-PR359-intake/assessment.md, SHA6fc5a95a1e5a96ff9b114223778a17f435b05842873ae469d732462373638933. The seven new commits are isolated in f217-only.diff, SHAb025943ebe9bbf1882a1957ec01f04ca457a28549f7227e055c13f9f87ea1ef9. Reuse requires the approved exact dependency/features, bounded decoded resources, complete admitted constructs, preserved template graphs and transactional owner publication. The branch is stacked on PR354, whose export/constructor work stays with F-X203 and must be reused once rather than duplicated. The approved exact pulldown-cmark =0.13.4 dependency and original linked-issue acceptance remain controlling. Contributor omissions and reported checks do not replace local acceptance. No source adoption or duplicate story is recorded.
+
+There are 28 open PRs and 38 included issues. Only discussion Issue264 changed in this refresh and remains excluded alongside Issue281. No included issue or existing PR head changed. Exact refresh evidence is /private/tmp/S91-intake-refresh-20261011T210723Z/receipt.json.
+
+## S91 intake closed, latest user decision
+
+The user closed new issue and PR intake on 2026-10-12. The current S91 scope is frozen at38 included issues and28 PRs from the authenticated 05:40:03 UTC snapshot, /private/tmp/S91-intake-refresh-20261012T053947Z/receipt.json. Issues264 and281 remain excluded and open. Later arrivals belong to a later sprint. This decision supersedes rolling intake instructions for S91. Finish all existing acceptance owners and reconcile their PRs against integrated results without reopening intake.
+
+## Approved S92 text watermark follow-up
+
+On 2026-10-12 the user approved the temporary F-X201 DrawingML text opacity
+boundary at 0.5, with named atomic refusal for other values and existing VML
+full-range support retained. F-X219 in S92 must replace this restriction with
+a faithful full-range representation after actual Word and LibreOffice
+qualification. This is a deferred implementation follow-up from existing
+F-X201 evidence, not new issue or PR intake.
+
+
+## Bounded intake and minor releases, 2026-10-12
+
+The user explicitly folds Issue360 and PR361 plus updated PR357 and PR359 into S91. The authenticated18:41UTC check adds one issue/PR pair and advances only those two existing heads. Included scope is39 issues and29 PRs, with discussion264/281 excluded and open. This admits these exact records, without an automatic rolling-intake loop.
+
+F-X220 owns font embedding across native Word/PowerPoint, both Python packages and CLIs, real producer-format/native font-use qualification, bounded decoding, source preservation and explicit license policy. Its admitted PR361 head is a5795f2219d1cde5c613890369df3d88a84fc242. F-X216 consumes PR357 incremental16ee45f3 to57011087. F-X217 consumes PR359 incremental7567b403 toe974ea22, preserving completed semantic mark/code/owner contracts. Existing assessments and failed runs remain retained, and contributor reported gates are not local qualification.
+
+F-X221 prepares both patch families in the existing lines after all28 repair stories complete: Word crates/Python0.16.1 and shared/PowerPoint crates/Python0.14.1. Current primary registry and GitHub CLI receipt verifies absent0.16.1/0.14.1 across both exact families, PyPI and remote tags. Preparation uses existing exact7/15 crate allowlists, new matching wheels/metadata, meaningful authenticated family notes and reviewed-SHA build-only rehearsal. No versions are changed yet and no publication is claimed. Final full sprint verification, clean sprint review and close remain due. The user authorizes publication and final addressed issue and PR reconciliation after successful publication. Exact reviewed main provenance, verified roles, publisher registration and artifacts remain mandatory, shared/PowerPoint first.
+
+Twenty of28 active stories are complete. F-X204, F-X215 and F-X217 are running in isolated worktrees with disjoint file leases. F-X211, F-X216, F-X218, F-X220 and F-X221 remain approved and pending. Bibliography, navigation, standalone authoring and full-range text watermark work remain deferred to S92. Required evidence and carried dirty work are retained.
+
+
+| Included issue | Included PR | Owner | Resolution contract |
+|---|---|---|---|
+| [360](https://github.com/tensorbee/rdocx/issues/360) | [361](https://github.com/tensorbee/rdocx/pull/361) | F-X220 | Explicit licensed font embedding, listing/removal/settings, both families and public surfaces, native producer/use and preserved imported font graphs |
+| 347,348,349 | [357](https://github.com/tensorbee/rdocx/pull/357) | F-X216 | Existing full slide-import contract, incremental head57011087 assessed without redoing accepted provider work |
+| 350,351 | [359](https://github.com/tensorbee/rdocx/pull/359) | F-X217 | Existing full Word import contract, incremental heade974ea22 adapted without losing semantic mark or code whitespace |
+
+### Final release preparation boundary
+
+F-X221 depends on every included repair F-X193 through F-X218 and F-X220 plus F-X222. It follows all source-sharing implementation waves and remains exclusive for versions, locks, manifests, notes, archive measurements and HLD release prose. Native and installed repair acceptance is not deferred to publication. Final versioned wheels are rebuilt once the complete source graph is fixed, then reviewed-SHA hosted artifacts and actual final integrated gates decide closure. The next commands after closure are /release rpptx-v0.14.1 followed by /release v0.16.1, under the user's explicit corrected patch publication authorization after exact-main-SHA and all release checks. Only /close-sprint merges main and creates the sprint tag. Only /release creates release tags or starts publication.
+
+## User-admitted PR363 and Issue362 in S91
+
+F-X222, Restore linear Word story range inventory and empty owners, M, is approved pending in S91. It resolves [Issue362](https://github.com/tensorbee/rdocx/issues/362) through assessed [PR363](https://github.com/tensorbee/rdocx/pull/363), immutable head0b9a3cccc1b31bac7ec4108c923faa176b072c47. The full five-carrier patch and two commits are authenticated against actual base733ce6f7 and all five resulting Git blobs. Comments/reviews contain no additional requests. Reuse the three native runtime carriers, adapt current physical source/namespace contracts, prove measured scaling and empty-owner behavior, and measure local archive metadata independently. Do not copy the donor's README/policy measurements.
+
+Included scope is40 issues and30 PRs. Issues264/281 remain excluded and open, and no automatic rolling intake loop is reopened. There are29 stories:20 completed,4 running and5 approved pending. F222's completed dependencies are F203 and F213, with Word source handover after F204. It does not reopen completed F203 or deferred bibliography/navigation. F221 now depends on F222 and follows all28 included repairs before preparing the two minor release families. Final full verification, sprint review and close preflight remain due.
+
+## S91 parallel delivery children
+
+F-X211 remains the existing acceptance owner, with F-X211a, Word checked XML
+owners and resource admission, and F-X211b, PowerPoint checked XML owners,
+implementing in isolated worktrees. F-X211c, Integrated Python compatibility
+and causal errors, follows both and its completed provider dependencies. The
+parent closes only after all three children close. This delivery partition
+keeps the frozen40 issues and30 PRs, all existing acceptance and the immutable
+100-script metric. Bibliography, navigation and standalone authoring stay S92.
+
+**Approved native Word font boundary, 2026-10-13**: F-X220 retains four API face kinds and genuine own-renderer and PowerPoint face selection. Native Word acceptance follows its documented one-font-per-name behavior, recording actual synthetic bold and empty native saved bold parts. The user moved native Word multi-face interoperability to F-X223 in S92. This does not move Issue360 or PR361 out of S91. Their native, public, CLI, preservation and authorization gates are qualified at the scoped F-X220 checkpoint. Final integrated sprint gates remain due.
+
+
+## Current dependency-prefix admission, 2026-10-13
+
+F-X211a, F-X215 and F-X218 complete at the reviewed current dependency-prefix checkpoint after root policy admission. Current paired execution measures32 Word and53 PowerPoint controls, all85 passing. Typing/fullstubs qualify through the explicit final-annotation-only bridge. Five verified packages, strict nine-crate Clippy, both WASM graphs and49 unchanged hashes qualify their actual recorded scopes. Original failed runner, genuine stub failure and all prior failed commands remain separate from successful successors.
+
+**Policy checkpoint**: Actual README inventory/examples and immutable registry-graph successors pass at source106b, receipt17b34fb9e839ce65672ad613f2f978654a64e22a6c3346687d3e0b1dbf068982. Root authenticates both exit0 logs and safe cleanup. Earlier137 observed passing policy cases and2 platform skips remain historical. Original141 failures and focused inventory failure08f234 stay retained. This is the scoped composite, not a replayed full141 module.
+
+Twenty-six of29 top-level stories are complete. Parent F-X211 remains running. F-X216 and compatibility child c are now claimed and running in separate worktrees. F-X221 remains approved pending all repair prerequisites. Word child a and PowerPoint child b are complete. No frozen100 score, whole2392 regression green, decoded-media/render authority, full workspace or sprint review is credited here. Intake stays frozen40 issues/30 PRs with264/281 excluded and open. Bibliography, navigation, standalone authoring, historical oracle regeneration and approved Word multi-face interoperability remain S92. No remote closure, main merge, tag, publication or push is claimed.
+
+
+## F-X216 scoped completion, 2026-10-14
+
+Complete slide import, source formatting and deck merge are integrated locally at501144b4. Issues347,348,349 and PR357 are locally addressed by the completed story. The validated handoff is consumed, current defining regression and scoped acceptance pass, and independent integration review reports zero defects and zero smells. Admitted native PowerPoint source comparisons, graph survival and two save/reopen cycles retain their exact documented boundaries.
+
+Twenty-seven of29 top-level stories are complete. Parent F-X211 and its compatibility child c remain running. F-X221 remains approved pending all repair prerequisites. Final full integrated verification, both explicitly ignored focused appearance riders and sprint review remain due. Four missing historical oracle assets remain uncredited in S92. Intake stays frozen40 issues/30 PRs, with264/281 excluded and open. No remote closure, main merge, tag, publication or push is claimed.
+
+
+## F-X211 failed candidate corrective partition, 2026-10-14
+
+The complete immutable first candidate records72 assertion successes and28
+failures, not a completed90-percent correct-file gate. F-X211d owns the
+exposed Word XML/alias/ancestor/style residuals in a separate worktree. c
+keeps PPT and shared causal/reporting fixes and final composed qualification.
+The parent retains every original acceptance condition and now has four
+delivery children. Twenty-nine top-level stories and the frozen40 issues/30
+PRs are unchanged. Preserve all failed candidates and never stitch a best-of
+retry rate or rewrite the corpus. Publication and close remain gated.
+
+
+## S91 Word compatibility repair checkpoint, 2026-10-14
+
+F-X211d is complete and integrated through its scoped dependency-prefix gate.
+Children a, b and d are complete. Child c owns the final fresh paired bindings,
+complete unchanged100 measurement and qualified native/rendered acceptance.
+Twenty-seven of29 top-level stories remain complete, with parent F-X211 and
+release preparation F-X221 unfinished. Bibliography, navigation and standalone
+authoring remain in S92. Intake stays frozen40 issues/30 PRs, with discussions
+264 and281 excluded and open. Final full verification, focused appearance
+riders, sprint review and authorized publication/closure remain due.
+
+
+## Issue378 execution intake, 2026-10-15
+
+The user adds F-X237 to S92 for the reported Python0.16.1 table-cell performance regression. The original five repair contracts remain intact. Qualify linear open and single-edit work, the exact40-by6 fill and authenticated same-host release0.16.0 timing while preserving checked physical-owner and revision semantics. This intake does not alter the historical frozen contribution or compatibility corpora.

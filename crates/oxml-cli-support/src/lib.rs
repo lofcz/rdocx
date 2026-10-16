@@ -24,6 +24,77 @@ pub enum Error {
     /// A JSON envelope payload tried to define the reserved schema field.
     #[error("JSON payload must not define reserved field \"schema\"")]
     ReservedSchemaField,
+    /// A replacement map violates the ordered typed array schema.
+    #[error("invalid replacement map: {0}")]
+    InvalidReplacementMap(String),
+}
+
+/// One pair of a replacement map: the text to find, its replacement, and
+/// the count the caller expects, when it gives one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplacementPair {
+    pub placeholder: String,
+    pub value: String,
+    pub expect: Option<usize>,
+}
+
+/// Parses a replacement map, a JSON array of objects such as
+/// `{"placeholder": "{{name}}", "value": "Ada", "expect": 2}`.
+///
+/// `expect` is optional. The pairs keep their order, because a later pair
+/// sees the text an earlier one wrote. Empty arrays succeed. Duplicate object keys
+/// follow serde_json last occurrence wins. A missing or non-string field, a negative or
+/// fractional `expect`, and any other key are refused, naming the
+/// zero-based pair.
+pub fn parse_replacement_map(json: &str) -> Result<Vec<ReplacementPair>, Error> {
+    let invalid = |message: String| Error::InvalidReplacementMap(message);
+    let value: Value =
+        serde_json::from_str(json).map_err(|error| invalid(format!("not JSON: {error}")))?;
+    let Value::Array(entries) = value else {
+        return Err(invalid(
+            "expected an array of {\"placeholder\", \"value\", \"expect\"} objects".to_owned(),
+        ));
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let Value::Object(fields) = entry else {
+                return Err(invalid(format!("pair {index} is not an object")));
+            };
+            if let Some(key) = fields
+                .keys()
+                .find(|key| !matches!(key.as_str(), "placeholder" | "value" | "expect"))
+            {
+                return Err(invalid(format!(
+                    "pair {index} has unknown key \"{key}\" (use placeholder, value, expect)"
+                )));
+            }
+            let text = |key: &str| match fields.get(key) {
+                Some(Value::String(text)) => Ok(text.clone()),
+                _ => Err(invalid(format!("pair {index} needs a string \"{key}\""))),
+            };
+            let placeholder = text("placeholder")?;
+            let expect = match fields.get("expect") {
+                None | Some(Value::Null) => None,
+                Some(count) => Some(
+                    count
+                        .as_u64()
+                        .and_then(|count| usize::try_from(count).ok())
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "pair {index} needs a non-negative integer \"expect\""
+                            ))
+                        })?,
+                ),
+            };
+            Ok(ReplacementPair {
+                placeholder,
+                value: text("value")?,
+                expect,
+            })
+        })
+        .collect()
 }
 
 /// Parses positive one-based values and inclusive ranges.
@@ -363,6 +434,35 @@ pub fn json_envelope(mut payload: Value) -> Result<Value, Error> {
     Ok(payload)
 }
 
+/// Convert an authenticated native report to an owned JSON value. No chain trust is implied.
+#[cfg(feature = "digital-signatures")]
+pub fn signature_report_json(report: &oxml_opc::SignatureReport) -> serde_json::Value {
+    use oxml_opc::SignatureIssue;
+    use serde_json::json;
+    let issues: Vec<_> = report.issues.iter().map(|issue| match issue {
+        SignatureIssue::MissingPart { uri } => json!({"kind": "missing_part", "details": {"uri": uri}}),
+        SignatureIssue::ChangedReference { uri, expected_digest, actual_digest } => json!({"kind": "changed_reference", "details": {"uri": uri, "expected_digest": expected_digest, "actual_digest": actual_digest}}),
+        SignatureIssue::DuplicateReference { uri } => json!({"kind": "duplicate_reference", "details": {"uri": uri}}),
+        SignatureIssue::MissingRelationship { source_part, relationship_id } => json!({"kind": "missing_relationship", "details": {"source_part": source_part, "relationship_id": relationship_id}}),
+        SignatureIssue::DuplicateRelationship { source_part, relationship_id } => json!({"kind": "duplicate_relationship", "details": {"source_part": source_part, "relationship_id": relationship_id}}),
+        SignatureIssue::ExternalRelationship { source_part, relationship_id, target } => json!({"kind": "external_relationship", "details": {"source_part": source_part, "relationship_id": relationship_id, "target": target}}),
+        SignatureIssue::MissingRelationshipTarget { source_part, relationship_id, target } => json!({"kind": "missing_relationship_target", "details": {"source_part": source_part, "relationship_id": relationship_id, "target": target}}),
+        SignatureIssue::UncoveredPart { part_name } => json!({"kind": "uncovered_part", "details": {"part_name": part_name}}),
+        SignatureIssue::UncoveredRelationship { source_part, relationship_id } => json!({"kind": "uncovered_relationship", "details": {"source_part": source_part, "relationship_id": relationship_id}}),
+        SignatureIssue::SignatureValueMismatch => json!({"kind": "signature_value_mismatch", "details": {}}),
+        SignatureIssue::OrphanSignaturePart { part_name } => json!({"kind": "orphan_signature_part", "details": {"part_name": part_name}}),
+    }).collect();
+    json!({
+        "signature_part": report.signature_part,
+        "signer": report.signer.as_ref().map(|signer| json!({"subject": signer.subject, "issuer": signer.issuer, "serial_number": signer.serial_number})),
+        "cryptographically_valid": report.cryptographically_valid,
+        "coverage_complete": report.coverage_complete,
+        "covered_parts": report.covered_parts,
+        "covered_relationships": report.covered_relationships.iter().map(|relationship| json!({"source_part": relationship.source_part, "relationship_id": relationship.relationship_id})).collect::<Vec<_>>(),
+        "issues": issues,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -624,4 +724,180 @@ mod tests {
         assert!(temp_entries(&temp).is_empty());
         fs::remove_dir_all(&temp).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn fx204_maps_preserve_empty_order_null_and_duplicate_key_policy() {
+    assert!(parse_replacement_map("[]").unwrap().is_empty());
+    let pairs=parse_replacement_map(r#"[{"placeholder":"A","value":"first","value":"second","expect":null},{"placeholder":"A","value":"third","expect":0}]"#).unwrap();
+    assert_eq!(pairs[0].value, "second");
+    assert_eq!(pairs[0].expect, None);
+    assert_eq!(pairs[1].expect, Some(0));
+    for value in [
+        r#"{}"#,
+        r#"[null]"#,
+        r#"[{"placeholder":"A","value":3}]"#,
+        r#"[{"placeholder":"A","value":"B","extra":0}]"#,
+        r#"[{"placeholder":"A","value":"B","expect":true}]"#,
+        r#"[{"placeholder":"A","value":"B","expect":-1}]"#,
+        r#"[{"placeholder":"A","value":"B","expect":1.2}]"#,
+    ] {
+        assert!(parse_replacement_map(value).is_err(), "{value}");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "digital-signatures")]
+#[test]
+fn signature_reports_keep_all_issue_fields_and_owned_values() {
+    use oxml_opc::{
+        CoveredRelationship, SignatureIssue, SignatureReport, SignerCertificateIdentity,
+    };
+    let cases = vec![
+        (
+            SignatureIssue::MissingPart {
+                uri: "uri-value".into(),
+            },
+            "missing_part",
+            vec![("uri", "uri-value")],
+        ),
+        (
+            SignatureIssue::ChangedReference {
+                uri: "uri-value".into(),
+                expected_digest: "expected_digest-value".into(),
+                actual_digest: "actual_digest-value".into(),
+            },
+            "changed_reference",
+            vec![
+                ("uri", "uri-value"),
+                ("expected_digest", "expected_digest-value"),
+                ("actual_digest", "actual_digest-value"),
+            ],
+        ),
+        (
+            SignatureIssue::DuplicateReference {
+                uri: "uri-value".into(),
+            },
+            "duplicate_reference",
+            vec![("uri", "uri-value")],
+        ),
+        (
+            SignatureIssue::MissingRelationship {
+                source_part: "source_part-value".into(),
+                relationship_id: "relationship_id-value".into(),
+            },
+            "missing_relationship",
+            vec![
+                ("source_part", "source_part-value"),
+                ("relationship_id", "relationship_id-value"),
+            ],
+        ),
+        (
+            SignatureIssue::DuplicateRelationship {
+                source_part: "source_part-value".into(),
+                relationship_id: "relationship_id-value".into(),
+            },
+            "duplicate_relationship",
+            vec![
+                ("source_part", "source_part-value"),
+                ("relationship_id", "relationship_id-value"),
+            ],
+        ),
+        (
+            SignatureIssue::ExternalRelationship {
+                source_part: "source_part-value".into(),
+                relationship_id: "relationship_id-value".into(),
+                target: "target-value".into(),
+            },
+            "external_relationship",
+            vec![
+                ("source_part", "source_part-value"),
+                ("relationship_id", "relationship_id-value"),
+                ("target", "target-value"),
+            ],
+        ),
+        (
+            SignatureIssue::MissingRelationshipTarget {
+                source_part: "source_part-value".into(),
+                relationship_id: "relationship_id-value".into(),
+                target: "target-value".into(),
+            },
+            "missing_relationship_target",
+            vec![
+                ("source_part", "source_part-value"),
+                ("relationship_id", "relationship_id-value"),
+                ("target", "target-value"),
+            ],
+        ),
+        (
+            SignatureIssue::UncoveredPart {
+                part_name: "part_name-value".into(),
+            },
+            "uncovered_part",
+            vec![("part_name", "part_name-value")],
+        ),
+        (
+            SignatureIssue::UncoveredRelationship {
+                source_part: "source_part-value".into(),
+                relationship_id: "relationship_id-value".into(),
+            },
+            "uncovered_relationship",
+            vec![
+                ("source_part", "source_part-value"),
+                ("relationship_id", "relationship_id-value"),
+            ],
+        ),
+        (
+            SignatureIssue::SignatureValueMismatch,
+            "signature_value_mismatch",
+            vec![],
+        ),
+        (
+            SignatureIssue::OrphanSignaturePart {
+                part_name: "part_name-value".into(),
+            },
+            "orphan_signature_part",
+            vec![("part_name", "part_name-value")],
+        ),
+    ];
+    let mut report = SignatureReport {
+        signature_part: "/_xmlsignatures/sig1.xml".into(),
+        signer: None,
+        cryptographically_valid: true,
+        coverage_complete: false,
+        covered_parts: vec!["/word/document.xml".into()],
+        covered_relationships: vec![CoveredRelationship {
+            source_part: "/".into(),
+            relationship_id: "rId1".into(),
+        }],
+        issues: vec![],
+    };
+    for (issue, kind, fields) in cases {
+        report.issues = vec![issue];
+        let mut json = signature_report_json(&report);
+        assert_eq!(json["signer"], serde_json::Value::Null);
+        assert_eq!(json["signature_part"], report.signature_part);
+        assert_eq!(json["cryptographically_valid"], true);
+        assert_eq!(json["coverage_complete"], false);
+        assert_eq!(json["issues"][0]["kind"], kind);
+        let details = json["issues"][0]["details"].as_object().unwrap();
+        assert_eq!(details.len(), fields.len());
+        for (key, value) in fields {
+            assert_eq!(details[key], value);
+        }
+        assert_eq!(json["covered_relationships"][0]["relationship_id"], "rId1");
+        json["covered_parts"][0] = serde_json::json!("mutated");
+        assert_eq!(report.covered_parts[0], "/word/document.xml");
+    }
+    report.signer = Some(SignerCertificateIdentity {
+        subject: "subject".into(),
+        issuer: "issuer".into(),
+        serial_number: "serial".into(),
+    });
+    let json = signature_report_json(&report);
+    assert_eq!(
+        json["signer"],
+        serde_json::json!({"subject":"subject","issuer":"issuer","serial_number":"serial"})
+    );
 }

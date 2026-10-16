@@ -17,7 +17,7 @@ use crate::block::{
     TableSemantics,
 };
 use crate::engine::SourceRegistry;
-use crate::input::{LayoutInput, MediaRegistry};
+use crate::input::{LayoutInput, MediaRegistry, RevisionView};
 use crate::style_resolver::NumberingState;
 use oxml_layout::{Color, Diagnostic, FontManager, Result, StructureId};
 
@@ -44,6 +44,21 @@ pub(crate) fn layout_table_rows<'a>(
             row_path.push(boundary);
             rows.push((row, row_path));
         }
+    }
+    rows
+}
+
+/// The rows [`layout_table_rows`] returns, less those that accepting every
+/// tracked change removes when the accepted view is laid out. The rows that
+/// remain keep their source paths.
+fn accepted_table_rows<'a>(
+    table: &'a CT_Tbl,
+    path: &[usize],
+    input: &LayoutInput,
+) -> Vec<(&'a CT_Row, Vec<usize>)> {
+    let mut rows = layout_table_rows(table, path);
+    if input.revision_view == RevisionView::Accepted {
+        rows.retain(|(row, _)| !row.accepted_view_removes());
     }
     rows
 }
@@ -419,6 +434,7 @@ pub fn layout_table(
         &WordStory::Document,
         &[],
         doc_grid,
+        true,
     )
     .map(|(block, _)| block)
 }
@@ -450,6 +466,7 @@ pub(crate) fn layout_table_with_provenance(
         story,
         path,
         doc_grid,
+        true,
     )
 }
 
@@ -467,15 +484,12 @@ fn layout_table_inner(
     story: &WordStory,
     path: &[usize],
     doc_grid: Option<&CT_DocGrid>,
+    top_level: bool,
 ) -> Result<(TableBlock, TableSemantics)> {
     let direct_width = tbl
         .properties
         .as_ref()
         .is_some_and(|properties| properties.width.is_some());
-    let direct_alignment = tbl
-        .properties
-        .as_ref()
-        .is_some_and(|properties| properties.jc.is_some());
     let mut resolved_table = tbl.clone();
     let mut resolved_properties = resolve_base_table_properties(tbl, styles);
     // The authored width type, captured before the direct width is dropped
@@ -489,12 +503,9 @@ fn layout_table_inner(
     if direct_width {
         resolved_properties.width = None;
     }
-    if direct_alignment {
-        resolved_properties.jc = None;
-    }
     resolved_table.properties = Some(resolved_properties);
     let tbl = &resolved_table;
-    let source_rows = layout_table_rows(tbl, path);
+    let source_rows = accepted_table_rows(tbl, path, input);
     let bidi_visual = tbl
         .properties
         .as_ref()
@@ -520,27 +531,21 @@ fn layout_table_inner(
         doc_grid,
     )? {
         Some(widths) => widths,
-        None => compute_column_widths(tbl.grid.as_ref(), available_width, tbl, path),
+        None => compute_column_widths(tbl.grid.as_ref(), available_width, tbl, &source_rows),
     };
     let table_width: f64 = col_widths.iter().sum();
 
     // Table indent
-    let authored_indent = tbl
+    let resolved_indent = tbl
         .properties
         .as_ref()
-        .and_then(|p| p.indent.as_ref())
-        .map(|ind| {
-            if ind.width_type == "dxa" {
-                ind.w as f64 / 20.0 // twips to pt
-            } else {
-                0.0
-            }
-        })
-        .unwrap_or(0.0);
-    let table_indent = match tbl.properties.as_ref().and_then(|properties| properties.jc) {
+        .and_then(|properties| properties.indent.as_ref())
+        .filter(|indent| indent.width_type == "dxa")
+        .map(|indent| indent.w as f64 / 20.0);
+    let mut table_indent = match tbl.properties.as_ref().and_then(|properties| properties.jc) {
         Some(ST_Jc::Center) => ((available_width - table_width) / 2.0).max(0.0),
         Some(ST_Jc::Right | ST_Jc::End) => (available_width - table_width).max(0.0),
-        _ => authored_indent,
+        _ => resolved_indent.unwrap_or(0.0),
     };
 
     // Direct table borders win. Table-style borders are the fallback.
@@ -568,11 +573,11 @@ fn layout_table_inner(
     let cell_margin_left = default_cell_margin
         .and_then(|m| m.left)
         .map(|t| t.to_pt())
-        .unwrap_or(5.4); // Word default ~108 twips
+        .unwrap_or(0.0);
     let cell_margin_right = default_cell_margin
         .and_then(|m| m.right)
         .map(|t| t.to_pt())
-        .unwrap_or(5.4);
+        .unwrap_or(0.0);
     let cell_margin_top = default_cell_margin
         .and_then(|m| m.top)
         .map(|t| t.to_pt())
@@ -912,6 +917,22 @@ fn layout_table_inner(
         }
     }
 
+    // Legacy movement uses the first accepted cell's resolved left margin.
+    // Missing indentation differs from an authored or style-inherited zero.
+    if top_level
+        && input.legacy_table_positioning
+        && !bidi_visual
+        && floating.is_none()
+        && let Some(first) = rows.iter().find_map(|row| row.cells.first())
+    {
+        match tbl.properties.as_ref().and_then(|properties| properties.jc) {
+            Some(ST_Jc::Center) => {}
+            Some(ST_Jc::Right | ST_Jc::End) => table_indent += first.margin_left,
+            _ if resolved_indent.is_some() => table_indent -= first.margin_left,
+            _ => {}
+        }
+    }
+
     let row_heights = rows.iter().map(|row| row.height).collect::<Vec<_>>();
     for (row, height) in rows.iter_mut().zip(&row_heights) {
         for cell in &mut row.cells {
@@ -947,17 +968,16 @@ fn layout_table_inner(
 
 /// The border one side of a cell draws, or `None` when it draws none.
 ///
-/// The cell's own edge wins over the table's, except that a `none` cell edge
-/// on the outside of the table falls back to the table's outer edge.
+/// The cell's own edge wins over the table's, on the outside of the table as
+/// on the inside, so a `nil` cell edge removes it. Word reads a `none` cell
+/// edge as unset, so that one falls back to the table's edge.
 pub(crate) fn resolved_cell_edge<'a>(
     cell_edge: Option<&'a CT_BorderEdge>,
     table_edge: Option<&'a CT_BorderEdge>,
-    outer_edge: bool,
 ) -> Option<&'a CT_BorderEdge> {
     let edge = match cell_edge {
-        Some(edge) if edge.val.is_none() && outer_edge => table_edge?,
-        Some(edge) => edge,
-        None => table_edge?,
+        Some(edge) if edge.val != ST_Border::None => edge,
+        _ => table_edge?,
     };
     // A picture border has no line to draw, so that side draws none.
     (!edge.val.is_none() && !matches!(edge.val, ST_Border::Art(_))).then_some(edge)
@@ -1005,7 +1025,6 @@ fn border_bands(rows: &[TableRow], table_borders: Option<&CT_TblBorders>) -> Vec
                 && let Some(edge) = resolved_cell_edge(
                     cell_borders.and_then(|borders| borders.top.as_ref()),
                     table_top,
-                    first_row,
                 )
             {
                 bands[row_index] = bands[row_index].max(border_band(edge));
@@ -1014,7 +1033,6 @@ fn border_bands(rows: &[TableRow], table_borders: Option<&CT_TblBorders>) -> Vec
                 && let Some(edge) = resolved_cell_edge(
                     cell_borders.and_then(|borders| borders.bottom.as_ref()),
                     table_bottom,
-                    last_row,
                 )
             {
                 bands[row_index + 1] = bands[row_index + 1].max(border_band(edge));
@@ -1051,6 +1069,32 @@ fn resolve_base_table_properties(table: &CT_Tbl, styles: &CT_Styles) -> CT_TblPr
     for style in chain.into_iter().rev() {
         if let Some(properties) = &style.table_properties {
             overlay_table_properties(&mut resolved, properties);
+        }
+        // Native controls qualify this fixed built-in identity and metadata,
+        // not arbitrary defaults. Only the effective base left edge changes.
+        if style.style_id == "TableNormal"
+            && style.name.as_deref() == Some("Normal Table")
+            && style.style_type == rdocx_oxml::styles::StyleType::Table
+            && style.is_default
+            && style.based_on.is_none()
+            && style.ui_priority == Some(99)
+            && style.semi_hidden == Some(true)
+            && style.unhide_when_used == Some(true)
+            && style.table_properties.as_ref().is_some_and(|properties| {
+                properties
+                    .indent
+                    .as_ref()
+                    .is_some_and(|indent| indent.width_type == "dxa" && indent.w == 0)
+                    && properties.cell_margin.as_ref().is_some_and(|margin| {
+                        margin.top == Some(rdocx_oxml::Twips(0))
+                            && margin.bottom == Some(rdocx_oxml::Twips(0))
+                    })
+            })
+        {
+            resolved
+                .cell_margin
+                .get_or_insert_with(Default::default)
+                .left = Some(rdocx_oxml::Twips(108));
         }
     }
     if let Some(properties) = direct {
@@ -1364,7 +1408,7 @@ fn autofit_column_widths(
         return Ok(None);
     }
 
-    let source_rows = layout_table_rows(tbl, path);
+    let source_rows = accepted_table_rows(tbl, path, input);
     let column_count = tbl
         .grid
         .as_ref()
@@ -1390,12 +1434,6 @@ fn autofit_column_widths(
     }
 
     let default_cell_margin = properties.and_then(|properties| properties.cell_margin.as_ref());
-    let horizontal_margin = default_cell_margin
-        .and_then(|margin| margin.left)
-        .map_or(5.4, |value| value.to_pt())
-        + default_cell_margin
-            .and_then(|margin| margin.right)
-            .map_or(5.4, |value| value.to_pt());
 
     let mut minima = vec![0.0f64; column_count];
     let mut maxima = vec![0.0f64; column_count];
@@ -1409,6 +1447,20 @@ fn autofit_column_widths(
                 .unwrap_or(0) as usize)
                 .min(column_count);
         for (cell, cell_path) in &layout_row_cells(row, row_path) {
+            // Match the final pass's direct, edgewise cell overlay. A missing
+            // edge inherits the table, while an explicit zero remains zero.
+            let own_margin = cell
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.cell_margin.as_ref());
+            let horizontal_margin = own_margin
+                .and_then(|margin| margin.left)
+                .or_else(|| default_cell_margin.and_then(|margin| margin.left))
+                .map_or(0.0, |value| value.to_pt())
+                + own_margin
+                    .and_then(|margin| margin.right)
+                    .or_else(|| default_cell_margin.and_then(|margin| margin.right))
+                    .map_or(0.0, |value| value.to_pt());
             let grid_span = cell
                 .properties
                 .as_ref()
@@ -1589,7 +1641,7 @@ fn compute_column_widths(
     grid: Option<&CT_TblGrid>,
     available_width: f64,
     table: &CT_Tbl,
-    path: &[usize],
+    rows: &[(&CT_Row, Vec<usize>)],
 ) -> Vec<f64> {
     let requested_width = table
         .properties
@@ -1620,7 +1672,7 @@ fn compute_column_widths(
         }
         _ => {
             // No grid defined — infer column count from the first row
-            let num_cols = layout_table_rows(table, path)
+            let num_cols = rows
                 .first()
                 .map(|(row, path)| {
                     layout_row_cells(row, path)
@@ -1670,7 +1722,7 @@ fn layout_cell_content(
         match item {
             CellContent::Paragraph(para) => {
                 let source = sources.and_then(|sources| sources.id(story, &source_path));
-                let (block, reflow_direction) = engine::layout_paragraph_with_source_in_table(
+                let (mut block, reflow_direction) = engine::layout_paragraph_with_source_in_table(
                     para,
                     available_width,
                     styles,
@@ -1684,12 +1736,19 @@ fn layout_cell_content(
                     table_style_rpr,
                     doc_grid,
                 )?;
+                if let Some(registry) = sources {
+                    registry.bind_text_boxes(&mut block, source)?;
+                }
                 blocks.push(CellBlock::Paragraph(block));
                 semantics.push(CellBlockSemantics::Paragraph(ParagraphSemantics {
+                    border_group_before: false,
                     source_node: source,
                     structure_id: None,
                     reflow_direction,
                 }));
+            }
+            CellContent::Table(tbl)
+                if input.revision_view == RevisionView::Accepted && tbl.accepted_view_removes() => {
             }
             CellContent::Table(tbl) => {
                 // Recursively lay out the nested table
@@ -1706,6 +1765,7 @@ fn layout_cell_content(
                     story,
                     &source_path,
                     doc_grid,
+                    false,
                 )?;
                 blocks.push(CellBlock::Table(nested));
                 semantics.push(CellBlockSemantics::Table(nested_semantics));
@@ -1728,6 +1788,22 @@ fn layout_cell_content(
                 &mut blocks,
                 &mut semantics,
             )?,
+        }
+    }
+    let paragraphs = blocks
+        .iter()
+        .map(|block| match block {
+            CellBlock::Paragraph(paragraph) => Some(paragraph),
+            CellBlock::Table(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let groups = crate::block::paragraph_border_groups(&paragraphs);
+    for ((block, semantics), (top, bottom)) in blocks.iter_mut().zip(&mut semantics).zip(groups) {
+        if let CellBlockSemantics::Paragraph(semantics) = semantics {
+            semantics.border_group_before = top;
+        }
+        if let CellBlock::Paragraph(paragraph) = block {
+            paragraph.remove_group_border_edges(top, bottom);
         }
     }
     // Two consecutive paragraphs of a cell are one flow, so Word keeps the
@@ -1773,7 +1849,7 @@ fn layout_control_cell_content(
         match content {
             SdtContent::Paragraph(paragraph) => {
                 let source = sources.and_then(|sources| sources.id(story, &source_path));
-                let (block, reflow_direction) = engine::layout_paragraph_with_source_in_table(
+                let (mut block, reflow_direction) = engine::layout_paragraph_with_source_in_table(
                     paragraph,
                     available_width,
                     styles,
@@ -1787,13 +1863,20 @@ fn layout_control_cell_content(
                     table_style_rpr,
                     doc_grid,
                 )?;
+                if let Some(registry) = sources {
+                    registry.bind_text_boxes(&mut block, source)?;
+                }
                 blocks.push(CellBlock::Paragraph(block));
                 semantics.push(CellBlockSemantics::Paragraph(ParagraphSemantics {
+                    border_group_before: false,
                     source_node: source,
                     structure_id: None,
                     reflow_direction,
                 }));
             }
+            SdtContent::Table(table)
+                if input.revision_view == RevisionView::Accepted
+                    && table.accepted_view_removes() => {}
             SdtContent::Table(table) => {
                 let (nested, nested_semantics) = layout_table_inner(
                     table,
@@ -1808,6 +1891,7 @@ fn layout_control_cell_content(
                     story,
                     &source_path,
                     doc_grid,
+                    false,
                 )?;
                 blocks.push(CellBlock::Table(nested));
                 semantics.push(CellBlockSemantics::Table(nested_semantics));
@@ -1837,6 +1921,127 @@ fn layout_control_cell_content(
         }
     }
     Ok(())
+}
+
+/// Effective accepted cell paragraph properties in physical source order.
+///
+/// This source projection uses the same table-style chain, conditional regions,
+/// logical grid positions and cell content selection as native table layout.
+/// Nested tables resolve their own style instead of inheriting the outer cell.
+/// It does not perform layout or mutate the imported model.
+pub fn effective_table_paragraph_properties<'a>(
+    table: &'a CT_Tbl,
+    styles: &CT_Styles,
+) -> Vec<(&'a rdocx_oxml::text::CT_P, rdocx_oxml::properties::CT_PPr)> {
+    let mut output = Vec::new();
+    if table.accepted_view_removes() {
+        return output;
+    }
+    let mut resolved_table = CT_Tbl::new();
+    resolved_table.properties = Some(resolve_base_table_properties(table, styles));
+    let mut rows = layout_table_rows(table, &[]);
+    rows.retain(|(row, _)| !row.accepted_view_removes());
+    // Only the count is used. Native fallback column inference is reused,
+    // so no declared-grid, grid-span or omitted-column policy is duplicated.
+    let columns = compute_column_widths(table.grid.as_ref(), 0.0, &resolved_table, &rows).len();
+    for (row_index, (row, path)) in rows.iter().enumerate() {
+        let row_properties = resolve_row_properties(
+            &resolved_table,
+            styles,
+            row,
+            row_index,
+            rows.len(),
+            columns.max(1),
+        );
+        let mut column = (row_properties.grid_before.unwrap_or(0) as usize).min(columns);
+        for (cell, _) in layout_row_cells(row, path) {
+            let cell_style = resolve_table_style_cell(
+                &resolved_table,
+                styles,
+                row_index,
+                column,
+                rows.len(),
+                columns,
+                &cell_conditional_selectors(row, cell),
+            );
+            if cell
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.v_merge)
+                != Some(VMerge::Continue)
+            {
+                for item in &cell.content {
+                    match item {
+                        rdocx_oxml::table::CellContent::Paragraph(paragraph) => {
+                            let direct = paragraph.properties.as_ref();
+                            let mut properties =
+                                crate::style_resolver::resolve_paragraph_properties_in_table(
+                                    direct.and_then(|properties| properties.style_id.as_deref()),
+                                    styles,
+                                    cell_style.paragraph_properties.as_ref(),
+                                );
+                            if let Some(direct) = direct {
+                                properties.merge_from(direct);
+                            }
+                            output.push((paragraph, properties));
+                        }
+                        rdocx_oxml::table::CellContent::Table(nested) => {
+                            output.extend(effective_table_paragraph_properties(nested, styles));
+                        }
+                        rdocx_oxml::table::CellContent::ContentControl(control) => {
+                            collect_control_paragraph_properties(
+                                control,
+                                styles,
+                                cell_style.paragraph_properties.as_ref(),
+                                &mut output,
+                            );
+                        }
+                    }
+                }
+            }
+            column += cell
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.grid_span)
+                .unwrap_or(1) as usize;
+        }
+    }
+    output
+}
+
+fn collect_control_paragraph_properties<'a>(
+    control: &'a CT_Sdt,
+    styles: &CT_Styles,
+    table_properties: Option<&rdocx_oxml::properties::CT_PPr>,
+    output: &mut Vec<(&'a rdocx_oxml::text::CT_P, rdocx_oxml::properties::CT_PPr)>,
+) {
+    for item in &control.content {
+        match item {
+            SdtContent::Paragraph(paragraph) => {
+                let direct = paragraph.properties.as_ref();
+                let mut properties = crate::style_resolver::resolve_paragraph_properties_in_table(
+                    direct.and_then(|properties| properties.style_id.as_deref()),
+                    styles,
+                    table_properties,
+                );
+                if let Some(direct) = direct {
+                    properties.merge_from(direct);
+                }
+                output.push((paragraph, properties));
+            }
+            SdtContent::Table(table) => {
+                output.extend(effective_table_paragraph_properties(table, styles))
+            }
+            SdtContent::ContentControl(nested) => {
+                collect_control_paragraph_properties(nested, styles, table_properties, output);
+            }
+            // Native cell layout does not admit row/cell/run/raw block owners here.
+            SdtContent::Row(_)
+            | SdtContent::Cell(_)
+            | SdtContent::Run(_)
+            | SdtContent::RawXml(_) => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2197,13 +2402,20 @@ mod tests {
 
     fn layout_with_styles(table: &CT_Tbl, width: f64, styles: &CT_Styles) -> TableBlock {
         let input = LayoutInput {
+            sequence_snapshot: None,
             revision_view: crate::input::RevisionView::Accepted,
+            revision_style: crate::input::RevisionStyle::Plain,
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
             do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
+            clamp_tabs_past_margin: false,
+            legacy_table_positioning: false,
+            modern_footnote_layout: false,
+            footnote_layout_like_word8: false,
             math_properties: None,
+            note_defaults: [None, None],
             document: rdocx_oxml::document::CT_Document {
                 body: rdocx_oxml::document::CT_Body {
                     content: Vec::new(),
@@ -2216,6 +2428,8 @@ mod tests {
             },
             styles: styles.clone(),
             numbering: None,
+            story_part_names: Default::default(),
+            story_bodies: Default::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             images: std::collections::HashMap::new(),
@@ -2228,6 +2442,7 @@ mod tests {
             core_properties: None,
             theme: None,
             fonts: Vec::new(),
+            embedded_fonts: Vec::new(),
         };
         let media = MediaRegistry::new(&input.images);
         let mut font_manager = FontManager::new();
@@ -2244,6 +2459,75 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn absent_side_margins_match_zero_in_intrinsic_and_final_layout() {
+        let mut table = CT_Tbl::new();
+        table.properties = Some(CT_TblPr {
+            layout: Some("autofit".to_owned()),
+            ..Default::default()
+        });
+        let mut row = CT_Row::new();
+        let mut cell = CT_Tc::new();
+        cell.paragraphs_mut()[0].add_run("Unbreakable");
+        row.cells.push(cell);
+        table.rows.push(row);
+        let absent = layout_with_defaults(&table, 468.0);
+        table.properties.as_mut().unwrap().cell_margin = Some(CT_TblCellMar {
+            left: Some(Twips(0)),
+            right: Some(Twips(0)),
+            ..Default::default()
+        });
+        let zero = layout_with_defaults(&table, 468.0);
+        assert_eq!(absent.table_width, zero.table_width);
+        assert_eq!(absent.rows[0].cells[0].margin_left, 0.0);
+        assert_eq!(absent.rows[0].cells[0].margin_right, 0.0);
+        table.properties.as_mut().unwrap().cell_margin = Some(CT_TblCellMar {
+            left: Some(Twips(108)),
+            right: Some(Twips(108)),
+            ..Default::default()
+        });
+        let padded = layout_with_defaults(&table, 468.0);
+        assert!((padded.table_width - absent.table_width - 10.8).abs() < 1e-9);
+        // Direct edge overlays must contribute the same intrinsic padding as
+        // their equivalent resolved table margins, including explicit zero.
+        for (table_left, table_right, own_left, own_right) in [
+            (None, None, Some(108), Some(108)),
+            (Some(108), Some(108), Some(0), None),
+            (None, Some(108), Some(288), Some(0)),
+            (Some(108), None, None, Some(0)),
+        ] {
+            table.properties.as_mut().unwrap().cell_margin = Some(CT_TblCellMar {
+                left: table_left.map(Twips),
+                right: table_right.map(Twips),
+                ..Default::default()
+            });
+            table.rows[0].cells[0].properties = Some(CT_TcPr {
+                cell_margin: Some(CT_TblCellMar {
+                    left: own_left.map(Twips),
+                    right: own_right.map(Twips),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let direct = layout_with_defaults(&table, 468.0);
+            let left = own_left.or(table_left).unwrap_or(0);
+            let right = own_right.or(table_right).unwrap_or(0);
+            table.rows[0].cells[0].properties = None;
+            table.properties.as_mut().unwrap().cell_margin = Some(CT_TblCellMar {
+                left: Some(Twips(left)),
+                right: Some(Twips(right)),
+                ..Default::default()
+            });
+            let equivalent = layout_with_defaults(&table, 468.0);
+            assert_eq!(
+                direct.table_width, equivalent.table_width,
+                "direct-cell padding differs from equivalent table padding"
+            );
+            assert_eq!(direct.rows[0].cells[0].margin_left, left as f64 / 20.0);
+            assert_eq!(direct.rows[0].cells[0].margin_right, right as f64 / 20.0);
+        }
     }
 
     #[test]
@@ -2342,7 +2626,7 @@ mod tests {
         row.cells.push(CT_Tc::new());
         row.cells.push(CT_Tc::new());
         tbl.rows.push(row);
-        let widths = compute_column_widths(None, 300.0, &tbl, &[]);
+        let widths = compute_column_widths(None, 300.0, &tbl, &layout_table_rows(&tbl, &[]));
         assert_eq!(widths.len(), 3);
         for w in &widths {
             assert!((w - 100.0).abs() < 0.01);
@@ -2389,13 +2673,20 @@ mod tests {
         // Layout with default styles
         let styles = rdocx_oxml::styles::CT_Styles::default();
         let input = crate::input::LayoutInput {
+            sequence_snapshot: None,
             revision_view: crate::input::RevisionView::Accepted,
+            revision_style: crate::input::RevisionStyle::Plain,
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
             do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
+            clamp_tabs_past_margin: false,
+            legacy_table_positioning: false,
+            modern_footnote_layout: false,
+            footnote_layout_like_word8: false,
             math_properties: None,
+            note_defaults: [None, None],
             document: rdocx_oxml::document::CT_Document {
                 body: rdocx_oxml::document::CT_Body {
                     content: Vec::new(),
@@ -2408,6 +2699,8 @@ mod tests {
             },
             styles: styles.clone(),
             numbering: None,
+            story_part_names: Default::default(),
+            story_bodies: Default::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             images: std::collections::HashMap::new(),
@@ -2420,6 +2713,7 @@ mod tests {
             core_properties: None,
             theme: None,
             fonts: Vec::new(),
+            embedded_fonts: Vec::new(),
         };
 
         let mut fm = FontManager::new();

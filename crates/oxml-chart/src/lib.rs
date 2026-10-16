@@ -22,7 +22,7 @@ use oxml_layout::{
     Color, FillRule, FontManager, GlyphRun, GroupElement, Paint, Path, PathCommand, PathElement,
     Point, PositionedElement, Rect, Stroke, Transform,
 };
-use oxml_sml::{Column, Workbook};
+use oxml_sml::{ChartCellValue, ChartRange, ChartRangeUpdate, Column, Workbook};
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer, XmlVersion};
 
@@ -288,6 +288,709 @@ pub fn authored_chart_parts(
     Ok((chart_xml, workbook_bytes))
 }
 
+/// Project one supported chart family and its cached data without changing source.
+/// Sparse numeric cache entries remain NaN, and sparse labels remain empty.
+/// Unsupported plots and incompatible category vectors return contextual errors.
+pub fn read_chart_data(chart_xml: &[u8]) -> Result<(ChartKind, ChartData)> {
+    let space = CT_ChartSpace::from_xml(chart_xml)?;
+    let [plot] = space.chart.plot_area.plots()? else {
+        return Err(invalid_authoring_value(
+            "chart data projection requires one supported plot",
+        ));
+    };
+    let (kind, series) = match plot {
+        Plot::Bar { series, .. } => (ChartKind::Bar, series),
+        Plot::Line { series, .. } => (ChartKind::Line, series),
+        Plot::Pie { series, .. } => (ChartKind::Pie, series),
+        Plot::Doughnut { series, .. } => (ChartKind::Doughnut, series),
+        Plot::Area { series, .. } => (ChartKind::Area, series),
+        Plot::Scatter { series, .. } => (ChartKind::Scatter, series),
+        Plot::Radar { series, .. } => (ChartKind::Radar, series),
+    };
+    let first = series
+        .first()
+        .ok_or_else(|| invalid_authoring_value("chart has no series"))?;
+    let categories = chart_category_labels(first)?;
+    let mut projected = Vec::with_capacity(series.len());
+    for item in series {
+        if chart_category_labels(item)? != categories {
+            return Err(invalid_authoring_value(
+                "chart series use different category or X vectors",
+            ));
+        }
+        let name = match &item.name {
+            Some(name) => name.values.first().cloned().unwrap_or_default(),
+            None if item.opaque_name => chart_literal_name(item)?,
+            None => String::new(),
+        };
+        projected.push((name, chart_dense_numbers(&item.values)?));
+    }
+    Ok((
+        kind,
+        ChartData {
+            categories,
+            series: projected,
+            number_format: (first.values.format_code != "General")
+                .then(|| first.values.format_code.clone()),
+            ..ChartData::default()
+        },
+    ))
+}
+
+fn chart_dense_numbers(data: &NumericData) -> Result<Vec<f64>> {
+    let (count, indexes) = cache_layout(&data.markup, data.values.len())?;
+    let count = chart_projection_count(count)?;
+    let mut values = vec![f64::NAN; count];
+    for (index, value) in indexes.into_iter().zip(&data.values) {
+        values[index as usize] = *value;
+    }
+    Ok(values)
+}
+
+fn chart_projection_count(count: u32) -> Result<usize> {
+    if count > 1_048_576 {
+        return Err(invalid_attribute("ptCount", "val", count.to_string()));
+    }
+    Ok(count as usize)
+}
+
+fn chart_category_labels(series: &Series) -> Result<Vec<String>> {
+    let (markup, labels) = match &series.categories {
+        Some(AxisData::String(data)) => (&data.markup, data.values.clone()),
+        Some(AxisData::Numeric(data)) => (
+            &data.markup,
+            data.values.iter().map(|value| value.to_string()).collect(),
+        ),
+        None if series.opaque_categories => {
+            return Err(invalid_authoring_value(
+                "unsupported literal or multilevel category projection",
+            ));
+        }
+        None => return Ok(Vec::new()),
+    };
+    let (count, indexes) = cache_layout(markup, labels.len())?;
+    let mut values = vec![String::new(); chart_projection_count(count)?];
+    for (index, value) in indexes.into_iter().zip(labels) {
+        values[index as usize] = value;
+    }
+    Ok(values)
+}
+
+fn chart_literal_name(series: &Series) -> Result<String> {
+    for raw in series.raw_children.at(2) {
+        let inherited = series
+            .namespace_declarations
+            .iter()
+            .filter_map(|(name, value)| {
+                let prefix = if name == "xmlns" {
+                    ""
+                } else {
+                    name.strip_prefix("xmlns:")?
+                };
+                Some((prefix.as_bytes().to_vec(), value.clone()))
+            })
+            .collect::<NamespaceBindings>();
+        let mut reader = Reader::from_reader(raw);
+        let mut buffer = Vec::new();
+        let mut namespaces = inherited;
+        let mut depth = 0usize;
+        loop {
+            match reader
+                .read_event_into(&mut buffer)
+                .map_err(OxmlError::from)?
+            {
+                Event::Start(element) => {
+                    if depth == 0 {
+                        if chart_child_local(&element, &namespaces)?.as_deref() != Some(b"tx") {
+                            break;
+                        }
+                        namespaces = chart_bindings(&namespaces, &element)?;
+                    }
+                    if depth == 1
+                        && chart_child_local(&element, &namespaces)?.as_deref() == Some(b"v")
+                    {
+                        let value = capture_element(&mut reader, &element)?;
+                        return Ok(parse_text_element(&value, b"v", &namespaces)?.0);
+                    }
+                    depth += 1;
+                }
+                Event::End(_) => {
+                    depth = depth.saturating_sub(1);
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buffer.clear();
+        }
+    }
+    Err(invalid_authoring_value(
+        "unsupported series name projection",
+    ))
+}
+
+/// Resolve only the root-owned ChartML externalData relationships attribute.
+pub fn chart_workbook_relationship_id(chart_xml: &[u8]) -> Result<Option<String>> {
+    use quick_xml::name::ResolveResult;
+    use quick_xml::reader::NsReader;
+    CT_ChartSpace::from_xml(chart_xml)?;
+    let mut reader = NsReader::from_reader(chart_xml);
+    let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    let mut result = None;
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(OxmlError::from)?;
+        let empty = matches!(&event, Event::Empty(_));
+        match (namespace, event) {
+            (namespace, Event::Start(element) | Event::Empty(element)) => {
+                if depth == 1
+                    && matches!(namespace, ResolveResult::Bound(value) if value.as_ref() == C_NS.as_bytes())
+                    && element.local_name().as_ref() == b"externalData"
+                {
+                    if result.is_some() {
+                        return Err(ChartError::DuplicateElement("c:externalData".into()));
+                    }
+                    for attribute in element.attributes() {
+                        let attribute = attribute.map_err(OxmlError::from)?;
+                        let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+                        if matches!(namespace, ResolveResult::Bound(value) if value.as_ref() == R_NS.as_bytes())
+                            && local.as_ref() == b"id"
+                        {
+                            result = Some(
+                                attribute
+                                    .decoded_and_normalized_value(
+                                        XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )
+                                    .map_err(OxmlError::from)?
+                                    .into_owned(),
+                            );
+                        }
+                    }
+                    if result.is_none() {
+                        return Err(ChartError::MissingElement("c:externalData/@r:id".into()));
+                    }
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            (_, Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+            }
+            (_, Event::DocType(_)) => {
+                return Err(invalid_authoring_value(
+                    "DOCTYPE is unsupported in chart data",
+                ));
+            }
+            (_, Event::Eof) => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(result)
+}
+
+#[derive(Debug)]
+struct ChartSourceNode {
+    local: Vec<u8>,
+    qualified: bool,
+    parent: Option<usize>,
+    start: usize,
+    end: usize,
+}
+
+fn chart_source_nodes(xml: &[u8]) -> Result<Vec<ChartSourceNode>> {
+    use quick_xml::name::ResolveResult;
+    use quick_xml::reader::NsReader;
+    let mut reader = NsReader::from_reader(xml);
+    let mut nodes: Vec<ChartSourceNode> = Vec::new();
+    let mut stack = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        let start = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(OxmlError::from)?;
+        let end = reader.buffer_position() as usize;
+        let empty = matches!(&event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let (namespace, local) = reader.resolver().resolve_element(element.name());
+                let qualified = matches!(namespace,ResolveResult::Bound(value) if value.as_ref()==C_NS.as_bytes());
+                let local = local.as_ref().to_vec();
+                let index = nodes.len();
+                if index >= 1_000_000 {
+                    return Err(invalid_authoring_value("chart XML node limit"));
+                }
+                nodes.push(ChartSourceNode {
+                    local,
+                    qualified,
+                    parent: stack.last().copied(),
+                    start,
+                    end,
+                });
+                if !empty {
+                    stack.push(index);
+                }
+            }
+            Event::End(_) => {
+                let index = stack
+                    .pop()
+                    .ok_or_else(|| invalid_authoring_value("unbalanced chart source"))?;
+                nodes[index].end = end;
+            }
+            Event::Text(text) if stack.is_empty() && !text.iter().all(u8::is_ascii_whitespace) => {
+                return Err(invalid_authoring_value("text outside chart XML root"));
+            }
+            Event::CData(_) | Event::GeneralRef(_) if stack.is_empty() => {
+                return Err(invalid_authoring_value("content outside chart XML root"));
+            }
+            Event::Decl(_) if start != 0 && !(start == 3 && xml.starts_with(b"\xef\xbb\xbf")) => {
+                return Err(invalid_authoring_value("misplaced chart XML declaration"));
+            }
+            Event::DocType(_) => {
+                return Err(invalid_authoring_value(
+                    "DOCTYPE is unsupported in chart source",
+                ));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !stack.is_empty() {
+        return Err(invalid_authoring_value("truncated chart source"));
+    }
+    Ok(nodes)
+}
+
+fn chart_child_node(nodes: &[ChartSourceNode], parent: usize, local: &[u8]) -> Result<usize> {
+    let found = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.parent == Some(parent) && node.qualified && node.local == local)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [index] = found.as_slice() else {
+        return Err(invalid_authoring_value(format!(
+            "chart data requires one owned {}",
+            String::from_utf8_lossy(local)
+        )));
+    };
+    Ok(*index)
+}
+
+fn chart_source_series(xml: &[u8]) -> Result<Vec<Series>> {
+    CT_ChartSpace::from_xml(xml)?.chart.plot_area.series()
+}
+
+fn resized_chart_range(original: &ChartRange, count: usize) -> Result<ChartRange> {
+    let mut range = original.clone();
+    range.last_row = range
+        .first_row
+        .checked_add(
+            count
+                .checked_sub(1)
+                .ok_or_else(|| invalid_authoring_value("empty chart data range"))?,
+        )
+        .ok_or_else(|| invalid_authoring_value("chart data row overflow"))?;
+    range.formula().map_err(invalid_authoring_value)?;
+    Ok(range)
+}
+
+fn replaced_string_reference(
+    original: &StringRef,
+    formula: String,
+    values: Vec<String>,
+) -> StringRef {
+    let mut result = original.clone();
+    result.formula = formula;
+    result.values = values;
+    result.markup.declared_point_count = None;
+    result.markup.point_indexes.clear();
+    result
+}
+
+fn replaced_numeric_reference(
+    original: &NumericData,
+    formula: String,
+    values: Vec<f64>,
+    number_format: Option<&str>,
+) -> NumericData {
+    let mut result = original.clone();
+    result.formula = formula;
+    result.values = values;
+    if let Some(format) = number_format {
+        result.format_code = format.to_owned();
+    }
+    result.markup.declared_point_count = None;
+    result.markup.point_indexes.clear();
+    result
+}
+
+/// Stage replacement chart caches and only their formula-owned workbook cells.
+/// The caller publishes both returned parts together after proving package owners.
+/// Original root, plot, axes, legend and surviving series formatting stay exact.
+pub fn replace_chart_data(
+    chart_xml: &[u8],
+    workbook: &[u8],
+    data: &ChartData,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (kind, current) = read_chart_data(chart_xml)?;
+    validate_chart_data(kind, data)?;
+    if data.category_axis_title.is_some()
+        || data.value_axis_title.is_some()
+        || !data.palette.is_empty()
+    {
+        return Err(invalid_authoring_value(
+            "replace_data changes chart data, not axis titles or palette",
+        ));
+    }
+    let workbook_id = chart_workbook_relationship_id(chart_xml)?
+        .ok_or_else(|| invalid_authoring_value("chart has no embedded workbook reference"))?;
+    let old_series = chart_source_series(chart_xml)?;
+    let first = old_series
+        .first()
+        .ok_or_else(|| invalid_authoring_value("chart has no editable series"))?;
+    let first_name = first
+        .name
+        .as_ref()
+        .ok_or_else(|| invalid_authoring_value("series title needs an owned workbook formula"))?;
+    let name_origin =
+        ChartRange::from_formula(&first_name.formula).map_err(invalid_authoring_value)?;
+    let values_origin =
+        ChartRange::from_formula(&first.values.formula).map_err(invalid_authoring_value)?;
+    if name_origin.first_row != name_origin.last_row || name_origin.sheet != values_origin.sheet {
+        return Err(invalid_authoring_value(
+            "series title and values must own one embedded worksheet",
+        ));
+    }
+    let category_origin = match first.categories.as_ref() {
+        Some(AxisData::String(reference)) => ChartRange::from_formula(&reference.formula),
+        Some(AxisData::Numeric(reference)) => ChartRange::from_formula(&reference.formula),
+        None => {
+            return Err(invalid_authoring_value(
+                "categories need an owned workbook formula",
+            ));
+        }
+    }
+    .map_err(invalid_authoring_value)?;
+    if category_origin.sheet != values_origin.sheet {
+        return Err(invalid_authoring_value(
+            "chart data must own one embedded worksheet",
+        ));
+    }
+    // Validate every formula boundary before an unchanged-data fast path.
+    for series in &old_series {
+        for formula in [
+            series.name.as_ref().map(|r| r.formula.as_str()),
+            Some(series.values.formula.as_str()),
+            series.categories.as_ref().map(|r| match r {
+                AxisData::String(r) => r.formula.as_str(),
+                AxisData::Numeric(r) => r.formula.as_str(),
+            }),
+        ] {
+            let formula = formula.ok_or_else(|| {
+                invalid_authoring_value("series needs ordinary formula-backed data")
+            })?;
+            let range = ChartRange::from_formula(formula).map_err(invalid_authoring_value)?;
+            if range.sheet != values_origin.sheet {
+                return Err(invalid_authoring_value(
+                    "series formula refers to a different worksheet",
+                ));
+            }
+        }
+    }
+    if data.categories == current.categories
+        && data.series == current.series
+        && data.number_format.as_ref().is_none_or(|format| {
+            Some(format) == current.number_format.as_ref()
+                || (format == "General" && current.number_format.is_none())
+        })
+    {
+        oxml_sml::chart_unused_columns(workbook, &values_origin.sheet, 0)
+            .map_err(invalid_authoring_value)?;
+        return Ok((chart_xml.to_vec(), workbook.to_vec()));
+    }
+    let nodes = chart_source_nodes(chart_xml)?;
+    let chart = chart_child_node(&nodes, 0, b"chart")?;
+    let plot_area = chart_child_node(&nodes, chart, b"plotArea")?;
+    let plot_local = match kind {
+        ChartKind::Bar => b"barChart".as_slice(),
+        ChartKind::Line => b"lineChart",
+        ChartKind::Pie => b"pieChart",
+        ChartKind::Doughnut => b"doughnutChart",
+        ChartKind::Area => b"areaChart",
+        ChartKind::Scatter => b"scatterChart",
+        ChartKind::Radar => b"radarChart",
+    };
+    let plot = chart_child_node(&nodes, plot_area, plot_local)?;
+    let series_nodes = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.parent == Some(plot) && node.qualified && node.local == b"ser")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if series_nodes.len() != old_series.len() {
+        return Err(invalid_authoring_value(
+            "editable series source inventory disagrees",
+        ));
+    }
+    let mut updates = Vec::new();
+    let mut patches = Vec::new();
+    for (ordinal, (old, &source_index)) in old_series.iter().zip(&series_nodes).enumerate() {
+        let old_name = old
+            .name
+            .as_ref()
+            .ok_or_else(|| invalid_authoring_value("series title needs formula-backed data"))?;
+        let old_name_range =
+            ChartRange::from_formula(&old_name.formula).map_err(invalid_authoring_value)?;
+        if old_name_range.first_row != old_name_range.last_row {
+            return Err(invalid_authoring_value(
+                "series title formula must own one cell",
+            ));
+        }
+        let old_value_range =
+            ChartRange::from_formula(&old.values.formula).map_err(invalid_authoring_value)?;
+        let categories = old
+            .categories
+            .as_ref()
+            .ok_or_else(|| invalid_authoring_value("series categories are missing"))?;
+        let old_category_range = ChartRange::from_formula(match categories {
+            AxisData::String(r) => &r.formula,
+            AxisData::Numeric(r) => &r.formula,
+        })
+        .map_err(invalid_authoring_value)?;
+        let Some((name, values)) = data.series.get(ordinal) else {
+            for original in [old_name_range, old_value_range, old_category_range] {
+                updates.push(ChartRangeUpdate {
+                    number_format: None,
+                    original: Some(original),
+                    target: None,
+                    values: Vec::new(),
+                });
+            }
+            patches.push((
+                nodes[source_index].start,
+                nodes[source_index].end,
+                Vec::new(),
+            ));
+            continue;
+        };
+        let new_value_range = resized_chart_range(&old_value_range, values.len())?;
+        let new_category_range = resized_chart_range(&old_category_range, data.categories.len())?;
+        updates.push(ChartRangeUpdate {
+            number_format: None,
+            original: Some(old_name_range.clone()),
+            target: Some(old_name_range.clone()),
+            values: vec![ChartCellValue::Text(name.clone())],
+        });
+        updates.push(ChartRangeUpdate {
+            number_format: Some(
+                data.number_format
+                    .as_deref()
+                    .unwrap_or(&old.values.format_code)
+                    .to_owned(),
+            ),
+            original: Some(old_value_range),
+            target: Some(new_value_range.clone()),
+            values: values.iter().copied().map(ChartCellValue::Number).collect(),
+        });
+        let category_cells = if matches!(categories, AxisData::Numeric(_)) {
+            data.categories
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map(ChartCellValue::Number)
+                        .map_err(invalid_authoring_value)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            data.categories
+                .iter()
+                .cloned()
+                .map(ChartCellValue::Text)
+                .collect()
+        };
+        updates.push(ChartRangeUpdate {
+            number_format: None,
+            original: Some(old_category_range),
+            target: Some(new_category_range.clone()),
+            values: category_cells,
+        });
+        let tx = chart_child_node(&nodes, source_index, b"tx")?;
+        let name_ref = chart_child_node(&nodes, tx, b"strRef")?;
+        let name_reference = replaced_string_reference(
+            old_name,
+            old_name_range.formula().map_err(invalid_authoring_value)?,
+            vec![name.clone()],
+        );
+        patches.push((
+            nodes[name_ref].start,
+            nodes[name_ref].end,
+            name_reference.to_xml()?,
+        ));
+        let value_wrapper = chart_child_node(
+            &nodes,
+            source_index,
+            if kind == ChartKind::Scatter {
+                b"yVal"
+            } else {
+                b"val"
+            },
+        )?;
+        let value_ref = chart_child_node(&nodes, value_wrapper, b"numRef")?;
+        let value_reference = replaced_numeric_reference(
+            &old.values,
+            new_value_range.formula().map_err(invalid_authoring_value)?,
+            values.clone(),
+            data.number_format.as_deref(),
+        );
+        patches.push((
+            nodes[value_ref].start,
+            nodes[value_ref].end,
+            value_reference.to_xml()?,
+        ));
+        let category_wrapper = chart_child_node(
+            &nodes,
+            source_index,
+            if kind == ChartKind::Scatter {
+                b"xVal"
+            } else {
+                b"cat"
+            },
+        )?;
+        let (local, bytes) = match categories {
+            AxisData::String(reference) => (
+                b"strRef".as_slice(),
+                replaced_string_reference(
+                    reference,
+                    new_category_range
+                        .formula()
+                        .map_err(invalid_authoring_value)?,
+                    data.categories.clone(),
+                )
+                .to_xml()?,
+            ),
+            AxisData::Numeric(reference) => (
+                b"numRef".as_slice(),
+                replaced_numeric_reference(
+                    reference,
+                    new_category_range
+                        .formula()
+                        .map_err(invalid_authoring_value)?,
+                    data.categories
+                        .iter()
+                        .map(|v| v.parse::<f64>().map_err(invalid_authoring_value))
+                        .collect::<Result<Vec<_>>>()?,
+                    None,
+                )
+                .to_xml()?,
+            ),
+        };
+        let category_ref = chart_child_node(&nodes, category_wrapper, local)?;
+        patches.push((nodes[category_ref].start, nodes[category_ref].end, bytes));
+    }
+    let added = data.series.len().saturating_sub(old_series.len());
+    if added > 0 {
+        let free = oxml_sml::chart_unused_columns(workbook, &values_origin.sheet, added)
+            .map_err(invalid_authoring_value)?;
+        let (default_xml, _) = authored_chart_parts(kind, data, &workbook_id)?;
+        let defaults = chart_source_series(&default_xml)?;
+        let max_index = old_series.iter().map(|s| s.index).max().unwrap();
+        let max_order = old_series.iter().map(|s| s.order).max().unwrap();
+        let mut bytes = Vec::new();
+        for (offset, column) in free.into_iter().enumerate() {
+            let ordinal = old_series.len() + offset;
+            let (name, values) = &data.series[ordinal];
+            let mut series = defaults[ordinal].clone();
+            let step = u32::try_from(offset + 1).map_err(invalid_authoring_value)?;
+            series.index = max_index
+                .checked_add(step)
+                .ok_or_else(|| invalid_authoring_value("chart series index overflow"))?;
+            series.order = max_order
+                .checked_add(step)
+                .ok_or_else(|| invalid_authoring_value("chart series order overflow"))?;
+            let mut title = name_origin.clone();
+            title.column = column;
+            let mut numbers = resized_chart_range(&values_origin, values.len())?;
+            numbers.column = column;
+            let category = resized_chart_range(&category_origin, data.categories.len())?;
+            series.name = Some(StringRef::new(
+                title.formula().map_err(invalid_authoring_value)?,
+                vec![name.clone()],
+            )?);
+            series.values = NumericData::new(
+                numbers.formula().map_err(invalid_authoring_value)?,
+                data.number_format
+                    .as_deref()
+                    .unwrap_or(&first.values.format_code)
+                    .to_owned(),
+                values.clone(),
+            )?;
+            series.categories = Some(if kind == ChartKind::Scatter {
+                AxisData::Numeric(NumericData::new(
+                    category.formula().map_err(invalid_authoring_value)?,
+                    "General".into(),
+                    data.categories
+                        .iter()
+                        .map(|v| v.parse::<f64>().map_err(invalid_authoring_value))
+                        .collect::<Result<Vec<_>>>()?,
+                )?)
+            } else {
+                AxisData::String(StringRef::new(
+                    category.formula().map_err(invalid_authoring_value)?,
+                    data.categories.clone(),
+                )?)
+            });
+            updates.push(ChartRangeUpdate {
+                number_format: None,
+                original: None,
+                target: Some(title),
+                values: vec![ChartCellValue::Text(name.clone())],
+            });
+            updates.push(ChartRangeUpdate {
+                number_format: Some(
+                    data.number_format
+                        .as_deref()
+                        .unwrap_or(&first.values.format_code)
+                        .to_owned(),
+                ),
+                original: None,
+                target: Some(numbers),
+                values: values.iter().copied().map(ChartCellValue::Number).collect(),
+            });
+            bytes.extend(series.to_xml_for_plot(kind == ChartKind::Scatter)?);
+        }
+        let position = nodes[*series_nodes.last().unwrap()].end;
+        patches.push((position, position, bytes));
+    }
+    let updated_workbook =
+        oxml_sml::merge_chart_ranges(workbook, &updates).map_err(invalid_authoring_value)?;
+    patches.sort_by_key(|(start, end, _)| (*start, *end));
+    for pair in patches.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(invalid_authoring_value(
+                "overlapping chart data source edits",
+            ));
+        }
+    }
+    let mut updated_chart = chart_xml.to_vec();
+    for (start, end, bytes) in patches.into_iter().rev() {
+        updated_chart.splice(start..end, bytes);
+    }
+    let (_, projected) = read_chart_data(&updated_chart)?;
+    if projected.categories != data.categories || projected.series != data.series {
+        return Err(invalid_authoring_value(
+            "replacement chart cache projection disagrees with requested data",
+        ));
+    }
+    Ok((updated_chart, updated_workbook))
+}
+
 fn validate_chart_data(kind: ChartKind, data: &ChartData) -> Result<()> {
     if data.categories.is_empty() {
         return Err(invalid_authoring_value("at least one category is required"));
@@ -459,12 +1162,13 @@ pub fn render_chart(
     color_map: &ColorMap,
     fonts: &mut FontManager,
 ) -> Result<GroupElement> {
-    let plot_bounds = geometry_plot_bounds(bounds)?;
     let plots = chart.plot_area.plots()?;
     let plot = plots
         .first()
         .ok_or_else(|| ChartError::MissingElement("c:plot".to_owned()))?;
     plot.validate()?;
+    let legend_layout = layout_legend(chart, plot, bounds, fonts)?;
+    let plot_bounds = legend_layout.plot;
     let series_colours = resolve_series_colours(plot, theme, color_map)?;
     let axes = chart.plot_area.axes()?;
     let options = geometry_options(plot, &axes, chart.disp_blanks_as)?;
@@ -494,14 +1198,11 @@ pub fn render_chart(
         &mut chart_annotations.labels,
     )?;
     render_legend(
-        chart,
-        plot,
-        plot_bounds,
-        fonts,
+        legend_layout,
         &series_colours,
         &mut annotations,
         &mut chart_annotations.labels,
-    )?;
+    );
 
     validate_geometry_coordinates(&chart_annotations.gridlines)?;
     validate_geometry_coordinates(&plot_children)?;
@@ -1417,6 +2118,8 @@ fn shape_label_with_properties(
         field_kind: None,
         field_source: None,
         note: None,
+        note_reference_source: None,
+        tab_aligned: None,
     })
 }
 
@@ -2355,40 +3058,154 @@ fn resolved_layout_colour(colour: ResolvedColor) -> Color {
     }
 }
 
-fn render_legend(
+struct LegendLayout {
+    plot: Rect,
+    labels: Vec<GlyphRun>,
+    keys: Vec<Rect>,
+}
+
+fn layout_legend(
     chart: &CT_Chart,
     plot: &Plot,
     bounds: Rect,
     fonts: &mut FontManager,
+) -> Result<LegendLayout> {
+    let full_plot = geometry_plot_bounds(bounds)?;
+    let Some(legend) = &chart.legend else {
+        return Ok(LegendLayout {
+            plot: full_plot,
+            labels: Vec::new(),
+            keys: Vec::new(),
+        });
+    };
+    let settings = legend.settings;
+    let horizontal = matches!(
+        settings.position,
+        LegendPosition::Top | LegendPosition::Bottom
+    );
+    if plot_series(plot).len() > MAX_CATEGORY_ANNOTATIONS {
+        return Err(invalid_authoring_value("legend entry limit"));
+    }
+    let mut labels = plot_series(plot)
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            shape_label(fonts, &series_name(series, index), Point { x: 0.0, y: 0.0 })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let available = if settings.overlay { full_plot } else { bounds };
+    let capacity = available.width - 12.0;
+    // Frozen native Word/PowerPoint 9 point legend controls qualify these
+    // nominal-font metrics within 1 point and the unchanged cropped paint gate.
+    let row_height = labels.first().map_or(0.0, |label| label.font_size * 1.875);
+    let mut positions = Vec::with_capacity(labels.len());
+    let mut width: f64 = 0.0;
+    let mut x = 0.0;
+    let mut y = 0.0;
+    for label in &labels {
+        let entry_width = label.advances.iter().sum::<f64>() + label.font_size * 7.0 / 9.0 + 4.0;
+        if !entry_width.is_finite() || entry_width > capacity {
+            return Err(invalid_authoring_value("legend label exceeds chart width"));
+        }
+        if horizontal && x > 0.0 && x + entry_width > capacity {
+            x = 0.0;
+            y += row_height;
+        }
+        positions.push(Point { x, y });
+        width = width.max(x + entry_width);
+        if horizontal {
+            x += entry_width + 4.0;
+        } else {
+            y += row_height;
+        }
+    }
+    let height = if labels.is_empty() {
+        0.0
+    } else if horizontal {
+        y + row_height
+    } else {
+        y
+    };
+    if height > available.height - 12.0 {
+        return Err(invalid_authoring_value(
+            "legend entries exceed chart height",
+        ));
+    }
+    let mut content = bounds;
+    if !settings.overlay && !labels.is_empty() {
+        match settings.position {
+            LegendPosition::Right | LegendPosition::TopRight => content.width -= width + 10.0,
+            LegendPosition::Left => {
+                content.x += width + 10.0;
+                content.width -= width + 10.0;
+            }
+            LegendPosition::Top => {
+                content.y += height + 10.0;
+                content.height -= height + 10.0;
+            }
+            LegendPosition::Bottom => content.height -= height + 10.0,
+        }
+    }
+    let plot_bounds = geometry_plot_bounds(content)?;
+    let area = if settings.overlay {
+        plot_bounds
+    } else {
+        bounds
+    };
+    let origin = match settings.position {
+        LegendPosition::Right => Point {
+            x: area.x + area.width - width - 6.0,
+            y: area.y + (area.height - height) / 2.0,
+        },
+        LegendPosition::TopRight => Point {
+            x: area.x + area.width - width - 6.0,
+            y: area.y + 6.0,
+        },
+        LegendPosition::Left => Point {
+            x: area.x + 6.0,
+            y: area.y + (area.height - height) / 2.0,
+        },
+        LegendPosition::Top => Point {
+            x: area.x + (area.width - width) / 2.0,
+            y: area.y + 6.0,
+        },
+        LegendPosition::Bottom => Point {
+            x: area.x + (area.width - width) / 2.0,
+            y: area.y + area.height - height - 6.0,
+        },
+    };
+    let mut keys = Vec::with_capacity(labels.len());
+    for (label, offset) in labels.iter_mut().zip(positions) {
+        let x = origin.x + offset.x;
+        let y = origin.y + offset.y;
+        keys.push(Rect {
+            x,
+            y: y + (row_height - label.font_size * 5.0 / 9.0) / 2.0,
+            width: label.font_size * 5.0 / 9.0,
+            height: label.font_size * 5.0 / 9.0,
+        });
+        label.origin = Point {
+            x: x + label.font_size * 7.0 / 9.0,
+            y: y + label.font_size * 7.0 / 6.0,
+        };
+    }
+    Ok(LegendLayout {
+        plot: plot_bounds,
+        labels,
+        keys,
+    })
+}
+
+fn render_legend(
+    layout: LegendLayout,
     series_colours: &[Color],
     paths: &mut Vec<PositionedElement>,
     labels: &mut Vec<PositionedElement>,
-) -> Result<()> {
-    if chart.legend.is_none() {
-        return Ok(());
+) {
+    for (key, colour) in layout.keys.into_iter().zip(series_colours) {
+        paths.push(filled_path(Path::rect(key), *colour));
     }
-    let x = bounds.x + bounds.width - 58.0;
-    for (index, (series, colour)) in plot_series(plot).iter().zip(series_colours).enumerate() {
-        let y = bounds.y + 6.0 + index as f64 * 13.0;
-        paths.push(filled_path(
-            Path::rect(Rect {
-                x,
-                y,
-                width: 7.0,
-                height: 7.0,
-            }),
-            *colour,
-        ));
-        labels.push(PositionedElement::Text(shape_label(
-            fonts,
-            &series_name(series, index),
-            Point {
-                x: x + 10.0,
-                y: y + 7.0,
-            },
-        )?));
-    }
-    Ok(())
+    labels.extend(layout.labels.into_iter().map(PositionedElement::Text));
 }
 
 fn validate_geometry_coordinates(elements: &[PositionedElement]) -> Result<()> {
@@ -4472,12 +5289,7 @@ impl SeriesParseState {
                 self.boundary = self.boundary.max(3);
             }
             b"spPr" => {
-                reject_conflicting_prefix_in_xml(&raw, b"a", A_NS)?;
-                let properties = CT_ShapeProperties::from_xml(&raw)?;
-                let mut writer = Writer::new(Vec::new());
-                properties.write_xml_as(&mut writer, "c:spPr")?;
-                reject_rewritten_foreign_elements(&raw, &writer.into_inner(), namespaces, b"spPr")?;
-                set_once(&mut self.sp_pr, properties, "c:spPr")?;
+                parse_chart_shape_properties(&raw, namespaces, &mut self.sp_pr)?;
                 self.boundary = self.boundary.max(4);
             }
             b"dLbls" => {
@@ -6565,9 +7377,291 @@ pub struct CT_PlotArea {
     axes: Vec<Axis>,
 }
 
-/// A chart legend shell whose current children remain opaque.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// The five ChartML legend positions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegendPosition {
+    #[default]
+    Right,
+    Left,
+    Top,
+    Bottom,
+    TopRight,
+}
+
+impl LegendPosition {
+    /// The ChartML lexical value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "r",
+            Self::Left => "l",
+            Self::Top => "t",
+            Self::Bottom => "b",
+            Self::TopRight => "tr",
+        }
+    }
+    /// Parse one of the five supported lexical values.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "r" => Ok(Self::Right),
+            "l" => Ok(Self::Left),
+            "t" => Ok(Self::Top),
+            "b" => Ok(Self::Bottom),
+            "tr" => Ok(Self::TopRight),
+            _ => Err(invalid_authoring_value(format!(
+                "unknown legend position {value}"
+            ))),
+        }
+    }
+}
+
+/// Effective legend settings. An absent legend has right/false defaults.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LegendSettings {
+    pub visible: bool,
+    pub position: LegendPosition,
+    pub overlay: bool,
+}
+
+fn legend_scalar_value(xml: &[u8], node: &ChartSourceNode) -> Result<String> {
+    let mut reader = Reader::from_reader(&xml[node.start..node.end]);
+    let value = match reader.read_event().map_err(OxmlError::from)? {
+        Event::Start(element) | Event::Empty(element) => attribute_value(&element, b"val")?
+            .unwrap_or_else(|| {
+                if node.local == b"legendPos" {
+                    "r".into()
+                } else {
+                    "1".into()
+                }
+            }),
+        _ => return Err(invalid_authoring_value("legend scalar root")),
+    };
+    loop {
+        match reader.read_event().map_err(OxmlError::from)? {
+            Event::End(_) | Event::Comment(_) | Event::PI(_) => {}
+            Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Event::Eof => return Ok(value),
+            _ => {
+                return Err(invalid_authoring_value(
+                    "legend scalar has non-scalar content",
+                ));
+            }
+        }
+    }
+}
+
+fn legend_settings_at(
+    xml: &[u8],
+    nodes: &[ChartSourceNode],
+    legend: usize,
+) -> Result<LegendSettings> {
+    let mut settings = LegendSettings {
+        visible: true,
+        ..LegendSettings::default()
+    };
+    let mut position = None;
+    let mut overlay = None;
+    for (index, node) in nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.parent == Some(legend) && n.qualified)
+    {
+        if node.local != b"legendPos" && node.local != b"overlay" {
+            continue;
+        }
+        if nodes.iter().any(|child| child.parent == Some(index)) {
+            return Err(invalid_authoring_value("legend scalar has child elements"));
+        }
+        let value = legend_scalar_value(xml, node)?;
+        if node.local == b"legendPos" {
+            set_once(&mut position, LegendPosition::parse(&value)?, "c:legendPos")?;
+        } else {
+            set_once(
+                &mut overlay,
+                parse_bool_lexical("c:overlay", "val", &value)?,
+                "c:overlay",
+            )?;
+        }
+    }
+    settings.position = position.unwrap_or_default();
+    settings.overlay = overlay.unwrap_or(false);
+    Ok(settings)
+}
+
+/// Read only the namespace-owned legend without rewriting producer bytes.
+pub fn chart_legend_settings(xml: &[u8]) -> Result<LegendSettings> {
+    oxml_core::xml::validate_strict_xml_1_0(xml)
+        .map_err(|error| invalid_authoring_value(format!("invalid chart XML: {error:?}")))?;
+    let nodes = chart_source_nodes(xml)?;
+    if !nodes
+        .first()
+        .is_some_and(|n| n.qualified && n.local == b"chartSpace")
+        || nodes.iter().filter(|n| n.parent.is_none()).count() != 1
+    {
+        return Err(invalid_authoring_value("owned chartSpace required"));
+    }
+    let chart = chart_child_node(&nodes, 0, b"chart")?;
+    let legends = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.parent == Some(chart) && n.qualified && n.local == b"legend")
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    match legends.as_slice() {
+        [] => Ok(LegendSettings::default()),
+        [index] => legend_settings_at(xml, &nodes, *index),
+        _ => Err(ChartError::DuplicateElement("c:legend".into())),
+    }
+}
+
+fn legend_child_rank(local: &[u8]) -> Option<u8> {
+    match local {
+        b"legendPos" => Some(0),
+        b"legendEntry" => Some(1),
+        b"layout" => Some(2),
+        b"overlay" => Some(3),
+        b"spPr" => Some(4),
+        b"txPr" => Some(5),
+        b"extLst" => Some(6),
+        _ => None,
+    }
+}
+
+fn insert_chart_child(
+    xml: &[u8],
+    node: &ChartSourceNode,
+    position: usize,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut reader = Reader::from_reader(&xml[node.start..node.end]);
+    let event = reader.read_event().map_err(OxmlError::from)?;
+    let mut result = xml.to_vec();
+    if let Event::Empty(element) = event {
+        let end = node.start + reader.buffer_position() as usize;
+        let name = element_name(&element);
+        let mut replacement = xml[node.start..end - 2].to_vec();
+        replacement.push(b'>');
+        replacement.extend_from_slice(bytes);
+        replacement.extend_from_slice(format!("</{name}>").as_bytes());
+        result.splice(node.start..node.end, replacement);
+    } else {
+        result.splice(position..position, bytes.iter().copied());
+    }
+    Ok(result)
+}
+
+/// Stage a legend edit, preserving all other source bytes. None leaves a property unchanged.
+/// Position and overlay edits of an absent legend are no-ops. Hiding drops its settings.
+pub fn set_chart_legend(
+    xml: &[u8],
+    visible: Option<bool>,
+    position: Option<LegendPosition>,
+    overlay: Option<bool>,
+) -> Result<Vec<u8>> {
+    let current = chart_legend_settings(xml)?;
+    if visible == Some(false) {
+        if !current.visible {
+            return Ok(xml.to_vec());
+        }
+        let nodes = chart_source_nodes(xml)?;
+        let chart = chart_child_node(&nodes, 0, b"chart")?;
+        let legend = chart_child_node(&nodes, chart, b"legend")?;
+        let mut result = xml.to_vec();
+        result.drain(nodes[legend].start..nodes[legend].end);
+        return Ok(result);
+    }
+    if !current.visible && visible != Some(true) {
+        return Ok(xml.to_vec());
+    }
+    if !current.visible {
+        let nodes = chart_source_nodes(xml)?;
+        let chart = chart_child_node(&nodes, 0, b"chart")?;
+        let after = chart_child_node(&nodes, chart, b"plotArea")?;
+        let bytes = format!(
+            "<c:legend xmlns:c=\"{C_NS}\"><c:legendPos val=\"{}\"/><c:overlay val=\"{}\"/></c:legend>",
+            position.unwrap_or_default().as_str(),
+            u8::from(overlay.unwrap_or(false))
+        );
+        return insert_chart_child(xml, &nodes[chart], nodes[after].end, bytes.as_bytes());
+    }
+    let mut result = xml.to_vec();
+    for (local, value, changed) in [
+        (
+            "legendPos",
+            position.unwrap_or(current.position).as_str().to_owned(),
+            position.is_some_and(|v| v != current.position),
+        ),
+        (
+            "overlay",
+            u8::from(overlay.unwrap_or(current.overlay)).to_string(),
+            overlay.is_some_and(|v| v != current.overlay),
+        ),
+    ] {
+        if !changed {
+            continue;
+        }
+        let nodes = chart_source_nodes(&result)?;
+        let chart = chart_child_node(&nodes, 0, b"chart")?;
+        let legend = chart_child_node(&nodes, chart, b"legend")?;
+        if let Some(node) = nodes
+            .iter()
+            .find(|n| n.parent == Some(legend) && n.qualified && n.local == local.as_bytes())
+        {
+            let mut reader = Reader::from_reader(&result[node.start..node.end]);
+            let event = reader.read_event().map_err(OxmlError::from)?;
+            let end = node.start + reader.buffer_position() as usize;
+            let mut writer = Writer::new(Vec::new());
+            match event {
+                Event::Start(element) | Event::Empty(element) => {
+                    let mut start = BytesStart::new(element_name(&element));
+                    push_attributes(&mut start, &capture_attributes_except(&element, b"val")?);
+                    start.push_attribute(("val", value.as_str()));
+                    writer
+                        .write_event(if result[end - 2..end] == *b"/>" {
+                            Event::Empty(start)
+                        } else {
+                            Event::Start(start)
+                        })
+                        .map_err(OxmlError::from)?;
+                }
+                _ => return Err(invalid_authoring_value("legend scalar root")),
+            }
+            result.splice(node.start..end, writer.into_inner());
+        } else {
+            let rank = legend_child_rank(local.as_bytes()).expect("owned legend scalar");
+            let insert = nodes
+                .iter()
+                .find(|n| {
+                    n.parent == Some(legend)
+                        && n.qualified
+                        && legend_child_rank(&n.local).is_some_and(|r| r > rank)
+                })
+                .map(|n| n.start)
+                .unwrap_or_else(|| {
+                    result[..nodes[legend].end]
+                        .iter()
+                        .rposition(|v| *v == b'<')
+                        .unwrap_or(nodes[legend].start)
+                });
+            let bytes = format!("<c:{local} xmlns:c=\"{C_NS}\" val=\"{value}\"/>");
+            result = insert_chart_child(&result, &nodes[legend], insert, bytes.as_bytes())?;
+        }
+    }
+    let expected = LegendSettings {
+        visible: true,
+        position: position.unwrap_or(current.position),
+        overlay: overlay.unwrap_or(current.overlay),
+    };
+    if chart_legend_settings(&result)? != expected {
+        return Err(invalid_authoring_value("legend edit projection mismatch"));
+    }
+    Ok(result)
+}
+
+/// A legend retaining opaque children and their effective projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CT_Legend {
+    root_name: String,
+    settings: LegendSettings,
     raw_attributes: Vec<(String, String)>,
     raw_children: OrderedRawChildren,
 }
@@ -7012,17 +8106,23 @@ impl AxisParseState {
                 self.boundary = self.boundary.max(11);
             }
             b"spPr" => {
-                reject_conflicting_prefix_in_xml(&raw, b"a", A_NS)?;
-                let properties = CT_ShapeProperties::from_xml(&raw)?;
-                let mut writer = Writer::new(Vec::new());
-                properties.write_xml_as(&mut writer, "c:spPr")?;
-                reject_rewritten_foreign_elements(&raw, &writer.into_inner(), namespaces, b"spPr")?;
-                set_once(&mut self.sp_pr, properties, "c:spPr")?;
+                parse_chart_shape_properties(&raw, namespaces, &mut self.sp_pr)?;
                 self.boundary = self.boundary.max(12);
             }
             b"txPr" => {
                 reject_conflicting_prefix_in_xml(&raw, b"a", A_NS)?;
-                let text = CT_TextBody::from_xml_as(&raw, b"txPr")?;
+                let inherited = namespaces
+                    .iter()
+                    .map(|(prefix, uri)| {
+                        Ok((
+                            std::str::from_utf8(prefix)
+                                .map_err(OxmlError::from)?
+                                .to_owned(),
+                            uri.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let text = CT_TextBody::from_xml_as_with_namespaces(&raw, b"txPr", &inherited)?;
                 let mut writer = Writer::new(Vec::new());
                 text.write_xml_as(&mut writer, "c:txPr")?;
                 reject_rewritten_foreign_elements(&raw, &writer.into_inner(), namespaces, b"txPr")?;
@@ -7363,7 +8463,7 @@ impl ChartLines {
                                 let name = chart_child_local(&child, &namespaces)?;
                                 let raw = capture_element(&mut reader, &child)?;
                                 if name.as_deref() == Some(b"spPr") {
-                                    parse_chart_lines_shape(&raw, &namespaces, &mut sp_pr)?;
+                                    parse_chart_shape_properties(&raw, &namespaces, &mut sp_pr)?;
                                     boundary = 1;
                                 } else {
                                     raw_children.push(boundary, raw);
@@ -7373,7 +8473,7 @@ impl ChartLines {
                                 let name = chart_child_local(&child, &namespaces)?;
                                 let raw = capture_empty_element(&child)?;
                                 if name.as_deref() == Some(b"spPr") {
-                                    parse_chart_lines_shape(&raw, &namespaces, &mut sp_pr)?;
+                                    parse_chart_shape_properties(&raw, &namespaces, &mut sp_pr)?;
                                     boundary = 1;
                                 } else {
                                     raw_children.push(boundary, raw);
@@ -7451,13 +8551,24 @@ impl ChartLines {
     }
 }
 
-fn parse_chart_lines_shape(
+fn parse_chart_shape_properties(
     raw: &[u8],
     namespaces: &NamespaceBindings,
     slot: &mut Option<CT_ShapeProperties>,
 ) -> Result<()> {
     reject_conflicting_prefix_in_xml(raw, b"a", A_NS)?;
-    let properties = CT_ShapeProperties::from_xml(raw)?;
+    let inherited = namespaces
+        .iter()
+        .map(|(prefix, uri)| {
+            Ok((
+                std::str::from_utf8(prefix)
+                    .map_err(OxmlError::from)?
+                    .to_owned(),
+                uri.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let properties = CT_ShapeProperties::from_xml_with_inherited_namespaces(raw, &inherited)?;
     let mut writer = Writer::new(Vec::new());
     properties.write_xml_as(&mut writer, "c:spPr")?;
     reject_rewritten_foreign_elements(raw, &writer.into_inner(), namespaces, b"spPr")?;
@@ -9926,17 +11037,77 @@ fn is_supported_series_plot(local: &[u8]) -> bool {
     )
 }
 
+impl Default for CT_Legend {
+    fn default() -> Self {
+        Self {
+            root_name: "c:legend".into(),
+            settings: LegendSettings {
+                visible: true,
+                ..LegendSettings::default()
+            },
+            raw_attributes: Vec::new(),
+            raw_children: OrderedRawChildren::default(),
+        }
+    }
+}
+
 impl CT_Legend {
-    fn from_xml(xml: &[u8]) -> Result<Self> {
+    fn from_xml_with_namespaces(xml: &[u8], namespaces: &NamespaceBindings) -> Result<Self> {
+        let mut wrapper = BytesStart::new("scope");
+        for (prefix, uri) in namespaces {
+            let name = if prefix.is_empty() {
+                "xmlns".to_owned()
+            } else {
+                format!("xmlns:{}", String::from_utf8_lossy(prefix))
+            };
+            wrapper.push_attribute((name.as_str(), uri.as_str()));
+        }
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .write_event(Event::Start(wrapper))
+            .map_err(OxmlError::from)?;
+        writer.get_mut().extend_from_slice(xml);
+        writer
+            .write_event(Event::End(BytesEnd::new("scope")))
+            .map_err(OxmlError::from)?;
+        let wrapped = writer.into_inner();
+        let nodes = chart_source_nodes(&wrapped)?;
+        let legend = chart_child_node(&nodes, 0, b"legend")?;
+        let settings = legend_settings_at(&wrapped, &nodes, legend)?;
         let (raw_attributes, raw_children) = parse_raw_shell(xml, b"legend", "c:legend")?;
+        let mut reader = Reader::from_reader(xml);
+        let root_name = loop {
+            match reader.read_event().map_err(OxmlError::from)? {
+                Event::Start(e) | Event::Empty(e) => break element_name(&e),
+                Event::Eof => return Err(missing_end("legend")),
+                _ => {}
+            }
+        };
+        // Preserve a producer root alias only when a foreign c binding must
+        // remain in scope for opaque descendants. Otherwise retain fixed c output.
+        let root_name = if raw_attributes
+            .iter()
+            .any(|(name, uri)| name == "xmlns:c" && uri != C_NS)
+        {
+            root_name
+        } else {
+            "c:legend".to_owned()
+        };
         Ok(Self {
+            root_name,
+            settings,
             raw_attributes,
             raw_children,
         })
     }
 
     fn write_xml<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-        write_raw_shell(writer, "c:legend", &self.raw_attributes, &self.raw_children)
+        write_raw_shell(
+            writer,
+            &self.root_name,
+            &self.raw_attributes,
+            &self.raw_children,
+        )
     }
 
     pub fn raw_children(&self) -> &OrderedRawChildren {
@@ -9957,7 +11128,9 @@ fn parse_raw_shell(
             .map_err(OxmlError::from)?
         {
             Event::Start(element) if matches_local_name(element.name().as_ref(), local) => {
-                reject_conflicting_prefix(&element, b"c", C_NS)?;
+                if local != b"legend" {
+                    reject_conflicting_prefix(&element, b"c", C_NS)?;
+                }
                 let raw_attributes = capture_attributes(&element)?;
                 let mut raw_children = OrderedRawChildren::default();
                 let mut child_buffer = Vec::new();
@@ -9986,7 +11159,9 @@ fn parse_raw_shell(
                 return Ok((raw_attributes, raw_children));
             }
             Event::Empty(element) if matches_local_name(element.name().as_ref(), local) => {
-                reject_conflicting_prefix(&element, b"c", C_NS)?;
+                if local != b"legend" {
+                    reject_conflicting_prefix(&element, b"c", C_NS)?;
+                }
                 return Ok((capture_attributes(&element)?, OrderedRawChildren::default()));
             }
             Event::Start(element) | Event::Empty(element) => {
@@ -10221,7 +11396,11 @@ impl ChartParseState {
                 self.boundary = self.boundary.max(8);
             }
             b"legend" => {
-                set_once(&mut self.legend, CT_Legend::from_xml(&raw)?, "c:legend")?;
+                set_once(
+                    &mut self.legend,
+                    CT_Legend::from_xml_with_namespaces(&raw, namespaces)?,
+                    "c:legend",
+                )?;
                 self.boundary = self.boundary.max(9);
             }
             b"plotVisOnly" => {
@@ -10473,17 +11652,23 @@ impl ChartSpaceParseState {
                 self.boundary = self.boundary.max(8);
             }
             b"spPr" => {
-                reject_conflicting_prefix_in_xml(&raw, b"a", A_NS)?;
-                let properties = CT_ShapeProperties::from_xml(&raw)?;
-                let mut writer = Writer::new(Vec::new());
-                properties.write_xml_as(&mut writer, "c:spPr")?;
-                reject_rewritten_foreign_elements(&raw, &writer.into_inner(), namespaces, b"spPr")?;
-                set_once(&mut self.sp_pr, properties, "c:spPr")?;
+                parse_chart_shape_properties(&raw, namespaces, &mut self.sp_pr)?;
                 self.boundary = self.boundary.max(9);
             }
             b"txPr" => {
                 reject_conflicting_prefix_in_xml(&raw, b"a", A_NS)?;
-                let text = CT_TextBody::from_xml_as(&raw, b"txPr")?;
+                let inherited = namespaces
+                    .iter()
+                    .map(|(prefix, uri)| {
+                        Ok((
+                            std::str::from_utf8(prefix)
+                                .map_err(OxmlError::from)?
+                                .to_owned(),
+                            uri.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let text = CT_TextBody::from_xml_as_with_namespaces(&raw, b"txPr", &inherited)?;
                 let mut writer = Writer::new(Vec::new());
                 text.write_xml_as(&mut writer, "c:txPr")?;
                 reject_rewritten_foreign_elements(&raw, &writer.into_inner(), namespaces, b"txPr")?;
@@ -11069,8 +12254,10 @@ mod tests {
         CT_ChartSpace, CT_DLbls, CT_ShapeProperties, CT_TextBody, ChartData, ChartGeometry,
         ChartKind, DataLabelPosition, DispBlanksAs, Domain, Grouping, NumberFormat, NumericData,
         Orientation, Plot, R_NS, ScatterStyle, Series, StringRef, TickLabelPosition, TickMark,
-        authored_chart_parts, capture_event, local_name, matches_local_name, nice_number_scale,
+        authored_chart_parts, capture_event, chart_workbook_relationship_id, local_name,
+        matches_local_name, nice_number_scale, read_chart_data,
         render_chart as render_chart_with_theme, render_geometry as render_geometry_with_theme,
+        replace_chart_data,
     };
 
     const MANIFEST: &str = include_str!("../../../scripts/pptx-corpus-manifest.tsv");
@@ -14650,6 +15837,17 @@ mod tests {
         assert_eq!(parsed.values.values, vec![1.5, 2.5]);
         assert!(matches!(parsed.categories, Some(AxisData::String(_))));
         assert_eq!(parsed, Series::from_xml(&parsed.to_xml().unwrap()).unwrap());
+
+        let foreign = br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:x="urn:producer"><c:idx val="0"/><c:order val="0"/><c:spPr><x:solidFill><x:srgbClr val="112233"/></x:solidFill></c:spPr><c:val><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#;
+        let parsed = Series::from_xml(foreign).unwrap();
+        assert!(parsed.sp_pr.as_ref().unwrap().fill.is_none());
+        let written = parsed.to_xml().unwrap();
+        assert!(
+            std::str::from_utf8(&written)
+                .unwrap()
+                .contains(r#"<x:solidFill><x:srgbClr val="112233"/></x:solidFill>"#)
+        );
+        assert_eq!(parsed, Series::from_xml(&written).unwrap());
     }
 
     #[test]
@@ -14683,7 +15881,6 @@ mod tests {
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>S!$A$1:$A$2</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="2"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#,
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>NaN</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#,
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="urn:producer"><c:idx val="0"/><c:order val="0"/><a:marker/><c:val><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#,
-            br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:x="urn:producer"><c:idx val="0"/><c:order val="0"/><c:spPr><x:solidFill><x:srgbClr val="112233"/></x:solidFill></c:spPr><c:val><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#,
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:idx val="0"/><c:order val="0"/><c:tx><c:v>opaque</c:v></c:tx><c:tx><c:strRef><c:f>S!$A$1</c:f><c:strCache><c:ptCount val="0"/></c:strCache></c:strRef></c:tx><c:val><c:numRef><c:f>S!$B$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#,
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:idx val="0"/><c:order val="0"/><c:cat><c:multiLvlStrRef/></c:cat><c:cat><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:cat><c:val><c:numRef><c:f>S!$B$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#,
             br#"<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>S!$B$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:val><c:bubbleSize><c:numLit/></c:bubbleSize><c:bubbleSize><c:numRef><c:f>S!$C$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="0"/></c:numCache></c:numRef></c:bubbleSize></c:ser>"#,
@@ -14889,7 +16086,7 @@ mod tests {
         assert_eq!(parsed.chart.disp_blanks_as, DispBlanksAs::Span);
         assert!(parsed.chart.title.is_some());
         assert!(parsed.chart.legend.is_some());
-        assert!(parsed.sp_pr.is_some());
+        assert!(parsed.sp_pr.as_ref().unwrap().fill.is_some());
         assert!(parsed.tx_pr.is_some());
 
         let written = String::from_utf8(parsed.to_xml().unwrap()).unwrap();
@@ -14904,7 +16101,7 @@ mod tests {
             "<c:plotVisOnly",
             "<c:dispBlanksAs",
             "<c:spPr>",
-            "<c:txPr>",
+            "<c:txPr",
         ] {
             assert!(written.contains(tag), "missing fixed-prefix tag {tag}");
         }
@@ -14915,14 +16112,15 @@ mod tests {
             "<c:plotVisOnly",
             "<c:dispBlanksAs",
             "<c:spPr>",
-            "<c:txPr>",
+            "<c:txPr",
         ]
         .iter()
         .map(|tag| written.find(tag).unwrap())
         .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(written.contains("<a:solidFill><a:srgbClr"));
-        assert!(written.contains("<a:bodyPr/><a:p/>"));
+        assert!(written.contains("<d:bodyPr/><d:p"));
+        assert!(written.contains(&format!("xmlns:d=\"{A_NS}\"")));
         assert_eq!(parsed, CT_ChartSpace::from_xml(written.as_bytes()).unwrap());
     }
 
@@ -14963,7 +16161,7 @@ mod tests {
             br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea/></c:chart><c:chart><c:plotArea/></c:chart></c:chartSpace>"#,
             br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:title/><c:title/><c:plotArea/></c:chart></c:chartSpace>"#,
             br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea/><c:plotVisOnly><c:child/></c:plotVisOnly></c:chart></c:chartSpace>"#,
-            br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:x="urn:foreign"><c:chart><c:plotArea/></c:chart><c:txPr><a:bodyPr/><a:p><x:r><x:t>foreign</x:t></x:r></a:p></c:txPr></c:chartSpace>"#,
+            br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:x="urn:foreign"><c:chart><c:plotArea/></c:chart><c:txPr><x:bodyPr/><a:p/></c:txPr></c:chartSpace>"#,
             br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:x="urn:foreign"><c:chart><c:plotArea/></c:chart><c:spPr><a:solidFill><x:srgbClr val="112233"/></a:solidFill></c:spPr></c:chartSpace>"#,
         ];
         for xml in cases {
@@ -14975,6 +16173,56 @@ mod tests {
                 String::from_utf8_lossy(xml)
             );
         }
+    }
+
+    #[test]
+    fn fx215_chart_text_adapter_preserves_qualified_and_foreign_owners() {
+        for (prefix, declarations) in [
+            ("d:", format!("xmlns:d=\"{A_NS}\"")),
+            ("", format!("xmlns=\"{A_NS}\"")),
+        ] {
+            let opaque = "<x:r><x:t>foreign</x:t></x:r>";
+            let xml = format!(
+                "<c:chartSpace xmlns:c=\"{C_NS}\" {declarations} xmlns:x=\"urn:foreign\"><c:chart><c:plotArea/></c:chart><c:txPr><{prefix}bodyPr/><{prefix}p>{opaque}<{prefix}r><{prefix}t>owned</{prefix}t></{prefix}r></{prefix}p></c:txPr></c:chartSpace>"
+            );
+            let chart = CT_ChartSpace::from_xml(xml.as_bytes()).unwrap();
+            let text = chart.tx_pr.as_ref().unwrap();
+            assert_eq!(text.paragraphs().len(), 1);
+            assert_eq!(text.paragraphs()[0].runs.len(), 1);
+            let written = chart.to_xml().unwrap();
+            assert!(std::str::from_utf8(&written).unwrap().contains(opaque));
+            let reopened = CT_ChartSpace::from_xml(&written).unwrap();
+            assert_eq!(
+                reopened.tx_pr.as_ref().unwrap().paragraphs()[0].runs.len(),
+                1
+            );
+            assert_eq!(
+                text.body_properties,
+                reopened.tx_pr.as_ref().unwrap().body_properties
+            );
+            for body in [text, reopened.tx_pr.as_ref().unwrap()] {
+                let oxml_drawing::text::TextRun::Run(run) = &body.paragraphs()[0].runs[0] else {
+                    panic!("qualified text must remain a regular run");
+                };
+                assert_eq!(run.text.value, "owned");
+            }
+        }
+        let xml = format!(
+            "<c:chartSpace xmlns:c=\"{C_NS}\" xmlns:a=\"{A_NS}\" xmlns:x=\"urn:foreign\"><c:chart><c:plotArea/></c:chart><c:txPr><a:bodyPr/><a:p><x:r><x:t>foreign</x:t></x:r></a:p></c:txPr></c:chartSpace>"
+        );
+        let chart = CT_ChartSpace::from_xml(xml.as_bytes()).unwrap();
+        assert!(
+            chart.tx_pr.as_ref().unwrap().paragraphs()[0]
+                .runs
+                .is_empty()
+        );
+        let saved = chart.to_xml().unwrap();
+        assert!(
+            std::str::from_utf8(&saved)
+                .unwrap()
+                .contains("<x:r><x:t>foreign</x:t></x:r>")
+        );
+        assert_eq!(chart, CT_ChartSpace::from_xml(&saved).unwrap());
     }
 
     #[test]
@@ -15556,7 +16804,7 @@ mod tests {
     fn oxml_chart_is_an_explicit_publication_candidate() {
         let manifest = include_str!("../Cargo.toml");
         assert!(manifest.contains("name = \"oxml-chart\""));
-        assert!(manifest.contains("version = \"0.12.1\""));
+        assert!(manifest.contains("version = \"0.14.1\""));
         assert!(manifest.contains("publish = true"));
         for dependency in [
             "oxml-core.workspace",
@@ -16398,5 +17646,591 @@ mod tests {
         let pixels = &bytes[cursor..];
         assert_eq!(pixels.len(), width * height * 3, "PPM pixel length");
         (width, height, pixels)
+    }
+    #[test]
+    fn fx215_existing_chart_data_projection() {
+        let data = ChartData {
+            categories: vec!["1".into(), "2".into()],
+            series: vec![("Revenue & margin".into(), vec![1.25, 2.5])],
+            number_format: Some("0.00".into()),
+            ..ChartData::default()
+        };
+        for kind in [
+            ChartKind::Bar,
+            ChartKind::Line,
+            ChartKind::Pie,
+            ChartKind::Doughnut,
+            ChartKind::Area,
+            ChartKind::Scatter,
+            ChartKind::Radar,
+        ] {
+            let (xml, _) = authored_chart_parts(kind, &data, "rIdWorkbook").unwrap();
+            let original = xml.clone();
+            let (actual_kind, actual) = read_chart_data(&xml).unwrap();
+            assert_eq!(actual_kind, kind);
+            assert_eq!(actual.categories, data.categories);
+            assert_eq!(actual.series, data.series);
+            assert_eq!(actual.number_format, data.number_format);
+            assert_eq!(xml, original);
+            assert_eq!(
+                chart_workbook_relationship_id(&xml).unwrap().as_deref(),
+                Some("rIdWorkbook")
+            );
+        }
+    }
+
+    #[test]
+    fn fx215_workbook_relationship_ignores_foreign_id_and_accepts_alias() {
+        let data = ChartData {
+            categories: vec!["One".into()],
+            series: vec![("Values".into(), vec![2.0])],
+            ..ChartData::default()
+        };
+        let (xml, _) = authored_chart_parts(ChartKind::Bar, &data, "rIdWorkbook").unwrap();
+        let xml = String::from_utf8(xml)
+            .unwrap()
+            .replace("r:id=", "rr:id=")
+            .replace(
+                "<c:externalData",
+                &format!(
+                    "<c:externalData xmlns:rr=\"{R_NS}\" xmlns:f=\"urn:foreign\" f:id=\"wrong\""
+                ),
+            );
+        assert_eq!(
+            chart_workbook_relationship_id(xml.as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some("rIdWorkbook")
+        );
+        let foreign = xml.replace(&format!("xmlns:rr=\"{R_NS}\""), "xmlns:rr=\"urn:foreign\"");
+        assert!(chart_workbook_relationship_id(foreign.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn fx215_replace_data_updates_cache_formula_and_workbook() {
+        let original = ChartData {
+            categories: vec!["North".into(), "South".into()],
+            series: vec![
+                ("Revenue".into(), vec![1.0, 2.0]),
+                ("Cost".into(), vec![0.5, 1.0]),
+            ],
+            ..ChartData::default()
+        };
+        for kind in [ChartKind::Bar, ChartKind::Line] {
+            let (xml, workbook) = authored_chart_parts(kind, &original, "rIdWorkbook").unwrap();
+            for series in [
+                vec![("New revenue".into(), vec![8.0, 9.0, 10.0])],
+                vec![
+                    ("New revenue".into(), vec![8.0, 9.0, 10.0]),
+                    ("New cost".into(), vec![1.0, 2.0, 3.0]),
+                    ("Profit".into(), vec![7.0, 7.0, 7.0]),
+                ],
+            ] {
+                let data = ChartData {
+                    categories: vec!["East".into(), "West".into(), "Central".into()],
+                    series,
+                    ..ChartData::default()
+                };
+                let (chart, book) = replace_chart_data(&xml, &workbook, &data).unwrap();
+                assert_eq!(read_chart_data(&chart).unwrap().1.series, data.series);
+                assert_eq!(
+                    read_chart_data(&chart).unwrap().1.categories,
+                    data.categories
+                );
+                let package = OpcPackage::from_reader(std::io::Cursor::new(book)).unwrap();
+                let sheet = String::from_utf8(
+                    package
+                        .get_part("/xl/worksheets/sheet1.xml")
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(sheet.contains("<v>8</v>"));
+                assert!(sheet.contains("<v>10</v>"));
+                assert!(sheet.contains("East"));
+            }
+        }
+    }
+
+    #[test]
+    fn fx215_surviving_series_and_workbook_opaque_payload() {
+        let original = ChartData {
+            categories: vec!["North".into(), "South".into()],
+            series: vec![("Revenue".into(), vec![1.0, 2.0])],
+            ..ChartData::default()
+        };
+        let (xml, workbook) =
+            authored_chart_parts(ChartKind::Bar, &original, "rIdWorkbook").unwrap();
+        let source=String::from_utf8(xml).unwrap().replace("<c:chartSpace ","<c:chartSpace xmlns:f=\"urn:foreign\" f:keep='root' ").replace("<c:ser ","<c:ser f:keep='series' ").replace("<c:idx", "<f:opaque data='exact'/><c:idx").replace("</c:ser>","<c:extLst><c:ext uri='producer'><f:payload value='retain'/></c:ext></c:extLst></c:ser>");
+        assert!(source.contains("f:keep='series'"));
+        assert!(source.contains("<f:opaque data='exact'/>"));
+        let data = ChartData {
+            categories: vec!["West".into()],
+            series: vec![("Changed".into(), vec![9.0])],
+            ..ChartData::default()
+        };
+        let (changed, _) = replace_chart_data(source.as_bytes(), &workbook, &data).unwrap();
+        let changed = String::from_utf8(changed).unwrap();
+        for exact in [
+            "f:keep='root'",
+            "f:keep='series'",
+            "<f:opaque data='exact'/>",
+            "<c:extLst><c:ext uri='producer'><f:payload value='retain'/></c:ext></c:extLst>",
+        ] {
+            assert!(changed.contains(exact), "{exact}");
+        }
+        let space = CT_ChartSpace::from_xml(changed.as_bytes()).unwrap();
+        assert_eq!(space.chart.plot_area.series().unwrap()[0].index, 0);
+        let no_op = replace_chart_data(source.as_bytes(), &workbook, &original).unwrap();
+        assert_eq!(no_op.0, source.as_bytes());
+        assert_eq!(no_op.1, workbook);
+    }
+
+    #[test]
+    fn fx215_all_seven_families_replace_data_without_changing_kind() {
+        let original = ChartData {
+            categories: vec!["1".into(), "2".into()],
+            series: vec![("Old".into(), vec![1.0, 2.0])],
+            ..ChartData::default()
+        };
+        let data = ChartData {
+            categories: vec!["3".into(), "4".into(), "5".into()],
+            series: vec![("New".into(), vec![0.25, 0.5, 0.75])],
+            number_format: Some("0.0%".into()),
+            ..ChartData::default()
+        };
+        for kind in [
+            ChartKind::Bar,
+            ChartKind::Line,
+            ChartKind::Pie,
+            ChartKind::Doughnut,
+            ChartKind::Area,
+            ChartKind::Scatter,
+            ChartKind::Radar,
+        ] {
+            let (chart, book) = authored_chart_parts(kind, &original, "rIdWorkbook").unwrap();
+            let (updated, workbook) = replace_chart_data(&chart, &book, &data).unwrap();
+            let (actual, projected) = read_chart_data(&updated).unwrap();
+            assert_eq!(actual, kind);
+            assert_eq!(projected.categories, data.categories);
+            assert_eq!(projected.series, data.series);
+            assert_eq!(projected.number_format, data.number_format);
+            let package = OpcPackage::from_reader(std::io::Cursor::new(workbook)).unwrap();
+            let styles =
+                String::from_utf8(package.get_part("/xl/styles.xml").unwrap().to_vec()).unwrap();
+            assert!(styles.contains("formatCode=\"0.0%\""));
+        }
+    }
+    #[test]
+    fn fx215_qualified_corpus_replacement_cardinalities() {
+        let corpus = corpus_dir();
+        assert!(corpus.is_dir(), "F-X215 required corpus is missing");
+        for deck in ["bar-chart.pptx", "line-chart.pptx", "chart-picture-bg.pptx"] {
+            let path = corpus.join(deck);
+            let expected = MANIFEST
+                .lines()
+                .find(|line| line.starts_with(&format!("{deck}\t")))
+                .unwrap()
+                .split('\t')
+                .nth(2)
+                .unwrap();
+            assert_eq!(sha256(&path), expected);
+            let package = OpcPackage::open(&path).unwrap();
+            let chart_part = "/ppt/charts/chart1.xml";
+            let chart = package.get_part(chart_part).unwrap();
+            let (kind, original) = read_chart_data(chart).unwrap();
+            let workbook_id = chart_workbook_relationship_id(chart).unwrap().unwrap();
+            let rel = package
+                .get_part_rels(chart_part)
+                .unwrap()
+                .items
+                .iter()
+                .find(|rel| rel.id == workbook_id)
+                .unwrap();
+            assert_eq!(rel.rel_type, oxml_opc::relationship::rel_types::PACKAGE);
+            assert_ne!(rel.target_mode.as_deref(), Some("External"));
+            let workbook_part = OpcPackage::resolve_rel_target(chart_part, &rel.target);
+            let workbook = package.get_part(&workbook_part).unwrap();
+            let mut variants = Vec::new();
+            if original.series.len() > 1 {
+                let mut fewer = original.clone();
+                fewer.series.pop();
+                variants.push(("fewer", fewer));
+            }
+            let mut more = original.clone();
+            more.series.push((
+                "Added exact values".into(),
+                (0..more.categories.len())
+                    .map(|index| 100.0 + index as f64)
+                    .collect(),
+            ));
+            variants.push(("more", more));
+            let mut categories = original.clone();
+            categories.categories.push("Added category".into());
+            for (_, values) in &mut categories.series {
+                values.push(777.0);
+            }
+            variants.push(("categories", categories));
+            for (label, data) in variants {
+                let (changed, book) = replace_chart_data(chart, workbook, &data)
+                    .unwrap_or_else(|error| panic!("{deck}/{label}: {error}"));
+                let (actual, projection) = read_chart_data(&changed).unwrap();
+                assert_eq!(actual, kind);
+                assert_eq!(projection.categories, data.categories);
+                assert_eq!(projection.series, data.series);
+                let mut candidate = package.clone();
+                candidate.set_part(chart_part, changed);
+                candidate.set_part(&workbook_part, book);
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                candidate.write_to(&mut bytes).unwrap();
+                if let Some(directory) = std::env::var_os("RDOCX_FX215_CANDIDATES_DIR") {
+                    let directory = PathBuf::from(directory);
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(
+                        directory.join(format!("{deck}-{label}.pptx")),
+                        bytes.get_ref(),
+                    )
+                    .unwrap();
+                }
+                let reopened =
+                    OpcPackage::from_reader(std::io::Cursor::new(bytes.into_inner())).unwrap();
+                for (part, source) in &package.parts {
+                    if part != chart_part && part != &workbook_part {
+                        assert_eq!(
+                            reopened.get_part(part).unwrap(),
+                            source,
+                            "{deck}/{label}: {part}"
+                        );
+                    }
+                }
+                for (owner, relationships) in &package.part_rels {
+                    assert_eq!(
+                        reopened.get_part_rels(owner).unwrap().to_xml().unwrap(),
+                        relationships.to_xml().unwrap()
+                    );
+                }
+                let old_book = OpcPackage::from_reader(std::io::Cursor::new(workbook)).unwrap();
+                let new_book = OpcPackage::from_reader(std::io::Cursor::new(
+                    reopened.get_part(&workbook_part).unwrap(),
+                ))
+                .unwrap();
+                for (part, source) in &old_book.parts {
+                    if part != "/xl/worksheets/sheet1.xml" && part != "/xl/styles.xml" {
+                        assert_eq!(
+                            new_book.get_part(part).unwrap(),
+                            source,
+                            "{deck}/{label}: workbook {part}"
+                        );
+                    }
+                }
+                eprintln!("F-X215 corpus {deck}/{label} qualified cache and workbook candidate");
+            }
+        }
+    }
+    #[test]
+    fn fx215_sparse_cache_projection_retains_missing_values() {
+        let plot = format!(
+            r#"<q:barChart><q:barDir val="col"/><q:grouping val="clustered"/>{}<q:axId val="-1884094432"/><q:axId val="-1884097184"/></q:barChart>"#,
+            sparse_category_series()
+        );
+        let xml = chart_with_plot(&plot);
+        let (_, data) = read_chart_data(xml.as_bytes()).unwrap();
+        assert_eq!(data.categories, vec!["North", "", "West"]);
+        assert_eq!(data.series[0].1[0], 1.0);
+        assert!(data.series[0].1[1].is_nan());
+        assert_eq!(data.series[0].1[2], 2.0);
+    }
+
+    #[test]
+    fn fx215_invalid_data_and_external_formula_preserve_inputs() {
+        let original = ChartData {
+            categories: vec!["North".into(), "South".into()],
+            series: vec![("Revenue".into(), vec![1.0, 2.0])],
+            ..ChartData::default()
+        };
+        let (xml, book) = authored_chart_parts(ChartKind::Bar, &original, "rIdWorkbook").unwrap();
+        let chart_source = xml.clone();
+        let book_source = book.clone();
+        let invalid = ChartData {
+            categories: original.categories.clone(),
+            series: vec![("Bad".into(), vec![f64::NAN, 1.0])],
+            ..ChartData::default()
+        };
+        assert!(replace_chart_data(&xml, &book, &invalid).is_err());
+        assert_eq!(xml, chart_source);
+        assert_eq!(book, book_source);
+        let external = String::from_utf8(xml.clone())
+            .unwrap()
+            .replace("Sheet1!", "'[1]Sheet1'!");
+        let changed = ChartData {
+            categories: original.categories.clone(),
+            series: vec![("New".into(), vec![8.0, 9.0])],
+            ..ChartData::default()
+        };
+        let error = replace_chart_data(external.as_bytes(), &book, &changed).unwrap_err();
+        assert!(error.to_string().contains("external workbook formula"));
+        assert_eq!(book, book_source);
+    }
+    #[test]
+    fn fx246_legend_position_reserves_measured_plot_space() {
+        let mut outputs = Vec::new();
+        for position in ["r", "b", "l"] {
+            let xml = chart_with_plot(&bar_plot("")).replace(
+                "</q:plotArea></q:chart>",
+                &format!("</q:plotArea><q:legend><q:legendPos val=\"{position}\"/><q:overlay val=\"0\"/></q:legend></q:chart>"),
+            );
+            let chart = CT_ChartSpace::from_xml(xml.as_bytes()).unwrap();
+            let mut fonts = FontManager::new_deterministic().unwrap();
+            outputs.push(format!(
+                "{:?}",
+                render_chart(&chart.chart, chart_bounds(), &mut fonts).unwrap()
+            ));
+        }
+        assert_ne!(
+            outputs[0], outputs[1],
+            "right and bottom legends must differ"
+        );
+        assert_ne!(outputs[0], outputs[2], "right and left legends must differ");
+    }
+
+    #[test]
+    fn fx246_legend_mutation_preserves_opaque_source_and_order() {
+        let base = chart_with_plot(&bar_plot(""));
+        let payload = "<x:legendPos xmlns:x='urn:foreign' val='unknown'/><!--keep exact--><x:opaque xmlns:x='urn:foreign' literal='a &amp; b'/>";
+        let xml=base.replace("</q:plotArea></q:chart>",&format!("</q:plotArea><q:legend xmlns:c='urn:foreign' producer='keep'>{payload}<q:layout/><q:overlay val='false' untouched='yes'/><q:extLst/></q:legend></q:chart>"));
+        let settings = super::chart_legend_settings(xml.as_bytes()).unwrap();
+        assert_eq!(
+            settings,
+            super::LegendSettings {
+                visible: true,
+                ..Default::default()
+            }
+        );
+        let parsed = CT_ChartSpace::from_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed.chart.legend.as_ref().unwrap().settings, settings);
+        assert_eq!(
+            super::set_chart_legend(
+                xml.as_bytes(),
+                None,
+                Some(super::LegendPosition::Right),
+                Some(false)
+            )
+            .unwrap(),
+            xml.as_bytes()
+        );
+        let changed = super::set_chart_legend(
+            xml.as_bytes(),
+            None,
+            Some(super::LegendPosition::Bottom),
+            Some(true),
+        )
+        .unwrap();
+        let text = String::from_utf8(changed.clone()).unwrap();
+        assert!(text.contains(payload));
+        assert!(text.contains("untouched=\"yes\""));
+        assert!(text.find("<c:legendPos").unwrap() < text.find("<q:layout").unwrap());
+        assert!(text.find("<q:overlay").unwrap() < text.find("<q:extLst").unwrap());
+        assert_eq!(
+            super::chart_legend_settings(&changed).unwrap(),
+            super::LegendSettings {
+                visible: true,
+                position: super::LegendPosition::Bottom,
+                overlay: true
+            }
+        );
+        assert!(
+            super::chart_legend_settings(
+                xml.replace(
+                    "<q:layout/>",
+                    "<q:legendPos val='l'/><q:legendPos val='r'/>"
+                )
+                .as_bytes()
+            )
+            .is_err()
+        );
+        assert!(
+            super::chart_legend_settings(xml.replace("val='false'", "val='maybe'").as_bytes())
+                .is_err()
+        );
+        let hidden = super::set_chart_legend(&changed, Some(false), None, None).unwrap();
+        assert!(!super::chart_legend_settings(&hidden).unwrap().visible);
+        assert_eq!(
+            super::set_chart_legend(&hidden, None, Some(super::LegendPosition::Left), Some(true))
+                .unwrap(),
+            hidden
+        );
+        let shown = super::set_chart_legend(
+            &hidden,
+            Some(true),
+            Some(super::LegendPosition::Top),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(
+            super::chart_legend_settings(&shown).unwrap(),
+            super::LegendSettings {
+                visible: true,
+                position: super::LegendPosition::Top,
+                overlay: true
+            }
+        );
+    }
+
+    #[test]
+    fn fx246_overlay_and_absent_legends_keep_the_correct_plot() {
+        use super::{CT_Legend, LegendPosition as P, LegendSettings};
+        let mut chart = labelled_bar_chart();
+        let bounds = chart_bounds();
+        let full = super::geometry_plot_bounds(bounds).unwrap();
+        let plot = chart.chart.plot_area.plots().unwrap()[0].clone();
+        let mut fonts = FontManager::new_deterministic().unwrap();
+        for position in [P::Right, P::Left, P::Top, P::Bottom, P::TopRight] {
+            chart.chart.legend = Some(CT_Legend {
+                settings: LegendSettings {
+                    visible: true,
+                    position,
+                    overlay: false,
+                },
+                ..Default::default()
+            });
+            let layout = super::layout_legend(&chart.chart, &plot, bounds, &mut fonts).unwrap();
+            for (key, label) in layout.keys.iter().zip(&layout.labels) {
+                let right = label.origin.x + label.advances.iter().sum::<f64>();
+                assert!(key.x >= bounds.x && right <= bounds.x + bounds.width);
+                let outside = key.x + key.width <= layout.plot.x
+                    || key.x >= layout.plot.x + layout.plot.width
+                    || key.y + key.height <= layout.plot.y
+                    || key.y >= layout.plot.y + layout.plot.height;
+                assert!(outside, "non-overlay {position:?}");
+                assert!(label.origin.y >= bounds.y && label.origin.y <= bounds.y + bounds.height);
+            }
+            chart.chart.legend.as_mut().unwrap().settings.overlay = true;
+            let overlay = super::layout_legend(&chart.chart, &plot, bounds, &mut fonts).unwrap();
+            assert_eq!(overlay.plot, full);
+            assert!(
+                overlay.keys.iter().any(|key| key.x < full.x + full.width
+                    && key.x + key.width > full.x
+                    && key.y < full.y + full.height
+                    && key.y + key.height > full.y),
+                "negative control moved inside the plot must be rejected by the non-overlap observer"
+            );
+        }
+        chart.chart.legend = None;
+        let absent = super::layout_legend(&chart.chart, &plot, bounds, &mut fonts).unwrap();
+        assert_eq!(absent.plot, full);
+        assert!(absent.keys.is_empty());
+    }
+
+    #[test]
+    fn fx246_legend_labels_fit_bounded_chart_geometry() {
+        let mut chart = labelled_bar_chart();
+        if let Plot::Bar { series, .. } = &mut chart.chart.plot_area.plots_mut().unwrap()[0] {
+            series[0].name.as_mut().unwrap().values[0] =
+                "A legend considerably wider than fifty eight points".into();
+        }
+        let mut fonts = FontManager::new_deterministic().unwrap();
+        assert!(
+            render_chart(&chart.chart, chart_bounds(), &mut fonts).is_err(),
+            "a chart too narrow for its label refuses explicitly"
+        );
+        let wide = Rect {
+            width: 600.0,
+            ..chart_bounds()
+        };
+        let group = render_chart(&chart.chart, wide, &mut fonts).unwrap();
+        assert!(format!("{group:?}").contains("considerably wider"));
+    }
+    #[test]
+    fn fx246_legend_scalar_defaults_and_local_shadows_are_qualified() {
+        let base = chart_with_plot(&bar_plot(""));
+        for (children, overlay) in [
+            ("<q:legendPos/><q:overlay/>", true),
+            (
+                "<q:legendPos xmlns:q='urn:foreign' val='not owned'/><q:overlay val='0'/>",
+                false,
+            ),
+            (
+                "<c:legendPos xmlns:c='urn:foreign' val='not owned'/>",
+                false,
+            ),
+        ] {
+            let xml = base.replace(
+                "</q:plotArea></q:chart>",
+                &format!("</q:plotArea><q:legend>{children}</q:legend></q:chart>"),
+            );
+            let settings = super::chart_legend_settings(xml.as_bytes()).unwrap();
+            assert_eq!(settings.position, super::LegendPosition::Right);
+            assert_eq!(settings.overlay, overlay);
+            assert_eq!(
+                CT_ChartSpace::from_xml(xml.as_bytes())
+                    .unwrap()
+                    .chart
+                    .legend
+                    .unwrap()
+                    .settings,
+                settings
+            );
+        }
+    }
+    #[test]
+    fn fx246_legend_entrypoints_require_one_well_formed_xml_document() {
+        let source = chart_with_plot(&bar_plot(""));
+        for invalid in [
+            format!("{source}NOT_XML_DOCUMENT_CONTENT"),
+            format!("NOT_XML_DOCUMENT_CONTENT{source}"),
+            format!("{source}<![CDATA[tail]]>"),
+            format!("{source}&amp;"),
+            format!("{source}{source}"),
+            format!("<!--prefix--><?xml version='1.0'?>{source}"),
+            source.replace("</q:chartSpace>", "<u:opaque/></q:chartSpace>"),
+            source.replace(
+                "</q:chartSpace>",
+                "<x:opaque xmlns:z='urn:producer' x:a='1' z:a='2'/></q:chartSpace>",
+            ),
+        ] {
+            assert!(
+                super::chart_legend_settings(invalid.as_bytes()).is_err(),
+                "getter admitted {invalid}"
+            );
+            assert!(
+                super::set_chart_legend(
+                    invalid.as_bytes(),
+                    Some(true),
+                    Some(super::LegendPosition::Left),
+                    None
+                )
+                .is_err(),
+                "setter admitted {invalid}"
+            );
+        }
+        let valid = format!(
+            "<?xml version='1.0'?><!--prolog-->{source}\n<!--tail--><?producer preserved?>"
+        );
+        assert_eq!(
+            super::set_chart_legend(valid.as_bytes(), None, None, None).unwrap(),
+            valid.as_bytes()
+        );
+    }
+
+    #[test]
+    fn fx246_nominal_legend_metrics_match_independent_native_components() {
+        let chart = labelled_bar_chart();
+        let plot = &chart.chart.plot_area.plots().unwrap()[0];
+        let mut fonts = FontManager::new_deterministic().unwrap();
+        let layout = super::layout_legend(&chart.chart, plot, chart_bounds(), &mut fonts).unwrap();
+        // Frozen Word16.113.2 and PowerPoint16.113.4, explicit Aptos9pt
+        // legend controls. Absolute position and cropped paint are separately
+        // qualified from actual PDFs with the same one-point bound.
+        assert!((layout.keys[0].width - 4.9433).abs() <= 1.0);
+        assert!((layout.labels[0].origin.x - layout.keys[0].x - 7.0399).abs() <= 1.0);
+        assert!((layout.keys[0].height - 4.9433).abs() <= 1.0);
+        let mut multiple = four_series_bar_chart();
+        multiple.chart.legend = Some(super::CT_Legend::default());
+        let plot = &multiple.chart.plot_area.plots().unwrap()[0];
+        let layout =
+            super::layout_legend(&multiple.chart, plot, chart_bounds(), &mut fonts).unwrap();
+        for pair in layout.keys.windows(2) {
+            assert!((pair[1].y - pair[0].y - 16.875).abs() <= 1.0);
+        }
     }
 }

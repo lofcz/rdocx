@@ -21,6 +21,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod bibliography;
 mod building_block;
 mod comments;
 mod comparison;
@@ -44,9 +45,16 @@ mod svg;
 pub mod table;
 mod template;
 
+pub use bibliography::{
+    BibliographyAuthor, BibliographyContributor, BibliographyContributorRole, BibliographyOptions,
+    BibliographyPerson, BibliographyProperty, BibliographySource, BibliographySourceField,
+    BibliographySourceInfo, BibliographySourceKind, BibliographyStyle, BibliographyStyleInfo,
+    BibliographyUpdateReport, CitationOptions, CitationSourceOptions,
+};
 pub use building_block::{BuildingBlock, BuildingBlockInfo, BuildingBlockKind};
 pub use comments::{
-    BookmarkRef, CommentRef, RunPosition, RunRange, StoryRunPosition, StoryRunRange,
+    BookmarkRef, CommentRef, RunPosition, RunRange, StoryRangeKind, StoryRangeRef,
+    StoryRunPosition, StoryRunRange,
 };
 pub use comparison::{
     ComparisonDiagnostic, ComparisonGranularity, ComparisonOptions, ComparisonStoryKind,
@@ -57,13 +65,17 @@ pub use document::{
     ContentMeasurement, Document, DocumentFragment, DrawingHorizontalAlignment,
     DrawingHorizontalRelativeFrom, DrawingVerticalAlignment, DrawingVerticalRelativeFrom,
     DrawingWrap, EmbeddedFont, EmbeddedFontKind, FontDefinition, FontEmbeddingLicense,
-    FragmentConflictPolicy, HeaderFooterKind, ImageInfo, IssueSeverity, LinkInfo, ListLevel,
-    ListLevelRestart, ListLevelSuffix, ListNumberFormat, NumberingDefinition,
-    NumberingDefinitionLevel, NumberingFormat, NumberingInstance, NumberingLevel,
-    NumberingLevelOverride, OutlineNode, PictureAnchor, PictureCrop, PictureOptions, RenderOptions,
-    ReplacementCountMismatch, Section, SectionRef, SectionStory, StoryError, StoryId,
-    StoryItemKind, StoryItemRef, StoryItemSnapshot, StoryKind, TextBoxDirection, TextBoxOptions,
-    TextWatermarkOptions, UnsupportedXmlRef, WordCreationProfile, WordPackageClass,
+    FragmentConflictPolicy, HeaderFooterKind, ImageInfo, ImageWatermarkOptions, IssueSeverity,
+    LinkInfo, ListLevel, ListLevelRestart, ListLevelSuffix, ListNumberFormat, NoteFamily,
+    NoteNumberFormat, NotePlacement, NotePolicy, NoteRestart, NoteSpecialRecord,
+    NumberingDefinition, NumberingDefinitionLevel, NumberingFormat, NumberingInstance,
+    NumberingLevel, NumberingLevelOverride, OutlineNode, PictureAnchor, PictureCrop,
+    PictureOccurrence, PictureOptions, RenderOptions, ReplacementCountMismatch, Section,
+    SectionRef, SectionStory, StoryError, StoryId, StoryItemKind, StoryItemRef, StoryItemSnapshot,
+    StoryKind, StoryText, StoryTextItem, TextBoxDirection, TextBoxOptions, TextDiagnostic,
+    TextReport, TextWatermarkOptions, UnsupportedXmlRef, ValidationFinding, ValidationReport,
+    ValidationSeverity, WordCreationProfile, WordPackageClass, derive_font_key,
+    validate_document_bytes, validate_document_file,
 };
 pub use embedded::{
     EmbeddedContentInfo, EmbeddedContentKind, EmbeddedMutationPolicy, EmbeddedSignatureState,
@@ -71,11 +83,14 @@ pub use embedded::{
 pub use epub::{EpubDiagnostic, EpubWriteResult};
 pub use error::{Error, Result};
 pub use field::{
-    BarcodeCaseStyle, BarcodeField, BarcodeKind, BarcodePointOfSaleStyle, FieldDateTime,
-    FieldEvaluation, FieldEvaluationContext, FieldOutcome, LayoutBackedFieldUpdateReport,
+    AuthorityEntry, BarcodeCaseStyle, BarcodeField, BarcodeKind, BarcodePointOfSaleStyle,
+    CaptionOptions, CaptionTarget, CrossReferenceNumber, CrossReferenceOptions, FieldDateTime,
+    FieldEvaluation, FieldEvaluationContext, FieldOutcome, FieldsUpdateReport,
+    GeneratedTablesReport, IndexEntry, IndexOptions, LayoutBackedFieldUpdateReport,
     LegacyFormFieldInfo, LegacyFormFieldKind, LegacyFormFieldValue, MailMergeControl,
     MailMergeData, MailMergeFormatContext, MailMergeFormattedText, MailMergeImage, MailMergeRecord,
-    MailMergeValue, TcField, TocEntrySelection, TocField, TocRebuildReport,
+    MailMergeValue, SequenceOptions, TableOfAuthoritiesOptions, TableOfFiguresOptions, TcField,
+    TocEntrySelection, TocField, TocRebuildReport,
 };
 pub use html::{
     HtmlDiagnostic, HtmlFragmentInsertResult, HtmlImageResource, HtmlReadResult, MhtmlDiagnostic,
@@ -86,7 +101,7 @@ pub use math::{
     equation_to_latex, equation_to_mathml,
 };
 pub use odt::{OdtDiagnostic, OdtReadResult, OdtWriteResult};
-pub use oxml_chart::{ChartData, ChartKind, RgbColor};
+pub use oxml_chart::{ChartData, ChartKind, LegendPosition, LegendSettings, RgbColor};
 pub use oxml_core::app_properties::AppProperties;
 pub use oxml_core::core_properties::CoreProperties;
 pub use oxml_core::custom_properties::{CustomProperty, CustomPropertyValue};
@@ -104,7 +119,7 @@ pub use paragraph::{
     ParagraphMark, ParagraphMarkRef, ParagraphRef, ParagraphTextAlignment, ParagraphTextDirection,
     SectionBreak, TabAlignment, TabLeader, TabStopRef, TextboxTightWrap,
 };
-pub use rdocx_layout::RevisionView;
+pub use rdocx_layout::{RevisionStyle, RevisionView};
 pub use rdocx_oxml::document::{CT_DocGrid, ST_DocGrid};
 pub use rdocx_oxml::header_footer::HdrFtrType;
 pub use rdocx_oxml::math::{

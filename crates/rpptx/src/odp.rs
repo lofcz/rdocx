@@ -422,7 +422,10 @@ fn read_archive(bytes: &[u8], limits: PackageReadLimits) -> Result<BTreeMap<Stri
         let mut entry = archive
             .by_index(index)
             .map_err(|error| odp_error(None, 0, format!("cannot read ODP entry: {error}")))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| odp_error(None, 0, format!("cannot decode ODP entry name: {error}")))?
+            .into_owned();
         validate_entry_name(&name)?;
         if entry.encrypted() {
             return Err(odp_error(Some(&name), 0, "unsupported ODP archive entry"));
@@ -463,7 +466,10 @@ fn read_archive(bytes: &[u8], limits: PackageReadLimits) -> Result<BTreeMap<Stri
     let mut first = archive
         .by_index(0)
         .map_err(|error| odp_error(None, 0, format!("cannot read ODP mimetype: {error}")))?;
-    if first.name() != "mimetype" || first.compression() != CompressionMethod::Stored {
+    let first_name = first
+        .name()
+        .map_err(|error| odp_error(None, 0, format!("cannot decode ODP mimetype name: {error}")))?;
+    if first_name != "mimetype" || first.compression() != CompressionMethod::Stored {
         return Err(odp_error(
             Some("mimetype"),
             0,
@@ -595,8 +601,13 @@ fn from_odp_with_limits(bytes: &[u8], limits: OdpLimits) -> Result<OdpReadResult
                     let mut slide = presentation
                         .slide_mut(page_index)
                         .expect("new slide exists");
-                    let mut shape =
-                        slide.add_shape("rect", rect.left, rect.top, rect.width, rect.height)?;
+                    let mut shape = slide.add_unstyled_shape(
+                        "rect",
+                        rect.left,
+                        rect.top,
+                        rect.width,
+                        rect.height,
+                    )?;
                     if !text.is_empty() {
                         shape.set_text(&text)?;
                     }
@@ -918,7 +929,7 @@ fn collect_node_text(node: &XmlNode, output: &mut String) {
         match child {
             XmlChild::Text(text) => output.push_str(text),
             XmlChild::Element(element) if element.is(TEXT_NS, "tab") => output.push('\t'),
-            XmlChild::Element(element) if element.is(TEXT_NS, "line-break") => output.push('\n'),
+            XmlChild::Element(element) if element.is(TEXT_NS, "line-break") => output.push('\u{b}'),
             XmlChild::Element(element) if element.is(TEXT_NS, "s") => {
                 let count = element
                     .attr(Some(TEXT_NS), "c")

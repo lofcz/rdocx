@@ -532,6 +532,47 @@ fn section_lookup_is_total_for_every_index() {
 }
 
 #[test]
+fn empty_cell_margins_do_not_make_ordinary_tables_unmodeled_after_reopening() {
+    for margins in ["<w:tcMar/>", "<w:tcMar />", "<w:tcMar></w:tcMar>"] {
+        let seed = Document::new().to_bytes().unwrap();
+        let mut package = OpcPackage::from_reader(std::io::Cursor::new(seed)).unwrap();
+        let rows = (0..7)
+            .map(|row| {
+                let cells = (0..3)
+                    .map(|column| {
+                        format!("<w:tc><w:tcPr>{margins}</w:tcPr><w:p><w:r><w:t>cell {row}:{column}</w:t></w:r></w:p></w:tc>")
+                    })
+                    .collect::<String>();
+                format!("<w:tr>{cells}</w:tr>")
+            })
+            .collect::<String>();
+        package.set_part(
+            "/word/document.xml",
+            format!("<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:tbl>{rows}</w:tbl><w:sectPr/></w:body></w:document>").into_bytes(),
+        );
+        let mut archive = std::io::Cursor::new(Vec::new());
+        package.write_to(&mut archive).unwrap();
+        let mut document = Document::from_bytes(archive.get_ref()).unwrap();
+        let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+
+        for document in [&mut document, &mut reopened] {
+            let table = document.tables().into_iter().next().unwrap();
+            assert_eq!(table.row_count(), 7, "{margins}");
+            for row in 0..7 {
+                let row_ref = table.row(row).unwrap();
+                assert_eq!(row_ref.cell_count(), 3, "{margins}");
+                for column in 0..3 {
+                    let cell = row_ref.cell(column).unwrap();
+                    assert!(cell.has_cell_margins(), "{margins}");
+                    assert!(!cell.has_unmodeled_properties(), "{margins}");
+                    assert_eq!(cell.text(), format!("cell {row}:{column}"), "{margins}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn section_geometry_round_trips_with_unsupported_children_in_order() {
     let seed = Document::new().to_bytes().unwrap();
     let mut package = OpcPackage::from_reader(std::io::Cursor::new(seed)).unwrap();
@@ -1712,6 +1753,85 @@ mod fresh_word_package_profile_tests {
     }
 
     #[test]
+    fn word_compatible_profiles_stamp_an_app_version_word_opens() {
+        // Word refuses a package whose AppVersion is not XX.YYYY (ECMA-376 Part 1, 22.2.2.3).
+        for class in all_classes() {
+            let package = package_from_profile(WordCreationProfile::WordCompatible(class));
+            let app = std::str::from_utf8(package.get_part("/docProps/app.xml").unwrap()).unwrap();
+            let version = app
+                .split_once("<AppVersion>")
+                .and_then(|(_, rest)| rest.split_once("</AppVersion>"))
+                .map(|(version, _)| version)
+                .expect("fresh app properties carry AppVersion");
+            let (major, minor) = version.split_once('.').expect("AppVersion has one dot");
+            assert!(
+                major.len() == 2
+                    && minor.len() == 4
+                    && major
+                        .bytes()
+                        .chain(minor.bytes())
+                        .all(|b| b.is_ascii_digit()),
+                "AppVersion {version:?} is not XX.YYYY"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_repairs_only_an_app_version_word_refuses() {
+        fn app_xml(application: &str, version: &str) -> Vec<u8> {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>{application}</Application><AppVersion>{version}</AppVersion></Properties>"#
+            )
+            .into_bytes()
+        }
+        fn resave(app: Vec<u8>) -> (OpcPackage, OpcPackage) {
+            let mut package = package_from_profile(WordCreationProfile::WordCompatible(
+                WordPackageClass::Document,
+            ));
+            package.set_part("/docProps/app.xml", app);
+            let bytes = package_bytes(&package);
+            let saved = Document::from_bytes(&bytes).unwrap().to_bytes().unwrap();
+            let saved = OpcPackage::from_reader(std::io::Cursor::new(saved)).unwrap();
+            (package, saved)
+        }
+        fn app_version(package: &OpcPackage) -> Option<String> {
+            let app = std::str::from_utf8(package.get_part("/docProps/app.xml").unwrap()).unwrap();
+            app.split_once("<AppVersion>")
+                .and_then(|(_, rest)| rest.split_once("</AppVersion>"))
+                .map(|(version, _)| version.to_owned())
+        }
+
+        // What rdocx 0.14.0 wrote: rewritten to the version rdocx stamps now.
+        let (_, saved) = resave(app_xml("rdocx", "0.14.0"));
+        let fresh = package_from_profile(WordCreationProfile::WordCompatible(
+            WordPackageClass::Document,
+        ));
+        assert_eq!(app_version(&saved), app_version(&fresh));
+        assert_ne!(app_version(&saved).as_deref(), Some("0.14.0"));
+
+        // Another producer's invalid value is dropped, its Application kept.
+        let extension =
+            r#"<ext:Producer xmlns:ext="urn:producer"><ext:Key value="a&amp;b"/></ext:Producer>"#;
+        let source = String::from_utf8(app_xml("Producer", "2.1")).unwrap();
+        let source = source.replace("</Properties>", &format!("{extension}</Properties>"));
+        let (_, saved) = resave(source.into_bytes());
+        assert_eq!(app_version(&saved), None);
+        let app = std::str::from_utf8(saved.get_part("/docProps/app.xml").unwrap()).unwrap();
+        assert!(app.contains("<Application>Producer</Application>"));
+        assert!(
+            app.contains(extension),
+            "unmodeled producer XML must survive repair"
+        );
+
+        // A valid foreign value keeps its part byte-identical.
+        let (original, saved) = resave(app_xml("Microsoft Office Word", "16.0000"));
+        assert_eq!(
+            saved.get_part("/docProps/app.xml"),
+            original.get_part("/docProps/app.xml")
+        );
+    }
+
+    #[test]
     fn document_new_uses_the_word_compatible_docx_profile() {
         let default = Document::new().to_bytes().unwrap();
         let compatible = Document::new_with_profile(WordCreationProfile::WordCompatible(
@@ -2049,7 +2169,9 @@ mod theme_and_embedded_font_tests {
         assert!(output.find("altName").unwrap() < output.find("embedRegular").unwrap());
 
         let mut reopened = Document::from_bytes(&package_bytes(&saved)).unwrap();
-        assert!(reopened.remove_font("Corpus Sans").unwrap().is_some());
+        let before_removal = reopened.to_bytes().unwrap();
+        assert!(reopened.remove_font("Corpus Sans").is_err());
+        assert_eq!(reopened.to_bytes().unwrap(), before_removal);
         let removed =
             OpcPackage::from_reader(std::io::Cursor::new(reopened.to_bytes().unwrap())).unwrap();
         let output = std::str::from_utf8(removed.get_part("/word/fontTable.xml").unwrap()).unwrap();
@@ -2174,7 +2296,7 @@ mod theme_and_embedded_font_tests {
         let source = root.join("source.docx");
         std::fs::write(&source, authored.to_bytes().unwrap()).unwrap();
         let status = std::process::Command::new("soffice")
-            .arg("--headless")
+            .args(["--headless", "--norestore", "--nodefault", "--nologo"])
             .arg(format!(
                 "-env:UserInstallation=file://{}",
                 profile.display()
@@ -2323,9 +2445,13 @@ mod theme_and_embedded_font_tests {
         let wrong_type_id = wrong_type_relationship.id.clone();
         wrong_type_relationship.rel_type = rel_types::IMAGE.to_owned();
         let mut wrong_type = Document::from_bytes(&package_bytes(&wrong_type_package)).unwrap();
-        wrong_type
-            .remove_embedded_font("Corpus Sans", EmbeddedFontKind::Regular)
-            .unwrap();
+        let before_removal = wrong_type.to_bytes().unwrap();
+        assert!(
+            wrong_type
+                .remove_embedded_font("Corpus Sans", EmbeddedFontKind::Regular)
+                .is_err()
+        );
+        assert_eq!(wrong_type.to_bytes().unwrap(), before_removal);
         let wrong_type_saved =
             OpcPackage::from_reader(std::io::Cursor::new(wrong_type.to_bytes().unwrap())).unwrap();
         assert_eq!(
@@ -2453,7 +2579,7 @@ mod settings_and_properties_tests {
         application.pages = Some(7);
         application.words = Some(420);
         application.application = Some("rdocx test".to_owned());
-        application.application_version = Some("1.0".to_owned());
+        application.application_version = Some("01.0000".to_owned());
         document
             .set_application_properties(application.clone())
             .unwrap();
@@ -2739,6 +2865,30 @@ mod settings_and_properties_tests {
     }
 
     #[test]
+    fn application_version_outside_the_word_form_is_refused() {
+        let mut document = Document::new();
+        let before = document.to_bytes().unwrap();
+        for version in ["0.14.0", "1.0", "test", "1.0000", "01.000", "01.00a0", ""] {
+            let mut application = AppProperties::default();
+            application.application_version = Some(version.to_owned());
+            let error = document
+                .set_application_properties(application)
+                .expect_err(version);
+            assert!(error.to_string().contains("XX.YYYY"), "{error}");
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+        let mut application = AppProperties::default();
+        application.application_version = Some("16.0000".to_owned());
+        document.set_application_properties(application).unwrap();
+        assert_eq!(
+            document
+                .application_properties()
+                .and_then(|properties| properties.application_version.as_deref()),
+            Some("16.0000")
+        );
+    }
+
+    #[test]
     fn fresh_property_output_has_no_clock_or_host_input() {
         fn authored() -> Vec<u8> {
             let mut document = Document::new_with_profile(WordCreationProfile::Minimal(
@@ -2752,7 +2902,7 @@ mod settings_and_properties_tests {
                 .unwrap();
             let mut application = AppProperties::default();
             application.application = Some("rdocx".to_owned());
-            application.application_version = Some("test".to_owned());
+            application.application_version = Some("00.0001".to_owned());
             document.set_application_properties(application).unwrap();
             document.to_bytes().unwrap()
         }
@@ -4960,7 +5110,7 @@ fn odt_reader_matches_pinned_libreoffice_structure() {
     std::fs::write(&source, &odt).unwrap();
 
     let status = std::process::Command::new("soffice")
-        .arg("--headless")
+        .args(["--headless", "--norestore", "--nodefault", "--nologo"])
         .arg(format!(
             "-env:UserInstallation=file://{}",
             profile.display()
@@ -5234,24 +5384,14 @@ fn rich_html_fragments_match_word_in_every_supported_container() {
         ("/word/footer-story.xml", 2, 1),
     ] {
         let relationships = package.get_part_rels(owner).unwrap();
-        let image_relationships = relationships
-            .items
-            .iter()
-            .filter(|relationship| relationship.rel_type == rel_types::IMAGE)
-            .collect::<Vec<_>>();
-        // Repeated copies of the same image share one relationship per story.
-        // Every drawing must still retain its reference to that relationship.
         assert_eq!(
-            image_relationships.len(),
-            1,
-            "image relationship owner {owner}"
-        );
-        let xml = String::from_utf8_lossy(package.get_part(owner).unwrap());
-        let reference = format!("r:embed=\"{}\"", image_relationships[0].id);
-        assert_eq!(
-            xml.matches(&reference).count(),
+            relationships
+                .items
+                .iter()
+                .filter(|relationship| relationship.rel_type == rel_types::IMAGE)
+                .count(),
             expected_images,
-            "image owner {owner}"
+            "image relationship owner {owner}"
         );
         assert_eq!(
             relationships
@@ -5435,6 +5575,8 @@ fn m23_drawings_text_boxes_and_watermarks_match_word() {
                 anchor: None,
                 name: Some("Cropped inline".to_owned()),
                 description: Some("inline corpus picture".to_owned()),
+                title: None,
+                decorative: false,
             },
         )
         .unwrap();
@@ -5470,6 +5612,8 @@ fn m23_drawings_text_boxes_and_watermarks_match_word() {
                 }),
                 name: Some("Floating picture".to_owned()),
                 description: None,
+                title: None,
+                decorative: false,
             },
         )
         .unwrap();
@@ -5600,6 +5744,8 @@ fn drawing_option_matrix_round_trips_with_story_relationships() {
                 anchor: None,
                 name: None,
                 description: None,
+                title: None,
+                decorative: false,
             },
         )
         .unwrap();
@@ -5644,7 +5790,7 @@ fn section_aware_watermark_pages_select_the_requested_variant() {
             rdocx::TextWatermarkOptions::default(),
         )
         .unwrap();
-    assert!(!document.even_and_odd_headers());
+    assert!(document.even_and_odd_headers());
     document
         .section_mut(0)
         .unwrap()
@@ -5701,6 +5847,8 @@ fn staged_drawing_invariants_reject_invalid_inputs_atomically() {
         anchor: None,
         name: None,
         description: None,
+        title: None,
+        decorative: false,
     };
     assert!(
         document
@@ -5745,6 +5893,8 @@ fn staged_drawing_invariants_reject_invalid_inputs_atomically() {
         anchor: None,
         name: None,
         description: None,
+        title: None,
+        decorative: false,
     };
     assert!(
         document
@@ -6228,11 +6378,11 @@ fn rtf_writer_resets_table_cell_paragraph_state() {
     {
         let mut table = document.add_table(1, 2);
         let mut first_cell = table.cell(0, 0).unwrap();
-        first_cell.remove_first_empty_paragraph();
         let mut first = first_cell.add_paragraph("center");
         first.set_alignment(Alignment::Center);
         let mut second = first_cell.add_paragraph("list");
         second.set_numbering(list_id, 0);
+        first_cell.remove_first_empty_paragraph();
         table.cell(0, 1).unwrap().set_text("default");
     }
 
@@ -7966,7 +8116,7 @@ fn checked_table_setters_are_atomic() {
                 .set_width_mode(TableWidth::Fixed(Length::emu(i64::MAX)))
                 .is_err()
         );
-        assert!(table.set_indent_checked(Length::twips(-1)).is_err());
+        assert!(table.set_indent_checked(Length::emu(i64::MAX)).is_err());
         assert!(table.set_shading_checked("not-a-color").is_err());
         assert!(
             table
@@ -10194,7 +10344,7 @@ fn source_built_style_graph_matches_pinned_word_effective_formatting() {
         let source = root.join("source.docx");
         std::fs::write(&source, authored.to_bytes().unwrap()).unwrap();
         let status = std::process::Command::new("soffice")
-            .arg("--headless")
+            .args(["--headless", "--norestore", "--nodefault", "--nologo"])
             .arg(format!(
                 "-env:UserInstallation=file://{}",
                 profile.display()
@@ -10313,13 +10463,18 @@ fn invalid_style_graph_never_publishes_a_partial_mutation() {
     package.write_to(&mut invalid_bytes).unwrap();
     let mut invalid = Document::from_bytes(invalid_bytes.get_ref()).unwrap();
     assert!(invalid.validate_style_graph().is_err());
+    // The source's own defect is retained. Only a defect the change adds rejects it.
     let invalid_before = invalid.to_bytes().unwrap();
     assert!(
         invalid
-            .add_style(StyleBuilder::paragraph("Rejected", "Rejected"))
+            .add_style(StyleBuilder::paragraph("Rejected", "Rejected").based_on("MissingStyle"))
             .is_err()
     );
     assert_eq!(invalid.to_bytes().unwrap(), invalid_before);
+    invalid
+        .add_style(StyleBuilder::paragraph("Accepted", "Accepted"))
+        .unwrap();
+    assert!(invalid.validate_style_graph().is_err());
 }
 
 #[test]
@@ -10509,6 +10664,7 @@ fn table_style_updates_merge_nested_borders_and_margins() {
                         space: None,
                         color: Some("AABBCC".to_owned()),
                         extra_attributes: Vec::new(),
+                        source_xml: None,
                     }),
                     ..CT_TblBorders::default()
                 }),
@@ -12145,9 +12301,28 @@ fn nested_table_round_trip() {
     assert_eq!(tbl2.cell(0, 1).unwrap().text(), "Outer A2");
     assert_eq!(tbl2.cell(1, 1).unwrap().text(), "Outer B2");
 
-    // Cell (1,0) should have paragraph text (nested table text excluded from text())
+    // Cell (1,0) should have paragraph text (nested table text excluded from text()),
+    // then the empty trailing paragraph that follows the nested table.
     let cell_b1_ref = tbl2.cell(1, 0).unwrap();
-    assert_eq!(cell_b1_ref.text(), "Before nested");
+    assert_eq!(cell_b1_ref.text(), "Before nested\n");
+}
+
+#[test]
+fn nested_table_keeps_the_trailing_cell_paragraph_word_requires() {
+    // Word refuses a package whose w:tc ends with a w:tbl.
+    let mut doc = Document::new();
+    let mut table = doc.add_table(1, 1);
+    let mut cell = table.cell(0, 0).unwrap();
+    cell.set_text("Nested table below:");
+    cell.add_table(1, 1).cell(0, 0).unwrap().set_text("Inner");
+    let package = OpcPackage::from_reader(std::io::Cursor::new(doc.to_bytes().unwrap())).unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let nested_end = xml.find("</w:tbl>").expect("nested table closes first") + "</w:tbl>".len();
+    let after_nested = xml[nested_end..].trim_start();
+    assert!(
+        after_nested.starts_with("<w:p>") || after_nested.starts_with("<w:p/>"),
+        "outer cell must end with a paragraph after the nested table: {after_nested:.40}"
+    );
 }
 
 #[test]
@@ -12809,6 +12984,7 @@ fn save_pdf_to_file() {
         &tracked_path,
         rdocx::RenderOptions {
             revision_view: rdocx::RevisionView::Tracked,
+            revision_style: rdocx::RevisionStyle::Plain,
         },
     );
     if result.is_ok() {
@@ -16879,7 +17055,8 @@ mod settings_and_web_settings_authoring_tests {
             "{word_default}"
         );
 
-        // A two-inch interval is 144 points from the 72-point left margin.
+        // A two-inch interval moves the implicit stop onto the wider grid,
+        // two inches from the margin as in Word.
         let two_inch = run_start(Some(Twips(2880)), "B");
         assert!((two_inch - 216.0).abs() < 0.01, "{two_inch}");
     }
@@ -18126,7 +18303,7 @@ mod f269_section_page_semantics {
         std::fs::write(&ours, document.to_pdf_deterministic().unwrap()).unwrap();
 
         let status = std::process::Command::new("soffice")
-            .arg("--headless")
+            .args(["--headless", "--norestore", "--nodefault", "--nologo"])
             .arg(format!(
                 "-env:UserInstallation=file://{}",
                 profile.display()
@@ -18316,6 +18493,7 @@ for image in (first, second):
                 num_fmt: Some("chicago".to_owned()),
                 num_start: Some(4),
                 num_restart: Some("eachSect".to_owned()),
+                special_references: Vec::new(),
                 extra_xml: Vec::new(),
             });
             section.set_endnote_properties(CT_NoteProperties {
@@ -18743,7 +18921,7 @@ mod f267_table_style_conditional_tests {
         std::fs::write(&ours, document.to_pdf_deterministic().unwrap()).unwrap();
 
         let status = std::process::Command::new("soffice")
-            .arg("--headless")
+            .args(["--headless", "--norestore", "--nodefault", "--nologo"])
             .arg(format!(
                 "-env:UserInstallation=file://{}",
                 profile.display()
@@ -19416,15 +19594,23 @@ mod advanced_table_authoring_and_geometry {
 
     fn layout_input(document: rdocx_oxml::document::CT_Document) -> rdocx_layout::LayoutInput {
         rdocx_layout::LayoutInput {
+            sequence_snapshot: None,
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
             do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
+            clamp_tabs_past_margin: false,
+            legacy_table_positioning: false,
+            modern_footnote_layout: false,
+            footnote_layout_like_word8: false,
             math_properties: None,
+            note_defaults: [None, None],
             document,
             styles: rdocx_oxml::styles::CT_Styles::new_default(),
             numbering: None,
+            story_part_names: Default::default(),
+            story_bodies: Default::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             images: std::collections::HashMap::new(),
@@ -19437,7 +19623,9 @@ mod advanced_table_authoring_and_geometry {
             endnotes: None,
             theme: None,
             fonts: Vec::new(),
+            embedded_fonts: Vec::new(),
             revision_view: rdocx_layout::RevisionView::Accepted,
+            revision_style: rdocx_layout::RevisionStyle::Plain,
         }
     }
 
@@ -19875,31 +20063,34 @@ mod advanced_table_authoring_and_geometry {
         assert_eq!(origins, GOLDEN_TABLE_GEOMETRY);
     }
 
-    /// Reviewed page geometry for
+    /// Reviewed deterministic page geometry for
     /// `fixed_autofit_and_nested_table_geometry_matches_reviewed_word_pages`,
     /// as `(x, y, width, height)` in points for every painted cell.
     ///
     /// Rows 1 to 6 are the fixed-grid table, which keeps its declared 144,
     /// 144 and 180 point columns. Rows 7 to 10 are the auto-width autofit
-    /// table, whose narrow `ID` column measures 20.34 points against a 242.28
+    /// table, whose narrow `ID` column measures 9.54 points against a 231.48
     /// point heading column and whose total stops short of the 468 point text
     /// column because the content fits. Rows 11 to 14 are the nested table,
     /// which resolves its own grid inside the owning cell content box.
+    /// F-X183 removes implicit side padding. Supplemental DELTA review binds
+    /// the exact Base and current outputs. This source-built geometry pin is
+    /// not an authenticated native Word GUI capture.
     const GOLDEN_TABLE_GEOMETRY: &[(f64, f64, f64, f64)] = &[
-        (72.0, 72.0, 144.0, 19.87),
-        (216.0, 72.0, 144.0, 19.87),
-        (360.0, 72.0, 180.0, 19.87),
-        (72.0, 91.87, 144.0, 19.87),
-        (216.0, 91.87, 144.0, 19.87),
-        (360.0, 91.87, 180.0, 19.87),
-        (72.0, 111.74, 20.34, 19.87),
-        (92.34, 111.74, 242.28, 19.87),
-        (72.0, 131.61, 20.34, 19.87),
-        (92.34, 131.61, 242.28, 19.87),
-        (311.4, 172.43, 111.6, 19.87),
-        (423.0, 172.43, 111.6, 19.87),
-        (311.4, 192.3, 111.6, 19.87),
-        (423.0, 192.3, 111.6, 19.87),
+        (72.0, 72.0, 144.0, 22.49),
+        (216.0, 72.0, 144.0, 22.49),
+        (360.0, 72.0, 180.0, 22.49),
+        (72.0, 94.49, 144.0, 22.49),
+        (216.0, 94.49, 144.0, 22.49),
+        (360.0, 94.49, 180.0, 22.49),
+        (72.0, 116.98, 9.54, 22.49),
+        (81.54, 116.98, 231.48, 22.49),
+        (72.0, 139.47, 9.54, 22.49),
+        (81.54, 139.47, 231.48, 22.49),
+        (306.0, 184.45, 112.5, 22.49),
+        (418.5, 184.45, 112.5, 22.49),
+        (306.0, 206.94, 112.5, 22.49),
+        (418.5, 206.94, 112.5, 22.49),
     ];
 }
 
@@ -19940,7 +20131,7 @@ mod f266a_mixed_script_typography {
     /// applied to a value whose sign of zero has been normalised, because
     /// `format!("{:.4}", -0.0)` renders `-0.0000`.
     pub(super) const MIXED_SCRIPT_GEOMETRY_DIGEST: &str =
-        "516ebb6e45438731d3cb0983707ad00c9de55068401e073ef2a069a56f397402";
+        "76a56930a97629b22c773a4e373ac7b86a00561bf1d90a0ad64b4e1a1e0cea6f";
 
     /// One page holding all five scripts, authored through the public facade.
     ///
@@ -20308,7 +20499,7 @@ mod f266b_ruby_and_emphasis_typography {
     /// rather than the top level. The serialisation is the one F-266a
     /// documents, and it is host-stable for the same reasons.
     pub(super) const RUBY_AND_EMPHASIS_GEOMETRY_DIGEST: &str =
-        "b119714501d061f912bf9c05224f66dc8d4a30f3bdd195040038b89157e6fbf6";
+        "c2d4266e76d20d8d2260d55071384d89b3eac1034851437628dd4764eed80373";
 
     /// Wrap producer body XML in a package a `Document` can open.
     fn producer_document(body: &str) -> Vec<u8> {
@@ -20711,9 +20902,9 @@ mod f266b_ruby_and_emphasis_typography {
 
         // The plain paragraphs fit one page. The same count with a 60 point
         // raise does not, which is only true if the raise reached the line.
-        assert_eq!(page_count(false, 30), 1);
+        assert_eq!(page_count(false, 25), 1);
         assert!(
-            page_count(true, 30) > 1,
+            page_count(true, 25) > 1,
             "the raise and the phonetic size reach the line height"
         );
     }
@@ -20907,7 +21098,8 @@ mod floating_table_placement_and_wrap {
     /// sit on the left, so the lines beside them start at 181 points, which is
     /// the left margin plus the 100 point table plus its 9 point right
     /// clearance. The page float sits on the right, so the lines beside it keep
-    /// their left edge and lose their right.
+    /// their left edge and lose their right. A box ends at the ink, since the
+    /// space after the last word of a wrapped line hangs past it.
     #[test]
     fn floating_tables_match_reviewed_word_page_geometry_and_pagination() {
         let mut document = Document::new();
@@ -20936,35 +21128,35 @@ mod floating_table_placement_and_wrap {
 
         // Each float sits whole on one page, at the rect its anchor resolves
         // to, and none of them advanced the flow.
-        assert_eq!(placed(&result, 4), [(1, 72.0, 72.0, 100.0, 39.74)]);
-        assert_eq!(placed(&result, 11), [(1, 72.0, 294.45, 100.0, 39.74)]);
-        assert_eq!(placed(&result, 22), [(1, 360.0, 450.0, 100.0, 39.74)]);
+        assert_eq!(placed(&result, 4), [(1, 72.0, 72.0, 100.0, 44.98)]);
+        assert_eq!(placed(&result, 11), [(1, 72.0, 325.89, 100.0, 44.98)]);
+        assert_eq!(placed(&result, 22), [(1, 360.0, 450.0, 100.0, 44.98)]);
 
         let first = &result.layout.pages[0];
         assert_eq!(
-            boxes_in_band(first, 68.0, 115.75),
+            boxes_in_band(first, 68.0, 120.98),
             [
-                (80.25, 181.0, 525.39),
-                (92.12, 181.0, 277.95),
-                (111.99, 181.0, 525.39),
+                (82.47, 181.0, 522.9),
+                (96.96, 181.0, 277.95),
+                (119.46, 181.0, 522.9),
             ],
             "margin-anchored float geometry moved"
         );
         assert_eq!(
-            boxes_in_band(first, 290.45, 338.2),
+            boxes_in_band(first, 321.89, 374.87),
             [
-                (302.7, 181.0, 525.39),
-                (314.57, 181.0, 277.95),
-                (334.44, 181.0, 525.39),
+                (336.36, 181.0, 522.9),
+                (350.85, 181.0, 277.95),
+                (373.34, 181.0, 522.9),
             ],
             "text-anchored float geometry moved"
         );
         assert_eq!(
-            boxes_in_band(first, 446.0, 493.75),
+            boxes_in_band(first, 446.0, 498.98),
             [
-                (457.54, 72.0, 241.43),
-                (477.41, 72.0, 343.91),
-                (489.28, 72.0, 241.43),
+                (455.31, 72.0, 341.42),
+                (469.8, 72.0, 241.43),
+                (492.29, 72.0, 341.42),
             ],
             "page-anchored float geometry moved"
         );
@@ -21007,14 +21199,14 @@ mod floating_table_placement_and_wrap {
         inline.vertical = TableFloatY::Inline;
         add_float(&mut document, "M", Some(inline));
         let result = document.layout_deterministic().expect("document lays out");
-        assert_eq!(placed(&result, 1), [(1, MARGIN_LEFT, text_y, 100.0, 39.74)]);
+        assert_eq!(placed(&result, 1), [(1, MARGIN_LEFT, text_y, 100.0, 44.98)]);
     }
 
     /// `w:tblpPr` is a position, and a position leaves no room for `w:tblInd`
     /// to contribute. An inline table with the same indent still takes it.
     #[test]
     fn a_floating_table_takes_its_origin_from_the_anchor_not_the_indent() {
-        let indented = |position: Option<TableFloatPosition>| {
+        let indented = |position: Option<TableFloatPosition>, indent: i32| {
             let mut document = Document::new();
             document.add_paragraph("One line above the table.");
             {
@@ -21022,7 +21214,7 @@ mod floating_table_placement_and_wrap {
                 table.set_column_width(0, Length::twips(1000));
                 table.set_column_width(1, Length::twips(1000));
                 table.set_width(Length::twips(2000));
-                table.set_indent(Length::twips(1440));
+                table.set_indent_checked(Length::twips(indent)).unwrap();
                 table
                     .set_float_position(position)
                     .expect("float position is valid");
@@ -21032,8 +21224,13 @@ mod floating_table_placement_and_wrap {
         };
 
         let float = float_at(TableAnchor::Margin, TableAnchor::Margin, 0, 0);
-        assert_eq!(indented(Some(float)), MARGIN_LEFT);
-        assert_eq!(indented(None), MARGIN_LEFT + 72.0);
+        for indent in [-1440, 0, 1440] {
+            assert_eq!(indented(Some(float), indent), MARGIN_LEFT);
+            assert_eq!(
+                indented(None, indent),
+                MARGIN_LEFT + f64::from(indent) / 20.0
+            );
+        }
     }
 }
 
@@ -21084,7 +21281,7 @@ mod f266c_character_grid_and_vertical_text {
     /// and the six coefficients of the transform that maps the run into page
     /// space, which is what makes a lost or altered rotation fail here.
     const GRID_AND_VERTICAL_GEOMETRY_DIGEST: &str =
-        "cb3043d53719f5dd9e16b61a001aff8c8827c19f96536972d4a17b9a626d2164";
+        "2002409b412388ad17b7f85e170d36b8c3658e6c7e4cff84098220772c006b76";
 
     /// One coordinate, with the sign of zero normalised, as F-266a documents.
     fn number(value: f64) -> String {
@@ -22116,5 +22313,3379 @@ mod f266c_character_grid_and_vertical_text {
                 .text_direction(),
             Some("tbRl")
         );
+    }
+}
+
+/// Replace the first `old` in a package part, which must hold it.
+fn replace_in_part(package: &mut OpcPackage, part: &str, old: &str, new: &str) {
+    let xml = std::str::from_utf8(package.get_part(part).unwrap()).unwrap();
+    assert!(xml.contains(old), "{part} holds {old}");
+    let xml = xml.replacen(old, new, 1);
+    package.set_part(part, xml.into_bytes());
+}
+
+/// #246: Google Docs writes integer measurements with a decimal part, as in
+/// `w:gridCol w:w="2210.0000000000005"`, in the body, styles, numbering and
+/// headers alike.
+fn decimal_measurement_package() -> Vec<u8> {
+    let mut seed = Document::new();
+    seed.set_header("Header");
+    seed.add_numbered_list_item("Item", 0);
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    replace_in_part(
+        &mut package,
+        "/word/document.xml",
+        "<w:body>",
+        concat!(
+            r#"<w:body><w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="4.0" w:space="1.5"/></w:pBdr>"#,
+            r#"<w:tabs><w:tab w:val="left" w:pos="1440.0"/></w:tabs>"#,
+            r#"<w:spacing w:before="120.0" w:line="275.99999999999994" w:lineRule="auto"/>"#,
+            r#"<w:ind w:left="720.5" w:hanging="226.99999999999977"/></w:pPr><w:r><w:t>Indented paragraph</w:t></w:r></w:p>"#,
+            r#"<w:tbl><w:tblPr><w:tblW w:w="8639.999999999999" w:type="dxa"/></w:tblPr>"#,
+            r#"<w:tblGrid><w:gridCol w:w="4320.0"/><w:gridCol w:w="4319.999999999999"/></w:tblGrid>"#,
+            r#"<w:tr><w:trPr><w:trHeight w:val="535.0000000000182"/></w:trPr>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="4319.999999999999" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell A</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="4320.0" w:type="dxa"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl>"#,
+        ),
+    );
+    replace_in_part(
+        &mut package,
+        "/word/document.xml",
+        r#"<w:pgSz w:w="12240""#,
+        r#"<w:pgSz w:w="12240.0""#,
+    );
+    replace_in_part(
+        &mut package,
+        "/word/document.xml",
+        r#"w:top="1440""#,
+        r#"w:top="1440.0""#,
+    );
+    replace_in_part(
+        &mut package,
+        "/word/styles.xml",
+        r#"w:after="160""#,
+        r#"w:after="159.5""#,
+    );
+    replace_in_part(
+        &mut package,
+        "/word/styles.xml",
+        r#"<w:sz w:val="22"/>"#,
+        r#"<w:sz w:val="22.0"/>"#,
+    );
+    replace_in_part(
+        &mut package,
+        "/word/numbering.xml",
+        r#"w:left="720" w:hanging="360""#,
+        r#"w:left="720.0" w:hanging="359.99999999999994""#,
+    );
+    replace_in_part(
+        &mut package,
+        "/word/header1.xml",
+        "<w:p>",
+        r#"<w:p><w:pPr><w:ind w:left="360.0"/></w:pPr>"#,
+    );
+    let mut bytes = Vec::new();
+    package
+        .write_to(&mut std::io::Cursor::new(&mut bytes))
+        .unwrap();
+    bytes
+}
+
+#[test]
+fn decimal_integer_measurements_round_to_the_nearest_integer() {
+    let source = decimal_measurement_package();
+    let mut document = Document::from_bytes(&source).expect("decimal measurements open");
+
+    let text = document.text();
+    assert!(
+        text.contains("Indented paragraph") && text.contains("Cell A"),
+        "{text}"
+    );
+    assert_eq!(document.header_text().as_deref(), Some("Header"));
+    let paragraph = &document.paragraphs()[0];
+    assert_eq!(paragraph.indent_left(), Some(Length::twips(721)));
+    assert_eq!(paragraph.space_before(), Some(Length::twips(120)));
+    let border = paragraph
+        .border(rdocx::paragraph::ParagraphBorderEdge::Top)
+        .unwrap();
+    assert_eq!(border.size_eighths_pt(), Some(4));
+    assert_eq!(border.space_points(), Some(2));
+    assert_eq!(
+        paragraph.tab_stop(0).unwrap().position(),
+        Length::twips(1440)
+    );
+    let table = &document.tables()[0];
+    assert_eq!(
+        table.grid_widths(),
+        vec![Length::twips(4320), Length::twips(4320)]
+    );
+    assert_eq!(table.width(), Some(Length::twips(8640)));
+    assert_eq!(
+        table.row(0).unwrap().height(),
+        Some(RowHeight::AtLeast(Length::twips(535)))
+    );
+    let section = document.sections().last().unwrap();
+    assert_eq!(
+        section.page_size(),
+        Some((Length::twips(12240), Length::twips(15840)))
+    );
+    assert_eq!(section.margins().unwrap().0, Length::twips(1440));
+
+    // An untouched part keeps its bytes, decimals included.
+    let untouched =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let original = OpcPackage::from_reader(std::io::Cursor::new(&source)).unwrap();
+    for part in [
+        "/word/document.xml",
+        "/word/styles.xml",
+        "/word/numbering.xml",
+        "/word/header1.xml",
+    ] {
+        assert_eq!(untouched.get_part(part), original.get_part(part), "{part}");
+    }
+
+    // Re-serializing the part preserves unchanged source-owned border and tab leaves.
+    document.add_paragraph("Edited");
+    let edited =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let body = std::str::from_utf8(edited.get_part("/word/document.xml").unwrap()).unwrap();
+    for expected in [
+        r#"<w:top w:val="single" w:sz="4.0" w:space="1.5"/>"#,
+        r#"<w:tab w:val="left" w:pos="1440.0"/>"#,
+        r#"w:before="120""#,
+        r#"w:line="276""#,
+        r#"w:left="721""#,
+        r#"w:hanging="227""#,
+        r#"<w:tblW w:w="8640" w:type="dxa"/>"#,
+        r#"<w:trHeight w:val="535"/>"#,
+        r#"<w:pgSz w:w="12240" w:h="15840"/>"#,
+        r#"w:top="1440""#,
+    ] {
+        assert!(body.contains(expected), "{expected} in {body}");
+    }
+    assert_eq!(body.matches(r#"<w:gridCol w:w="4320"/>"#).count(), 2);
+    assert_eq!(
+        body.matches(r#"<w:tcW w:w="4320" w:type="dxa"/>"#).count(),
+        2
+    );
+    // Explicitly authored leaves have no imported lexical owner and write integers.
+    document
+        .add_paragraph("Authored measurements")
+        .border_bottom_with_space(BorderStyle::Single, 4, 2, "000000")
+        .add_tab_stop(TabAlignment::Left, Length::twips(1440));
+    let authored =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let authored_body =
+        std::str::from_utf8(authored.get_part("/word/document.xml").unwrap()).unwrap();
+    assert!(
+        authored_body
+            .contains(r#"<w:bottom w:val="single" w:sz="4" w:space="2" w:color="000000"/>"#),
+        "{authored_body}"
+    );
+    assert_eq!(
+        authored_body
+            .matches(r#"<w:tab w:val="left" w:pos="1440"/>"#)
+            .count(),
+        1
+    );
+    assert_eq!(
+        authored_body
+            .matches(r#"<w:top w:val="single" w:sz="4.0" w:space="1.5"/>"#)
+            .count(),
+        1
+    );
+    assert_eq!(
+        authored_body
+            .matches(r#"<w:tab w:val="left" w:pos="1440.0"/>"#)
+            .count(),
+        1
+    );
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    let reopened_paragraphs = reopened.paragraphs();
+    let authored_paragraph = reopened_paragraphs.last().unwrap();
+    let border = authored_paragraph.bottom_border().unwrap();
+    assert_eq!(border.size_eighths_pt(), Some(4));
+    assert_eq!(border.space_points(), Some(2));
+    assert_eq!(
+        authored_paragraph.tab_stop(0).unwrap().position(),
+        Length::twips(1440)
+    );
+    let styles = rdocx_oxml::CT_Styles::from_xml(original.get_part("/word/styles.xml").unwrap())
+        .unwrap()
+        .to_xml()
+        .unwrap();
+    let styles = String::from_utf8(styles).unwrap();
+    assert!(styles.contains(r#"w:after="160""#), "{styles}");
+    assert!(styles.contains(r#"<w:sz w:val="22"/>"#), "{styles}");
+    let numbering =
+        rdocx_oxml::CT_Numbering::from_xml(original.get_part("/word/numbering.xml").unwrap())
+            .unwrap()
+            .to_xml()
+            .unwrap();
+    let numbering = String::from_utf8(numbering).unwrap();
+    assert!(
+        numbering.contains(r#"<w:ind w:left="720" w:hanging="360"/>"#),
+        "{numbering}"
+    );
+    let header = CT_HdrFtr::from_xml(original.get_part("/word/header1.xml").unwrap())
+        .unwrap()
+        .to_xml_header()
+        .unwrap();
+    let header = String::from_utf8(header).unwrap();
+    assert!(header.contains(r#"<w:ind w:left="360"/>"#), "{header}");
+}
+
+#[test]
+fn a_refused_measurement_names_its_element_attribute_and_value() {
+    let seed = Document::new().to_bytes().unwrap();
+    for (old, new, message) in [
+        (
+            r#"<w:pgSz w:w="12240""#,
+            r#"<w:pgSz w:w="1.224e4""#,
+            r#"w:pgSz/@w:w "1.224e4" is not an integer measurement"#,
+        ),
+        (
+            r#"w:top="1440""#,
+            r#"w:top="NaN""#,
+            r#"w:pgMar/@w:top "NaN" is not an integer measurement"#,
+        ),
+        (
+            r#"<w:pgSz w:w="12240""#,
+            r#"<w:pgSz w:w="2147483647.5""#,
+            r#"w:pgSz/@w:w "2147483647.5" is out of range"#,
+        ),
+    ] {
+        let mut package = OpcPackage::from_reader(std::io::Cursor::new(&seed)).unwrap();
+        replace_in_part(&mut package, "/word/document.xml", old, new);
+        let mut bytes = Vec::new();
+        package
+            .write_to(&mut std::io::Cursor::new(&mut bytes))
+            .unwrap();
+        let Err(error) = Document::from_bytes(&bytes) else {
+            panic!("{new} opened");
+        };
+        let error = error.to_string();
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[test]
+fn rich_footnotes_match_word_after_create_edit_reorder_and_remove() {
+    const WORD_ORACLE_VERSION: &str = "Microsoft Word 16.113.2 build 16.113.26092012";
+    // Word's PDF has three pages. Both body references on page one are
+    // numbered by occurrence, and the long note continues onto pages two
+    // and three before the second note.
+    const WORD_PAGE_COUNT: usize = 3;
+    let mut document = Document::new();
+    document.add_paragraph("body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let first = document.create_footnote(&location, "first").unwrap();
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let second = document.create_footnote(&location, "second").unwrap();
+    assert_eq!((first, second), (2, 3));
+    let first_story = document.footnote_story(first).unwrap().unwrap();
+    let mut paragraph = rdocx_oxml::text::CT_P::new();
+    paragraph.add_run("rich continuation");
+    document
+        .insert_content(
+            &rdocx::ContentLocation::end(first_story),
+            rdocx::ContentFragment::paragraph(paragraph).unwrap(),
+        )
+        .unwrap();
+    document.move_footnote_before(second, first).unwrap();
+    assert_eq!(
+        document
+            .footnotes()
+            .iter()
+            .map(|item| item.0)
+            .collect::<Vec<_>>(),
+        [second, first]
+    );
+    let bytes = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert!(body.contains(&format!("footnoteReference w:id=\"{first}\"")));
+    assert!(body.contains(&format!("footnoteReference w:id=\"{second}\"")));
+    let notes = std::str::from_utf8(package.get_part("/word/footnotes.xml").unwrap()).unwrap();
+    assert!(notes.contains("rich continuation"));
+    document.remove_footnote(first).unwrap();
+    let mut reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.footnotes(), vec![(second, "second".to_owned())]);
+    let package =
+        OpcPackage::from_reader(std::io::Cursor::new(reopened.to_bytes().unwrap())).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert!(!body.contains(&format!("footnoteReference w:id=\"{first}\"")));
+    assert!(body.contains(&format!("footnoteReference w:id=\"{second}\"")));
+
+    let mut oracle = Document::new();
+    oracle.add_paragraph("Body opening");
+    let location = oracle.paragraph_story_location(0).unwrap().unwrap();
+    let long = std::iter::repeat_n("continued footnote text", 500)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let long_id = oracle.create_footnote(&location, &long).unwrap();
+    let location = oracle.paragraph_story_location(0).unwrap().unwrap();
+    let short_id = oracle
+        .create_footnote(&location, "short second footnote")
+        .unwrap();
+    oracle.move_footnote_before(short_id, long_id).unwrap();
+    let pdf = oracle.to_pdf_deterministic().unwrap();
+    let source = std::env::temp_dir().join(format!("f272-note-{}.pdf", std::process::id()));
+    std::fs::write(&source, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&source)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&source);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let pages = text
+        .trim_end_matches('\u{c}')
+        .split('\u{c}')
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), WORD_PAGE_COUNT, "{WORD_ORACLE_VERSION}");
+    assert!(pages[0].contains("Body opening12"), "{}", pages[0]);
+    assert!(pages[0].contains("continued footnote text"));
+    assert!(pages[1].contains("continued footnote text"));
+    assert!(pages[2].contains("continued footnote text"));
+    assert!(pages[2].contains("short second footnote"));
+}
+
+#[test]
+fn mixed_rich_notes_match_word_at_section_and_document_end_boundaries() {
+    const WORD_ORACLE_VERSION: &str = "Microsoft Word 16.113.2 build 16.113.26092012";
+    // Word's AX view of this generated DOCX has two pages. Body markers are
+    // 1/i and 2/ii, and both endnotes follow the final body text on page two.
+    // F-279 now retains that measured document-end flow on page two.
+    // The authored native default decimal marker policy remains independent
+    // of this bounded physical placement regression.
+    const WORD_PAGE_COUNT: usize = 2;
+    let mut document = Document::new();
+    document.add_paragraph("First section body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let footnote = document
+        .create_footnote(&location, "first footnote body")
+        .unwrap();
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let endnote = document
+        .create_endnote(&location, "first endnote body")
+        .unwrap();
+    document
+        .add_paragraph("Section boundary")
+        .section_break(SectionBreak::NextPage);
+    document.add_paragraph("Second section body");
+    let location = document.paragraph_story_location(2).unwrap().unwrap();
+    let second_footnote = document
+        .create_footnote(&location, "second footnote body")
+        .unwrap();
+    let location = document.paragraph_story_location(2).unwrap().unwrap();
+    let second_endnote = document
+        .create_endnote(&location, "second endnote body")
+        .unwrap();
+    assert_eq!(footnote, endnote);
+    assert_eq!(second_footnote, second_endnote);
+    assert_ne!(
+        document.footnote_story(footnote).unwrap().unwrap().kind(),
+        document.endnote_story(endnote).unwrap().unwrap().kind()
+    );
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert!(reopened.endnote_story(endnote).unwrap().is_some());
+    assert!(reopened.endnote_story(second_endnote).unwrap().is_some());
+    let bytes = document.to_bytes().unwrap();
+    if std::env::var_os("F273_ORACLE_DUMP").is_some() {
+        std::fs::write("/private/tmp/f273-note-oracle.docx", &bytes).unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let source = std::env::temp_dir().join(format!("f273-note-{}.pdf", std::process::id()));
+    std::fs::write(&source, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&source)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&source);
+    assert!(output.status.success(), "{WORD_ORACLE_VERSION}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let pages = text
+        .trim_end_matches('\u{c}')
+        .split('\u{c}')
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pages.len(),
+        WORD_PAGE_COUNT,
+        "{WORD_ORACLE_VERSION}: {text}"
+    );
+    assert!(pages[0].contains("First section body11"), "{text}");
+    assert!(!pages[0].contains("First section body1i"), "{text}");
+    assert!(pages[0].contains("first footnote body"), "{text}");
+    assert!(pages[1].contains("Second section body22"), "{text}");
+    assert!(!pages[1].contains("Second section body2ii"), "{text}");
+    assert!(pages[1].contains("second footnote body"), "{text}");
+    assert!(pages[1].contains("first endnote body"), "{text}");
+    assert!(pages[1].contains("second endnote body"), "{text}");
+}
+
+#[test]
+fn note_policies_match_pinned_word_markers_and_page_placement() {
+    use rdocx::{NoteFamily, NoteNumberFormat, NotePlacement, NotePolicy, NoteRestart};
+    const WORD_ORACLE: &str = "Microsoft Word 16.113.2 build 16.113.26092012";
+    let mut document = Document::new();
+    document.add_paragraph("First section body");
+    let first = document.paragraph_story_location(0).unwrap().unwrap();
+    document.create_endnote(&first, "First endnote").unwrap();
+    document
+        .add_paragraph("Section boundary")
+        .section_break(SectionBreak::NextPage);
+    document.add_paragraph("Second section body");
+    let second = document.paragraph_story_location(2).unwrap().unwrap();
+    document.create_endnote(&second, "Second endnote").unwrap();
+    document
+        .set_note_policy(
+            NoteFamily::Endnote,
+            NotePolicy {
+                placement: NotePlacement::DocumentEnd,
+                format: NoteNumberFormat::LowerRoman,
+                start: 1,
+                restart: NoteRestart::Continuous,
+            },
+        )
+        .unwrap();
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document.save("/private/tmp/f274-note-oracle.docx").unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let source = std::env::temp_dir().join(format!("f274-note-{}.pdf", std::process::id()));
+    std::fs::write(&source, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&source)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&source);
+    assert!(output.status.success(), "{WORD_ORACLE}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("First section bodyi"),
+        "{WORD_ORACLE}: {text}"
+    );
+    assert!(
+        text.contains("Second section bodyii"),
+        "{WORD_ORACLE}: {text}"
+    );
+    let pages = text
+        .trim_end_matches('\u{c}')
+        .split('\u{c}')
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2, "{WORD_ORACLE}: {text}");
+    assert!(pages[1].contains("First endnote"), "{WORD_ORACLE}: {text}");
+    assert!(pages[1].contains("Second endnote"), "{WORD_ORACLE}: {text}");
+
+    for (format, label) in [
+        (NoteNumberFormat::Decimal, "2"),
+        (NoteNumberFormat::UpperRoman, "II"),
+        (NoteNumberFormat::LowerRoman, "ii"),
+        (NoteNumberFormat::UpperLetter, "B"),
+        (NoteNumberFormat::LowerLetter, "b"),
+    ] {
+        let mut sample = Document::new();
+        sample.add_paragraph("Foot format");
+        let foot = sample.paragraph_story_location(0).unwrap().unwrap();
+        sample.create_footnote(&foot, "Foot note text").unwrap();
+        sample.add_paragraph("End format");
+        let end = sample.paragraph_story_location(1).unwrap().unwrap();
+        sample.create_endnote(&end, "End note text").unwrap();
+        for (family, placement) in [
+            (NoteFamily::Footnote, NotePlacement::PageBottom),
+            (NoteFamily::Endnote, NotePlacement::DocumentEnd),
+        ] {
+            let policy = NotePolicy {
+                format,
+                start: 2,
+                restart: NoteRestart::Continuous,
+                placement,
+            };
+            sample.set_note_policy(family, policy).unwrap();
+            sample
+                .section_mut(0)
+                .unwrap()
+                .set_note_policy(family, policy)
+                .unwrap();
+        }
+        let pdf = sample.to_pdf_deterministic().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "f274-formats-{format:?}-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, pdf).unwrap();
+        let output = std::process::Command::new("pdftotext")
+            .arg("-layout")
+            .arg(&path)
+            .arg("-")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!("Foot format{label}")),
+            "{format:?}: {text}"
+        );
+        assert!(
+            text.contains(&format!("End format{label}")),
+            "{format:?}: {text}"
+        );
+        assert!(text.contains("Foot note text"), "{format:?}: {text}");
+        assert!(text.contains("End note text"), "{format:?}: {text}");
+    }
+    endnotes_at_section_end_follow_each_sections_body();
+    footnote_markers_restart_on_each_physical_page();
+    body_and_note_markers_share_formatted_labels();
+    authored_separator_replaces_only_its_special_record();
+    beneath_text_footnotes_follow_the_body_in_page_flow();
+    authored_endnote_separator_flows_with_final_body_page();
+    carried_footnote_uses_authored_separator_and_notice();
+    custom_endnote_mark_keeps_numeric_endnote_stream();
+    removing_note_policy_keeps_special_record_selection();
+    special_records_require_selected_ids();
+    carried_endnote_uses_authored_continuation_content();
+    oversized_endnote_continuation_separator_does_not_stall_flow();
+}
+
+#[test]
+fn endnotes_at_section_end_follow_each_sections_body() {
+    use rdocx::{NoteFamily, NoteNumberFormat, NotePlacement, NotePolicy, NoteRestart};
+    let mut document = Document::new();
+    document.add_paragraph("First section body");
+    let first = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_endnote(&first, "First section endnote")
+        .unwrap();
+    document
+        .add_paragraph("Section boundary")
+        .section_break(SectionBreak::NextPage);
+    document.add_paragraph("Second section body");
+    let second = document.paragraph_story_location(2).unwrap().unwrap();
+    document
+        .create_endnote(&second, "Second section endnote")
+        .unwrap();
+    document
+        .set_note_policy(
+            NoteFamily::Endnote,
+            NotePolicy {
+                placement: NotePlacement::SectionEnd,
+                format: NoteNumberFormat::LowerRoman,
+                start: 1,
+                restart: NoteRestart::EachSection,
+            },
+        )
+        .unwrap();
+    document
+        .section_mut(1)
+        .unwrap()
+        .set_note_policy(
+            NoteFamily::Endnote,
+            NotePolicy {
+                placement: NotePlacement::SectionEnd,
+                format: NoteNumberFormat::LowerRoman,
+                start: 1,
+                restart: NoteRestart::EachSection,
+            },
+        )
+        .unwrap();
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-sectend-override-oracle.docx")
+            .unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-sectend-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let pages = text
+        .trim_end_matches('\u{c}')
+        .split('\u{c}')
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2, "{text}");
+    assert!(pages[0].contains("First section bodyi"), "{text}");
+    assert!(pages[0].contains("First section endnote"), "{text}");
+    assert!(!pages[0].contains("Second section endnote"), "{text}");
+    assert!(pages[1].contains("Second section bodyi"), "{text}");
+    assert!(pages[1].contains("Second section endnote"), "{text}");
+    assert!(!pages[1].contains("First section endnote"), "{text}");
+}
+
+#[test]
+fn footnote_markers_restart_on_each_physical_page() {
+    use rdocx::{NoteFamily, NoteNumberFormat, NotePlacement, NotePolicy, NoteRestart};
+    let mut document = Document::new();
+    document.add_paragraph("First page body");
+    let first = document.paragraph_story_location(0).unwrap().unwrap();
+    document.create_footnote(&first, "First page note").unwrap();
+    document
+        .add_paragraph("Page boundary")
+        .page_break_before(true);
+    document.add_paragraph("Second page body");
+    let second = document.paragraph_story_location(2).unwrap().unwrap();
+    document
+        .create_footnote(&second, "Second page note")
+        .unwrap();
+    let policy = NotePolicy {
+        placement: NotePlacement::PageBottom,
+        format: NoteNumberFormat::UpperLetter,
+        start: 2,
+        restart: NoteRestart::EachPage,
+    };
+    document
+        .set_note_policy(NoteFamily::Footnote, policy)
+        .unwrap();
+    for index in 0..document.section_count() {
+        document
+            .section_mut(index)
+            .unwrap()
+            .set_note_policy(NoteFamily::Footnote, policy)
+            .unwrap();
+    }
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-page-restart-oracle.docx")
+            .unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-page-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let pages = text
+        .trim_end_matches('\u{c}')
+        .split('\u{c}')
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2, "{text}");
+    assert!(pages[0].contains("First page bodyB"), "{text}");
+    assert!(pages[0].contains("B\n    First page note"), "{text}");
+    assert!(pages[1].contains("Second page bodyB"), "{text}");
+    assert!(pages[1].contains("B\n    Second page note"), "{text}");
+}
+
+#[test]
+fn body_and_note_markers_share_formatted_labels() {
+    let mut document = Document::new();
+    document.add_paragraph("First normal");
+    let first = document.paragraph_story_location(0).unwrap().unwrap();
+    let first_id = document.create_footnote(&first, "first note text").unwrap();
+    document.add_paragraph("Custom mark");
+    let custom = document.paragraph_story_location(1).unwrap().unwrap();
+    let custom_id = document
+        .create_footnote_with_mark(&custom, "custom note text", "*")
+        .unwrap();
+    document.add_paragraph("Second normal");
+    let second = document.paragraph_story_location(2).unwrap().unwrap();
+    let second_id = document
+        .create_footnote(&second, "second note text")
+        .unwrap();
+    assert_ne!(first_id, custom_id);
+    assert_ne!(custom_id, second_id);
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert!(reopened.footnote_story(custom_id).unwrap().is_some());
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-custom-mark-oracle.docx")
+            .unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-custom-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("First normal1"), "{text}");
+    assert!(text.contains("Custom mark*"), "{text}");
+    assert!(text.contains("Second normal2"), "{text}");
+    assert!(text.contains("first note text"), "{text}");
+    assert!(text.contains("custom note text"), "{text}");
+    assert!(text.contains("second note text"), "{text}");
+}
+
+#[test]
+fn authored_separator_replaces_only_its_special_record() {
+    let mut document = Document::new();
+    document.add_paragraph("Referenced body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let normal_id = document.create_footnote(&location, "Normal note").unwrap();
+    let mut separator = rdocx_oxml::text::CT_P::new();
+    separator.add_run("Author separator");
+    let id = document
+        .set_note_special_record(
+            rdocx::NoteFamily::Footnote,
+            rdocx::NoteSpecialRecord::Separator,
+            vec![separator],
+        )
+        .unwrap();
+    let mut replacement = rdocx_oxml::text::CT_P::new();
+    replacement.add_run("Replacement separator");
+    assert_eq!(
+        document
+            .set_note_special_record(
+                rdocx::NoteFamily::Footnote,
+                rdocx::NoteSpecialRecord::Separator,
+                vec![replacement],
+            )
+            .unwrap(),
+        id
+    );
+    assert!(document.footnote_story(normal_id).unwrap().is_some());
+    let bytes = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let xml = String::from_utf8(package.get_part("/word/footnotes.xml").unwrap().to_vec()).unwrap();
+    assert_eq!(xml.matches("Replacement separator").count(), 1);
+    assert!(!xml.contains("Author separator"));
+    assert!(xml.contains("Normal note"));
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-separator-oracle.docx")
+            .unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-separator-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Replacement separator"), "{text}");
+}
+
+#[test]
+fn invalid_note_policy_rolls_back_atomically() {
+    let mut document = Document::new();
+    document.add_paragraph("Stable body");
+    let before = document.to_bytes().unwrap();
+    let invalid_start = rdocx::NotePolicy {
+        format: rdocx::NoteNumberFormat::Decimal,
+        start: 0,
+        restart: rdocx::NoteRestart::Continuous,
+        placement: rdocx::NotePlacement::PageBottom,
+    };
+    assert!(
+        document
+            .set_note_policy(rdocx::NoteFamily::Footnote, invalid_start)
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    let invalid_family = rdocx::NotePolicy {
+        start: 1,
+        placement: rdocx::NotePlacement::DocumentEnd,
+        ..invalid_start
+    };
+    assert!(
+        document
+            .set_note_policy(rdocx::NoteFamily::Footnote, invalid_family)
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    assert!(
+        document
+            .set_note_special_record(
+                rdocx::NoteFamily::Endnote,
+                rdocx::NoteSpecialRecord::ContinuationNotice,
+                Vec::new(),
+            )
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn beneath_text_footnotes_follow_the_body_in_page_flow() {
+    fn note_y(placement: rdocx::NotePlacement) -> f64 {
+        let mut document = Document::new();
+        document.add_paragraph("Short body");
+        let location = document.paragraph_story_location(0).unwrap().unwrap();
+        document.create_footnote(&location, "Spatial note").unwrap();
+        let policy = rdocx::NotePolicy {
+            format: rdocx::NoteNumberFormat::Decimal,
+            start: 1,
+            restart: rdocx::NoteRestart::Continuous,
+            placement,
+        };
+        document
+            .set_note_policy(rdocx::NoteFamily::Footnote, policy)
+            .unwrap();
+        if placement == rdocx::NotePlacement::BeneathText {
+            document
+                .section_mut(0)
+                .unwrap()
+                .set_note_policy(rdocx::NoteFamily::Footnote, policy)
+                .unwrap();
+            let package =
+                OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap()))
+                    .unwrap();
+            for part in ["/word/document.xml", "/word/settings.xml"] {
+                let xml = String::from_utf8(package.get_part(part).unwrap().to_vec()).unwrap();
+                assert!(
+                    xml.contains(r#"<w:pos w:val="beneathText"/>"#),
+                    "{part}: {xml}"
+                );
+            }
+        }
+        if placement == rdocx::NotePlacement::BeneathText
+            && std::env::var_os("F274_ORACLE_DUMP").is_some()
+        {
+            document
+                .save("/private/tmp/f274-beneath-text-oracle.docx")
+                .unwrap();
+        }
+        let layout = document.layout_deterministic().unwrap();
+        assert_eq!(layout.layout.pages.len(), 1);
+        let mut y = None;
+        oxml_layout::walk(&layout.layout.pages[0].elements, &mut |element, _| {
+            if let oxml_layout::PositionedElement::Text(run) = element
+                && run.text.contains("Spatial")
+            {
+                y = Some(run.origin.y);
+            }
+        });
+        y.expect("footnote text appears")
+    }
+    // Word for Mac 16.113.2 displayed the valid document and final-section
+    // beneathText fixture at the page bottom. Pin that observed band while
+    // asserting the native renderer applies the OOXML beneathText placement.
+    const WORD_OBSERVED_PLACEMENT: rdocx::NotePlacement = rdocx::NotePlacement::PageBottom;
+    let word_band = note_y(WORD_OBSERVED_PLACEMENT);
+    let native_beneath_text = note_y(rdocx::NotePlacement::BeneathText);
+    assert!(word_band > native_beneath_text + 100.0);
+}
+
+#[test]
+fn authored_endnote_separator_flows_with_final_body_page() {
+    let mut document = Document::new();
+    document.add_paragraph("Endnote body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_endnote(&location, "Endnote content")
+        .unwrap();
+    let policy = rdocx::NotePolicy {
+        format: rdocx::NoteNumberFormat::Decimal,
+        start: 1,
+        restart: rdocx::NoteRestart::Continuous,
+        placement: rdocx::NotePlacement::DocumentEnd,
+    };
+    document
+        .set_note_policy(rdocx::NoteFamily::Endnote, policy)
+        .unwrap();
+    document
+        .section_mut(0)
+        .unwrap()
+        .set_note_policy(rdocx::NoteFamily::Endnote, policy)
+        .unwrap();
+    let mut separator = rdocx_oxml::text::CT_P::new();
+    separator.add_run("Endnote separator text");
+    document
+        .set_note_special_record(
+            rdocx::NoteFamily::Endnote,
+            rdocx::NoteSpecialRecord::Separator,
+            vec![separator],
+        )
+        .unwrap();
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-end-separator-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Endnote separator text"), "{text}");
+    assert!(text.contains("Endnote content"), "{text}");
+    assert_eq!(
+        document.layout_deterministic().unwrap().layout.pages.len(),
+        1
+    );
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-endnote-separator-oracle.docx")
+            .unwrap();
+    }
+}
+
+#[test]
+fn carried_footnote_uses_authored_separator_and_notice() {
+    let mut document = Document::new();
+    document.add_paragraph("Carry body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_footnote(&location, &"carry text ".repeat(1200))
+        .unwrap();
+    for (record, text) in [
+        (
+            rdocx::NoteSpecialRecord::ContinuationSeparator,
+            "Continued separator",
+        ),
+        (
+            rdocx::NoteSpecialRecord::ContinuationNotice,
+            "Continued on next page",
+        ),
+    ] {
+        let mut paragraph = rdocx_oxml::text::CT_P::new();
+        paragraph.add_run(text);
+        document
+            .set_note_special_record(rdocx::NoteFamily::Footnote, record, vec![paragraph])
+            .unwrap();
+    }
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-carry-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(document.layout_deterministic().unwrap().layout.pages.len() > 1);
+    assert!(text.contains("Continued separator"), "{text}");
+    assert!(text.contains("Continued on next page"), "{text}");
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-carry-oracle.docx")
+            .unwrap();
+    }
+}
+
+#[test]
+fn custom_endnote_mark_keeps_numeric_endnote_stream() {
+    let mut document = Document::new();
+    document.add_paragraph("Custom endnote");
+    let custom = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_endnote_with_mark(&custom, "Custom endnote text", "†")
+        .unwrap();
+    document.add_paragraph("Ordinary endnote");
+    let ordinary = document.paragraph_story_location(1).unwrap().unwrap();
+    document
+        .create_endnote(&ordinary, "Ordinary endnote text")
+        .unwrap();
+    let policy = rdocx::NotePolicy {
+        format: rdocx::NoteNumberFormat::LowerRoman,
+        start: 1,
+        restart: rdocx::NoteRestart::Continuous,
+        placement: rdocx::NotePlacement::DocumentEnd,
+    };
+    document
+        .set_note_policy(rdocx::NoteFamily::Endnote, policy)
+        .unwrap();
+    document
+        .section_mut(0)
+        .unwrap()
+        .set_note_policy(rdocx::NoteFamily::Endnote, policy)
+        .unwrap();
+    let pdf = document.to_pdf_deterministic().unwrap();
+    let path = std::env::temp_dir().join(format!("f274-custom-end-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Custom endnote†"), "{text}");
+    assert!(text.contains("Ordinary endnotei"), "{text}");
+    assert!(text.contains("Custom endnote text"), "{text}");
+    assert!(text.contains("Ordinary endnote text"), "{text}");
+    if std::env::var_os("F274_ORACLE_DUMP").is_some() {
+        document
+            .save("/private/tmp/f274-custom-endnote-oracle.docx")
+            .unwrap();
+    }
+}
+
+#[test]
+fn removing_note_policy_keeps_special_record_selection() {
+    let mut document = Document::new();
+    document.add_paragraph("Body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document.create_footnote(&location, "Note").unwrap();
+    let mut separator = rdocx_oxml::text::CT_P::new();
+    separator.add_run("Retained separator");
+    let id = document
+        .set_note_special_record(
+            rdocx::NoteFamily::Footnote,
+            rdocx::NoteSpecialRecord::Separator,
+            vec![separator],
+        )
+        .unwrap();
+    document
+        .set_note_policy(
+            rdocx::NoteFamily::Footnote,
+            rdocx::NotePolicy {
+                format: rdocx::NoteNumberFormat::UpperLetter,
+                start: 2,
+                restart: rdocx::NoteRestart::Continuous,
+                placement: rdocx::NotePlacement::PageBottom,
+            },
+        )
+        .unwrap();
+    document
+        .remove_note_policy(rdocx::NoteFamily::Footnote)
+        .unwrap();
+    assert!(
+        document
+            .remove_note_policy(rdocx::NoteFamily::Footnote)
+            .unwrap()
+            .is_none()
+    );
+    let properties = document
+        .note_properties(rdocx::NoteFamily::Footnote)
+        .unwrap();
+    assert_eq!(properties.special_references, vec![id]);
+    assert_eq!(properties.num_fmt, None);
+    let layout = document.layout_deterministic().unwrap();
+    let mut found = false;
+    oxml_layout::walk(&layout.layout.pages[0].elements, &mut |element, _| {
+        if let oxml_layout::PositionedElement::Text(run) = element
+            && run.text.contains("Retained")
+        {
+            found = true;
+        }
+    });
+    assert!(found);
+}
+
+#[test]
+fn special_records_require_selected_ids() {
+    let mut document = Document::new();
+    document.add_paragraph("Body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document.create_footnote(&location, "Note").unwrap();
+    let mut separator = rdocx_oxml::text::CT_P::new();
+    separator.add_run("Selected separator");
+    document
+        .set_note_special_record(
+            rdocx::NoteFamily::Footnote,
+            rdocx::NoteSpecialRecord::Separator,
+            vec![separator],
+        )
+        .unwrap();
+    let bytes = document.to_bytes().unwrap();
+    let mut package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let notes =
+        String::from_utf8(package.get_part("/word/footnotes.xml").unwrap().to_vec()).unwrap();
+    package.set_part(
+        "/word/footnotes.xml",
+        notes.replace(r#"w:id="-1""#, r#"w:id="77""#).into_bytes(),
+    );
+    let settings =
+        String::from_utf8(package.get_part("/word/settings.xml").unwrap().to_vec()).unwrap();
+    package.set_part(
+        "/word/settings.xml",
+        settings
+            .replace(r#"<w:footnote w:id="-1"/>"#, "")
+            .into_bytes(),
+    );
+    let mut output = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut output).unwrap();
+    let reopened = Document::from_bytes(output.get_ref()).unwrap();
+    let layout = reopened.layout_deterministic().unwrap();
+    let mut found = false;
+    oxml_layout::walk(&layout.layout.pages[0].elements, &mut |element, _| {
+        if let oxml_layout::PositionedElement::Text(run) = element
+            && run.text.contains("Selected")
+        {
+            found = true;
+        }
+    });
+    assert!(!found);
+}
+
+#[test]
+fn carried_endnote_uses_authored_continuation_content() {
+    let mut document = Document::new();
+    document.add_paragraph("Body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_endnote(&location, &"Endnote carry ".repeat(1500))
+        .unwrap();
+    for (record, text) in [
+        (
+            rdocx::NoteSpecialRecord::ContinuationSeparator,
+            "Endnote continued separator",
+        ),
+        (
+            rdocx::NoteSpecialRecord::ContinuationNotice,
+            "Endnote continued notice",
+        ),
+    ] {
+        let mut paragraph = rdocx_oxml::text::CT_P::new();
+        paragraph.add_run(text);
+        document
+            .set_note_special_record(rdocx::NoteFamily::Endnote, record, vec![paragraph])
+            .unwrap();
+    }
+    let layout = document.layout_deterministic().unwrap();
+    assert!(layout.layout.pages.len() > 1);
+    let mut text = String::new();
+    for page in &layout.layout.pages {
+        oxml_layout::walk(&page.elements, &mut |element, _| {
+            if let oxml_layout::PositionedElement::Text(run) = element {
+                text.push_str(&run.text);
+            }
+        });
+    }
+    assert!(text.contains("Endnote continued separator"), "{text}");
+    assert!(text.contains("Endnote continued notice"), "{text}");
+}
+
+#[test]
+fn oversized_endnote_continuation_separator_does_not_stall_flow() {
+    let mut document = Document::new();
+    document.add_paragraph("Body");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .create_endnote(&location, &"Endnote carry ".repeat(1600))
+        .unwrap();
+    let mut separator = rdocx_oxml::text::CT_P::new();
+    separator.add_run(&"Oversized separator ".repeat(100));
+    document
+        .set_note_special_record(
+            rdocx::NoteFamily::Endnote,
+            rdocx::NoteSpecialRecord::ContinuationSeparator,
+            vec![separator],
+        )
+        .unwrap();
+    let mut notice = rdocx_oxml::text::CT_P::new();
+    notice.add_run("A continuation notice must also fit");
+    document
+        .set_note_special_record(
+            rdocx::NoteFamily::Endnote,
+            rdocx::NoteSpecialRecord::ContinuationNotice,
+            vec![notice],
+        )
+        .unwrap();
+    let layout = document.layout_deterministic().unwrap();
+    assert!(layout.layout.pages.len() > 1);
+    assert!(layout.layout.pages.len() < 12);
+}
+
+#[test]
+fn cross_story_ranges_reopen_with_exact_endpoints() {
+    let mut document = container_neutral_story_fixture();
+    for kind in [
+        StoryKind::Body,
+        StoryKind::TableCell,
+        StoryKind::TextBox,
+        StoryKind::Header,
+        StoryKind::Footer,
+        StoryKind::Footnote,
+        StoryKind::Endnote,
+        StoryKind::Comment,
+    ] {
+        let range_for = |document: &Document| {
+            let story = document
+                .stories()
+                .unwrap()
+                .into_iter()
+                .find(|story| story.kind() == kind)
+                .unwrap();
+            let location = document
+                .story_items(&story)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind() == StoryItemKind::Paragraph)
+                .unwrap()
+                .location()
+                .clone();
+            rdocx::StoryRunRange {
+                start: rdocx::StoryRunPosition {
+                    location: location.clone(),
+                    run_index: 0,
+                },
+                end: rdocx::StoryRunPosition {
+                    location,
+                    run_index: 1,
+                },
+            }
+        };
+        let name = format!("F275{kind:?}");
+        let id = document
+            .add_story_bookmark(&name, range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(
+            document.story_ranges().unwrap().iter().any(|entry| {
+                entry.bookmark_id() == Some(id)
+                    && entry.range().start.run_index == 0
+                    && entry.range().end.run_index == 1
+                    && entry.range().start.location.story().kind() == kind
+            }),
+            "{kind:?}"
+        );
+        let permission = document
+            .add_story_permission_range(Some("Ada"), None, range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(document.story_ranges().unwrap().iter().any(|entry| {
+            matches!(entry.kind(), rdocx::StoryRangeKind::Permission { id, editor: Some(editor), .. }
+                if *id == permission && editor == "Ada")
+                && entry.range().start.location.story().kind() == kind
+        }), "permission {kind:?}");
+        document
+            .add_story_proofing_range("spell", range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(document.story_ranges().unwrap().iter().any(|entry| {
+            matches!(entry.kind(), rdocx::StoryRangeKind::Proofing { kind: proof } if proof == "spell")
+                && entry.range().start.location.story().kind() == kind
+        }), "proofing {kind:?}");
+        let comment = document
+            .add_story_comment(range_for(&document), "Ada", None, "annotation")
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(
+            document.story_ranges().unwrap().iter().any(|entry| {
+                matches!(entry.kind(), rdocx::StoryRangeKind::Comment { id } if *id == comment)
+                    && entry.range().start.location.story().kind() == kind
+            }),
+            "comment {kind:?}"
+        );
+    }
+    let nested = document.paragraph_story_location(2).unwrap().unwrap();
+    assert_eq!(nested.index_path().len(), 2);
+    let nested_range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: nested.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location: nested,
+            run_index: 1,
+        },
+    };
+    let nested_id = document
+        .add_story_bookmark("F275BlockControl", nested_range)
+        .unwrap();
+    document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert!(document.story_ranges().unwrap().iter().any(|entry| {
+        entry.bookmark_id() == Some(nested_id)
+            && entry.range().start.location.index_path().len() == 2
+    }));
+    for family in ["permission", "proofing", "comment"] {
+        let nested = document.paragraph_story_location(2).unwrap().unwrap();
+        let range = rdocx::StoryRunRange {
+            start: rdocx::StoryRunPosition {
+                location: nested.clone(),
+                run_index: 0,
+            },
+            end: rdocx::StoryRunPosition {
+                location: nested,
+                run_index: 1,
+            },
+        };
+        match family {
+            "permission" => {
+                document
+                    .add_story_permission_range(None, Some("everyone"), range)
+                    .unwrap();
+            }
+            "proofing" => document.add_story_proofing_range("gram", range).unwrap(),
+            "comment" => {
+                document
+                    .add_story_comment(range, "Ada", None, "nested annotation")
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    }
+    assert_eq!(
+        document
+            .story_ranges()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.range().start.location.index_path().len() == 2)
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn related_story_block_controls_reopen_with_all_range_families() {
+    let mut seed = container_neutral_story_fixture();
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    for (part, old, replacement) in [
+        (
+            "/word/document.xml",
+            "<w:p><w:r><w:t>cell</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>cell control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+        (
+            "/word/document.xml",
+            "<w:p><w:r><w:t>text box</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>text box control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+        (
+            "/word/header-story.xml",
+            "<a:p><a:r><a:t>header</a:t></a:r></a:p>",
+            "<a:sdt><a:sdtContent><a:p><a:r><a:t>header control</a:t></a:r></a:p></a:sdtContent></a:sdt>",
+        ),
+        (
+            "/word/footer-story.xml",
+            "<w:p><w:r><w:t>footer</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>footer control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+        (
+            "/word/footnotes-story.xml",
+            "<w:p><w:r><w:t>footnote</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>footnote control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+        (
+            "/word/endnotes-story.xml",
+            "<w:p><w:r><w:t>endnote</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>endnote control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+        (
+            "/word/comments-story.xml",
+            "<w:p><w:r><w:t>comment</w:t></w:r></w:p>",
+            "<w:sdt><w:sdtContent><w:p><w:r><w:t>comment control</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        ),
+    ] {
+        let xml = std::str::from_utf8(package.get_part(part).unwrap()).unwrap();
+        assert!(xml.contains(old), "{part}");
+        package.set_part(part, xml.replacen(old, replacement, 1).into_bytes());
+    }
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    for kind in [
+        StoryKind::TableCell,
+        StoryKind::TextBox,
+        StoryKind::Header,
+        StoryKind::Footer,
+        StoryKind::Footnote,
+        StoryKind::Endnote,
+        StoryKind::Comment,
+    ] {
+        let range_for = |document: &Document| {
+            let story = document
+                .stories()
+                .unwrap()
+                .into_iter()
+                .find(|story| story.kind() == kind)
+                .unwrap();
+            let control = document
+                .story_items(&story)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind() == StoryItemKind::ContentControl)
+                .unwrap();
+            let location = rdocx::ContentLocation::new(
+                story,
+                StoryItemKind::Paragraph,
+                vec![control.location().index_path()[0], 0],
+            );
+            rdocx::StoryRunRange {
+                start: rdocx::StoryRunPosition {
+                    location: location.clone(),
+                    run_index: 0,
+                },
+                end: rdocx::StoryRunPosition {
+                    location,
+                    run_index: 1,
+                },
+            }
+        };
+        let bookmark = document
+            .add_story_bookmark(&format!("Nested{kind:?}"), range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(
+            document
+                .story_ranges()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.bookmark_id() == Some(bookmark)
+                    && entry.range().start.location.story().kind() == kind
+                    && entry.range().start.location.index_path().len() == 2)
+        );
+        let permission = document
+            .add_story_permission_range(Some("Ada"), None, range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(document.story_ranges().unwrap().iter().any(|entry| matches!(entry.kind(), rdocx::StoryRangeKind::Permission { id, .. } if *id == permission) && entry.range().start.location.story().kind() == kind && entry.range().end.location.index_path().len() == 2));
+        document
+            .add_story_proofing_range("spell", range_for(&document))
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(
+            document
+                .story_ranges()
+                .unwrap()
+                .iter()
+                .any(
+                    |entry| matches!(entry.kind(), rdocx::StoryRangeKind::Proofing { .. })
+                        && entry.range().start.location.story().kind() == kind
+                        && entry.range().end.location.index_path().len() == 2
+                )
+        );
+        let comment = document
+            .add_story_comment(range_for(&document), "Ada", None, "nested annotation")
+            .unwrap();
+        document = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert!(document.story_ranges().unwrap().iter().any(
+            |entry| matches!(entry.kind(), rdocx::StoryRangeKind::Comment { id } if *id == comment)
+                && entry.range().start.location.story().kind() == kind
+                && entry.range().end.location.index_path().len() == 2
+        ));
+    }
+}
+
+#[test]
+fn nested_control_ranges_follow_physical_order_not_item_index_order() {
+    let mut seed = container_neutral_story_fixture();
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    let header = std::str::from_utf8(package.get_part("/word/header-story.xml").unwrap()).unwrap();
+    let header = header.replacen(
+        "<a:p><a:r><a:t>header</a:t></a:r></a:p>",
+        "<a:sdt><a:sdtContent><a:sdt><a:sdtContent><a:p><a:r><a:t>inner</a:t></a:r></a:p></a:sdtContent></a:sdt><a:p><a:r><a:t>outer</a:t></a:r></a:p></a:sdtContent></a:sdt>",
+        1,
+    );
+    package.set_part("/word/header-story.xml", header.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    let header_story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Header)
+        .unwrap();
+    let controls = document
+        .story_items(&header_story)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind() == StoryItemKind::ContentControl)
+        .map(|item| item.location().index_path()[0])
+        .collect::<Vec<_>>();
+    assert_eq!(controls.len(), 2);
+    let inner = rdocx::ContentLocation::new(
+        header_story.clone(),
+        StoryItemKind::Paragraph,
+        vec![controls[1], 0],
+    );
+    let outer =
+        rdocx::ContentLocation::new(header_story, StoryItemKind::Paragraph, vec![controls[0], 0]);
+    assert!(inner.index_path() > outer.index_path());
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: inner,
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location: outer,
+            run_index: 1,
+        },
+    };
+    let id = document.add_story_bookmark("PhysicalOrder", range).unwrap();
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    let pair = reopened
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.bookmark_id() == Some(id))
+        .unwrap();
+    assert!(pair.range().start.location.index_path() > pair.range().end.location.index_path());
+}
+
+#[test]
+fn nested_body_controls_accept_physical_story_range_endpoints() {
+    let mut seed = container_neutral_story_fixture();
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let body = body.replacen(
+        "<w:p><w:r><w:t>body</w:t></w:r></w:p>",
+        "<w:sdt><w:sdtContent><w:sdt><w:sdtContent><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>outer</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        1,
+    );
+    package.set_part("/word/document.xml", body.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    let body_story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Body)
+        .unwrap();
+    let controls = document
+        .story_items(&body_story)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind() == StoryItemKind::ContentControl)
+        .map(|item| item.location().index_path()[0])
+        .collect::<Vec<_>>();
+    assert!(controls.len() >= 2);
+    let inner = rdocx::ContentLocation::new(
+        body_story.clone(),
+        StoryItemKind::Paragraph,
+        vec![controls[1], 0],
+    );
+    let outer =
+        rdocx::ContentLocation::new(body_story, StoryItemKind::Paragraph, vec![controls[0], 0]);
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: inner,
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location: outer,
+            run_index: 1,
+        },
+    };
+    let id = document.add_story_bookmark("BodyNested", range).unwrap();
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    let pair = reopened
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.bookmark_id() == Some(id))
+        .unwrap();
+    assert!(pair.range().start.location.index_path() > pair.range().end.location.index_path());
+    assert_eq!(pair.range().start.run_index, 0);
+    assert_eq!(pair.range().end.run_index, 1);
+}
+
+#[test]
+fn story_marker_allocation_is_family_aware() {
+    let mut document = Document::new();
+    document.add_paragraph("alpha");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    let bookmark = document.add_story_bookmark("Bookmark", range).unwrap();
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    let permission = document
+        .add_story_permission_range(Some("editor"), None, range)
+        .unwrap();
+    assert_eq!(bookmark, permission);
+}
+
+#[test]
+fn paired_marker_mutation_preserves_unknown_siblings() {
+    let mut document = Document::new();
+    document.add_paragraph("alpha");
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    let id = document.add_story_bookmark("Anchor", range).unwrap();
+    assert!(document.remove_story_bookmark(id).unwrap());
+    assert!(document.story_ranges().unwrap().is_empty());
+
+    let mut seed = container_neutral_story_fixture();
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    let header = std::str::from_utf8(package.get_part("/word/header-story.xml").unwrap()).unwrap();
+    let header = header
+        .replacen(
+            "<a:p><a:r>",
+            "<a:p><a:bookmarkStart a:id=\"77\" a:name=\"Alias\"/><x:slot x:flag=\"exact\"/><a:r>",
+            1,
+        )
+        .replacen(
+            "</a:r></a:p>",
+            "</a:r><a:bookmarkEnd a:id=\"77\"/></a:p>",
+            1,
+        );
+    package.set_part("/word/header-story.xml", header.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    assert!(document.story_ranges().unwrap().iter().any(|entry| {
+        matches!(entry.kind(), rdocx::StoryRangeKind::Bookmark { id: 77, name } if name == "Alias")
+    }));
+    let header = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Header)
+        .unwrap();
+    let location = document.story_items(&header).unwrap()[0].location().clone();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    document
+        .add_story_permission_range(Some("Ada"), None, range)
+        .unwrap();
+    let bytes = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let header = std::str::from_utf8(package.get_part("/word/header-story.xml").unwrap()).unwrap();
+    assert!(header.contains("<a:bookmarkStart a:id=\"77\" a:name=\"Alias\"/>"));
+    assert!(header.contains("<a:bookmarkEnd a:id=\"77\"/>"));
+    assert!(header.contains("<x:slot x:flag=\"exact\"/>"));
+}
+
+#[test]
+fn story_comment_endpoint_move_keeps_one_reference_and_its_definition() {
+    let mut document = container_neutral_story_fixture();
+    let body = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Body)
+        .unwrap();
+    let location = document
+        .story_items(&body)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind() == StoryItemKind::Paragraph)
+        .unwrap()
+        .location()
+        .clone();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    let id = document
+        .add_story_comment(range, "Ada", None, "moved comment")
+        .unwrap();
+    let selected = document
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| matches!(entry.kind(), rdocx::StoryRangeKind::Comment { id: found } if *found == id))
+        .unwrap();
+    let header = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Header)
+        .unwrap();
+    let location = document
+        .story_items(&header)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind() == StoryItemKind::Paragraph)
+        .unwrap()
+        .location()
+        .clone();
+    let target = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    document.move_story_range(&selected, target).unwrap();
+    assert!(
+        document
+            .move_story_range(&selected, selected.range().clone())
+            .is_err()
+    );
+    let before_stale_remove = document.to_bytes().unwrap();
+    assert!(!document.remove_story_range(&selected).unwrap());
+    assert_eq!(document.to_bytes().unwrap(), before_stale_remove);
+    let bytes = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let header = std::str::from_utf8(package.get_part("/word/header-story.xml").unwrap()).unwrap();
+    let comments =
+        std::str::from_utf8(package.get_part("/word/comments-story.xml").unwrap()).unwrap();
+    assert!(!body.contains(&format!("commentRangeStart w:id=\"{id}\"")));
+    assert!(body.contains("<x:keep x:flag=\"exact\"><x:child/></x:keep>"));
+    assert!(header.contains("<x:header x:flag=\"exact\"/>"));
+    assert!(header.contains(&format!("commentRangeStart w:id=\"{id}\"")));
+    assert_eq!(
+        body.matches(&format!("commentReference w:id=\"{id}\""))
+            .count(),
+        0
+    );
+    assert_eq!(
+        header
+            .matches(&format!("commentReference w:id=\"{id}\""))
+            .count(),
+        1
+    );
+    assert!(comments.contains("moved comment"));
+    let moved = document
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| matches!(entry.kind(), rdocx::StoryRangeKind::Comment { id: found } if *found == id))
+        .unwrap();
+    assert!(document.remove_story_range(&moved).unwrap());
+    let package =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let header = std::str::from_utf8(package.get_part("/word/header-story.xml").unwrap()).unwrap();
+    let comments =
+        std::str::from_utf8(package.get_part("/word/comments-story.xml").unwrap()).unwrap();
+    assert!(!header.contains(&format!("commentRangeStart w:id=\"{id}\"")));
+    assert!(!header.contains(&format!("commentRangeEnd w:id=\"{id}\"")));
+    assert_eq!(
+        header
+            .matches(&format!("commentReference w:id=\"{id}\""))
+            .count(),
+        1
+    );
+    assert!(comments.contains("moved comment"));
+}
+
+#[test]
+fn proofing_ranges_without_ids_remove_only_the_selected_pair() {
+    let mut document = Document::new();
+    document.add_paragraph("first");
+    document.add_paragraph("second");
+    for index in 0..2 {
+        let location = document.paragraph_story_location(index).unwrap().unwrap();
+        let range = rdocx::StoryRunRange {
+            start: rdocx::StoryRunPosition {
+                location: location.clone(),
+                run_index: 0,
+            },
+            end: rdocx::StoryRunPosition {
+                location,
+                run_index: 1,
+            },
+        };
+        document.add_story_proofing_range("spell", range).unwrap();
+    }
+    let selected = document
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(entry.kind(), rdocx::StoryRangeKind::Proofing { kind } if kind == "spell")
+                && entry.range().start.location.index_path() == [1]
+        })
+        .unwrap();
+    assert!(document.remove_story_range(&selected).unwrap());
+    let remaining = document.story_ranges().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].range().start.location.index_path(), [0]);
+}
+
+#[test]
+fn hidden_markers_do_not_shift_checked_removal_ordinals() {
+    let mut seed = Document::new();
+    seed.add_paragraph("visible");
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let body = body.replacen(
+        "<w:p><w:r>",
+        "<w:p><w:del><w:bookmarkStart w:id=\"80\" w:name=\"Hidden\"/></w:del><w:r>",
+        1,
+    );
+    package.set_part("/word/document.xml", body.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    let id = document.add_story_bookmark("Visible", range).unwrap();
+    let selected = document
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.bookmark_id() == Some(id))
+        .unwrap();
+    assert!(document.remove_story_range(&selected).unwrap());
+    let bytes = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert!(body.contains("Hidden"));
+    assert!(!body.contains("Visible"));
+}
+
+#[test]
+fn crossing_story_markers_reject_addition_without_partial_edit() {
+    let mut seed = Document::new();
+    seed.add_paragraph("text");
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(seed.to_bytes().unwrap())).unwrap();
+    let body = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let body = body.replacen(
+        "<w:p><w:r>",
+        "<w:p><w:bookmarkStart w:id=\"17\" w:name=\"Outer\"/><w:permStart w:id=\"17\" w:ed=\"Ada\"/><w:r>",
+        1,
+    ).replacen(
+        "</w:r></w:p>",
+        "</w:r><w:bookmarkEnd w:id=\"17\"/><w:permEnd w:id=\"17\"/></w:p>",
+        1,
+    );
+    package.set_part("/word/document.xml", body.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    let before = document.to_bytes().unwrap();
+    let location = document.paragraph_story_location(0).unwrap().unwrap();
+    let range = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location,
+            run_index: 1,
+        },
+    };
+    assert!(document.add_story_bookmark("Another", range).is_err());
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn invalid_story_range_moves_are_atomic() {
+    let mut document = container_neutral_story_fixture();
+    let body = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Body)
+        .unwrap();
+    let body_location = document.story_items(&body).unwrap()[0].location().clone();
+    let original = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: body_location.clone(),
+            run_index: 0,
+        },
+        end: rdocx::StoryRunPosition {
+            location: body_location,
+            run_index: 1,
+        },
+    };
+    let id = document.add_story_bookmark("Atomic", original).unwrap();
+    let selected = document
+        .story_ranges()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.bookmark_id() == Some(id))
+        .unwrap();
+    let header = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == StoryKind::Header)
+        .unwrap();
+    let header_location = document.story_items(&header).unwrap()[0].location().clone();
+    let invalid = rdocx::StoryRunRange {
+        start: selected.range().start.clone(),
+        end: rdocx::StoryRunPosition {
+            location: header_location,
+            run_index: 1,
+        },
+    };
+    let before = document.to_bytes().unwrap();
+    assert!(document.move_story_range(&selected, invalid).is_err());
+    assert_eq!(document.to_bytes().unwrap(), before);
+    let reversed = rdocx::StoryRunRange {
+        start: rdocx::StoryRunPosition {
+            location: selected.range().start.location.clone(),
+            run_index: 1,
+        },
+        end: rdocx::StoryRunPosition {
+            location: selected.range().end.location.clone(),
+            run_index: 0,
+        },
+    };
+    assert!(document.move_story_range(&selected, reversed).is_err());
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn issue_282_row_removal_does_not_orphan_comment_definitions() {
+    let mut document = Document::new();
+    document
+        .add_table(2, 1)
+        .cell(0, 0)
+        .unwrap()
+        .set_text("anchor");
+    let story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == rdocx::StoryKind::TableCell)
+        .unwrap();
+    let location = document.story_items(&story).unwrap()[0].location().clone();
+    document
+        .add_story_comment(
+            rdocx::StoryRunRange {
+                start: rdocx::StoryRunPosition {
+                    location: location.clone(),
+                    run_index: 0,
+                },
+                end: rdocx::StoryRunPosition {
+                    location,
+                    run_index: 1,
+                },
+            },
+            "Ada",
+            None,
+            "root",
+        )
+        .unwrap();
+    assert!(document.remove_table_row(0, 0).unwrap());
+    assert!(
+        Document::from_bytes(&document.to_bytes().unwrap())
+            .unwrap()
+            .comments()
+            .is_empty()
+    );
+}
+
+#[test]
+fn issue_282_pop_refuses_a_complete_commented_fragment() {
+    let mut document = Document::new();
+    document.add_paragraph("anchor");
+    document
+        .add_comment(
+            rdocx::RunRange {
+                start: rdocx::RunPosition {
+                    body_index: 0,
+                    run_index: 0,
+                },
+                end: rdocx::RunPosition {
+                    body_index: 0,
+                    run_index: 1,
+                },
+            },
+            "Ada",
+            None,
+            "root",
+        )
+        .unwrap();
+    let story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == rdocx::StoryKind::Body)
+        .unwrap();
+    let location = document.story_items(&story).unwrap()[0].location().clone();
+    let before = document.to_bytes().unwrap();
+    assert!(document.remove_content_at(&location).is_err());
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn issue_282_cell_text_keeps_the_comment_reference() {
+    let mut document = Document::new();
+    document
+        .add_table(1, 1)
+        .cell(0, 0)
+        .unwrap()
+        .set_text("anchor");
+    let story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|story| story.kind() == rdocx::StoryKind::TableCell)
+        .unwrap();
+    let location = document.story_items(&story).unwrap()[0].location().clone();
+    document
+        .add_story_comment(
+            rdocx::StoryRunRange {
+                start: rdocx::StoryRunPosition {
+                    location: location.clone(),
+                    run_index: 0,
+                },
+                end: rdocx::StoryRunPosition {
+                    location,
+                    run_index: 1,
+                },
+            },
+            "Ada",
+            None,
+            "root",
+        )
+        .unwrap();
+    document
+        .table_mut(0)
+        .unwrap()
+        .cell(0, 0)
+        .unwrap()
+        .set_text("updated");
+    let package =
+        oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap()))
+            .unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert_eq!(xml.matches("<w:commentReference ").count(), 1, "{xml}");
+}
+
+#[test]
+fn issue_282_rtf_cell_import_keeps_empty_and_formatted_paragraphs() {
+    for (content, expected) in [
+        ("", vec![""]),
+        ("ordinary", vec!["ordinary"]),
+        (r"{\b first}\par {\i second}", vec!["first", "second"]),
+    ] {
+        let input = format!(r"{{\rtf1\ansi\trowd\cellx2000\intbl {content}\cell\row}}");
+        let mut document = Document::from_rtf_bytes(input.as_bytes()).unwrap().document;
+        let table = document.table(0).unwrap();
+        let cell = table.cell(0, 0).unwrap();
+        assert_eq!(
+            cell.paragraphs().map(|p| p.text()).collect::<Vec<_>>(),
+            expected
+        );
+        let before = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&before).unwrap();
+        assert_eq!(
+            reopened
+                .table(0)
+                .unwrap()
+                .cell(0, 0)
+                .unwrap()
+                .paragraph_count(),
+            expected.len()
+        );
+        if expected.len() == 2 {
+            let rtf = rtf_text(document.to_rtf_bytes().unwrap().bytes);
+            assert!(rtf.contains("\\b "), "{rtf}");
+            assert!(rtf.contains("\\i "), "{rtf}");
+        }
+    }
+}
+
+#[test]
+fn checked_table_indentation_accepts_signed_twips_and_removes_direct_indent() {
+    let mut document = Document::new();
+    document.add_table(1, 1);
+    let before = document.to_bytes().unwrap();
+    document
+        .table_mut(0)
+        .unwrap()
+        .set_indent_value(None)
+        .unwrap();
+    assert_eq!(document.to_bytes().unwrap(), before);
+    for emu in [-914_400, -636, -634, 0, 634, 636, 914_400] {
+        document
+            .table_mut(0)
+            .unwrap()
+            .set_indent_value(Some(Length::emu(emu)))
+            .unwrap();
+        let bytes = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            reopened.table(0).unwrap().indent().unwrap().to_emu(),
+            (emu / 635) * 635
+        );
+    }
+    document
+        .table_mut(0)
+        .unwrap()
+        .set_indent_value(None)
+        .unwrap();
+    assert!(document.table(0).unwrap().indent().is_none());
+    let bytes = document.to_bytes().unwrap();
+    assert!(
+        Document::from_bytes(&bytes)
+            .unwrap()
+            .table(0)
+            .unwrap()
+            .indent()
+            .is_none()
+    );
+    for emu in [
+        i64::MIN,
+        i64::MAX,
+        (i64::from(i32::MAX) + 1) * 635,
+        (i64::from(i32::MIN) - 1) * 635,
+    ] {
+        assert!(
+            document
+                .table_mut(0)
+                .unwrap()
+                .set_indent_value(Some(Length::emu(emu)))
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+    }
+    for twips in [i32::MIN, i32::MAX] {
+        document
+            .table_mut(0)
+            .unwrap()
+            .set_indent_checked(Length::twips(twips))
+            .unwrap();
+        assert_eq!(
+            document.table(0).unwrap().indent().unwrap().to_emu(),
+            i64::from(twips) * 635
+        );
+    }
+}
+
+#[test]
+fn fx200_checked_one_call_lists_validate_before_allocating_and_round_trip_all_levels() {
+    for numbered in [false, true] {
+        let mut document = Document::new();
+        let before = document.to_bytes().unwrap();
+        let invalid = if numbered {
+            document.try_add_numbered_list_item("bad", 9).map(|_| ())
+        } else {
+            document.try_add_bullet_list_item("bad", 9).map(|_| ())
+        };
+        assert!(invalid.is_err());
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let invalid = if numbered {
+            document
+                .try_add_numbered_list_item("bad\u{0}", 0)
+                .map(|_| ())
+        } else {
+            document.try_add_bullet_list_item("bad\u{0}", 0).map(|_| ())
+        };
+        assert!(invalid.is_err());
+        assert_eq!(document.to_bytes().unwrap(), before);
+        for level in 0..9 {
+            if numbered {
+                document.try_add_numbered_list_item("item", level).unwrap();
+            } else {
+                document.try_add_bullet_list_item("item", level).unwrap();
+            }
+        }
+        assert_eq!(document.paragraph_count(), 9);
+        let saved = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        assert_eq!(reopened.paragraph_count(), 9);
+        assert_eq!(reopened.numbering_definitions().len(), 1);
+        assert_eq!(reopened.numbering_instances().len(), 1);
+        reopened.validate_numbering_graph().unwrap();
+    }
+}
+
+#[test]
+fn fx202_picture_options_title_decorative_and_invalid_metadata_are_atomic() {
+    use rdocx::{Length, PictureOptions, StoryKind};
+    let mut document = Document::new();
+    document.add_paragraph("unrelated body");
+    let story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind() == StoryKind::Body)
+        .unwrap();
+    for invalid in ["bad\u{0}name", "bad\u{1}name"] {
+        let before = document.to_bytes().unwrap();
+        assert!(
+            document
+                .add_picture_with_options(
+                    &story,
+                    &mhtml_pixel_png(),
+                    "picture.png",
+                    PictureOptions {
+                        width: Length::pt(20.0),
+                        height: Length::pt(10.0),
+                        crop: None,
+                        anchor: None,
+                        name: Some("visible name".into()),
+                        description: Some("description".into()),
+                        title: Some(invalid.into()),
+                        decorative: true,
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+    }
+    document
+        .add_picture_with_options(
+            &story,
+            &mhtml_pixel_png(),
+            "picture.png",
+            PictureOptions {
+                width: Length::pt(20.0),
+                height: Length::pt(10.0),
+                crop: None,
+                anchor: None,
+                name: Some("visible name".into()),
+                description: Some("description & more".into()),
+                title: Some("title <literal>".into()),
+                decorative: true,
+            },
+        )
+        .unwrap();
+    let bytes = document.to_bytes().unwrap();
+    let package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(bytes.clone())).unwrap();
+    let parsed = rdocx_oxml::document::CT_Document::from_xml(
+        package.get_part("/word/document.xml").unwrap(),
+    )
+    .unwrap();
+    let inline = parsed
+        .body
+        .paragraphs()
+        .flat_map(|p| &p.runs)
+        .flat_map(|r| &r.content)
+        .find_map(|content| match content {
+            rdocx_oxml::text::RunContent::Drawing(drawing) => drawing.inline.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(inline.name.as_deref(), Some("visible name"));
+    assert_eq!(inline.description.as_deref(), Some("description & more"));
+    assert_eq!(inline.title.as_deref(), Some("title <literal>"));
+    assert!(inline.decorative);
+    let mut reopened = Document::from_bytes(&bytes).unwrap();
+    assert_eq!(reopened.to_bytes().unwrap(), bytes);
+    assert_eq!(reopened.paragraphs()[0].text(), "unrelated body");
+}
+
+#[test]
+fn fx202_physical_pictures_resize_one_shared_media_and_reject_changed_source() {
+    use rdocx::{Length, PictureOptions, StoryKind};
+    let mut document = Document::new();
+    document.add_paragraph("outside");
+    let story = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind() == StoryKind::Body)
+        .unwrap();
+    document
+        .add_picture_with_options(
+            &story,
+            &mhtml_pixel_png(),
+            "one.png",
+            PictureOptions {
+                width: Length::pt(20.0),
+                height: Length::pt(10.0),
+                crop: None,
+                anchor: None,
+                name: Some("first".into()),
+                description: Some("description".into()),
+                title: Some("title".into()),
+                decorative: true,
+            },
+        )
+        .unwrap();
+    // Add a second physical drawing of the same media through the legacy
+    // relationship-wide native authoring route.
+    document.add_picture(
+        &mhtml_pixel_png(),
+        "two.png",
+        Length::pt(20.0),
+        Length::pt(10.0),
+    );
+    let initial = document.pictures().unwrap();
+    assert_eq!(initial.len(), 2);
+    // Pin one shared relationship independently of media import allocation.
+    if initial[0].relationship_id != initial[1].relationship_id {
+        let mut package =
+            oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap()))
+                .unwrap();
+        let source = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+        let old = format!("r:embed=\"{}\"", initial[1].relationship_id);
+        assert_eq!(source.matches(&old).count(), 1);
+        let updated = source.replace(&old, &format!("r:embed=\"{}\"", initial[0].relationship_id));
+        package.set_part("/word/document.xml", updated.into_bytes());
+        let mut archive = std::io::Cursor::new(Vec::new());
+        package.write_to(&mut archive).unwrap();
+        document = Document::from_bytes(&archive.into_inner()).unwrap();
+    }
+    let pictures = document.pictures().unwrap();
+    assert_eq!(pictures.len(), 2);
+    assert_eq!(pictures[0].relationship_id, pictures[1].relationship_id);
+    assert_eq!(pictures[0].name.as_deref(), Some("first"));
+    assert_eq!(pictures[0].title.as_deref(), Some("title"));
+    assert!(pictures[0].decorative);
+    assert_eq!(pictures[0].bytes, mhtml_pixel_png());
+    assert_eq!(pictures[0].content_type, "image/png");
+    assert_ne!(pictures[0].location, pictures[1].location);
+    let before = document.to_bytes().unwrap();
+    assert!(
+        document
+            .set_picture_size_at(&pictures[0], Length::emu(0), Length::pt(30.0))
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    document
+        .set_picture_size_at(&pictures[0], Length::pt(40.0), Length::pt(30.0))
+        .unwrap();
+    let resized = document.pictures().unwrap();
+    assert_eq!(
+        (resized[0].width, resized[0].height),
+        (Length::pt(40.0).to_emu(), Length::pt(30.0).to_emu())
+    );
+    assert_eq!(
+        (resized[1].width, resized[1].height),
+        (pictures[1].width, pictures[1].height)
+    );
+    assert_eq!(resized[1].bytes, pictures[1].bytes);
+    assert_eq!(resized[0].title, pictures[0].title);
+    let changed = document.to_bytes().unwrap();
+    assert!(
+        document
+            .set_picture_size_at(&pictures[0], Length::pt(50.0), Length::pt(30.0))
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), changed);
+    let reopened = Document::from_bytes(&changed).unwrap();
+    assert_eq!(reopened.pictures().unwrap(), resized);
+    assert_eq!(reopened.paragraphs()[0].text(), "outside");
+}
+
+#[test]
+fn fx202_internal_heading_links_stage_bookmarks_and_refuse_invalid_targets() {
+    let mut document = Document::new();
+    document.add_paragraph("Target").set_style("Heading1");
+    document.add_paragraph("See ");
+    let heading = document.paragraph_story_location(0).unwrap().unwrap();
+    let source = document.paragraph_story_location(1).unwrap().unwrap();
+    let before = document.to_bytes().unwrap();
+    assert!(
+        document
+            .add_internal_hyperlink_at(&source, "missing", "Unknown", None)
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    let inserted = document
+        .add_heading_hyperlink_at(&source, &heading, "target", Some("owned tip"))
+        .unwrap();
+    assert_eq!(inserted.run_index, 1);
+    let bookmarks = document.bookmarks();
+    assert_eq!(bookmarks.len(), 1);
+    assert_eq!(bookmarks[0].name(), Some("Heading_1"));
+    let name = bookmarks[0].name().unwrap().to_owned();
+    let source = document.paragraph_story_location(1).unwrap().unwrap();
+    let heading = document.paragraph_story_location(0).unwrap().unwrap();
+    document
+        .add_heading_hyperlink_at(&source, &heading, "again", None)
+        .unwrap();
+    assert_eq!(document.bookmarks().len(), 1);
+    let source = document.paragraph_story_location(1).unwrap().unwrap();
+    document
+        .add_internal_hyperlink_at(&source, "anchor", &name, Some("second tip"))
+        .unwrap();
+    let bytes = document.to_bytes().unwrap();
+    let package = oxml_opc::OpcPackage::from_reader(std::io::Cursor::new(bytes.clone())).unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert_eq!(xml.matches("w:anchor=\"Heading_1\"").count(), 3);
+    assert!(xml.contains("owned tip") && xml.contains("second tip"));
+    assert!(
+        !package
+            .get_part_rels("/word/document.xml")
+            .unwrap()
+            .items
+            .iter()
+            .any(|rel| rel.rel_type
+                == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink")
+    );
+    let reopened = Document::from_bytes(&bytes).unwrap();
+    assert_eq!(reopened.paragraphs()[0].text(), "Target");
+    assert_eq!(reopened.paragraphs()[1].text(), "See targetagainanchor");
+    let before = document.to_bytes().unwrap();
+    let source = document.paragraph_story_location(1).unwrap().unwrap();
+    let heading = document.paragraph_story_location(0).unwrap().unwrap();
+    assert!(
+        document
+            .add_heading_hyperlink_at(&source, &heading, "bad\u{0}", None)
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn fx202_configured_run_pictures_keep_related_owner_options_and_atomicity() {
+    use rdocx::{Length, PictureCrop, PictureOptions, StoryKind, StoryRunPosition};
+    let mut document = container_neutral_story_fixture();
+    for kind in [
+        StoryKind::Body,
+        StoryKind::Header,
+        StoryKind::TableCell,
+        StoryKind::TextBox,
+    ] {
+        let story = document
+            .stories()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind() == kind)
+            .unwrap();
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.location().story() == &story
+                    && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+            })
+            .unwrap()
+            .location()
+            .clone();
+        let position = StoryRunPosition {
+            location,
+            run_index: 1,
+        };
+        let original_text = document
+            .read_story_paragraph(&position.location, |p| p.text())
+            .unwrap();
+        let options = PictureOptions {
+            width: Length::pt(20.0),
+            height: Length::pt(10.0),
+            crop: Some(PictureCrop {
+                left: 10000,
+                top: 0,
+                right: 5000,
+                bottom: 0,
+            }),
+            anchor: None,
+            name: Some("actual owner".into()),
+            description: Some("rich image".into()),
+            title: Some("owned title".into()),
+            decorative: true,
+        };
+        let before = document.to_bytes().unwrap();
+        assert!(
+            document
+                .insert_picture_with_options_at(
+                    &position,
+                    b"not an image",
+                    "bad.png",
+                    Some(Length::pt(20.0)),
+                    Some(Length::pt(10.0)),
+                    Some(options.clone())
+                )
+                .is_err()
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let picture = document
+            .insert_picture_with_options_at(
+                &position,
+                &mhtml_pixel_png(),
+                "actual.png",
+                Some(Length::pt(20.0)),
+                Some(Length::pt(10.0)),
+                Some(options),
+            )
+            .unwrap();
+        assert_eq!(picture.location.story().kind(), kind);
+        assert_eq!(picture.title.as_deref(), Some("owned title"));
+        assert!(picture.decorative);
+        assert_eq!(picture.bytes, mhtml_pixel_png());
+        let package =
+            OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+        let rel = package
+            .get_part_rels(picture.location.story().part_name())
+            .unwrap()
+            .items
+            .iter()
+            .find(|r| r.id == picture.relationship_id)
+            .unwrap();
+        assert_eq!(rel.rel_type, rel_types::IMAGE);
+        let fresh = document
+            .pictures()
+            .unwrap()
+            .into_iter()
+            .find(|p| p == &picture)
+            .unwrap();
+        assert_eq!(
+            document
+                .read_story_paragraph(&fresh.location, |p| p.text())
+                .unwrap(),
+            original_text
+        );
+        document
+            .set_picture_size_at(&fresh, Length::pt(30.0), Length::pt(15.0))
+            .unwrap();
+        let resized = document
+            .pictures()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.location.story().kind() == kind)
+            .unwrap();
+        assert_eq!(resized.width, Length::pt(30.0).to_emu());
+        assert_eq!(resized.bytes, picture.bytes);
+        let saved = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        assert_eq!(reopened.pictures().unwrap(), document.pictures().unwrap());
+    }
+}
+
+#[test]
+fn fx202_anchored_picture_aliases_resize_only_owned_extents_and_keep_crop() {
+    use rdocx::{
+        DrawingHorizontalRelativeFrom, DrawingVerticalRelativeFrom, DrawingWrap, Length,
+        PictureAnchor, PictureCrop, PictureOptions, StoryKind,
+    };
+    let mut document = Document::new();
+    document.add_paragraph("anchor outside");
+    let body = document
+        .stories()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind() == StoryKind::Body)
+        .unwrap();
+    document
+        .add_picture_with_options(
+            &body,
+            &mhtml_pixel_png(),
+            "anchored.png",
+            PictureOptions {
+                width: Length::pt(40.0),
+                height: Length::pt(20.0),
+                crop: Some(PictureCrop {
+                    left: 10000,
+                    top: 0,
+                    right: 20000,
+                    bottom: 0,
+                }),
+                anchor: Some(PictureAnchor {
+                    horizontal_relative_from: DrawingHorizontalRelativeFrom::Margin,
+                    horizontal_offset: Length::pt(18.0),
+                    horizontal_alignment: None,
+                    vertical_relative_from: DrawingVerticalRelativeFrom::Paragraph,
+                    vertical_offset: Length::pt(6.0),
+                    vertical_alignment: None,
+                    wrap: DrawingWrap::Square,
+                    distance_top: Length::pt(2.0),
+                    distance_bottom: Length::pt(3.0),
+                    distance_left: Length::pt(4.0),
+                    distance_right: Length::pt(5.0),
+                    relative_height: 7,
+                    behind_text: false,
+                }),
+                name: Some("anchor".into()),
+                description: Some("alt".into()),
+                title: Some("title".into()),
+                decorative: true,
+            },
+        )
+        .unwrap();
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap())
+        .unwrap()
+        .replace("xmlns:wp=", "xmlns:q=")
+        .replace("wp:", "q:")
+        .replace(
+            "<q:docPr ",
+            "<q:docPr xmlns:z=\"urn:producer\" z:flag=\"exact\" ",
+        );
+    assert!(xml.contains("z:flag=\"exact\""));
+    package.set_part("/word/document.xml", xml.as_bytes().to_vec());
+    let mut archive = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut archive).unwrap();
+    let mut document = Document::from_bytes(&archive.into_inner()).unwrap();
+    let picture = document.pictures().unwrap().remove(0);
+    assert!(picture.anchored && picture.decorative);
+    assert_eq!(picture.title.as_deref(), Some("title"));
+    document
+        .set_picture_size_at(&picture, Length::pt(60.0), Length::pt(30.0))
+        .unwrap();
+    let saved = document.to_bytes().unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(saved.clone())).unwrap();
+    let after = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    for source in [
+        "z:flag=\"exact\"",
+        "l=\"10000\"",
+        "r=\"20000\"",
+        "relativeHeight=\"7\"",
+        "distT=\"25400\"",
+    ] {
+        assert!(xml.contains(source) && after.contains(source), "{source}");
+    }
+    assert!(after.contains("<q:extent"));
+    let resized = document.pictures().unwrap().remove(0);
+    assert_eq!(
+        (resized.width, resized.height),
+        (Length::pt(60.0).to_emu(), Length::pt(30.0).to_emu())
+    );
+    assert_eq!(resized.bytes, picture.bytes);
+    assert_eq!(
+        Document::from_bytes(&saved).unwrap().pictures().unwrap()[0],
+        resized
+    );
+}
+
+#[test]
+fn fx202_related_source_links_and_imported_invalid_names_are_checked_atomically() {
+    use rdocx::StoryKind;
+    let mut document = container_neutral_story_fixture();
+    document.paragraph_mut(0).unwrap().set_style("Heading1");
+    for kind in [
+        StoryKind::Header,
+        StoryKind::Footer,
+        StoryKind::TableCell,
+        StoryKind::TextBox,
+    ] {
+        let source = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.location().story().kind() == kind
+                    && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+            })
+            .unwrap()
+            .location()
+            .clone();
+        let heading = document.paragraph_story_location(0).unwrap().unwrap();
+        let result = document
+            .add_heading_hyperlink_at(&source, &heading, "linked", Some("related tip"))
+            .unwrap();
+        assert_eq!(result.location.story().kind(), kind);
+        assert_eq!(document.bookmarks().len(), 1);
+        let source = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.location().story().kind() == kind
+                    && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+            })
+            .unwrap()
+            .location()
+            .clone();
+        document
+            .add_internal_hyperlink_at(&source, "again", "Heading_1", None)
+            .unwrap();
+        let saved = document.to_bytes().unwrap();
+        let package = OpcPackage::from_reader(std::io::Cursor::new(saved.clone())).unwrap();
+        let owner =
+            std::str::from_utf8(package.get_part(source.story().part_name()).unwrap()).unwrap();
+        assert!(owner.contains("related tip"));
+        assert!(owner.contains("Heading_1"));
+        assert!(
+            !package
+                .get_part_rels(source.story().part_name())
+                .is_some_and(|rels| rels
+                    .items
+                    .iter()
+                    .any(|r| r.rel_type == rel_types::HYPERLINK))
+        );
+        let reopened = Document::from_bytes(&saved).unwrap();
+        assert_eq!(reopened.bookmarks().len(), 1);
+    }
+    let mut package =
+        OpcPackage::from_reader(std::io::Cursor::new(document.to_bytes().unwrap())).unwrap();
+    let source = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    assert_eq!(source.matches("w:name=\"Heading_1\"").count(), 1);
+    package.set_part(
+        "/word/document.xml",
+        source
+            .replace("w:name=\"Heading_1\"", "w:name=\"Bad Name\"")
+            .into_bytes(),
+    );
+    let mut archive = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut archive).unwrap();
+    let mut document = Document::from_bytes(&archive.into_inner()).unwrap();
+    let bookmark = &document.bookmarks()[0];
+    assert_eq!(bookmark.name(), Some("Bad Name"));
+    assert!(bookmark.issue().is_none() && bookmark.range().is_some());
+    let source = document
+        .story_item_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.location().story().kind() == StoryKind::Header
+                && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+        })
+        .unwrap()
+        .location()
+        .clone();
+    let before = document.to_bytes().unwrap();
+    let error = document
+        .add_internal_hyperlink_at(&source, "invalid", "Bad Name", None)
+        .unwrap_err();
+    assert!(error.to_string().contains("valid Word bookmark name"));
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn fx202_supported_heading_destinations_and_external_tooltips_are_atomic() {
+    use rdocx::StoryKind;
+    for kind in [StoryKind::Header, StoryKind::Footer, StoryKind::TableCell] {
+        let mut document = container_neutral_story_fixture();
+        let target = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.location().story().kind() == kind
+                    && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+            })
+            .unwrap()
+            .location()
+            .clone();
+        document
+            .edit_story_paragraph(&target, |p| {
+                p.set_style("Heading1");
+                Ok(())
+            })
+            .unwrap();
+        let target = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.location().story().kind() == kind
+                    && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+            })
+            .unwrap()
+            .location()
+            .clone();
+        let source = document.paragraph_story_location(0).unwrap().unwrap();
+        document
+            .add_heading_hyperlink_at(&source, &target, "target", Some("related destination"))
+            .unwrap();
+        let ranges = document.story_ranges().unwrap();
+        let bookmark = ranges.iter().find(|entry| matches!(entry.kind(), rdocx::StoryRangeKind::Bookmark { name, .. } if name == "Heading_1")).unwrap();
+        assert_eq!(bookmark.range().start.location.story().kind(), kind);
+        let target = bookmark.range().start.location.clone();
+        let source = document.paragraph_story_location(0).unwrap().unwrap();
+        document
+            .add_heading_hyperlink_at(&source, &target, "again", None)
+            .unwrap();
+        assert_eq!(
+            document
+                .story_ranges()
+                .unwrap()
+                .iter()
+                .filter(|entry| matches!(entry.kind(), rdocx::StoryRangeKind::Bookmark { .. }))
+                .count(),
+            1
+        );
+        let bytes = document.to_bytes().unwrap();
+        assert_eq!(
+            Document::from_bytes(&bytes)
+                .unwrap()
+                .story_ranges()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let mut document = container_neutral_story_fixture();
+    let location = document
+        .story_item_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.location().story().kind() == StoryKind::Header
+                && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+        })
+        .unwrap()
+        .location()
+        .clone();
+    let rel = document
+        .add_hyperlink_relationship_to_story(location.story(), "https://example.com/#fragment")
+        .unwrap();
+    let location = document
+        .story_item_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.location().story().kind() == StoryKind::Header
+                && item.location().item_kind() == rdocx::StoryItemKind::Paragraph
+        })
+        .unwrap()
+        .location()
+        .clone();
+    let before = document.to_bytes().unwrap();
+    assert!(
+        document
+            .edit_story_paragraph(&location, |p| {
+                p.add_hyperlink_with_tooltip("invalid", &rel, Some("invalid\u{0}"))?;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    document
+        .edit_story_paragraph(&location, |p| {
+            p.add_hyperlink_with_tooltip("valid", &rel, Some("valid & tooltip"))?;
+            Ok(())
+        })
+        .unwrap();
+    let bytes = document.to_bytes().unwrap();
+    let reopened = Document::from_bytes(&bytes).unwrap();
+    let package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let xml = std::str::from_utf8(package.get_part(location.story().part_name()).unwrap()).unwrap();
+    assert!(xml.contains("valid &amp; tooltip"));
+    assert!(
+        package
+            .get_part_rels(location.story().part_name())
+            .unwrap()
+            .items
+            .iter()
+            .any(|r| r.target == "https://example.com/#fragment")
+    );
+    assert!(
+        reopened
+            .story_item_snapshots()
+            .unwrap()
+            .iter()
+            .any(|item| item.location().story().kind() == StoryKind::Header
+                && item.text().is_some_and(|text| text.contains("valid")))
+    );
+}
+
+#[test]
+fn fx202_malformed_story_picture_bytes_refuse_before_allocation() {
+    use rdocx::{Length, StoryKind};
+    let mut document = container_neutral_story_fixture();
+    for kind in [StoryKind::Body, StoryKind::Header, StoryKind::TableCell] {
+        let story = document
+            .stories()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind() == kind)
+            .unwrap();
+        let before = document.to_bytes().unwrap();
+        for bytes in [b"not an image".as_slice(), b"\x89PNG\r\n\x1a\n".as_slice()] {
+            assert!(
+                document
+                    .insert_picture_to_story(
+                        &story,
+                        None,
+                        bytes,
+                        "bad.png",
+                        Some(Length::pt(10.0)),
+                        Some(Length::pt(10.0))
+                    )
+                    .is_err()
+            );
+            assert_eq!(document.to_bytes().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn fx211d_opaque_word_owners_preserve_corpus_fragments() {
+    let opaque = "<corpus:keep key=\"one\"/><corpus:keep key=\"two\"/>";
+    let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    for kind in ["table", "cell", "section"] {
+        let mut document = Document::new();
+        document.add_table(1, 1);
+        document.add_paragraph("XML sibling preserved");
+        let table_location = |document: &Document| {
+            document
+                .story_item_snapshots()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.location().item_kind() == StoryItemKind::Table)
+                .unwrap()
+                .location()
+                .clone()
+        };
+        let root = format!(
+            r#"xmlns:x="{w}" xmlns:corpus="urn:s91:corpus" corpus:stamp="opaque-attribute""#
+        );
+        let xml = match kind {
+            "table" => format!(
+                r#"<x:tbl {root}><x:tblGrid><x:gridCol x:w="1440"/></x:tblGrid><x:tr><x:tc><x:p><x:r><x:t>XML seed</x:t></x:r></x:p></x:tc></x:tr>{opaque}</x:tbl>"#
+            ),
+            "cell" => {
+                format!(r#"<x:tc {root}><x:p><x:r><x:t>XML seed</x:t></x:r></x:p>{opaque}</x:tc>"#)
+            }
+            _ => format!(
+                r#"<x:sectPr {root}><x:pgSz x:w="12240" x:h="15840"/><x:pgMar x:top="1440" x:right="1440" x:bottom="1440" x:left="1440" x:header="720" x:footer="720" x:gutter="0"/>{opaque}</x:sectPr>"#
+            ),
+        };
+        let replace = |document: &mut Document, xml: &str| {
+            match kind {
+                "table" => document.replace_table_xml(&table_location(document), xml),
+                "cell" => document.replace_cell_xml(&table_location(document), 0, 0, xml),
+                _ => document.replace_section_properties_xml(0, xml),
+            }
+            .unwrap();
+        };
+        replace(&mut document, &xml);
+        let selected = |document: &Document| {
+            match kind {
+                "table" => document.table_element_xml(&table_location(document)),
+                "cell" => document.cell_element_xml(&table_location(document), 0, 0),
+                _ => document.section_properties_xml(0),
+            }
+            .unwrap()
+        };
+        let exact = String::from_utf8(selected(&document)).unwrap();
+        assert!(exact.contains(opaque), "{kind}: {exact}");
+        let changed = if kind == "section" {
+            exact.replace("left=\"1440\"", "left=\"1600\"")
+        } else {
+            exact.replace("XML seed", "XML changed")
+        };
+        assert_ne!(changed, exact);
+        replace(&mut document, &changed);
+        let saved = document.to_bytes().unwrap();
+        let reopened = Document::from_bytes(&saved).unwrap();
+        let exact = String::from_utf8(selected(&reopened)).unwrap();
+        assert!(
+            exact.contains(opaque) && exact.contains("opaque-attribute"),
+            "{kind}: {exact}"
+        );
+        assert!(
+            reopened
+                .paragraphs()
+                .iter()
+                .any(|p| p.text() == "XML sibling preserved")
+        );
+    }
+}
+
+#[test]
+fn fx211d_checked_merge_retains_text_and_refuses_boundary_loss() {
+    let mut document = Document::new();
+    document.add_table(2, 2);
+    document
+        .table_mut(0)
+        .unwrap()
+        .cell(0, 0)
+        .unwrap()
+        .set_text("origin");
+    let before = document.to_bytes().unwrap();
+    assert!(
+        document
+            .table_mut(0)
+            .unwrap()
+            .merge_cells((0, 0), (8, 1))
+            .is_err()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    let merged = document
+        .table_mut(0)
+        .unwrap()
+        .merge_cells((0, 0), (1, 1))
+        .unwrap();
+    assert_eq!(merged, (0, 0));
+    document
+        .table_mut(0)
+        .unwrap()
+        .split_cell(merged.0, merged.1)
+        .unwrap();
+    let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.table(0).unwrap().row_count(), 2);
+    for row in 0..2 {
+        assert_eq!(reopened.table(0).unwrap().row(row).unwrap().cell_count(), 2);
+    }
+    assert!(
+        reopened
+            .table(0)
+            .unwrap()
+            .cell(0, 0)
+            .unwrap()
+            .text()
+            .contains("origin")
+    );
+}
+
+#[test]
+fn fx211d_requested_builtin_table_style_is_lazy_and_does_not_change_defaults() {
+    let mut document = Document::new();
+    let before = document.to_bytes().unwrap();
+    assert!(
+        !document
+            .ensure_builtin_table_style("unknown guessed style")
+            .unwrap()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+    let defaults = document
+        .styles()
+        .iter()
+        .filter(|s| s.is_default())
+        .map(|s| s.style_id().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        document
+            .ensure_builtin_table_style("Light Shading Accent 1")
+            .unwrap()
+    );
+    assert_eq!(
+        document.style("LightShading-Accent1").unwrap().name(),
+        Some("Light Shading Accent 1")
+    );
+    let styles = document.styles();
+    assert_eq!(
+        styles
+            .iter()
+            .filter(|s| s.is_default())
+            .map(|s| s.style_id().to_owned())
+            .collect::<Vec<_>>(),
+        defaults
+    );
+    let before = document.to_bytes().unwrap();
+    assert!(
+        !document
+            .ensure_builtin_table_style("LightShading-Accent1")
+            .unwrap()
+    );
+    assert_eq!(document.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn fx211d_merge_refuses_removed_opaque_properties_atomically() {
+    let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let opaque = r#"<x:keep xmlns:x="urn:opaque" marker="preserve"/>"#;
+    let mut unsafe_successes = Vec::new();
+    for kind in ["properties", "borders"] {
+        let mut document = Document::new();
+        document.add_table(1, 2);
+        let location = document
+            .story_item_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.location().item_kind() == StoryItemKind::Table)
+            .unwrap()
+            .location()
+            .clone();
+        let properties = if kind == "borders" {
+            format!("<w:tcBorders>{opaque}</w:tcBorders>")
+        } else {
+            opaque.to_owned()
+        };
+        let xml = format!(
+            r#"<w:tc xmlns:w="{w}"><w:tcPr>{properties}</w:tcPr><w:p><w:r><w:t>second</w:t></w:r></w:p></w:tc>"#
+        );
+        document.replace_cell_xml(&location, 0, 1, &xml).unwrap();
+        let before = document.to_bytes().unwrap();
+        assert_eq!(
+            document
+                .table_mut(0)
+                .unwrap()
+                .merge_cells((0, 1), (0, 1))
+                .unwrap(),
+            (0, 1)
+        );
+        assert_eq!(document.to_bytes().unwrap(), before);
+        let result = document.table_mut(0).unwrap().merge_cells((0, 0), (0, 1));
+        if result.is_ok() {
+            unsafe_successes.push(kind);
+        } else {
+            assert_eq!(
+                document.to_bytes().unwrap(),
+                before,
+                "{kind}: refusal mutated package"
+            );
+            let reopened = Document::from_bytes(&before).unwrap();
+            let reopened_location = reopened
+                .story_item_snapshots()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.location().item_kind() == StoryItemKind::Table)
+                .unwrap()
+                .location()
+                .clone();
+            assert_eq!(reopened.table(0).unwrap().row(0).unwrap().cell_count(), 2);
+            assert!(
+                String::from_utf8(reopened.cell_element_xml(&reopened_location, 0, 1).unwrap())
+                    .unwrap()
+                    .contains(opaque)
+            );
+        }
+    }
+    assert!(
+        unsafe_successes.is_empty(),
+        "merge discarded opaque properties: {unsafe_successes:?}"
+    );
+}
+
+#[test]
+fn run_width_scale_and_position_can_restore_inheritance_after_reopen() {
+    const OPAQUE: &str = r#"<x:keep xmlns:x="urn:producer" x:flag="exact"/>"#;
+    let mut document = Document::new();
+    document.add_paragraph("").add_run("value").bold(false);
+    let bytes = document.to_bytes().unwrap();
+    let mut package = OpcPackage::from_reader(std::io::Cursor::new(bytes)).unwrap();
+    let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap()).unwrap();
+    let xml = xml.replacen("</w:rPr>", &format!("{OPAQUE}</w:rPr>"), 1);
+    package.set_part("/word/document.xml", xml.into_bytes());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    let mut document = Document::from_bytes(&bytes.into_inner()).unwrap();
+    {
+        let mut paragraph = document.paragraph_mut(0).unwrap();
+        let mut run = paragraph.run_mut(0).unwrap();
+        run.set_width_scale(80);
+        run.set_position(-4);
+    }
+    for (scale, position) in [
+        (Some(80), Some(-4)),
+        (None, Some(-4)),
+        (Some(0), None),
+        (None, None),
+        (Some(100), Some(0)),
+    ] {
+        {
+            let mut paragraph = document.paragraph_mut(0).unwrap();
+            let mut run = paragraph.run_mut(0).unwrap();
+            run.set_width_scale_value(scale);
+            run.set_position_value(position);
+        }
+        let bytes = document.to_bytes().unwrap();
+        document = Document::from_bytes(&bytes).unwrap();
+        let xml = document_xml(&mut document);
+        assert!(std::str::from_utf8(&xml).unwrap().contains(OPAQUE));
+        let model = rdocx_oxml::CT_Document::from_xml(&xml).unwrap();
+        let rdocx_oxml::document::BodyContent::Paragraph(paragraph) = &model.body.content[0] else {
+            panic!("expected paragraph");
+        };
+        let properties = paragraph.runs[0].properties.as_ref().unwrap();
+        assert_eq!(properties.width_scale, scale);
+        assert_eq!(properties.position, position);
+        assert_eq!(properties.bold, Some(false));
+    }
+
+    let mut plain = Document::new();
+    plain.add_paragraph("").add_run("plain");
+    {
+        let mut paragraph = plain.paragraph_mut(0).unwrap();
+        let mut run = paragraph.run_mut(0).unwrap();
+        run.set_width_scale_value(None);
+        run.set_position_value(None);
+    }
+    let bytes = plain.to_bytes().unwrap();
+    let mut reopened = Document::from_bytes(&bytes).unwrap();
+    let xml = document_xml(&mut reopened);
+    assert!(!std::str::from_utf8(&xml).unwrap().contains("<w:rPr"));
+}
+
+#[test]
+fn fx246_word_legend_roundtrip_noops_and_shared_owners() {
+    use rdocx::{ChartData, ChartKind, LegendPosition as P};
+    let mut document = Document::new();
+    let data = ChartData {
+        categories: vec!["Q1".into(), "Q2".into()],
+        series: vec![
+            ("North".into(), vec![12.0, 14.0]),
+            ("South".into(), vec![9.0, 11.0]),
+        ],
+        ..Default::default()
+    };
+    document
+        .add_chart(
+            ChartKind::Bar,
+            Length::inches(6.0),
+            Length::inches(2.6),
+            &data,
+        )
+        .unwrap();
+    let original = document.to_bytes().unwrap();
+    document
+        .set_chart_legend(0, None, Some(P::Right), Some(false))
+        .unwrap();
+    assert_eq!(document.to_bytes().unwrap(), original);
+    for position in [P::Right, P::Left, P::Top, P::Bottom, P::TopRight] {
+        document
+            .set_chart_legend(0, None, Some(position), Some(true))
+            .unwrap();
+        let reopened = Document::from_bytes(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.chart_legend(0).unwrap().position, position);
+        assert!(reopened.chart_legend(0).unwrap().overlay);
+    }
+    let mut package = OpcPackage::from_reader(std::io::Cursor::new(original)).unwrap();
+    let body = String::from_utf8(package.get_part("/word/document.xml").unwrap().to_vec()).unwrap();
+    let start = body.find("<w:p>").unwrap();
+    let end = start + body[start..].find("</w:p>").unwrap() + 6;
+    let doubled = body.replacen("</w:body>", &format!("{}</w:body>", &body[start..end]), 1);
+    package.set_part("/word/document.xml", doubled.into_bytes());
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut cursor).unwrap();
+    let mut shared = Document::from_bytes(&cursor.into_inner()).unwrap();
+    shared
+        .set_chart_legend(0, None, Some(P::Bottom), Some(true))
+        .unwrap();
+    assert_eq!(shared.chart_legend(0).unwrap().position, P::Bottom);
+    assert_eq!(shared.chart_legend(1).unwrap().position, P::Right);
+    shared.set_chart_legend(0, Some(false), None, None).unwrap();
+    let hidden = shared.to_bytes().unwrap();
+    shared
+        .set_chart_legend(0, None, Some(P::Left), Some(true))
+        .unwrap();
+    assert_eq!(shared.to_bytes().unwrap(), hidden);
+    shared.set_chart_legend(0, Some(true), None, None).unwrap();
+    assert_eq!(shared.chart_legend(0).unwrap().position, P::Right);
+    assert!(!shared.chart_legend(0).unwrap().overlay);
+    let before = shared.to_bytes().unwrap();
+    assert!(
+        shared
+            .set_chart_legend(999, None, Some(P::Left), None)
+            .is_err()
+    );
+    assert_eq!(shared.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn fx246_both_formats_render_three_distinct_legend_positions() {
+    use rdocx::{ChartData, ChartKind, LegendPosition as P};
+    let data = ChartData {
+        categories: vec!["Q1".into(), "Q2".into(), "Q3".into()],
+        series: vec![
+            ("North".into(), vec![12.0, 14.0, 15.0]),
+            ("South".into(), vec![9.0, 11.0, 10.0]),
+            ("West".into(), vec![7.0, 8.0, 13.0]),
+        ],
+        ..Default::default()
+    };
+    let mut word = Document::new();
+    word.add_paragraph("Quarterly volume by region.");
+    word.add_chart(
+        ChartKind::Bar,
+        Length::inches(6.0),
+        Length::inches(2.6),
+        &data,
+    )
+    .unwrap();
+    let mut ppt = rpptx::Presentation::new().unwrap();
+    ppt.add_slide(6).unwrap();
+    let id = ppt
+        .add_chart(
+            0,
+            ChartKind::Bar,
+            Length::inches(0.5).as_emu(),
+            Length::inches(1.0).as_emu(),
+            Length::inches(6.0).as_emu(),
+            Length::inches(2.6).as_emu(),
+            &data,
+        )
+        .unwrap()
+        .non_visual_id()
+        .unwrap();
+    let mut word_renders = Vec::new();
+    let mut ppt_renders = Vec::new();
+    for position in [P::Right, P::Bottom, P::Left] {
+        word.set_chart_legend(1, None, Some(position), Some(false))
+            .unwrap();
+        ppt.set_chart_legend(0, id, None, Some(position), Some(false))
+            .unwrap();
+        word_renders.push(
+            word.render_page_to_png_deterministic(0, 150.0)
+                .unwrap()
+                .unwrap(),
+        );
+        ppt_renders.push(ppt.slide_png_deterministic(0, 150.0).unwrap().unwrap());
+    }
+    for renders in [word_renders, ppt_renders] {
+        assert_ne!(renders[0], renders[1]);
+        assert_ne!(renders[0], renders[2]);
+        assert_ne!(renders[1], renders[2]);
+    }
+    // The external native exports use these exact unmodified Issue383 packages.
+    // Export their deterministic product counterparts when qualifying the oracle.
+    if let Some(root) = std::env::var_os("RDOCX_FX246_NATIVE_INPUTS") {
+        let root = std::path::PathBuf::from(root);
+        for name in ["default", "bottom", "left", "right-explicit"] {
+            let document = Document::open(root.join(format!("legend-{name}.docx"))).unwrap();
+            std::fs::write(
+                root.join(format!("legend-{name}-docx-deterministic.pdf")),
+                document.to_pdf_deterministic().unwrap(),
+            )
+            .unwrap();
+            let deck = rpptx::Presentation::from_bytes(
+                &std::fs::read(root.join(format!("legend-{name}.pptx"))).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("legend-{name}-pptx-deterministic.pdf")),
+                deck.to_pdf_deterministic().unwrap(),
+            )
+            .unwrap();
+        }
+        if let Some(font) = std::env::var_os("RDOCX_FX246_NATIVE_FONT") {
+            let bytes = std::fs::read(font).unwrap();
+            let fonts = [("Carlito", bytes.as_slice())];
+            let document = Document::open(root.join("legend-right-fontmatched.docx")).unwrap();
+            std::fs::write(
+                root.join("legend-right-fontmatched-docx-deterministic.pdf"),
+                document
+                    .to_pdf_with_fonts_deterministic_and_options(
+                        &fonts,
+                        rdocx::RenderOptions::default(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            let deck =
+                rpptx::Presentation::open(root.join("legend-right-fontmatched.pptx")).unwrap();
+            std::fs::write(
+                root.join("legend-right-fontmatched-pptx-deterministic.pdf"),
+                deck.to_pdf_deterministic_with_fonts(&fonts).unwrap(),
+            )
+            .unwrap();
+        }
     }
 }

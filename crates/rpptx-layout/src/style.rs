@@ -4,11 +4,13 @@ use std::fmt;
 
 use oxml_drawing::color::ColorChoice;
 use oxml_drawing::effect::CT_EffectList;
-use oxml_drawing::fill::Fill;
+use oxml_drawing::fill::{Fill, GradientGeometry};
 use oxml_drawing::line::CT_LineProperties;
+use oxml_drawing::shape_props::CT_ShapeProperties;
 use oxml_drawing::style_ref::FontCollectionIndex;
+use oxml_drawing::theme::CT_EffectStyle;
 use rpptx_oxml::connector::CT_ConnectionShape;
-use rpptx_oxml::shape_tree::CT_Shape;
+use rpptx_oxml::shape_tree::{CT_Shape, CT_ShapeStyle};
 
 use crate::ResolveCtx;
 
@@ -71,15 +73,25 @@ impl ResolveCtx<'_> {
         &self,
         shape: &CT_Shape,
     ) -> Result<EffectiveShapeStyle, ResolveError> {
+        let (mut effective, referenced_effect_style) =
+            self.shape_style_for_placement(shape, false)?;
+        effective.effects = resolve_effects(
+            referenced_effect_style,
+            shape.style(),
+            &shape.shape_properties,
+        )?;
+        Ok(effective)
+    }
+
+    // The boundsless validator cannot normalize shape-relative gradient rotation.
+    // Placed rendering retains its existing substitution and normalization policy.
+    pub(crate) fn shape_style_for_placement(
+        &self,
+        shape: &CT_Shape,
+        unplaced: bool,
+    ) -> Result<(EffectiveShapeStyle, Option<CT_EffectStyle>), ResolveError> {
         let matrix = &self.theme.theme_elements.format_scheme;
-        let referenced_effect_style = match shape.style() {
-            Some(style) => matrix_entry(
-                "effect",
-                style.effect_reference.index,
-                &matrix.effect_styles,
-            )?,
-            None => None,
-        };
+        let referenced_effect_style = self.referenced_effect_style(shape.style())?;
         let mut effective = if let Some(style) = shape.style() {
             EffectiveShapeStyle {
                 fill: referenced_fill(
@@ -88,10 +100,7 @@ impl ResolveCtx<'_> {
                     &matrix.background_fill_styles,
                 )?,
                 line: matrix_entry("line", style.line_reference.index, &matrix.line_styles)?,
-                effects: referenced_effect_style
-                    .as_ref()
-                    .filter(|style| !style.has_unmodelled_effect())
-                    .and_then(|style| style.effect_list.clone()),
+                effects: None,
                 font_collection: Some(style.font_reference.index),
             }
         } else {
@@ -108,12 +117,6 @@ impl ResolveCtx<'_> {
                 effective.line = Some(explicit.clone());
             }
         }
-        let has_explicit_unmodelled_effect = shape.shape_properties.has_unmodelled_effect();
-        if has_explicit_unmodelled_effect {
-            effective.effects = None;
-        } else if let Some(explicit) = &shape.shape_properties.effects {
-            effective.effects = Some(explicit.clone());
-        }
 
         let fill_reference = shape
             .style()
@@ -121,44 +124,47 @@ impl ResolveCtx<'_> {
         let line_reference = shape
             .style()
             .and_then(|style| style.line_reference.color.as_ref());
-        let effect_reference = shape
-            .style()
-            .and_then(|style| style.effect_reference.color.as_ref());
-        let unmodelled_effect_has_placeholder = if has_explicit_unmodelled_effect {
-            shape
-                .shape_properties
-                .has_unmodelled_effect_placeholder_color()
-        } else {
-            referenced_effect_style
-                .as_ref()
-                .is_some_and(|style| style.has_unmodelled_effect_placeholder_color())
-        };
-        if unmodelled_effect_has_placeholder {
-            return Err(ResolveError::UnresolvedPlaceholderColor {
-                reference: "effect",
-            });
-        }
-        if let Some(fill) = effective.fill.as_mut() {
+        if let Some(fill) = effective.fill.as_mut()
+            && !(unplaced
+                && matches!(fill, Fill::Gradient(gradient) if gradient.rotate_with_shape == Some(false)))
+        {
             substitute_fill(fill, fill_reference, "fill")?;
         }
         if let Some(line) = effective.line.as_mut()
             && let Some(fill) = line.fill.as_mut()
+            && !(unplaced
+                && matches!(fill, Fill::Gradient(gradient) if gradient.rotate_with_shape == Some(false)))
         {
             substitute_fill(fill, line_reference, "line")?;
         }
-        if let Some(effects) = effective.effects.as_mut() {
-            if let Some(shadow) = effects.outer_shadow.as_mut()
-                && let Some(color) = shadow.color.as_mut()
-            {
-                substitute_color(color, effect_reference, "effect")?;
-            }
-            if effects.has_unmodelled_placeholder_color() {
-                return Err(ResolveError::UnresolvedPlaceholderColor {
-                    reference: "effect",
-                });
-            }
+        Ok((effective, referenced_effect_style))
+    }
+
+    /// Resolves the effects of an ordinary shape or a connector: the theme
+    /// effect its style's `a:effectRef` selects, replaced as a whole by a
+    /// direct `a:effectLst`. Index 0 and an empty direct list both leave no
+    /// effect.
+    pub(crate) fn effective_effects(
+        &self,
+        style: Option<&CT_ShapeStyle>,
+        properties: &CT_ShapeProperties,
+    ) -> Result<Option<CT_EffectList>, ResolveError> {
+        let referenced_effect_style = self.referenced_effect_style(style)?;
+        resolve_effects(referenced_effect_style, style, properties)
+    }
+
+    fn referenced_effect_style(
+        &self,
+        style: Option<&CT_ShapeStyle>,
+    ) -> Result<Option<CT_EffectStyle>, ResolveError> {
+        match style {
+            Some(style) => matrix_entry(
+                "effect",
+                style.effect_reference.index,
+                &self.theme.theme_elements.format_scheme.effect_styles,
+            ),
+            None => Ok(None),
         }
-        Ok(effective)
     }
 
     /// Resolves one connector's line from its style's theme line reference and
@@ -166,6 +172,7 @@ impl ResolveCtx<'_> {
     pub(crate) fn effective_connector_line(
         &self,
         connector: &CT_ConnectionShape,
+        unplaced: bool,
     ) -> Result<Option<CT_LineProperties>, ResolveError> {
         let style = connector.style();
         let mut line = match style {
@@ -183,12 +190,60 @@ impl ResolveCtx<'_> {
                 line = Some(explicit.clone());
             }
         }
-        if let Some(fill) = line.as_mut().and_then(|line| line.fill.as_mut()) {
+        if let Some(fill) = line.as_mut().and_then(|line| line.fill.as_mut())
+            && !(unplaced
+                && matches!(fill, Fill::Gradient(gradient) if gradient.rotate_with_shape == Some(false)))
+        {
             let reference = style.and_then(|style| style.line_reference.color.as_ref());
             substitute_fill(fill, reference, "line")?;
         }
         Ok(line)
     }
+}
+
+/// Chooses the effects a shape draws from its referenced theme effect style
+/// and its direct `a:effectLst`, then resolves their placeholder colours.
+fn resolve_effects(
+    referenced_effect_style: Option<CT_EffectStyle>,
+    style: Option<&CT_ShapeStyle>,
+    properties: &CT_ShapeProperties,
+) -> Result<Option<CT_EffectList>, ResolveError> {
+    let has_explicit_unmodelled_effect = properties.has_unmodelled_effect();
+    let unmodelled_effect_has_placeholder = if has_explicit_unmodelled_effect {
+        properties.has_unmodelled_effect_placeholder_color()
+    } else {
+        referenced_effect_style
+            .as_ref()
+            .is_some_and(|style| style.has_unmodelled_effect_placeholder_color())
+    };
+    if unmodelled_effect_has_placeholder {
+        return Err(ResolveError::UnresolvedPlaceholderColor {
+            reference: "effect",
+        });
+    }
+    let mut effects = if has_explicit_unmodelled_effect {
+        None
+    } else if let Some(explicit) = &properties.effects {
+        Some(explicit.clone())
+    } else {
+        referenced_effect_style
+            .filter(|style| !style.has_unmodelled_effect())
+            .and_then(|style| style.effect_list)
+    };
+    if let Some(effects) = effects.as_mut() {
+        let effect_reference = style.and_then(|style| style.effect_reference.color.as_ref());
+        if let Some(shadow) = effects.outer_shadow.as_mut()
+            && let Some(color) = shadow.color.as_mut()
+        {
+            substitute_color(color, effect_reference, "effect")?;
+        }
+        if effects.has_unmodelled_placeholder_color() {
+            return Err(ResolveError::UnresolvedPlaceholderColor {
+                reference: "effect",
+            });
+        }
+    }
+    Ok(effects)
 }
 
 fn matrix_entry<T: Clone>(
@@ -255,7 +310,19 @@ pub(crate) fn substitute_fill(
     match fill {
         Fill::Solid(fill) => substitute_optional_color(&mut fill.color, reference, kind),
         Fill::Gradient(fill) => {
+            // Match the paint boundary before resolving colours that cannot be drawn.
+            if matches!(fill.flip.as_deref(), Some("x" | "y" | "xy"))
+                || fill.tile_rect.is_some()
+                || matches!(fill.geometry.as_ref(), Some(GradientGeometry::Path(path)) if !path.fill_to_rect.as_ref().is_some_and(|rect| {
+                    [rect.left, rect.top, rect.right, rect.bottom].into_iter().all(|value| value.is_some_and(|value| value.0 == 50_000))
+                }))
+            {
+                return Ok(());
+            }
             for stop in &mut fill.stops {
+                if stop.color.is_none() {
+                    break;
+                }
                 substitute_optional_color(&mut stop.color, reference, kind)?;
             }
             Ok(())

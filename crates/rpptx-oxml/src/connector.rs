@@ -11,8 +11,9 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 
 use crate::namespace::{
-    FIXED_SHAPE_TREE_PREFIXES, MC_NS, NamespaceBindings, P_NS, R_NS, all_attributes,
-    root_attributes, self_contained_attributes,
+    FIXED_SHAPE_TREE_PREFIXES, MC_NS, NamespaceBindings, P_NS, R_NS, accessibility_parent_bindings,
+    all_attributes, non_visual_drawing_decorative, non_visual_drawing_text, root_attributes,
+    self_contained_attributes, set_non_visual_drawing_decorative,
 };
 use crate::shape_tree::CT_ShapeStyle;
 
@@ -148,6 +149,26 @@ impl CT_ConnectionShape {
         Ok(())
     }
 
+    /// Sets the `idx` of the typed style's `a:effectRef`, the theme effect
+    /// style the connector draws. Index 0 references no theme effect.
+    ///
+    /// The preserved `p:style` is rewritten from the typed view only when the
+    /// index changes. Returns `false` and changes nothing when the connector
+    /// has no typed style.
+    pub fn set_effect_reference_index(&mut self, index: u32) -> Result<bool> {
+        let Some(style) = self.raw.typed_style.as_deref() else {
+            return Ok(false);
+        };
+        if style.effect_reference.index == index {
+            return Ok(true);
+        }
+        let mut style = style.clone();
+        style.effect_reference.index = index;
+        self.raw.style = Some(style.to_fragment()?);
+        self.raw.typed_style = Some(Box::new(style));
+        Ok(true)
+    }
+
     /// Returns the typed format-scheme references of `p:style`.
     ///
     /// A style that does not carry `a:lnRef`, `a:fillRef`, `a:effectRef`,
@@ -175,6 +196,87 @@ impl CT_ConnectionShape {
             .iter()
             .find(|(name, _)| name == "name")
             .map(|(_, value)| value.as_str())
+    }
+
+    /// Returns the direct accessibility description.
+    pub fn alt_text(&self) -> Option<String> {
+        self.raw
+            .non_visual
+            .drawing_properties
+            .raw_attributes
+            .iter()
+            .find_map(|(key, value)| (key == "descr").then(|| value.clone()))
+    }
+
+    /// Returns the direct accessibility title.
+    pub fn title(&self) -> Option<String> {
+        self.raw
+            .non_visual
+            .drawing_properties
+            .raw_attributes
+            .iter()
+            .find_map(|(key, value)| (key == "title").then(|| value.clone()))
+    }
+
+    fn set_accessibility_text(&mut self, key: &str, text: Option<&str>) -> Result<()> {
+        if let Some(text) = text {
+            oxml_core::xml::reject_non_xml_characters("shape accessibility text", text)?;
+        }
+        let attributes = &mut self.raw.non_visual.drawing_properties.raw_attributes;
+        if let Some(position) = attributes.iter().position(|(name, _)| name == key) {
+            if let Some(text) = text {
+                attributes[position].1 = text.to_owned();
+            } else {
+                attributes.remove(position);
+            }
+        } else if let Some(text) = text {
+            attributes.push((key.to_owned(), text.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Replaces or clears the direct accessibility description.
+    pub fn set_alt_text(&mut self, text: Option<&str>) -> Result<()> {
+        self.set_accessibility_text("descr", text)
+    }
+
+    /// Replaces or clears the direct accessibility title.
+    pub fn set_title(&mut self, text: Option<&str>) -> Result<()> {
+        self.set_accessibility_text("title", text)
+    }
+
+    fn accessibility_xml(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(Vec::new());
+        self.raw
+            .non_visual
+            .drawing_properties
+            .write_xml(&mut writer, "p:cNvPr")?;
+        Ok(writer.into_inner())
+    }
+
+    /// Returns the qualified decorative flag without promoting defaults.
+    pub fn decorative(&self) -> bool {
+        let bindings = accessibility_parent_bindings(
+            &self.raw.raw_attributes,
+            &self.raw.non_visual.raw_attributes,
+        );
+        self.accessibility_xml()
+            .is_ok_and(|xml| non_visual_drawing_decorative(&xml, &bindings))
+    }
+
+    /// Changes only the qualified decorative flag, retaining unrelated extensions.
+    pub fn set_decorative(&mut self, decorative: bool) -> Result<()> {
+        let bindings = accessibility_parent_bindings(
+            &self.raw.raw_attributes,
+            &self.raw.non_visual.raw_attributes,
+        );
+        let mut xml = self.accessibility_xml()?;
+        set_non_visual_drawing_decorative(&mut xml, decorative, &bindings)?;
+        let candidate = RawElement::from_fragment(&xml)?;
+        // Only the child content is owned by this operation. Keep all attributes.
+        self.raw.non_visual.drawing_properties.raw_content = candidate.raw_content;
+        self.raw.non_visual.drawing_properties.was_empty = candidate.was_empty;
+        Ok(())
     }
 
     /// Changes the producer-facing non-visual connector name.
@@ -377,7 +479,10 @@ fn capture_root_child(
             *boundary = 1;
         }
         (Some(P_NS), b"spPr") if *boundary == 1 && shape_properties.is_none() => {
-            *shape_properties = Some(CT_ShapeProperties::from_xml(&raw).map_err(drawing_error)?);
+            *shape_properties = Some(
+                CT_ShapeProperties::from_xml_with_inherited_namespaces(&raw, &namespaces.entries())
+                    .map_err(drawing_error)?,
+            );
             *boundary = 2;
         }
         (Some(P_NS), b"style") if *boundary == 2 && style.is_none() => {
@@ -783,6 +888,16 @@ fn capture_connector_property_child(
 }
 
 impl CT_Connection {
+    /// Creates one authored connector attachment with no imported opaque payload.
+    pub fn new(id: u32, idx: u32) -> Self {
+        Self {
+            id,
+            idx,
+            raw_attributes: Vec::new(),
+            raw_content: Vec::new(),
+        }
+    }
+
     fn from_fragment(xml: &[u8]) -> Result<Self> {
         let mut reader = Reader::from_reader(xml);
         let mut buffer = Vec::new();
@@ -843,7 +958,15 @@ impl RawElement {
         loop {
             match reader.read_event_into(&mut buffer)? {
                 Event::Start(start) => {
-                    let raw_attributes = root_attributes(&start, FIXED_SHAPE_TREE_PREFIXES)?;
+                    let mut raw_attributes = root_attributes(&start, FIXED_SHAPE_TREE_PREFIXES)?;
+                    for key in ["descr", "title"] {
+                        if let Some(value) = non_visual_drawing_text(xml, key)
+                            && let Some((_, existing)) =
+                                raw_attributes.iter_mut().find(|(name, _)| name == key)
+                        {
+                            *existing = value;
+                        }
+                    }
                     let content_start = reader.buffer_position() as usize;
                     let content_end = endpoint_content_end(&mut reader, &start)?;
                     return Ok(Self {
@@ -853,8 +976,17 @@ impl RawElement {
                     });
                 }
                 Event::Empty(start) => {
+                    let mut raw_attributes = root_attributes(&start, FIXED_SHAPE_TREE_PREFIXES)?;
+                    for key in ["descr", "title"] {
+                        if let Some(value) = non_visual_drawing_text(xml, key)
+                            && let Some((_, existing)) =
+                                raw_attributes.iter_mut().find(|(name, _)| name == key)
+                        {
+                            *existing = value;
+                        }
+                    }
                     return Ok(Self {
-                        raw_attributes: root_attributes(&start, FIXED_SHAPE_TREE_PREFIXES)?,
+                        raw_attributes,
                         raw_content: Vec::new(),
                         was_empty: true,
                     });
@@ -868,7 +1000,17 @@ impl RawElement {
 
     fn write_xml<W: Write>(&self, writer: &mut Writer<W>, name: &str) -> Result<()> {
         let mut start = BytesStart::new(name);
-        push_attributes(&mut start, &self.raw_attributes);
+        for (key, value) in &self.raw_attributes {
+            if matches!(key.as_str(), "descr" | "title") {
+                let escaped = quick_xml::escape::escape(value)
+                    .replace('\r', "&#13;")
+                    .replace('\n', "&#10;")
+                    .replace('\t', "&#9;");
+                start.push_attribute((key.as_bytes(), escaped.as_bytes()));
+            } else {
+                start.push_attribute((key.as_str(), value.as_str()));
+            }
+        }
         if self.was_empty {
             writer.write_event(Event::Empty(start))?;
         } else {
@@ -1016,5 +1158,49 @@ mod constructor_tests {
             r#"</p:spPr><p:style><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="1"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="tx1"/></a:fontRef></p:style></p:cxnSp>"#
         ));
         assert_eq!(CT_ConnectionShape::from_xml(&xml).unwrap(), connector);
+    }
+
+    #[test]
+    fn effect_reference_index_rewrites_only_the_effect_reference() {
+        let mut connector = CT_ConnectionShape::new_free_standing(
+            2,
+            "Connector 2",
+            "line",
+            CT_Transform2D::default(),
+        )
+        .unwrap();
+        assert!(!connector.set_effect_reference_index(0).unwrap());
+        assert!(connector.style().is_none());
+
+        connector.set_default_style().unwrap();
+        assert!(connector.set_effect_reference_index(0).unwrap());
+
+        assert_eq!(connector.style().unwrap().effect_reference.index, 0);
+        let xml = connector.to_xml().unwrap();
+        let text = String::from_utf8(xml.clone()).unwrap();
+        assert!(text.contains(
+            r#"</p:spPr><p:style><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="tx1"/></a:fontRef></p:style></p:cxnSp>"#
+        ));
+        assert_eq!(CT_ConnectionShape::from_xml(&xml).unwrap(), connector);
+    }
+
+    #[test]
+    fn unchanged_effect_reference_index_keeps_the_style_bytes() {
+        let xml = format!(
+            r#"<q:cxnSp xmlns:q="{}" xmlns:d="{}"><q:nvCxnSpPr><q:cNvPr name="Elbow" id="7"/><q:cNvCxnSpPr/><q:nvPr/></q:nvCxnSpPr><q:spPr><d:prstGeom prst="bentConnector3"><d:avLst/></d:prstGeom></q:spPr><q:style><d:lnRef idx="1"><d:schemeClr val="accent1"><d:shade val="95000"/><d:satMod val="105000"/></d:schemeClr></d:lnRef><d:fillRef idx="0"><d:schemeClr val="accent1"/></d:fillRef><d:effectRef idx="0"><d:schemeClr val="accent1"/></d:effectRef><d:fontRef idx="minor"><d:schemeClr val="tx1"/></d:fontRef></q:style></q:cxnSp>"#,
+            super::P_NS,
+            super::A_NS
+        );
+        let mut connector = CT_ConnectionShape::from_xml(xml.as_bytes()).unwrap();
+        let before = connector.to_xml().unwrap();
+        assert_eq!(connector.style().unwrap().effect_reference.index, 0);
+
+        assert!(connector.set_effect_reference_index(0).unwrap());
+
+        assert_eq!(connector.to_xml().unwrap(), before);
+        let text = String::from_utf8(before).unwrap();
+        assert!(text.contains(
+            r#"<q:style><d:lnRef idx="1"><d:schemeClr val="accent1"><d:shade val="95000"/>"#
+        ));
     }
 }

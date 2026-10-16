@@ -15,8 +15,8 @@ use oxml_drawing::line::{
 };
 use oxml_drawing::style_ref::{FontCollectionIndex, StyleReference};
 use oxml_drawing::table::{
-    CT_TableBorders, CT_TableCellStyle, CT_TablePartStyle, CT_TableStyle, CT_TableStyleList,
-    CT_TableTextStyle,
+    CT_TableBackgroundStyle, CT_TableBorders, CT_TableCellStyle, CT_TablePartStyle, CT_TableStyle,
+    CT_TableStyleList, CT_TableTextStyle,
 };
 use oxml_drawing::text::{
     CT_TextBody, CT_TextBodyProperties, CT_TextCharacterProperties, CT_TextListStyle,
@@ -34,9 +34,7 @@ use rpptx_oxml::graphic_frame::GraphicDataPayload;
 use rpptx_oxml::picture::CT_Picture;
 use rpptx_oxml::placeholder::{CT_Placeholder, PhType, PlaceholderKey};
 use rpptx_oxml::shape_tree::{CT_Shape, ShapeTreeChild};
-use rpptx_oxml::slide_parts::{
-    BackgroundRendering, CT_HeaderFooter, CT_Slide, CT_SlideLayout, CT_SlideMaster,
-};
+use rpptx_oxml::slide_parts::{BackgroundRendering, CT_Slide, CT_SlideLayout, CT_SlideMaster};
 
 use crate::ResolveError;
 use crate::style::{referenced_fill, substitute_fill};
@@ -274,34 +272,15 @@ impl<'a> ResolveCtx<'a> {
         let slide_children = &self.slide.common_slide_data.shape_tree.children;
         let layout_children = &self.layout.common_slide_data.shape_tree.children;
         let master_children = &self.master.common_slide_data.shape_tree.children;
-        let mut slide_latent = Vec::new();
-        let mut layout_latent = Vec::new();
-        collect_occupied_latent(slide_children, &mut slide_latent);
-        collect_occupied_latent(layout_children, &mut layout_latent);
-
         let mut flattened = Vec::new();
         if let Some(background) = self.effective_background() {
             flattened.push(FlattenedItem::Background(background));
         }
-        let master_latent_policy = self
-            .master
-            .header_footer
-            .as_ref()
-            .map(LatentPolicy::from_header_footer);
-        let layout_latent_policy = self
-            .layout
-            .header_footer
-            .as_ref()
-            .map(LatentPolicy::from_header_footer);
-        let mut master_deeper = layout_latent.clone();
-        master_deeper.extend(slide_latent.iter().cloned());
         emit_tree(
             master_children,
             PassRules {
                 source: FlattenedSource::Master,
                 emit_non_placeholders: self.layout.show_master_shapes.unwrap_or(true),
-                deeper_latent: &master_deeper,
-                latent_policy: master_latent_policy,
             },
             &mut flattened,
         );
@@ -310,8 +289,6 @@ impl<'a> ResolveCtx<'a> {
             PassRules {
                 source: FlattenedSource::Layout,
                 emit_non_placeholders: self.slide.show_master_shapes.unwrap_or(true),
-                deeper_latent: &slide_latent,
-                latent_policy: layout_latent_policy,
             },
             &mut flattened,
         );
@@ -320,12 +297,25 @@ impl<'a> ResolveCtx<'a> {
             PassRules {
                 source: FlattenedSource::Slide,
                 emit_non_placeholders: true,
-                deeper_latent: &[],
-                latent_policy: None,
             },
             &mut flattened,
         );
         flattened
+    }
+
+    /// Enumerates physical leaves without visibility or placeholder filtering.
+    /// Child paths retain source ordinals, including nested groups. Opaque
+    /// alternate content stays an explicit leaf rather than a writable fallback.
+    pub fn owned_items(&self, source: FlattenedSource) -> Vec<(Vec<usize>, FlattenedItem<'_>)> {
+        let children = match source {
+            FlattenedSource::Slide => &self.slide.common_slide_data.shape_tree.children,
+            FlattenedSource::Layout => &self.layout.common_slide_data.shape_tree.children,
+            FlattenedSource::Master => &self.master.common_slide_data.shape_tree.children,
+            FlattenedSource::Background => return Vec::new(),
+        };
+        let mut output = Vec::new();
+        collect_owned_items(children, source, Transform::IDENTITY, 0, &[], &mut output);
+        output
     }
 
     /// Resolves one owned renderer-facing slide at the supplied point size.
@@ -417,6 +407,55 @@ impl<'a> ResolveCtx<'a> {
         )
     }
 
+    /// Resolve a physically owned text shape even when draw flattening hides
+    /// its placeholder. Explicit autofit inventory and its read-only report
+    /// need the same producing scope and inheritance as visible rendering.
+    pub fn resolve_owned_text_shape(
+        &self,
+        item: FlattenedItem<'_>,
+        size: (f64, f64),
+        hyperlinks: &ScopedHyperlinkTargets,
+    ) -> Result<(ResolvedSlide, ResolvedSlideTextDirections), ResolveError> {
+        let FlattenedItem::Shape {
+            source,
+            child,
+            group_scale,
+            group_transform,
+            group_issues,
+        } = item
+        else {
+            return Err(ResolveError::ConcreteValue {
+                kind: "autofit owner",
+                detail: "not a physically owned shape".to_owned(),
+            });
+        };
+        let mut resolved = ResolvedSlide {
+            unresolved_member_count: 0,
+            size,
+            background: None,
+            shapes: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        push_group_diagnostics(group_issues, &mut resolved.diagnostics);
+        let mut directions = Vec::new();
+        let shape = self.resolve_flattened_shape(
+            ShapePlacement {
+                source,
+                group_scale,
+                group_transform,
+            },
+            child,
+            None,
+            (Some(hyperlinks), None),
+            None,
+            (&mut resolved.diagnostics, &mut directions),
+        )?;
+        if let Some(shape) = shape {
+            resolved.shapes.push(shape);
+        }
+        Ok((resolved, vec![directions]))
+    }
+
     /// Resolves one timestamped slide while retaining text directions and target identity.
     pub fn resolve_slide_with_chart_resources_and_text_directions_at(
         &self,
@@ -497,7 +536,26 @@ impl<'a> ResolveCtx<'a> {
         mut fonts: Option<&mut FontManager>,
         mut identities: Option<&mut Vec<ResolvedShapeIdentity>>,
     ) -> Result<(ResolvedSlide, ResolvedSlideTextDirections), ResolveError> {
+        for (kind, tree) in [
+            ("slide shape tree", &self.slide.common_slide_data.shape_tree),
+            (
+                "layout shape tree",
+                &self.layout.common_slide_data.shape_tree,
+            ),
+            (
+                "master shape tree",
+                &self.master.common_slide_data.shape_tree,
+            ),
+        ] {
+            rpptx_oxml::shape_tree::validate_shape_nesting(&tree.children).map_err(|error| {
+                ResolveError::ConcreteValue {
+                    kind,
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         let mut slide = ResolvedSlide {
+            unresolved_member_count: 0,
             size,
             background: None,
             shapes: Vec::new(),
@@ -554,18 +612,52 @@ impl<'a> ResolveCtx<'a> {
                 } => {
                     push_group_diagnostics(group_issues, &mut slide.diagnostics);
                     let mut shape_text_directions = Vec::new();
-                    if let Some(shape) = self.resolve_flattened_shape(
-                        ShapePlacement {
-                            source,
-                            group_scale,
-                            group_transform,
-                        },
-                        child,
-                        media,
-                        (hyperlinks, charts),
-                        fonts.as_deref_mut(),
-                        (&mut slide.diagnostics, &mut shape_text_directions),
-                    )? {
+                    let mut member_diagnostics = Vec::new();
+                    let result = self
+                        .resolve_flattened_shape(
+                            ShapePlacement {
+                                source,
+                                group_scale,
+                                group_transform,
+                            },
+                            child,
+                            media,
+                            (hyperlinks, charts),
+                            fonts.as_deref_mut(),
+                            (&mut member_diagnostics, &mut shape_text_directions),
+                        )
+                        .and_then(|resolved| {
+                            if resolved.is_none() {
+                                self.validate_unplaced_member(child, source, hyperlinks)?;
+                            }
+                            Ok(resolved)
+                        });
+                    let resolved = match result {
+                        Ok(resolved) => {
+                            slide.diagnostics.extend(member_diagnostics);
+                            resolved
+                        }
+                        Err(
+                            error @ (ResolveError::StyleIndexOutOfRange { .. }
+                            | ResolveError::UnresolvedPlaceholderColor { .. }
+                            | ResolveError::ConcreteValue { .. }),
+                        ) => {
+                            // Count the failed owner before deciding whether it can draw.
+                            slide.unresolved_member_count += 1;
+                            shape_text_directions.clear();
+                            self.unresolved_shape_fallback(
+                                ShapePlacement {
+                                    source,
+                                    group_scale,
+                                    group_transform,
+                                },
+                                child,
+                                &error,
+                                &mut slide.diagnostics,
+                            )
+                        }
+                    };
+                    if let Some(shape) = resolved {
                         if let Some(identities) = identities.as_deref_mut() {
                             identities.push(self.shape_identity(source, child));
                         }
@@ -576,6 +668,204 @@ impl<'a> ResolveCtx<'a> {
             }
         }
         Ok((slide, text_directions))
+    }
+
+    // Missing placement must not hide an error in the owned semantic inputs.
+    // Validate only dimension-independent values already consumed by this resolver.
+    // No replacement geometry or guessed dimensions are manufactured.
+    fn validate_unplaced_member(
+        &self,
+        child: &ShapeTreeChild,
+        source: FlattenedSource,
+        hyperlinks: Option<&ScopedHyperlinkTargets>,
+    ) -> Result<(), ResolveError> {
+        let (fill, line, effects) = match child {
+            ShapeTreeChild::Shape(shape) => {
+                let (mut effective, _) = self.shape_style_for_placement(shape, true)?;
+                effective.effects =
+                    self.effective_effects(shape.style(), &shape.shape_properties)?;
+                if let Some(body) = shape.text_body.as_ref() {
+                    self.resolve_text_body(shape, body, source, hyperlinks, &mut Vec::new())?;
+                }
+                (effective.fill, effective.line, effective.effects)
+            }
+            ShapeTreeChild::Picture(picture) => (
+                None,
+                picture.shape_properties.line.clone(),
+                picture.shape_properties.effects.clone(),
+            ),
+            ShapeTreeChild::Connector(connector) => (
+                connector.shape_properties.fill.clone(),
+                self.effective_connector_line(connector, true)?,
+                self.effective_effects(connector.style(), &connector.shape_properties)?,
+            ),
+            ShapeTreeChild::GraphicFrame(frame) => {
+                if let GraphicDataPayload::Table(table) = frame.graphic_data.payload() {
+                    self.resolve_table(
+                        table,
+                        source,
+                        hyperlinks,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    )?;
+                }
+                return Ok(());
+            }
+            ShapeTreeChild::AlternateContent(_) | ShapeTreeChild::GroupShape(_) => return Ok(()),
+        };
+        for fill in [
+            fill.as_ref(),
+            line.as_ref().and_then(|line| line.fill.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match fill {
+                Fill::Solid(solid) => {
+                    if let Some(color) = solid.color.as_ref() {
+                        self.concrete_color(color)?;
+                    }
+                }
+                Fill::Gradient(gradient)
+                    if gradient.rotate_with_shape != Some(false)
+                        && matches!(gradient.flip.as_deref(), None | Some("none"))
+                        && gradient.tile_rect.is_none()
+                        && !matches!(
+                            gradient.geometry.as_ref(),
+                            Some(GradientGeometry::Path(_))
+                        ) =>
+                {
+                    // These stop colors precede dimension-dependent paint construction.
+                    // Keep concrete_fill's early unsupported boundary for a missing color.
+                    for stop in &gradient.stops {
+                        let Some(color) = stop.color.as_ref() else {
+                            break;
+                        };
+                        self.concrete_color(color)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(shadow) = effects
+            .as_ref()
+            .and_then(|effects| effects.outer_shadow.as_ref())
+        {
+            self.concrete_shadow(shadow)?;
+        }
+        Ok(())
+    }
+
+    fn unresolved_shape_fallback(
+        &self,
+        placement: ShapePlacement,
+        child: &ShapeTreeChild,
+        error: &ResolveError,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<ResolvedShape> {
+        let id = child
+            .non_visual_id()
+            .map_or_else(|| "without an id".to_owned(), |id| id.to_string());
+        let name = child.non_visual_name().unwrap_or_default();
+        let source = flattened_source_name(placement.source);
+        let values = match child {
+            ShapeTreeChild::Shape(shape) => transform_values(self.effective_xfrm(shape).as_ref()),
+            ShapeTreeChild::Picture(picture) => {
+                transform_values(self.effective_picture_xfrm(picture).as_ref())
+            }
+            ShapeTreeChild::GraphicFrame(frame) => transform_values(Some(&frame.transform)),
+            ShapeTreeChild::Connector(connector) => {
+                connector_transform_values(connector.shape_properties.transform.as_ref())
+            }
+            ShapeTreeChild::AlternateContent(alternate) => alternate
+                .chart_choice()
+                .and_then(|frame| transform_values(Some(&frame.transform))),
+            ShapeTreeChild::GroupShape(_) => None,
+        };
+        let values = values.filter(|(bounds, rotation, flip_h, flip_v)| {
+            let bounds = scaled_group_bounds(*bounds, placement.group_scale);
+            let matrix = resolved_shape_page_transform(&ResolvedShape {
+                group_transform: placement.group_transform,
+                bounds,
+                rotation_deg: *rotation,
+                flip_h: *flip_h,
+                flip_v: *flip_v,
+                geometry: ResolvedGeometry::BoundsFallback,
+                fill: None,
+                image_fill: None,
+                line: None,
+                head_end: None,
+                tail_end: None,
+                shadow: None,
+                content: ResolvedContent::None,
+                unsupported: Some("unresolved shape"),
+            });
+            [
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+                *rotation,
+                matrix.a,
+                matrix.b,
+                matrix.c,
+                matrix.d,
+                matrix.e,
+                matrix.f,
+            ]
+            .into_iter()
+            .all(f64::is_finite)
+                && bounds.width >= 0.0
+                && bounds.height >= 0.0
+                && (bounds.width > 0.0 || bounds.height > 0.0)
+                && [
+                    Point { x: 0.0, y: 0.0 },
+                    Point {
+                        x: bounds.width,
+                        y: 0.0,
+                    },
+                    Point {
+                        x: 0.0,
+                        y: bounds.height,
+                    },
+                    Point {
+                        x: bounds.width,
+                        y: bounds.height,
+                    },
+                ]
+                .into_iter()
+                .all(|point| {
+                    let point = matrix.apply(point);
+                    point.x.is_finite() && point.y.is_finite()
+                })
+        });
+        let retained = if values.is_some() {
+            "retained as bounds"
+        } else {
+            "omitted without trustworthy finite bounds"
+        };
+        diagnostics.push(Diagnostic {
+            message: format!(
+                "unresolved member {source} shape {id} \"{name}\" {retained}: {error}"
+            ),
+        });
+        let (bounds, rotation_deg, flip_h, flip_v) = values?;
+        Some(ResolvedShape {
+            group_transform: placement.group_transform,
+            bounds: scaled_group_bounds(bounds, placement.group_scale),
+            rotation_deg,
+            flip_h,
+            flip_v,
+            geometry: ResolvedGeometry::BoundsFallback,
+            fill: None,
+            image_fill: None,
+            line: None,
+            head_end: None,
+            tail_end: None,
+            shadow: None,
+            content: ResolvedContent::None,
+            unsupported: Some("unresolved shape"),
+        })
     }
 
     fn shape_identity(
@@ -590,7 +880,7 @@ impl<'a> ResolveCtx<'a> {
             FlattenedSource::Background => &[],
         };
         let mut containing_group_ids = Vec::new();
-        find_group_lineage(children, child, &mut Vec::new(), &mut containing_group_ids);
+        find_group_lineage(children, child, &[], &mut containing_group_ids);
         ResolvedShapeIdentity {
             source,
             shape_id: child.non_visual_id(),
@@ -631,6 +921,9 @@ impl<'a> ResolveCtx<'a> {
                 text_directions,
             ),
             ShapeTreeChild::Picture(picture) => {
+                if picture.hidden() {
+                    return Ok(None);
+                }
                 let Some((bounds, rotation_deg, flip_h, flip_v)) =
                     transform_values(self.effective_picture_xfrm(picture).as_ref())
                 else {
@@ -797,7 +1090,7 @@ impl<'a> ResolveCtx<'a> {
                     .unwrap_or((None, None));
                 let has_line_source =
                     connector.shape_properties.line.is_some() || connector.style().is_some();
-                let effective_line = self.effective_connector_line(connector)?;
+                let effective_line = self.effective_connector_line(connector, false)?;
                 let mut line = effective_line
                     .as_ref()
                     .map(|line| self.concrete_line(line, (bounds.width, bounds.height)))
@@ -807,6 +1100,15 @@ impl<'a> ResolveCtx<'a> {
                     .as_ref()
                     .map(resolved_line_ends)
                     .unwrap_or((None, None));
+                let shadow = self
+                    .effective_effects(connector.style(), &connector.shape_properties)
+                    .and_then(|effects| {
+                        effects
+                            .as_ref()
+                            .and_then(|effects| effects.outer_shadow.as_ref())
+                            .map(|shadow| self.concrete_shadow(shadow))
+                            .transpose()
+                    })?;
                 let (geometry, geometry_unsupported, geometry_diagnostic) = if let Some(custom) =
                     &connector.shape_properties.custom_geometry
                 {
@@ -882,7 +1184,7 @@ impl<'a> ResolveCtx<'a> {
                     line,
                     head_end,
                     tail_end,
-                    shadow: None,
+                    shadow,
                     content: ResolvedContent::None,
                     unsupported,
                 }))
@@ -1122,10 +1424,58 @@ impl<'a> ResolveCtx<'a> {
                     }
                     _ => None,
                 };
-                let (fill, unsupported) = self.concrete_fill(
-                    normalized.as_ref().unwrap_or(fill),
-                    (bounds.width, bounds.height),
-                )?;
+                let selected = normalized.as_ref().unwrap_or(fill);
+                let shape_path = matches!(selected, Fill::Gradient(g) if matches!(&g.geometry, Some(GradientGeometry::Path(p)) if p.kind == PathGradientKind::Shape));
+                let (fill, unsupported) = if shape_path {
+                    let preset = shape
+                        .shape_properties
+                        .preset_geometry
+                        .as_ref()
+                        .map(|p| p.preset.as_str())
+                        .unwrap_or("rect");
+                    if shape.shape_properties.custom_geometry.is_some()
+                        || !matches!(preset, "rect" | "ellipse")
+                    {
+                        (None, Some("shape path gradient on unsupported contour"))
+                    } else {
+                        let mut selected = selected.clone();
+                        if preset == "ellipse"
+                            && let Fill::Gradient(g) = &mut selected
+                            && let Some(GradientGeometry::Path(p)) = &mut g.geometry
+                        {
+                            p.kind = PathGradientKind::Circle;
+                        }
+                        // A circle path expands to the corner. An ellipse shape stops at its own contour.
+                        let (mut paint, unsupported) =
+                            self.concrete_fill(&selected, (bounds.width, bounds.height))?;
+                        if preset == "ellipse"
+                            && let Some(Paint::Grid { colors, .. }) = &mut paint
+                            && let Fill::Gradient(g) = &selected
+                        {
+                            let mut stops = g
+                                .stops
+                                .iter()
+                                .filter_map(|stop| {
+                                    stop.color.as_ref().map(|c| {
+                                        self.concrete_color(c).map(|color| GradientStop {
+                                            offset: f64::from(stop.position.0) / 100_000.0,
+                                            color,
+                                        })
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+                            for (index, color) in colors.iter_mut().enumerate() {
+                                let x = ((index % 128) as f64 + 0.5) / 64.0 - 1.0;
+                                let y = ((index / 128) as f64 + 0.5) / 64.0 - 1.0;
+                                *color = path_gradient_color(&stops, x.hypot(y));
+                            }
+                        }
+                        (paint, unsupported)
+                    }
+                } else {
+                    self.concrete_fill(selected, (bounds.width, bounds.height))?
+                };
                 (fill, None, unsupported, None)
             }
             None => (None, None, None, None),
@@ -1637,13 +1987,14 @@ impl ResolveCtx<'_> {
                 if gradient.tile_rect.is_some() {
                     return Ok((None, Some("gradient tile rectangle")));
                 }
-                if let Some(GradientGeometry::Path(path)) = &gradient.geometry {
-                    let unsupported = match path.kind {
-                        PathGradientKind::Circle => "circle path gradient",
-                        PathGradientKind::Rectangle => "rectangle path gradient",
-                        PathGradientKind::Shape => "shape path gradient",
-                    };
-                    return Ok((None, Some(unsupported)));
+                if let Some(GradientGeometry::Path(path)) = &gradient.geometry
+                    && !path.fill_to_rect.as_ref().is_some_and(|rect| {
+                        [rect.left, rect.top, rect.right, rect.bottom]
+                            .into_iter()
+                            .all(|value| value.is_some_and(|value| value.0 == 50_000))
+                    })
+                {
+                    return Ok((None, Some("path gradient with non-centred fill rectangle")));
                 }
                 let mut stops = Vec::with_capacity(gradient.stops.len());
                 for stop in &gradient.stops {
@@ -1694,21 +2045,110 @@ impl ResolveCtx<'_> {
                                 x: center.x + delta.x,
                                 y: center.y + delta.y,
                             },
-                            stops,
+                            powerpoint_gradient_stops(&stops),
                             (true, true),
                         )
                     }
                     None => Paint::linear(
                         Point { x: 0.0, y: 0.0 },
                         Point { x: size.0, y: 0.0 },
-                        stops,
+                        powerpoint_gradient_stops(&stops),
                         (true, true),
                     ),
-                    Some(GradientGeometry::Path(_)) => unreachable!("rejected above"),
+                    Some(GradientGeometry::Path(path)) => {
+                        let centered = path.fill_to_rect.as_ref().is_some_and(|r| {
+                            [r.left, r.top, r.right, r.bottom]
+                                .into_iter()
+                                .all(|v| v.is_some_and(|v| v.0 == 50_000))
+                        });
+                        if !centered {
+                            return Ok((
+                                None,
+                                Some("path gradient with non-centred fill rectangle"),
+                            ));
+                        }
+                        let mut ordered = stops;
+                        ordered.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+                        let mut colors = Vec::with_capacity(128 * 128);
+                        for y in 0..128 {
+                            for x in 0..128 {
+                                let dx = ((f64::from(x) + 0.5) / 128.0 - 0.5).abs() * 2.0;
+                                let dy = ((f64::from(y) + 0.5) / 128.0 - 0.5).abs() * 2.0;
+                                let distance = match path.kind {
+                                    PathGradientKind::Circle => {
+                                        dx.hypot(dy) / std::f64::consts::SQRT_2
+                                    }
+                                    PathGradientKind::Rectangle | PathGradientKind::Shape => {
+                                        dx.max(dy)
+                                    }
+                                };
+                                colors.push(path_gradient_color(&ordered, distance));
+                            }
+                        }
+                        let Some(paint) = Paint::grid(
+                            Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: size.0,
+                                height: size.1,
+                            },
+                            128,
+                            128,
+                            colors,
+                        ) else {
+                            return Ok((
+                                None,
+                                Some("path gradient without positive finite extent"),
+                            ));
+                        };
+                        paint
+                    }
                 };
                 Ok((Some(paint), None))
             }
-            Fill::Pattern(_) => Ok((None, Some("pattern fill"))),
+            Fill::Pattern(pattern) => {
+                let Some(rows) = pattern.preset.as_deref().and_then(native_pattern_rows) else {
+                    return Ok((None, Some("pattern without supported preset")));
+                };
+                let foreground = pattern
+                    .foreground
+                    .as_ref()
+                    .map(|c| self.concrete_color(c))
+                    .transpose()?
+                    .unwrap_or(Color::BLACK);
+                let background = pattern
+                    .background
+                    .as_ref()
+                    .map(|c| self.concrete_color(c))
+                    .transpose()?
+                    .unwrap_or(Color::WHITE);
+                let mut colors = Vec::with_capacity(4096);
+                for &row in rows {
+                    let bits = NATIVE_PATTERN_ROW_WEIGHTS[usize::from(row)];
+                    for x in 0..64 {
+                        let weight = ((bits >> (126 - x * 2)) & 3) as u8;
+                        colors.push(blend_fill_colors(
+                            background,
+                            foreground,
+                            f64::from(weight) / 2.0,
+                        ));
+                    }
+                }
+                Ok((
+                    Paint::grid(
+                        Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 8.0,
+                            height: 8.0,
+                        },
+                        64,
+                        64,
+                        colors,
+                    ),
+                    None,
+                ))
+            }
             Fill::Blip(_) => Ok((None, Some("picture fill media"))),
         }
     }
@@ -1782,7 +2222,7 @@ impl ResolveCtx<'_> {
         })
     }
 
-    fn concrete_color(&self, choice: &ColorChoice) -> Result<Color, ResolveError> {
+    pub(crate) fn concrete_color(&self, choice: &ColorChoice) -> Result<Color, ResolveError> {
         let owned_lookup = self.theme_lookup();
         let lookup = owned_lookup
             .iter()
@@ -1954,6 +2394,14 @@ impl ResolveCtx<'_> {
                 }
                 TextRun::Break(_) => runs.push(ResolvedTextRun::Break),
                 TextRun::Field(field) => {
+                    if field.text.is_none()
+                        && field.field_type.as_deref().is_some_and(|kind| {
+                            kind == "datetime"
+                                || (1..=13).any(|index| kind == format!("datetime{index}"))
+                        })
+                    {
+                        diagnostics.push(Diagnostic { message: "uncached automatic date field has no computed date for static rendering".to_owned() });
+                    }
                     let mut style = self.resolve_run_style(
                         shape,
                         paragraph.properties.as_ref(),
@@ -2017,8 +2465,8 @@ impl ResolveCtx<'_> {
         paragraph: Option<&oxml_drawing::text::CT_TextParagraphProperties>,
         run: Option<&CT_TextCharacterProperties>,
     ) -> Result<ResolvedRunStyle, ResolveError> {
-        let effective = self.effective_text_properties(shape, paragraph, run).run;
-        self.resolved_run_style(effective)
+        let effective = self.effective_text_properties(shape, paragraph, run);
+        self.resolved_run_style(effective.run, effective.language)
     }
 
     fn resolve_table_run_style(
@@ -2027,15 +2475,14 @@ impl ResolveCtx<'_> {
         paragraph: Option<&oxml_drawing::text::CT_TextParagraphProperties>,
         run: Option<&CT_TextCharacterProperties>,
     ) -> Result<ResolvedRunStyle, ResolveError> {
-        let effective = self
-            .effective_table_text_properties(Some(table_style), paragraph, run)
-            .run;
-        self.resolved_run_style(effective)
+        let effective = self.effective_table_text_properties(Some(table_style), paragraph, run);
+        self.resolved_run_style(effective.run, effective.language)
     }
 
     fn resolved_run_style(
         &self,
         effective: CT_TextCharacterProperties,
+        language: Option<String>,
     ) -> Result<ResolvedRunStyle, ResolveError> {
         let fill = effective
             .fill
@@ -2048,6 +2495,13 @@ impl ResolveCtx<'_> {
             bold: effective.bold.unwrap_or(false),
             italic: effective.italic.unwrap_or(false),
             all_caps: effective.all_caps.unwrap_or(false),
+            small_caps: effective.small_caps.unwrap_or(false),
+            language,
+            highlight: effective
+                .highlight
+                .as_ref()
+                .map(|colour| self.concrete_color(colour))
+                .transpose()?,
             underline: effective
                 .underline
                 .is_some_and(|value| value != oxml_drawing::text::TextUnderline::None),
@@ -2129,7 +2583,7 @@ impl ResolveCtx<'_> {
             .columns
             .iter()
             .map(|width| emu_to_points(width.0))
-            .collect();
+            .collect::<Vec<_>>();
         let selected_id = table
             .properties
             .as_ref()
@@ -2144,12 +2598,12 @@ impl ResolveCtx<'_> {
             default_id.and_then(|id| styles.styles.iter().find(|style| style.style_id == id))
         });
         let builtin_style = if explicit_style.is_none() {
-            selected_id.and_then(builtin_table_style)
+            selected_id.and_then(CT_TableStyle::builtin)
         } else {
             None
         };
         let builtin_default = if selected_id.is_none() && default_style.is_none() {
-            default_id.and_then(builtin_table_style)
+            default_id.and_then(CT_TableStyle::builtin)
         } else {
             None
         };
@@ -2329,7 +2783,15 @@ impl ResolveCtx<'_> {
                             None
                         };
                         if let Some(body) = text.as_mut()
-                            && body.autofit != ResolvedAutofit::None
+                            && let Some(anchor) = cell
+                                .properties
+                                .as_ref()
+                                .and_then(|properties| properties.anchor)
+                        {
+                            body.anchor = resolved_anchor(anchor);
+                        }
+                        if let Some(body) = text.as_mut()
+                            && body.autofit == ResolvedAutofit::Shape
                         {
                             body.autofit = ResolvedAutofit::None;
                             let message = "table cell autofit is unsupported and was ignored";
@@ -2368,11 +2830,58 @@ impl ResolveCtx<'_> {
                 })
             })
             .collect::<Result<Vec<_>, ResolveError>>()?;
+        let background = match style.and_then(|style| style.background.as_ref()) {
+            Some(background) => {
+                let size = (
+                    column_widths.iter().sum(),
+                    rows.iter().map(|row| row.height).sum(),
+                );
+                self.resolve_table_background(background, size, diagnostics)?
+            }
+            None => None,
+        };
         Ok(ResolvedTable {
             right_to_left: table_properties.is_some_and(|properties| properties.right_to_left),
             column_widths,
             rows,
+            background,
         })
+    }
+
+    /// Resolves a table style's `a:tblBg` fill over the whole table box.
+    fn resolve_table_background(
+        &self,
+        background: &CT_TableBackgroundStyle,
+        size: (f64, f64),
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<Option<Paint>, ResolveError> {
+        let referenced = background
+            .fill_reference
+            .as_ref()
+            .map(|reference| self.table_referenced_fill(reference))
+            .transpose()?
+            .flatten();
+        let (paint, unsupported) = referenced
+            .as_ref()
+            .or(background.fill.as_ref())
+            .map(|fill| self.concrete_fill(fill, size))
+            .transpose()?
+            .unwrap_or((None, None));
+        for unsupported in background
+            .unsupported
+            .iter()
+            .map(String::as_str)
+            .chain(unsupported)
+        {
+            let message = format!("unsupported table background {unsupported} was ignored");
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == message)
+            {
+                diagnostics.push(Diagnostic { message });
+            }
+        }
+        Ok(paint)
     }
 
     fn resolve_table_border(
@@ -2415,636 +2924,6 @@ impl ResolveCtx<'_> {
         substitute_fill(&mut fill, reference.color.as_ref(), "table cell")?;
         Ok(Some(fill))
     }
-}
-
-// Office's built-in table style IDs, grouped by visual family and theme accent.
-// Source: LibreOffice oox predefined-table-styles.cxx.
-const BUILTIN_TABLE_STYLES: &[(&str, &str, &str)] = &[
-    (
-        "{2D5ABB26-0587-4C30-8999-92F81FD0307C}",
-        "Themed-Style-1",
-        "",
-    ),
-    (
-        "{3C2FFA5D-87B4-456A-9821-1D502468CF0F}",
-        "Themed-Style-1",
-        "Accent1",
-    ),
-    (
-        "{284E427A-3D55-4303-BF80-6455036E1DE7}",
-        "Themed-Style-1",
-        "Accent2",
-    ),
-    (
-        "{69C7853C-536D-4A76-A0AE-DD22124D55A5}",
-        "Themed-Style-1",
-        "Accent3",
-    ),
-    (
-        "{775DCB02-9BB8-47FD-8907-85C794F793BA}",
-        "Themed-Style-1",
-        "Accent4",
-    ),
-    (
-        "{35758FB7-9AC5-4552-8A53-C91805E547FA}",
-        "Themed-Style-1",
-        "Accent5",
-    ),
-    (
-        "{08FB837D-C827-4EFA-A057-4D05807E0F7C}",
-        "Themed-Style-1",
-        "Accent6",
-    ),
-    (
-        "{5940675A-B579-460E-94D1-54222C63F5DA}",
-        "Themed-Style-2",
-        "",
-    ),
-    (
-        "{D113A9D2-9D6B-4929-AA2D-F23B5EE8CBE7}",
-        "Themed-Style-2",
-        "Accent1",
-    ),
-    (
-        "{18603FDC-E32A-4AB5-989C-0864C3EAD2B8}",
-        "Themed-Style-2",
-        "Accent2",
-    ),
-    (
-        "{306799F8-075E-4A3A-A7F6-7FBC6576F1A4}",
-        "Themed-Style-2",
-        "Accent3",
-    ),
-    (
-        "{E269D01E-BC32-4049-B463-5C60D7B0CCD2}",
-        "Themed-Style-2",
-        "Accent4",
-    ),
-    (
-        "{327F97BB-C833-4FB7-BDE5-3F7075034690}",
-        "Themed-Style-2",
-        "Accent5",
-    ),
-    (
-        "{638B1855-1B75-4FBE-930C-398BA8C253C6}",
-        "Themed-Style-2",
-        "Accent6",
-    ),
-    (
-        "{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF}",
-        "Light-Style-1",
-        "",
-    ),
-    (
-        "{3B4B98B0-60AC-42C2-AFA5-B58CD77FA1E5}",
-        "Light-Style-1",
-        "Accent1",
-    ),
-    (
-        "{0E3FDE45-AF77-4B5C-9715-49D594BDF05E}",
-        "Light-Style-1",
-        "Accent2",
-    ),
-    (
-        "{C083E6E3-FA7D-4D7B-A595-EF9225AFEA82}",
-        "Light-Style-1",
-        "Accent3",
-    ),
-    (
-        "{D27102A9-8310-4765-A935-A1911B00CA55}",
-        "Light-Style-1",
-        "Accent4",
-    ),
-    (
-        "{5FD0F851-EC5A-4D38-B0AD-8093EC10F338}",
-        "Light-Style-1",
-        "Accent5",
-    ),
-    (
-        "{68D230F3-CF80-4859-8CE7-A43EE81993B5}",
-        "Light-Style-1",
-        "Accent6",
-    ),
-    (
-        "{7E9639D4-E3E2-4D34-9284-5A2195B3D0D7}",
-        "Light-Style-2",
-        "",
-    ),
-    (
-        "{69012ECD-51FC-41F1-AA8D-1B2483CD663E}",
-        "Light-Style-2",
-        "Accent1",
-    ),
-    (
-        "{72833802-FEF1-4C79-8D5D-14CF1EAF98D9}",
-        "Light-Style-2",
-        "Accent2",
-    ),
-    (
-        "{F2DE63D5-997A-4646-A377-4702673A728D}",
-        "Light-Style-2",
-        "Accent3",
-    ),
-    (
-        "{17292A2E-F333-43FB-9621-5CBBE7FDCDCB}",
-        "Light-Style-2",
-        "Accent4",
-    ),
-    (
-        "{5A111915-BE36-4E01-A7E5-04B1672EAD32}",
-        "Light-Style-2",
-        "Accent5",
-    ),
-    (
-        "{912C8C85-51F0-491E-9774-3900AFEF0FD7}",
-        "Light-Style-2",
-        "Accent6",
-    ),
-    (
-        "{616DA210-FB5B-4158-B5E0-FEB733F419BA}",
-        "Light-Style-3",
-        "",
-    ),
-    (
-        "{BC89EF96-8CEA-46FF-86C4-4CE0E7609802}",
-        "Light-Style-3",
-        "Accent1",
-    ),
-    (
-        "{5DA37D80-6434-44D0-A028-1B22A696006F}",
-        "Light-Style-3",
-        "Accent2",
-    ),
-    (
-        "{8799B23B-EC83-4686-B30A-512413B5E67A}",
-        "Light-Style-3",
-        "Accent3",
-    ),
-    (
-        "{ED083AE6-46FA-4A59-8FB0-9F97EB10719F}",
-        "Light-Style-3",
-        "Accent4",
-    ),
-    (
-        "{BDBED569-4797-4DF1-A0F4-6AAB3CD982D8}",
-        "Light-Style-3",
-        "Accent5",
-    ),
-    (
-        "{E8B1032C-EA38-4F05-BA0D-38AFFFC7BED3}",
-        "Light-Style-3",
-        "Accent6",
-    ),
-    (
-        "{793D81CF-94F2-401A-BA57-92F5A7B2D0C5}",
-        "Medium-Style-1",
-        "",
-    ),
-    (
-        "{B301B821-A1FF-4177-AEE7-76D212191A09}",
-        "Medium-Style-1",
-        "Accent1",
-    ),
-    (
-        "{9DCAF9ED-07DC-4A11-8D7F-57B35C25682E}",
-        "Medium-Style-1",
-        "Accent2",
-    ),
-    (
-        "{1FECB4D8-DB02-4DC6-A0A2-4F2EBAE1DC90}",
-        "Medium-Style-1",
-        "Accent3",
-    ),
-    (
-        "{1E171933-4619-4E11-9A3F-F7608DF75F80}",
-        "Medium-Style-1",
-        "Accent4",
-    ),
-    (
-        "{FABFCF23-3B69-468F-B69F-88F6DE6A72F2}",
-        "Medium-Style-1",
-        "Accent5",
-    ),
-    (
-        "{10A1B5D5-9B99-4C35-A422-299274C87663}",
-        "Medium-Style-1",
-        "Accent6",
-    ),
-    (
-        "{073A0DAA-6AF3-43AB-8588-CEC1D06C72B9}",
-        "Medium-Style-2",
-        "",
-    ),
-    (
-        "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}",
-        "Medium-Style-2",
-        "Accent1",
-    ),
-    (
-        "{21E4AEA4-8DFA-4A89-87EB-49C32662AFE0}",
-        "Medium-Style-2",
-        "Accent2",
-    ),
-    (
-        "{F5AB1C69-6EDB-4FF4-983F-18BD219EF322}",
-        "Medium-Style-2",
-        "Accent3",
-    ),
-    (
-        "{00A15C55-8517-42AA-B614-E9B94910E393}",
-        "Medium-Style-2",
-        "Accent4",
-    ),
-    (
-        "{7DF18680-E054-41AD-8BC1-D1AEF772440D}",
-        "Medium-Style-2",
-        "Accent5",
-    ),
-    (
-        "{93296810-A885-4BE3-A3E7-6D5BEEA58F35}",
-        "Medium-Style-2",
-        "Accent6",
-    ),
-    (
-        "{8EC20E35-A176-4012-BC5E-935CFFF8708E}",
-        "Medium-Style-3",
-        "",
-    ),
-    (
-        "{6E25E649-3F16-4E02-A733-19D2CDBF48F0}",
-        "Medium-Style-3",
-        "Accent1",
-    ),
-    (
-        "{85BE263C-DBD7-4A20-BB59-AAB30ACAA65A}",
-        "Medium-Style-3",
-        "Accent2",
-    ),
-    (
-        "{EB344D84-9AFB-497E-A393-DC336BA19D2E}",
-        "Medium-Style-3",
-        "Accent3",
-    ),
-    (
-        "{EB9631B5-78F2-41C9-869B-9F39066F8104}",
-        "Medium-Style-3",
-        "Accent4",
-    ),
-    (
-        "{74C1A8A3-306A-4EB7-A6B1-4F7E0EB9C5D6}",
-        "Medium-Style-3",
-        "Accent5",
-    ),
-    (
-        "{2A488322-F2BA-4B5B-9748-0D474271808F}",
-        "Medium-Style-3",
-        "Accent6",
-    ),
-    (
-        "{D7AC3CCA-C797-4891-BE02-D94E43425B78}",
-        "Medium-Style-4",
-        "",
-    ),
-    (
-        "{69CF1AB2-1976-4502-BF36-3FF5EA218861}",
-        "Medium-Style-4",
-        "Accent1",
-    ),
-    (
-        "{8A107856-5554-42FB-B03E-39F5DBC370BA}",
-        "Medium-Style-4",
-        "Accent2",
-    ),
-    (
-        "{0505E3EF-67EA-436B-97B2-0124C06EBD24}",
-        "Medium-Style-4",
-        "Accent3",
-    ),
-    (
-        "{C4B1156A-380E-4F78-BDF5-A606A8083BF9}",
-        "Medium-Style-4",
-        "Accent4",
-    ),
-    (
-        "{22838BEF-8BB2-4498-84A7-C5851F593DF1}",
-        "Medium-Style-4",
-        "Accent5",
-    ),
-    (
-        "{16D9F66E-5EB9-4882-86FB-DCBF35E3C3E4}",
-        "Medium-Style-4",
-        "Accent6",
-    ),
-    ("{E8034E78-7F5D-4C2E-B375-FC64B27BC917}", "Dark-Style-1", ""),
-    (
-        "{125E5076-3810-47DD-B79F-674D7AD40C01}",
-        "Dark-Style-1",
-        "Accent1",
-    ),
-    (
-        "{37CE84F3-28C3-443E-9E96-99CF82512B78}",
-        "Dark-Style-1",
-        "Accent2",
-    ),
-    (
-        "{D03447BB-5D67-496B-8E87-E561075AD55C}",
-        "Dark-Style-1",
-        "Accent3",
-    ),
-    (
-        "{E929F9F4-4A8F-4326-A1B4-22849713DDAB}",
-        "Dark-Style-1",
-        "Accent4",
-    ),
-    (
-        "{8FD4443E-F989-4FC4-A0C8-D5A2AF1F390B}",
-        "Dark-Style-1",
-        "Accent5",
-    ),
-    (
-        "{AF606853-7671-496A-8E4F-DF71F8EC918B}",
-        "Dark-Style-1",
-        "Accent6",
-    ),
-    ("{5202B0CA-FC54-4496-8BCA-5EF66A818D29}", "Dark-Style-2", ""),
-    (
-        "{0660B408-B3CF-4A94-85FC-2B1E0A45F4A2}",
-        "Dark-Style-2",
-        "Accent1",
-    ),
-    (
-        "{91EBBBCC-DAD2-459C-BE2E-F6DE35CF9A28}",
-        "Dark-Style-2",
-        "Accent3",
-    ),
-    (
-        "{46F890A9-2807-4EBB-B81D-B2AA78EC7F39}",
-        "Dark-Style-2",
-        "Accent5",
-    ),
-];
-
-/// Materializes a built-in Office table style that has an ID but no package definition.
-fn builtin_table_style(style_id: &str) -> Option<CT_TableStyle> {
-    let (_, family, accent) = BUILTIN_TABLE_STYLES
-        .iter()
-        .find(|(id, _, _)| id.eq_ignore_ascii_case(style_id))?;
-    let accent = if accent.is_empty() {
-        "dk1"
-    } else {
-        match *accent {
-            "Accent1" => "accent1",
-            "Accent2" => "accent2",
-            "Accent3" => "accent3",
-            "Accent4" => "accent4",
-            "Accent5" => "accent5",
-            _ => "accent6",
-        }
-    };
-    let mut xml = format!(
-        "<a:tblStyleLst xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:tblStyle styleId=\"{style_id}\" styleName=\"{family}\">"
-    );
-    let edge = [
-        ("left", accent),
-        ("right", accent),
-        ("top", accent),
-        ("bottom", accent),
-    ];
-    let white_edge = [
-        ("left", "lt1"),
-        ("right", "lt1"),
-        ("top", "lt1"),
-        ("bottom", "lt1"),
-    ];
-    match *family {
-        "Themed-Style-1" => {
-            builtin_style_region(&mut xml, "wholeTbl", None, Some("dk1"), &edge);
-            builtin_style_region(
-                &mut xml,
-                "band1H",
-                Some((accent, "alpha", 40000)),
-                None,
-                &[],
-            );
-            builtin_style_region(
-                &mut xml,
-                "band1V",
-                Some((accent, "alpha", 40000)),
-                None,
-                &[],
-            );
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                Some((accent, "", 0)),
-                Some("lt1"),
-                &[("bottom", "lt1")],
-            );
-        }
-        "Themed-Style-2" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some((accent, "", 0)),
-                Some("lt1"),
-                &edge,
-            );
-            builtin_style_region(&mut xml, "band1H", Some(("lt1", "alpha", 20000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some(("lt1", "alpha", 20000)), None, &[]);
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                None,
-                Some("lt1"),
-                &[("bottom", "lt1")],
-            );
-        }
-        "Light-Style-1" | "Light-Style-3" => {
-            builtin_style_region(&mut xml, "wholeTbl", None, Some("tx1"), &edge);
-            builtin_style_region(
-                &mut xml,
-                "band1H",
-                Some((accent, "alpha", 20000)),
-                None,
-                &[],
-            );
-            builtin_style_region(
-                &mut xml,
-                "band1V",
-                Some((accent, "alpha", 20000)),
-                None,
-                &[],
-            );
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                None,
-                Some(accent),
-                &[("bottom", accent)],
-            );
-        }
-        "Light-Style-2" => {
-            builtin_style_region(&mut xml, "wholeTbl", None, Some("tx1"), &edge);
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                Some((accent, "", 0)),
-                Some("bg1"),
-                &[],
-            );
-            builtin_style_region(&mut xml, "lastRow", None, None, &[("top", accent)]);
-        }
-        "Medium-Style-1" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some(("lt1", "", 0)),
-                Some("dk1"),
-                &edge,
-            );
-            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 20000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 20000)), None, &[]);
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                Some((accent, "", 0)),
-                Some("lt1"),
-                &[],
-            );
-        }
-        "Medium-Style-2" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some((accent, "tint", 20000)),
-                Some("dk1"),
-                &white_edge,
-            );
-            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
-            for name in ["firstRow", "lastRow", "firstCol", "lastCol"] {
-                builtin_style_region(
-                    &mut xml,
-                    name,
-                    Some((accent, "", 0)),
-                    Some("lt1"),
-                    &white_edge,
-                );
-            }
-        }
-        "Medium-Style-3" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some(("lt1", "", 0)),
-                Some("dk1"),
-                &[("top", "dk1"), ("bottom", "dk1")],
-            );
-            builtin_style_region(&mut xml, "band1H", Some(("dk1", "tint", 20000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some(("dk1", "tint", 20000)), None, &[]);
-            for name in ["firstRow", "firstCol", "lastCol"] {
-                builtin_style_region(&mut xml, name, Some((accent, "", 0)), Some("lt1"), &[]);
-            }
-        }
-        "Medium-Style-4" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some((accent, "tint", 20000)),
-                Some("dk1"),
-                &edge,
-            );
-            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                Some((accent, "tint", 20000)),
-                Some(accent),
-                &[],
-            );
-            builtin_style_region(
-                &mut xml,
-                "lastRow",
-                Some(("dk1", "tint", 20000)),
-                None,
-                &[("top", "dk1")],
-            );
-        }
-        "Dark-Style-1" | "Dark-Style-2" => {
-            builtin_style_region(
-                &mut xml,
-                "wholeTbl",
-                Some((accent, "tint", 20000)),
-                Some("dk1"),
-                &[],
-            );
-            builtin_style_region(&mut xml, "band1H", Some((accent, "tint", 40000)), None, &[]);
-            builtin_style_region(&mut xml, "band1V", Some((accent, "tint", 40000)), None, &[]);
-            builtin_style_region(
-                &mut xml,
-                "firstRow",
-                Some(("dk1", "", 0)),
-                Some("lt1"),
-                &white_edge,
-            );
-            builtin_style_region(&mut xml, "lastRow", Some((accent, "", 0)), None, &[]);
-        }
-        _ => unreachable!("built-in family mapping is exhaustive"),
-    }
-    let header_end = xml.find("<a:wholeTbl>")?;
-    let mut ordered = xml[..header_end].to_owned();
-    for region in [
-        "wholeTbl", "band1H", "band2H", "band1V", "band2V", "lastCol", "firstCol", "lastRow",
-        "seCell", "swCell", "firstRow", "neCell", "nwCell",
-    ] {
-        let open = format!("<a:{region}>");
-        if let Some(start) = xml.find(&open) {
-            let close = format!("</a:{region}>");
-            let end = xml[start..].find(&close)? + start + close.len();
-            ordered.push_str(&xml[start..end]);
-        }
-    }
-    ordered.push_str("</a:tblStyle></a:tblStyleLst>");
-    CT_TableStyleList::from_xml(ordered.as_bytes())
-        .ok()?
-        .styles
-        .into_iter()
-        .next()
-}
-
-fn builtin_style_region(
-    xml: &mut String,
-    region: &str,
-    fill: Option<(&str, &str, u32)>,
-    text: Option<&str>,
-    borders: &[(&str, &str)],
-) {
-    xml.push_str(&format!("<a:{region}>"));
-    if let Some(text) = text {
-        xml.push_str(&format!(
-            "<a:tcTxStyle><a:schemeClr val=\"{text}\"/></a:tcTxStyle>"
-        ));
-    }
-    if fill.is_some() || !borders.is_empty() {
-        xml.push_str("<a:tcStyle>");
-        if !borders.is_empty() {
-            xml.push_str("<a:tcBdr>");
-            for (edge, color) in borders {
-                xml.push_str(&format!("<a:{edge}><a:ln w=\"12700\"><a:solidFill><a:schemeClr val=\"{color}\"/></a:solidFill></a:ln></a:{edge}>"));
-            }
-            xml.push_str("</a:tcBdr>");
-        }
-        if let Some((color, transform, value)) = fill {
-            xml.push_str(&format!("<a:solidFill><a:schemeClr val=\"{color}\">"));
-            if !transform.is_empty() {
-                xml.push_str(&format!("<a:{transform} val=\"{value}\"/>"));
-            }
-            xml.push_str("</a:schemeClr></a:solidFill>");
-        }
-        xml.push_str("</a:tcStyle>");
-    }
-    xml.push_str(&format!("</a:{region}>"));
 }
 
 #[derive(Default)]
@@ -3404,6 +3283,7 @@ fn universal_measure_points(value: &str) -> Result<f64, ResolveError> {
         })?;
     match unit {
         "pt" => Ok(number),
+        "pc" | "pi" => Ok(number * 12.0),
         "in" => Ok(number * 72.0),
         "cm" => Ok(number * 72.0 / 2.54),
         "mm" => Ok(number * 72.0 / 25.4),
@@ -3513,6 +3393,11 @@ fn resolve_standalone_text_body(
                     }
                     TextRun::Break(_) => Ok(ResolvedTextRun::Break),
                     TextRun::Field(field) => {
+if field.text.is_none()
+                        && field.field_type.as_deref().is_some_and(|kind| kind == "datetime" || (1..=13).any(|index| kind == format!("datetime{index}")))
+                    {
+                        diagnostics.push(Diagnostic { message: "uncached automatic date field has no computed date for static rendering".to_owned() });
+                    }
                         let mut style = context.resolve_table_run_style(
                             table_style,
                             paragraph.properties.as_ref(),
@@ -3571,6 +3456,16 @@ fn resolve_standalone_text_body(
     Ok((resolved_text_body(&properties, paragraphs)?, directions))
 }
 
+fn resolved_anchor(anchor: DrawingTextAnchor) -> TextAnchor {
+    match anchor {
+        DrawingTextAnchor::Top => TextAnchor::Top,
+        DrawingTextAnchor::Center => TextAnchor::Center,
+        DrawingTextAnchor::Bottom => TextAnchor::Bottom,
+        DrawingTextAnchor::Justified => TextAnchor::Justified,
+        DrawingTextAnchor::Distributed => TextAnchor::Distributed,
+    }
+}
+
 fn resolved_text_body(
     properties: &CT_TextBodyProperties,
     paragraphs: Vec<ResolvedParagraph>,
@@ -3581,13 +3476,7 @@ fn resolved_text_body(
         right: coordinate_points(properties.right_inset.as_ref())?,
         bottom: coordinate_points(properties.bottom_inset.as_ref())?,
     };
-    let anchor = match properties.anchor.unwrap_or(DrawingTextAnchor::Top) {
-        DrawingTextAnchor::Top => TextAnchor::Top,
-        DrawingTextAnchor::Center => TextAnchor::Center,
-        DrawingTextAnchor::Bottom => TextAnchor::Bottom,
-        DrawingTextAnchor::Justified => TextAnchor::Justified,
-        DrawingTextAnchor::Distributed => TextAnchor::Distributed,
-    };
+    let anchor = resolved_anchor(properties.anchor.unwrap_or(DrawingTextAnchor::Top));
     let vertical = match properties
         .vertical
         .unwrap_or(DrawingTextVertical::Horizontal)
@@ -3623,62 +3512,9 @@ fn resolved_text_body(
 }
 
 #[derive(Clone, Copy)]
-struct LatentPolicy {
-    date_time: bool,
-    footer: bool,
-    slide_number: bool,
-}
-
-impl LatentPolicy {
-    fn from_header_footer(header_footer: &CT_HeaderFooter) -> Self {
-        Self {
-            date_time: header_footer.date_time_enabled(),
-            footer: header_footer.footer_enabled(),
-            slide_number: header_footer.slide_number_enabled(),
-        }
-    }
-
-    fn permits(self, ph_type: &PhType) -> bool {
-        match ph_type {
-            PhType::DateTime => self.date_time,
-            PhType::Footer => self.footer,
-            PhType::SlideNumber => self.slide_number,
-            _ => true,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PassRules<'a> {
+struct PassRules {
     source: FlattenedSource,
     emit_non_placeholders: bool,
-    deeper_latent: &'a [PlaceholderKey],
-    latent_policy: Option<LatentPolicy>,
-}
-
-fn collect_occupied_latent(children: &[ShapeTreeChild], keys: &mut Vec<PlaceholderKey>) {
-    for child in children {
-        match child {
-            ShapeTreeChild::GroupShape(group) => collect_occupied_latent(&group.children, keys),
-            ShapeTreeChild::AlternateContent(alternate) => {
-                if let Some(fallback) = alternate.selected_fallback() {
-                    collect_occupied_latent(fallback, keys);
-                }
-            }
-            ShapeTreeChild::Shape(shape) => {
-                if let Some(placeholder) = shape.placeholder.as_ref()
-                    && is_latent(&placeholder.effective_type())
-                    && shape
-                        .text_body
-                        .as_ref()
-                        .is_some_and(|body| !body.plain_text().trim().is_empty())
-                {
-                    push_unmatched(keys, placeholder.key());
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 fn push_unmatched(keys: &mut Vec<PlaceholderKey>, key: PlaceholderKey) {
@@ -3693,34 +3529,31 @@ fn push_unmatched(keys: &mut Vec<PlaceholderKey>, key: PlaceholderKey) {
 fn find_group_lineage(
     children: &[ShapeTreeChild],
     target: &ShapeTreeChild,
-    lineage: &mut Vec<u32>,
+    lineage: &[u32],
     found: &mut Vec<u32>,
 ) -> bool {
-    for child in children {
+    let mut pending = children
+        .iter()
+        .rev()
+        .map(|c| (c, lineage.to_vec()))
+        .collect::<Vec<_>>();
+    while let Some((child, mut ancestors)) = pending.pop() {
         if std::ptr::eq(child, target) {
-            *found = lineage.clone();
+            *found = ancestors;
             return true;
         }
-        match child {
+        let descendants = match child {
             ShapeTreeChild::GroupShape(group) => {
                 if let Some(id) = child.non_visual_id() {
-                    lineage.push(id);
+                    ancestors.push(id);
                 }
-                if find_group_lineage(&group.children, target, lineage, found) {
-                    return true;
-                }
-                if child.non_visual_id().is_some() {
-                    lineage.pop();
-                }
+                Some(group.children.as_slice())
             }
-            ShapeTreeChild::AlternateContent(alternate) => {
-                if let Some(fallback) = alternate.selected_fallback()
-                    && find_group_lineage(fallback, target, lineage, found)
-                {
-                    return true;
-                }
-            }
-            _ => {}
+            ShapeTreeChild::AlternateContent(alternate) => alternate.selected_fallback(),
+            _ => None,
+        };
+        if let Some(descendants) = descendants {
+            pending.extend(descendants.iter().rev().map(|c| (c, ancestors.clone())));
         }
     }
     false
@@ -3888,33 +3721,40 @@ fn collect_timeline_group_geometries(
     parent_to_page: Transform,
     geometries: &mut BTreeMap<u32, TimelineGroupGeometry>,
 ) {
-    for child in children {
+    let mut pending = children
+        .iter()
+        .rev()
+        .map(|c| (c, parent_to_page))
+        .collect::<Vec<_>>();
+    while let Some((child, parent)) = pending.pop() {
         match child {
             ShapeTreeChild::GroupShape(group) => {
                 let child_to_parent = group
                     .group_transform()
                     .and_then(group_affine)
                     .map_or(Transform::IDENTITY, |(transform, _)| transform);
-                if let Some((group_id, geometry)) = child
+                if let Some((id, geometry)) = child
                     .non_visual_id()
                     .zip(group.group_transform().and_then(group_extent_geometry))
                 {
                     geometries.insert(
-                        group_id,
+                        id,
                         TimelineGroupGeometry {
-                            normalized_to_page: geometry.then(parent_to_page),
+                            normalized_to_page: geometry.then(parent),
                         },
                     );
                 }
-                collect_timeline_group_geometries(
-                    &group.children,
-                    child_to_parent.then(parent_to_page),
-                    geometries,
+                pending.extend(
+                    group
+                        .children
+                        .iter()
+                        .rev()
+                        .map(|c| (c, child_to_parent.then(parent))),
                 );
             }
             ShapeTreeChild::AlternateContent(alternate) => {
                 if let Some(fallback) = alternate.selected_fallback() {
-                    collect_timeline_group_geometries(fallback, parent_to_page, geometries);
+                    pending.extend(fallback.iter().rev().map(|c| (c, parent)));
                 }
             }
             _ => {}
@@ -4125,9 +3965,46 @@ fn intersect_optional_rect(left: Option<Rect>, right: Option<Rect>) -> Option<Re
     }
 }
 
+fn collect_owned_items<'a>(
+    children: &'a [ShapeTreeChild],
+    source: FlattenedSource,
+    parent: Transform,
+    issues: u8,
+    path: &[usize],
+    output: &mut Vec<(Vec<usize>, FlattenedItem<'a>)>,
+) {
+    let mut pending = children
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(ordinal, c)| {
+            let mut own_path = path.to_vec();
+            own_path.push(ordinal);
+            (c, parent, issues, own_path)
+        })
+        .collect::<Vec<_>>();
+    while let Some((child, parent, issues, path)) = pending.pop() {
+        if let ShapeTreeChild::GroupShape(group) = child {
+            let (transform, own_issues) = group
+                .group_transform()
+                .and_then(group_affine)
+                .unwrap_or((Transform::IDENTITY, GROUP_ZERO_X | GROUP_ZERO_Y));
+            pending.extend(group.children.iter().enumerate().rev().map(|(ordinal, c)| {
+                let mut own_path = path.clone();
+                own_path.push(ordinal);
+                (c, transform.then(parent), issues | own_issues, own_path)
+            }));
+        } else {
+            let mut leaf = Vec::new();
+            push_flattened_shape(&mut leaf, source, child, parent, issues);
+            output.push((path, leaf.remove(0)));
+        }
+    }
+}
+
 fn emit_tree<'a>(
     children: &'a [ShapeTreeChild],
-    rules: PassRules<'_>,
+    rules: PassRules,
     output: &mut Vec<FlattenedItem<'a>>,
 ) {
     let mut emitted_latent = Vec::new();
@@ -4143,54 +4020,42 @@ fn emit_tree<'a>(
 
 fn emit_tree_inner<'a>(
     children: &'a [ShapeTreeChild],
-    rules: PassRules<'_>,
+    rules: PassRules,
     parent_transform: Transform,
     parent_issues: u8,
     emitted_latent: &mut Vec<PlaceholderKey>,
     output: &mut Vec<FlattenedItem<'a>>,
 ) {
-    for child in children {
+    let mut pending = children
+        .iter()
+        .rev()
+        .map(|c| (c, parent_transform, parent_issues))
+        .collect::<Vec<_>>();
+    while let Some((child, parent, inherited_issues)) = pending.pop() {
         match child {
             ShapeTreeChild::GroupShape(group) => {
                 let (transform, issues) = group
                     .group_transform()
                     .and_then(group_affine)
                     .unwrap_or((Transform::IDENTITY, 0));
-                emit_tree_inner(
-                    &group.children,
-                    rules,
-                    transform.then(parent_transform),
-                    parent_issues | issues,
-                    emitted_latent,
-                    output,
+                pending.extend(
+                    group
+                        .children
+                        .iter()
+                        .rev()
+                        .map(|c| (c, transform.then(parent), inherited_issues | issues)),
                 );
             }
-            ShapeTreeChild::AlternateContent(alternate) => {
-                if alternate.chart_choice().is_some() {
-                    emit_leaf(
-                        child,
-                        rules,
-                        parent_transform,
-                        parent_issues,
-                        emitted_latent,
-                        output,
-                    );
-                } else if let Some(fallback) = alternate.selected_fallback() {
-                    emit_tree_inner(
-                        fallback,
-                        rules,
-                        parent_transform,
-                        parent_issues,
-                        emitted_latent,
-                        output,
-                    );
+            ShapeTreeChild::AlternateContent(alternate) if alternate.chart_choice().is_none() => {
+                if let Some(fallback) = alternate.selected_fallback() {
+                    pending.extend(fallback.iter().rev().map(|c| (c, parent, inherited_issues)));
                 }
             }
             _ => emit_leaf(
                 child,
                 rules,
-                parent_transform,
-                parent_issues,
+                parent,
+                inherited_issues,
                 emitted_latent,
                 output,
             ),
@@ -4200,7 +4065,7 @@ fn emit_tree_inner<'a>(
 
 fn emit_leaf<'a>(
     child: &'a ShapeTreeChild,
-    rules: PassRules<'_>,
+    rules: PassRules,
     group_transform: Transform,
     group_issues: u8,
     emitted_latent: &mut Vec<PlaceholderKey>,
@@ -4231,25 +4096,10 @@ fn emit_leaf<'a>(
         }
         return;
     };
-    let ph_type = placeholder.effective_type();
-    let key = placeholder.key();
-    if !is_latent(&ph_type)
-        || !rules
-            .latent_policy
-            .is_some_and(|policy| policy.permits(&ph_type))
-        || !child_is_occupied(child)
-        || rules
-            .deeper_latent
-            .iter()
-            .any(|deeper| placeholder_keys_match(&key, deeper))
-        || emitted_latent
-            .iter()
-            .any(|emitted| placeholder_keys_match(&key, emitted))
-    {
-        return;
-    }
-    push_unmatched(emitted_latent, key);
-    push_flattened_shape(output, rules.source, child, group_transform, group_issues);
+    // Native occupied master/layout footer shapes are authoring templates,
+    // never inherited visible content. Ordinary master/layout shapes above
+    // retain their existing showMasterSp policy.
+    let _ = (placeholder, emitted_latent);
 }
 
 fn push_flattened_shape<'a>(
@@ -4344,11 +4194,6 @@ fn group_affine(transform: &CT_Transform2D) -> Option<(Transform, u8)> {
     };
     let center_x = x + width / 2.0;
     let center_y = y + height / 2.0;
-    affine = affine.then(Transform::rotate_about(
-        f64::from(transform.rotation.0) / 60_000.0,
-        center_x,
-        center_y,
-    ));
     if transform.flip_horizontal || transform.flip_vertical {
         affine = affine.then(Transform {
             a: if transform.flip_horizontal { -1.0 } else { 1.0 },
@@ -4367,6 +4212,11 @@ fn group_affine(transform: &CT_Transform2D) -> Option<(Transform, u8)> {
             },
         });
     }
+    affine = affine.then(Transform::rotate_about(
+        f64::from(transform.rotation.0) / 60_000.0,
+        center_x,
+        center_y,
+    ));
     Some((affine, issues))
 }
 
@@ -4380,10 +4230,15 @@ fn child_placeholder(child: &ShapeTreeChild) -> Option<&CT_Placeholder> {
 
 fn child_is_occupied(child: &ShapeTreeChild) -> bool {
     match child {
-        ShapeTreeChild::Shape(shape) => shape
-            .text_body
-            .as_ref()
-            .is_some_and(|body| !body.plain_text().trim().is_empty()),
+        ShapeTreeChild::Shape(shape) => shape.text_body.as_ref().is_some_and(|body| {
+            !body.plain_text().trim().is_empty()
+                || body.paragraphs().iter().any(|paragraph| {
+                    paragraph
+                        .runs
+                        .iter()
+                        .any(|run| matches!(run, TextRun::Field(_)))
+                })
+        }),
         ShapeTreeChild::Picture(picture) => picture.blip_fill.is_some(),
         _ => false,
     }
@@ -4512,6 +4367,454 @@ fn find_placeholder<'a>(
     None
 }
 
+fn blend_fill_colors(a: Color, b: Color, t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+// PowerPoint's documented two-colour endpoint and mirrored three-colour
+// gradients use channel-directed gamma 1.875. Other stop lists remain linear.
+// This PPT resolver samples the curve for existing encoded-RGB Paint consumers.
+// Word colour/tint policy and source-derived pattern palette weights stay intact.
+fn powerpoint_fill_colors(a: Color, b: Color, t: f64) -> Color {
+    fn channel(a: f64, b: f64, t: f64) -> f64 {
+        let weight = if b >= a {
+            1.0 - (1.0 - t).powf(1.875)
+        } else {
+            t.powf(1.875)
+        };
+        a + (b - a) * weight
+    }
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: channel(a.r, b.r, t),
+        g: channel(a.g, b.g, t),
+        b: channel(a.b, b.b, t),
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+fn powerpoint_gradient_stops(stops: &[GradientStop]) -> Vec<GradientStop> {
+    let mut ordered = stops.to_vec();
+    ordered.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    let gamma = ordered.len() == 2 && ordered[0].offset == 0.0 && ordered[1].offset == 1.0
+        || ordered.len() == 3
+            && ordered[0].offset == 0.0
+            && ordered[2].offset == 1.0
+            && ordered[0].color == ordered[2].color;
+    if !gamma {
+        return ordered;
+    }
+    let mut sampled = Vec::with_capacity(ordered.len() + 257);
+    for i in 0..=256 {
+        let offset = f64::from(i) / 256.0;
+        sampled.push(GradientStop {
+            offset,
+            color: path_gradient_color(&ordered, offset),
+        });
+    }
+    // Retain exact original stops, including coincident hard colour boundaries.
+    sampled.extend(ordered);
+    sampled.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    sampled
+}
+
+fn path_gradient_color(stops: &[GradientStop], distance: f64) -> Color {
+    let Some(first) = stops.first() else {
+        return Color::BLACK;
+    };
+    let gamma = stops.len() == 2 && stops[0].offset == 0.0 && stops[1].offset == 1.0
+        || stops.len() == 3
+            && stops[0].offset == 0.0
+            && stops[2].offset == 1.0
+            && stops[0].color == stops[2].color;
+    let distance = distance.clamp(0.0, 1.0);
+    if distance <= first.offset {
+        return first.color;
+    }
+    for pair in stops.windows(2) {
+        if distance <= pair[1].offset {
+            let width = pair[1].offset - pair[0].offset;
+            let t = if width > 0.0 {
+                (distance - pair[0].offset) / width
+            } else {
+                1.0
+            };
+            return if gamma {
+                powerpoint_fill_colors(pair[0].color, pair[1].color, t)
+            } else {
+                blend_fill_colors(pair[0].color, pair[1].color, t)
+            };
+        }
+    }
+    stops.last().map(|stop| stop.color).unwrap_or(first.color)
+}
+
+// Native PowerPoint 16.113.4 source-owned preset tiles, 8pt with 64 samples per axis.
+// Original PDF SHA82e0bfb2cd978c59ebac96d72020e2d28fc2a0bead9728ad8ba3e8b1e34674c0.
+// Each two-bit weight is background, half foreground, or foreground. Equal rows
+// share only constant data, retaining every sample from the independently captured tiles.
+const NATIVE_PATTERN_ROW_WEIGHTS: [u128; 77] = [
+    0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,
+    0xaaaa0000000000000000000000000000,
+    0xaaaaaaaa00000000aaaaaaaa00000000,
+    0x0000aaaaaaaa00000000aaaaaaaa0000,
+    0x00000000aaaaaaaa00000000aaaaaaaa,
+    0xaaaa00000000aaaaaaaa00000000aaaa,
+    0x00000000000000000000000000000000,
+    0xaaaa000000000000aaaa000000000000,
+    0x0000aaaa000000000000aaaa00000000,
+    0x00000000aaaa000000000000aaaa0000,
+    0x000000000000aaaa000000000000aaaa,
+    0xaaaaaaaaaaaaaaaa0000000000000000,
+    0x0000000000000000aaaaaaaaaaaaaaaa,
+    0x0000000000000000aaaa000000000000,
+    0x0000000000000000000000000000aaaa,
+    0x000000000000000000000000aaaa0000,
+    0x00000000000000000000aaaa00000000,
+    0x000000000000aaaaaaaa000000000000,
+    0x00000000aaaa00000000aaaa00000000,
+    0x0000aaaa0000000000000000aaaa0000,
+    0xaaaa000000000000000000000000aaaa,
+    0xaaaa555500000000000000005555aaaa,
+    0x5555aaaa5555000000005555aaaa5555,
+    0x00005555aaaa55555555aaaa55550000,
+    0x000000005555aaaaaaaa555500000000,
+    0x000000000000aaaa0000000000000000,
+    0xaaaa0000aaaa0000aaaa0000aaaa0000,
+    0xaaaa5555000000000000000000005555,
+    0x5555aaaa555500000000000000000000,
+    0x00005555aaaa55550000000000000000,
+    0x000000005555aaaa5555000000000000,
+    0x0000000000005555aaaa555500000000,
+    0x00000000000000005555aaaa55550000,
+    0x000000000000000000005555aaaa5555,
+    0x5555000000000000000000005555aaaa,
+    0xaaaa0000aaaaaaaa000000000000aaaa,
+    0x00000000aaaaaaaa0000000000000000,
+    0x000000000000000000000000aaaaaaaa,
+    0x000000000000aaaaaaaa0000aaaaaaaa,
+    0xaaaaaaaa0000aaaaaaaa000000000000,
+    0xaaaaaaaa000000000000000000000000,
+    0x0000000000000000aaaaaaaa00000000,
+    0xaaaa000000000000aaaaaaaa0000aaaa,
+    0x0000aaaa0000aaaa0000aaaa0000aaaa,
+    0xaaaa00000000000000000000aaaa0000,
+    0x00000000aaaa0000aaaa000000000000,
+    0x0000aaaa0000aaaa000000000000aaaa,
+    0x000000000000aaaa0000aaaa0000aaaa,
+    0xaaaaaaaaaaaa0000aaaaaaaaaaaa0000,
+    0xaaaa0000aaaaaaaaaaaa0000aaaaaaaa,
+    0x0000aaaaaaaaaaaa0000aaaaaaaaaaaa,
+    0xaaaaaaaa0000aaaaaaaaaaaa0000aaaa,
+    0xaaaaaaaaaaaa0000aaaaaaaaaaaaaaaa,
+    0xaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000,
+    0xaaaaaaaaaaaaaaaa0000aaaaaaaaaaaa,
+    0x0000aaaaaaaaaaaaaaaaaaaaaaaaaaaa,
+    0xaaaa0000000000000000aaaa00000000,
+    0x0000aaaa00000000aaaa000000000000,
+    0x0000aaaa000000000000000000000000,
+    0x00000000aaaa00000000000000000000,
+    0x00000000aaaaaaaaaaaa000000000000,
+    0x0000aaaaaaaaaaaaaaaaaaaa00000000,
+    0xaaaa000000000000aaaa00000000aaaa,
+    0xaaaa000000000000aaaaaaaaaaaaaaaa,
+    0xaaaa00000000aaaaaaaa000000000000,
+    0xaaaaaaaaaaaaaaaaaaaa000000000000,
+    0x00000000aaaa00000000aaaa0000aaaa,
+    0x0000aaaa0000aaaa0000aaaa00000000,
+    0x0000aaaa000000000000aaaa0000aaaa,
+    0x000000000000aaaa0000aaaa00000000,
+    0xaaaaaaaa00000000000000000000aaaa,
+    0xaaaaaaaaaaaa00000000000000000000,
+    0x0000aaaaaaaaaaaa0000000000000000,
+    0x000000000000aaaaaaaaaaaa00000000,
+    0x0000000000000000aaaaaaaaaaaa0000,
+    0x00000000000000000000aaaaaaaaaaaa,
+    0xaaaa00000000000000000000aaaaaaaa,
+];
+
+fn native_pattern_rows(preset: &str) -> Option<&'static [u8; 64]> {
+    match preset {
+        "cross" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1,
+        ]),
+        "dkDnDiag" => Some(&[
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5,
+            5, 5, 5, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5,
+            5, 5, 5, 5, 5, 5,
+        ]),
+        "dkHorz" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6,
+        ]),
+        "dkUpDiag" => Some(&[
+            4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 5, 5, 5, 5, 5,
+            5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 5, 5,
+            5, 5, 5, 5, 5, 5,
+        ]),
+        "dkVert" => Some(&[
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2, 2, 2,
+        ]),
+        "dashDnDiag" => Some(&[
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8,
+            8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "dashHorz" => Some(&[
+            11, 11, 11, 11, 11, 11, 11, 11, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 12, 12, 12, 12, 12, 12, 12, 12, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "dashUpDiag" => Some(&[
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 10, 10, 10, 10, 10, 10, 10, 10, 9, 9,
+            9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "dashVert" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+        ]),
+        "diagBrick" => Some(&[
+            14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16,
+            16, 16, 13, 13, 13, 13, 13, 13, 13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18, 18,
+            18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20,
+        ]),
+        "diagCross" => Some(&[
+            21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23,
+            23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23,
+            23, 23, 23, 23, 22, 22, 22, 22, 22, 22, 22, 22, 21, 21, 21, 21, 21, 21, 21, 21,
+        ]),
+        "divot" => Some(&[
+            6, 6, 6, 6, 6, 6, 6, 6, 25, 25, 25, 25, 25, 25, 25, 25, 13, 13, 13, 13, 13, 13, 13, 13,
+            25, 25, 25, 25, 25, 25, 25, 25, 6, 6, 6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1, 1, 14, 14,
+            14, 14, 14, 14, 14, 14, 1, 1, 1, 1, 1, 1, 1, 1,
+        ]),
+        "dotDmnd" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 9, 9, 9, 9, 9, 9, 9, 9, 6, 6, 6, 6, 6,
+            6, 6, 6, 13, 13, 13, 13, 13, 13, 13, 13, 6, 6, 6, 6, 6, 6, 6, 6, 9, 9, 9, 9, 9, 9, 9,
+            9, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "dotGrid" => Some(&[
+            26, 26, 26, 26, 26, 26, 26, 26, 6, 6, 6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6,
+            6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1,
+            1, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "dnDiag" => Some(&[
+            27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29,
+            29, 29, 30, 30, 30, 30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32,
+            32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34,
+        ]),
+        "horz" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6,
+        ]),
+        "horzBrick" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+        ]),
+        "lgCheck" => Some(&[
+            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+            12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        ]),
+        "lgConfetti" => Some(&[
+            35, 35, 35, 35, 35, 35, 35, 35, 36, 36, 36, 36, 36, 36, 36, 36, 37, 37, 37, 37, 37, 37,
+            37, 37, 38, 38, 38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40,
+            40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42, 42, 42, 42, 42, 42, 42,
+        ]),
+        "lgGrid" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1,
+        ]),
+        "ltDnDiag" => Some(&[
+            7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10,
+            10, 10, 10, 10, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+            10, 10, 10, 10, 10, 10, 10, 10,
+        ]),
+        "ltHorz" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6,
+        ]),
+        "ltUpDiag" => Some(&[
+            10, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8, 7, 7,
+            7, 7, 7, 7, 7, 7, 10, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8,
+            8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 7, 7,
+        ]),
+        "ltVert" => Some(&[
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 7, 7, 7,
+        ]),
+        "narHorz" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6,
+            6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6,
+            6, 6, 6, 6, 6, 6,
+        ]),
+        "narVert" => Some(&[
+            43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
+            43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
+            43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
+        ]),
+        "openDmnd" => Some(&[
+            44, 44, 44, 44, 44, 44, 44, 44, 8, 8, 8, 8, 8, 8, 8, 8, 45, 45, 45, 45, 45, 45, 45, 45,
+            25, 25, 25, 25, 25, 25, 25, 25, 45, 45, 45, 45, 45, 45, 45, 45, 8, 8, 8, 8, 8, 8, 8, 8,
+            44, 44, 44, 44, 44, 44, 44, 44, 14, 14, 14, 14, 14, 14, 14, 14,
+        ]),
+        "pct10" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 13, 13, 13, 13, 13, 13, 13, 13, 6, 6,
+            6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 13, 13, 13, 13, 13,
+            13, 13, 13, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "pct20" => Some(&[
+            7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 9, 9, 9, 9, 9, 9, 9, 9, 6, 6, 6, 6, 6,
+            6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 9, 9, 9, 9, 9, 9, 9, 9, 6, 6,
+            6, 6, 6, 6, 6, 6,
+        ]),
+        "pct25" => Some(&[
+            7, 7, 7, 7, 7, 7, 7, 7, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7, 9, 9, 9, 9, 9,
+            9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7, 9, 9,
+            9, 9, 9, 9, 9, 9,
+        ]),
+        "pct30" => Some(&[
+            26, 26, 26, 26, 26, 26, 26, 26, 8, 8, 8, 8, 8, 8, 8, 8, 26, 26, 26, 26, 26, 26, 26, 26,
+            10, 10, 10, 10, 10, 10, 10, 10, 26, 26, 26, 26, 26, 26, 26, 26, 8, 8, 8, 8, 8, 8, 8, 8,
+            26, 26, 26, 26, 26, 26, 26, 26, 10, 10, 10, 10, 10, 10, 10, 10,
+        ]),
+        "pct40" => Some(&[
+            26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43, 43, 43, 43, 43, 26, 26, 26, 26, 26, 26,
+            26, 26, 46, 46, 46, 46, 46, 46, 46, 46, 26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43,
+            43, 43, 43, 43, 26, 26, 26, 26, 26, 26, 26, 26, 47, 47, 47, 47, 47, 47, 47, 47,
+        ]),
+        "pct5" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 13, 13, 13, 13, 13, 13, 13, 13, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+            6, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "pct50" => Some(&[
+            26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43, 43, 43, 43, 43, 26, 26, 26, 26, 26, 26,
+            26, 26, 43, 43, 43, 43, 43, 43, 43, 43, 26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43,
+            43, 43, 43, 43, 26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43, 43, 43, 43, 43,
+        ]),
+        "pct60" => Some(&[
+            48, 48, 48, 48, 48, 48, 48, 48, 43, 43, 43, 43, 43, 43, 43, 43, 49, 49, 49, 49, 49, 49,
+            49, 49, 43, 43, 43, 43, 43, 43, 43, 43, 48, 48, 48, 48, 48, 48, 48, 48, 43, 43, 43, 43,
+            43, 43, 43, 43, 49, 49, 49, 49, 49, 49, 49, 49, 43, 43, 43, 43, 43, 43, 43, 43,
+        ]),
+        "pct70" => Some(&[
+            50, 50, 50, 50, 50, 50, 50, 50, 51, 51, 51, 51, 51, 51, 51, 51, 50, 50, 50, 50, 50, 50,
+            50, 50, 51, 51, 51, 51, 51, 51, 51, 51, 50, 50, 50, 50, 50, 50, 50, 50, 51, 51, 51, 51,
+            51, 51, 51, 51, 50, 50, 50, 50, 50, 50, 50, 50, 51, 51, 51, 51, 51, 51, 51, 51,
+        ]),
+        "pct75" => Some(&[
+            50, 50, 50, 50, 50, 50, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0, 51, 51, 51, 51, 51, 51, 51, 51,
+            0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0, 51, 51,
+            51, 51, 51, 51, 51, 51, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]),
+        "pct80" => Some(&[
+            52, 52, 52, 52, 52, 52, 52, 52, 0, 0, 0, 0, 0, 0, 0, 0, 53, 53, 53, 53, 53, 53, 53, 53,
+            0, 0, 0, 0, 0, 0, 0, 0, 52, 52, 52, 52, 52, 52, 52, 52, 0, 0, 0, 0, 0, 0, 0, 0, 53, 53,
+            53, 53, 53, 53, 53, 53, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]),
+        "pct90" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 54, 54, 54, 54,
+            54, 54, 54, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            55, 55, 55, 55, 55, 55, 55, 55,
+        ]),
+        "plaid" => Some(&[
+            26, 26, 26, 26, 26, 26, 26, 26, 43, 43, 43, 43, 43, 43, 43, 43, 26, 26, 26, 26, 26, 26,
+            26, 26, 43, 43, 43, 43, 43, 43, 43, 43, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+        ]),
+        "shingle" => Some(&[
+            37, 37, 37, 37, 37, 37, 37, 37, 56, 56, 56, 56, 56, 56, 56, 56, 57, 57, 57, 57, 57, 57,
+            57, 57, 36, 36, 36, 36, 36, 36, 36, 36, 41, 41, 41, 41, 41, 41, 41, 41, 15, 15, 15, 15,
+            15, 15, 15, 15, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        ]),
+        "smCheck" => Some(&[
+            5, 5, 5, 5, 5, 5, 5, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 5,
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 5, 5,
+            5, 5, 5, 5, 5, 5,
+        ]),
+        "smConfetti" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 13, 13, 13, 13, 13, 13, 13, 13, 58, 58, 58, 58, 58, 58, 58, 58,
+            15, 15, 15, 15, 15, 15, 15, 15, 25, 25, 25, 25, 25, 25, 25, 25, 14, 14, 14, 14, 14, 14,
+            14, 14, 59, 59, 59, 59, 59, 59, 59, 59, 16, 16, 16, 16, 16, 16, 16, 16,
+        ]),
+        "smGrid" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 7, 7, 7,
+        ]),
+        "solidDmnd" => Some(&[
+            25, 25, 25, 25, 25, 25, 25, 25, 60, 60, 60, 60, 60, 60, 60, 60, 61, 61, 61, 61, 61, 61,
+            61, 61, 53, 53, 53, 53, 53, 53, 53, 53, 61, 61, 61, 61, 61, 61, 61, 61, 60, 60, 60, 60,
+            60, 60, 60, 60, 25, 25, 25, 25, 25, 25, 25, 25, 6, 6, 6, 6, 6, 6, 6, 6,
+        ]),
+        "sphere" => Some(&[
+            50, 50, 50, 50, 50, 50, 50, 50, 62, 62, 62, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63, 63,
+            63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 50, 50, 50, 50, 50, 50, 50, 50, 64, 64, 64, 64,
+            64, 64, 64, 64, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65,
+        ]),
+        "trellis" => Some(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 5, 5, 5,
+            5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5,
+            5, 5, 5, 5, 5, 5,
+        ]),
+        "upDiag" => Some(&[
+            34, 34, 34, 34, 34, 34, 34, 34, 33, 33, 33, 33, 33, 33, 33, 33, 32, 32, 32, 32, 32, 32,
+            32, 32, 31, 31, 31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 30, 30, 30, 29, 29, 29, 29,
+            29, 29, 29, 29, 28, 28, 28, 28, 28, 28, 28, 28, 27, 27, 27, 27, 27, 27, 27, 27,
+        ]),
+        "vert" => Some(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1,
+        ]),
+        "wave" => Some(&[
+            6, 6, 6, 6, 6, 6, 6, 6, 17, 17, 17, 17, 17, 17, 17, 17, 66, 66, 66, 66, 66, 66, 66, 66,
+            40, 40, 40, 40, 40, 40, 40, 40, 6, 6, 6, 6, 6, 6, 6, 6, 17, 17, 17, 17, 17, 17, 17, 17,
+            66, 66, 66, 66, 66, 66, 66, 66, 40, 40, 40, 40, 40, 40, 40, 40,
+        ]),
+        "weave" => Some(&[
+            7, 7, 7, 7, 7, 7, 7, 7, 67, 67, 67, 67, 67, 67, 67, 67, 9, 9, 9, 9, 9, 9, 9, 9, 68, 68,
+            68, 68, 68, 68, 68, 68, 7, 7, 7, 7, 7, 7, 7, 7, 69, 69, 69, 69, 69, 69, 69, 69, 9, 9,
+            9, 9, 9, 9, 9, 9, 46, 46, 46, 46, 46, 46, 46, 46,
+        ]),
+        "wdDnDiag" => Some(&[
+            70, 70, 70, 70, 70, 70, 70, 70, 71, 71, 71, 71, 71, 71, 71, 71, 72, 72, 72, 72, 72, 72,
+            72, 72, 60, 60, 60, 60, 60, 60, 60, 60, 73, 73, 73, 73, 73, 73, 73, 73, 74, 74, 74, 74,
+            74, 74, 74, 74, 75, 75, 75, 75, 75, 75, 75, 75, 76, 76, 76, 76, 76, 76, 76, 76,
+        ]),
+        "wdUpDiag" => Some(&[
+            76, 76, 76, 76, 76, 76, 76, 76, 75, 75, 75, 75, 75, 75, 75, 75, 74, 74, 74, 74, 74, 74,
+            74, 74, 73, 73, 73, 73, 73, 73, 73, 73, 60, 60, 60, 60, 60, 60, 60, 60, 72, 72, 72, 72,
+            72, 72, 72, 72, 71, 71, 71, 71, 71, 71, 71, 71, 70, 70, 70, 70, 70, 70, 70, 70,
+        ]),
+        "zigZag" => Some(&[
+            20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 19, 19, 19, 19, 19, 19, 18, 18, 18, 18, 18, 18,
+            18, 18, 17, 17, 17, 17, 17, 17, 17, 17, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 19, 19,
+            19, 19, 19, 19, 18, 18, 18, 18, 18, 18, 18, 18, 17, 17, 17, 17, 17, 17, 17, 17,
+        ]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -4557,6 +4860,93 @@ mod tests {
         assert!(
             (actual - expected).abs() < 1.0e-10,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn fx214_manual_shape_tree_admission_and_iterative_affine_order() {
+        use rpptx_oxml::shape_tree::CT_GroupShape;
+        let leaf = shape_with_details(
+            None,
+            None,
+            "<a:xfrm><a:off x=\"12700\" y=\"25400\"/><a:ext cx=\"38100\" cy=\"50800\"/></a:xfrm>",
+            None,
+        );
+        let mut fixture = Fixture::new(&leaf, "", "");
+        let leaf = fixture
+            .slide
+            .common_slide_data
+            .shape_tree
+            .children
+            .remove(0);
+        let mut child = leaf;
+        for id in 0..32 {
+            let mut group = CT_GroupShape::new_empty(100 + id, "Nested");
+            group.children.push(child);
+            child = ShapeTreeChild::GroupShape(Box::new(group));
+        }
+        fixture
+            .slide
+            .common_slide_data
+            .shape_tree
+            .children
+            .push(child);
+        let ctx = fixture.context();
+        let resolved = ctx.resolve_slide((960.0, 540.0)).unwrap();
+        assert_eq!(resolved.shapes.len(), 1);
+        assert_eq!(
+            resolved.shapes[0].bounds,
+            Rect {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0
+            }
+        );
+        assert_eq!(resolved.shapes[0].group_transform, Transform::IDENTITY);
+        let flat = ctx.flatten();
+        let FlattenedItem::Shape { child, .. } = flat.last().unwrap() else {
+            panic!("shape leaf");
+        };
+        let lineage = Vec::new();
+        let mut found = Vec::new();
+        assert!(super::find_group_lineage(
+            &fixture.slide.common_slide_data.shape_tree.children,
+            child,
+            &lineage,
+            &mut found
+        ));
+        assert_eq!(found, (100..132).rev().collect::<Vec<_>>());
+        let child = fixture
+            .slide
+            .common_slide_data
+            .shape_tree
+            .children
+            .remove(0);
+        let mut outer = CT_GroupShape::new_empty(132, "Refused");
+        outer.children.push(child);
+        fixture
+            .slide
+            .common_slide_data
+            .shape_tree
+            .children
+            .push(ShapeTreeChild::GroupShape(Box::new(outer)));
+        let error = fixture
+            .context()
+            .resolve_slide((960.0, 540.0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("slide shape tree") && error.contains("offending depth 33"),
+            "{error}"
+        );
+        assert!(
+            fixture
+                .slide
+                .to_xml()
+                .unwrap_err()
+                .to_string()
+                .contains("offending depth 33")
         );
     }
 
@@ -5286,9 +5676,9 @@ mod tests {
         else {
             panic!("expected inherited master gradient paint");
         };
-        assert_eq!(stops.len(), 2);
+        assert_eq!(stops.len(), 259);
         assert_eq!(stops[0].color, Color::from_hex("FF0000"));
-        assert_eq!(stops[1].color, Color::from_hex("0000FF"));
+        assert_eq!(stops.last().unwrap().color, Color::from_hex("0000FF"));
         assert!(resolved.diagnostics.is_empty());
     }
 
@@ -5541,13 +5931,20 @@ mod tests {
         );
 
         let resolved = fixture.context().resolve_slide((40.0, 20.0)).unwrap();
-        assert!(resolved.background.is_none());
-        assert_eq!(
-            resolved.diagnostics,
-            vec![oxml_layout::Diagnostic {
-                message: "unsupported background pattern fill".to_owned(),
-            }]
-        );
+        let Some(ResolvedBackground::Paint(Paint::Grid {
+            bounds,
+            columns,
+            rows,
+            colors,
+        })) = &resolved.background
+        else {
+            panic!("supported pattern background must paint");
+        };
+        assert_eq!((*columns, *rows), (64, 64));
+        assert_eq!((bounds.width, bounds.height), (8.0, 8.0));
+        assert!(colors.contains(&Color::from_hex("FF0000")));
+        assert!(colors.contains(&Color::WHITE));
+        assert!(resolved.diagnostics.is_empty());
 
         let group_fill = Fixture::from_xml(
             &slide_xml_with("", r#"<p:bg><p:bgPr><a:grpFill/></p:bgPr></p:bg>"#, ""),
@@ -5646,7 +6043,58 @@ mod tests {
     }
 
     #[test]
-    fn inherited_latent_placeholders_obey_their_source_header_footer_flags() {
+    fn fx208_native_latent_footer_templates_require_slide_owned_fields() {
+        let inherited = [
+            shape_with_text(Some("dt"), Some(2), "template date"),
+            shape_with_text(Some("ftr"), Some(3), "template footer"),
+            shape_with_text(Some("sldNum"), Some(4), "template number"),
+        ]
+        .join("");
+        let ordinary = shape_with_text(None, None, "ordinary master text");
+        let owned = shape_with_text(Some("ftr"), Some(3), "owned slide footer");
+        for flags in [
+            "",
+            "<p:hf/>",
+            "<p:hf dt=\"1\" ftr=\"1\" sldNum=\"1\"/>",
+            "<p:hf dt=\"0\" ftr=\"0\" sldNum=\"0\"/>",
+        ] {
+            let fixture = Fixture::from_xml(
+                &slide_xml_with("", "", &owned),
+                &layout_xml_with(
+                    "type=\"title\" showSpecialPlsOnTitleSld=\"1\"",
+                    "",
+                    &inherited,
+                    flags,
+                ),
+                &master_xml_with("", &format!("{inherited}{ordinary}"), flags),
+            );
+            let actual = fixture
+                .context()
+                .flatten()
+                .iter()
+                .filter_map(|item| item_text(item).map(|text| (item.source(), text)))
+                .collect::<Vec<_>>();
+            assert!(
+                actual.contains(&(FlattenedSource::Master, "ordinary master text".into())),
+                "ordinary master positive setup"
+            );
+            assert!(
+                actual.contains(&(FlattenedSource::Slide, "owned slide footer".into())),
+                "slide-owned positive setup"
+            );
+            assert_eq!(
+                actual,
+                [
+                    (FlattenedSource::Master, "ordinary master text".into()),
+                    (FlattenedSource::Slide, "owned slide footer".into()),
+                ],
+                "F208 native latent-template visibility: {flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_latent_placeholders_remain_templates_regardless_of_flags() {
         let latent_shapes = [
             shape_with_text(Some("dt"), Some(1), "date"),
             shape_with_text(Some("ftr"), Some(2), "footer"),
@@ -5665,13 +6113,7 @@ mod tests {
             .iter()
             .filter_map(|item| item_text(item).map(|text| (item.source(), text)))
             .collect::<Vec<_>>();
-        assert_eq!(
-            layout_sources_and_text,
-            [
-                (FlattenedSource::Layout, "footer".to_owned()),
-                (FlattenedSource::Layout, "number".to_owned()),
-            ]
-        );
+        assert!(layout_sources_and_text.is_empty());
 
         let master_fixture = Fixture::from_xml(
             &slide_xml_with("", "", ""),
@@ -5688,17 +6130,11 @@ mod tests {
             .iter()
             .filter_map(|item| item_text(item).map(|text| (item.source(), text)))
             .collect::<Vec<_>>();
-        assert_eq!(
-            master_sources_and_text,
-            [
-                (FlattenedSource::Master, "date".to_owned()),
-                (FlattenedSource::Master, "footer".to_owned()),
-            ]
-        );
+        assert!(master_sources_and_text.is_empty());
     }
 
     #[test]
-    fn empty_latent_placeholders_fall_back_by_type_and_source() {
+    fn empty_latent_placeholders_do_not_materialize_inherited_templates() {
         fn source_texts(fixture: &Fixture) -> Vec<(FlattenedSource, String)> {
             fixture
                 .context()
@@ -5745,7 +6181,7 @@ mod tests {
             );
             assert_eq!(
                 source_texts(&empty_slide),
-                [(FlattenedSource::Layout, "layout".to_owned())],
+                Vec::<(FlattenedSource, String)>::new(),
                 "empty slide {ph_type}"
             );
 
@@ -5765,7 +6201,7 @@ mod tests {
             );
             assert_eq!(
                 source_texts(&empty_layout),
-                [(FlattenedSource::Master, "master".to_owned())],
+                Vec::<(FlattenedSource, String)>::new(),
                 "empty layout {ph_type}"
             );
 
@@ -5842,6 +6278,7 @@ mod tests {
         assert_eq!(stats.decks, EXPECTED_CORPUS_DECKS);
         assert!(stats.slides > EXPECTED_CORPUS_DECKS);
         assert_eq!(stats.contextual_errors, 0, "{}", stats.errors.join("\n"));
+        assert_eq!(stats.unresolved_members, 0, "{}", stats.errors.join("\n"));
         assert_eq!(stats.resolved, stats.slides);
         assert_eq!(stats.theme_references, 0);
     }
@@ -6177,6 +6614,32 @@ mod tests {
                     .to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn fx209_hidden_picture_is_omitted_without_affecting_visible_owners() {
+        for (attribute, count) in [
+            ("", 1),
+            ("hidden='0'", 1),
+            ("hidden='false'", 1),
+            ("hidden='1'", 0),
+            ("hidden='true'", 0),
+            ("xmlns:f='urn:foreign' f:hidden='1'", 1),
+        ] {
+            let input = picture("rId1", "", "", 0)
+                .replace("<p:cNvPr/>", &format!("<p:cNvPr {attribute}/>"));
+            let fixture = Fixture::new(&input, "", "");
+            let media = ScopedMediaIds {
+                slide: HashMap::from([("rId1".to_owned(), MediaId(11))]),
+                ..ScopedMediaIds::default()
+            };
+            let resolved = fixture
+                .context()
+                .resolve_slide_with_media((40.0, 20.0), &media)
+                .unwrap();
+            assert_eq!(resolved.shapes.len(), count, "{attribute}");
+            assert!(resolved.diagnostics.is_empty());
+        }
     }
 
     #[test]
@@ -6584,6 +7047,95 @@ mod tests {
     }
 
     #[test]
+    fn connector_shadow_resolves_from_its_effect_reference_under_its_direct_effects() {
+        let styled = |effect_index: u32, direct: &str| {
+            connector("line", 127_000, 254_000, "", direct).replace(
+                "</p:cxnSp>",
+                &format!(
+                    r#"<p:style><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="{effect_index}"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="tx1"/></a:fontRef></p:style></p:cxnSp>"#
+                ),
+            )
+        };
+        let direct_shadow = r#"<a:ln w="12700"/><a:effectLst><a:outerShdw blurRad="12700" dist="25400" dir="0"><a:srgbClr val="FF0000"/></a:outerShdw></a:effectLst>"#;
+        let fixture = Fixture::new(
+            &[
+                styled(3, ""),
+                styled(0, ""),
+                styled(3, "<a:effectLst/>"),
+                connector("line", 127_000, 254_000, "", direct_shadow),
+            ]
+            .join(""),
+            "",
+            "",
+        );
+
+        let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "{:?}",
+            resolved.diagnostics
+        );
+        let shadows: Vec<_> = resolved
+            .shapes
+            .iter()
+            .map(|shape| shape.shadow.is_some())
+            .collect();
+        assert_eq!(shadows, [true, false, false, true]);
+        assert!(matches!(
+            resolved.shapes[3].shadow,
+            Some(Effect::OuterShadow { color, .. }) if color == Color::from_hex("FF0000")
+        ));
+    }
+
+    #[test]
+    fn unresolvable_connector_effect_uses_counted_member_bounds_recovery() {
+        let styled = |effect_reference: &str, direct: &str| {
+            connector("line", 127_000, 254_000, "", direct).replace(
+                "</p:cxnSp>",
+                &format!(
+                    r#"<p:style><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef>{effect_reference}<a:fontRef idx="minor"><a:schemeClr val="tx1"/></a:fontRef></p:style></p:cxnSp>"#
+                ),
+            )
+        };
+        let placeholder_shadow = r#"<a:effectLst><a:outerShdw blurRad="12700" dist="25400" dir="0"><a:schemeClr val="phClr"/></a:outerShdw></a:effectLst>"#;
+        let fixture = Fixture::new(
+            &[
+                styled(
+                    r#"<a:effectRef idx="9"><a:schemeClr val="accent1"/></a:effectRef>"#,
+                    "",
+                ),
+                styled(r#"<a:effectRef idx="0"/>"#, placeholder_shadow),
+            ]
+            .join(""),
+            "",
+            "",
+        );
+
+        let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+
+        assert_eq!(resolved.unresolved_member_count, 2);
+        assert_eq!(resolved.shapes.len(), 2);
+        assert_eq!(resolved.diagnostics.len(), 2);
+        assert!(
+            resolved.diagnostics[0]
+                .message
+                .contains("effect style index 9")
+        );
+        assert!(
+            resolved.diagnostics[1]
+                .message
+                .contains("effect style retains an unresolved phClr")
+        );
+        for shape in &resolved.shapes {
+            assert_eq!(shape.geometry, ResolvedGeometry::BoundsFallback);
+            assert_eq!(shape.line, None);
+            assert_eq!(shape.shadow, None);
+            assert_eq!(shape.content, ResolvedContent::None);
+        }
+    }
+
+    #[test]
     fn unknown_preset_keeps_bounds_text_and_diagnostic() {
         let shape = format!(
             "<p:sp><p:nvSpPr><p:cNvPr/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}<a:prstGeom prst=\"futureBurst\"/></p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>keep this text</a:t></a:r></a:p></p:txBody></p:sp>",
@@ -6896,6 +7448,28 @@ mod tests {
     }
 
     #[test]
+    fn fx205_pica_spacing_is_resolved_as_source_points() {
+        for unit in ["pc", "pi"] {
+            let text = format!(
+                r#"<a:bodyPr/><a:p><a:r><a:rPr spc="1{unit}"/><a:t>spaced</a:t></a:r></a:p>"#
+            );
+            let fixture = Fixture::new(
+                &shape_with_details(None, None, &transform(0), Some(&text)),
+                "",
+                "",
+            );
+            let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+            let ResolvedContent::Text(body) = &resolved.shapes[0].content else {
+                panic!("text")
+            };
+            let ResolvedTextRun::Text { style, .. } = &body.paragraphs[0].runs[0] else {
+                panic!("run")
+            };
+            assert_eq!(style.spacing, Some(12.0));
+        }
+    }
+
+    #[test]
     fn paragraph_spacing_and_bullet_size_are_concrete() {
         let text = r#"<a:bodyPr/><a:p><a:pPr><a:lnSpc><a:spcPct val="120000"/></a:lnSpc><a:spcBef><a:spcPts val="600"/></a:spcBef><a:spcAft><a:spcPts val="300"/></a:spcAft><a:buSzPct val="125000"/><a:buChar char="*"/></a:pPr><a:r><a:t>spaced</a:t></a:r></a:p>"#;
         let fixture = Fixture::new(
@@ -7001,6 +7575,29 @@ mod tests {
     }
 
     #[test]
+    fn fx206_tcpr_anchor_resolution_modes_and_absent_body_fallback() {
+        for (attribute, expected) in [
+            ("", ResolvedTextAnchor::Bottom),
+            (" anchor='t'", ResolvedTextAnchor::Top),
+            (" anchor='ctr'", ResolvedTextAnchor::Center),
+            (" anchor='b'", ResolvedTextAnchor::Bottom),
+        ] {
+            let frame = format!(
+                r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="127000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc><a:txBody><a:bodyPr anchor="b"/><a:lstStyle/><a:p><a:r><a:t>cell</a:t></a:r></a:p></a:txBody><a:tcPr{attribute}/></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#
+            );
+            let fixture = Fixture::new(&frame, "", "");
+            let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+            let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+                panic!("table");
+            };
+            assert_eq!(
+                table.rows[0].cells[0].text.as_ref().unwrap().anchor,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn table_cells_resolve_body_and_paragraph_properties() {
         let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="127000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc><a:txBody><a:bodyPr lIns="12700" anchor="b" vert="vert"><a:spAutoFit/></a:bodyPr><a:lstStyle/><a:p><a:pPr marL="25400" algn="ctr"/><a:r><a:t>cell</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
         let fixture = Fixture::new(frame, "", "");
@@ -7063,13 +7660,11 @@ mod tests {
 
     #[test]
     fn builtin_table_styles_resolve_without_package_definitions() {
-        assert_eq!(super::BUILTIN_TABLE_STYLES.len(), 74);
-        for (id, _, _) in super::BUILTIN_TABLE_STYLES {
-            let style = super::builtin_table_style(id).expect("known built-in style parses");
-            assert_eq!(&style.style_id, id);
-            assert!(style.whole_table.is_some());
-        }
-        assert!(super::builtin_table_style("{00000000-0000-0000-0000-000000000000}").is_none());
+        let id = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}";
+        let style = super::CT_TableStyle::builtin(id).expect("known built-in style parses");
+        assert_eq!(style.style_id, id);
+        assert!(style.whole_table.is_some());
+        assert!(super::CT_TableStyle::builtin("{00000000-0000-0000-0000-000000000000}").is_none());
 
         let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="254000" cy="254000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc/></a:tr><a:tr h="127000"><a:tc/></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
         let fixture = Fixture::new(frame, "", "");
@@ -7165,20 +7760,143 @@ mod tests {
             table.rows[0].cells[0].fill,
             Some(Paint::Solid(Color::from_hex("333333")))
         );
-        assert_eq!(table.rows[0].cells[1].fill, None);
-        assert!(
-            table.rows[0].cells[1]
-                .left
-                .as_ref()
-                .is_some_and(|border| border.stroke.is_none())
-        );
-        assert!(resolved.diagnostics.iter().any(|diagnostic| {
+        let Some(Paint::Grid {
+            columns,
+            rows,
+            colors,
+            ..
+        }) = &table.rows[0].cells[1].fill
+        else {
+            panic!("supported direct cell pattern must paint");
+        };
+        assert_eq!((*columns, *rows), (64, 64));
+        assert!(colors.contains(&Color::from_hex("FF0000")));
+        assert!(colors.contains(&Color::WHITE));
+        let stroke = table.rows[0].cells[1]
+            .left
+            .as_ref()
+            .and_then(|border| border.stroke.as_ref())
+            .expect("supported pattern border must remain visible");
+        let Paint::Grid {
+            columns,
+            rows,
+            colors,
+            ..
+        } = &stroke.paint
+        else {
+            panic!("expected pattern border grid");
+        };
+        assert_eq!((*columns, *rows), (64, 64));
+        assert!(colors.contains(&Color::from_hex("FF0000")));
+        assert!(colors.contains(&Color::WHITE));
+        assert!(!resolved.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "unsupported table cell pattern fill was ignored"
         }));
     }
 
     #[test]
-    fn table_cell_autofit_is_ignored_and_records_a_diagnostic() {
+    fn builtin_table_style_ids_resolve_unless_the_package_defines_them() {
+        // python-pptx names Medium Style 2 - Accent 1 without defining it.
+        let frame = |style_id: &str| {
+            format!(
+                r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="381000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1" bandRow="1">{style_id}</a:tblPr><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>head</a:t></a:r></a:p></a:txBody></a:tc></a:tr><a:tr h="127000"><a:tc/></a:tr><a:tr h="127000"><a:tc/></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#
+            )
+        };
+        let medium_2_accent_1 =
+            "<a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId>";
+        let resolve = |frame: &str, styles: Option<&oxml_drawing::table::CT_TableStyleList>| {
+            let fixture = Fixture::new(frame, "", "");
+            let mut context = fixture.context();
+            if let Some(styles) = styles {
+                context = context.with_table_styles(styles);
+            }
+            let resolved = context.resolve_slide((10.0, 30.0)).unwrap();
+            let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+                panic!("expected table");
+            };
+            table.clone()
+        };
+
+        let table = resolve(&frame(medium_2_accent_1), None);
+        let fills = table
+            .rows
+            .iter()
+            .map(|row| row.cells[0].fill.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(fills[0], Some(Paint::Solid(Color::from_hex("156082"))));
+        assert_eq!(fills[1], Some(Paint::Solid(Color::from_hex("CCD2D8"))));
+        assert_eq!(fills[2], Some(Paint::Solid(Color::from_hex("E7EAED"))));
+        let heading_rule = table.rows[0].cells[0].bottom.as_ref().unwrap();
+        let heading_rule = heading_rule.stroke.as_ref().unwrap();
+        assert_eq!(heading_rule.paint, Paint::Solid(Color::from_hex("FFFFFF")));
+        assert_eq!(heading_rule.width, 3.0);
+        let ResolvedTextRun::Text { style, .. } =
+            &table.rows[0].cells[0].text.as_ref().unwrap().paragraphs[0].runs[0]
+        else {
+            panic!("expected heading run");
+        };
+        assert!(style.bold);
+        assert_eq!(style.fill, Some(Paint::Solid(Color::from_hex("FFFFFF"))));
+
+        // A definition in the package wins over the built-in one.
+        let styles = oxml_drawing::table::CT_TableStyleList::from_xml(br#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"><a:tblStyle styleId="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" styleName="Own"><a:firstRow><a:tcStyle><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:tcStyle></a:firstRow></a:tblStyle></a:tblStyleLst>"#).unwrap();
+        let table = resolve(&frame(medium_2_accent_1), Some(&styles));
+        assert_eq!(
+            table.rows[0].cells[0].fill,
+            Some(Paint::Solid(Color::from_hex("FF0000")))
+        );
+        assert_eq!(table.rows[1].cells[0].fill, None);
+    }
+
+    #[test]
+    fn a_builtin_default_style_applies_when_the_package_has_no_definition() {
+        let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="127000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1"/><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc/></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
+        let styles = oxml_drawing::table::CT_TableStyleList::from_xml(br#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"/>"#).unwrap();
+        let fixture = Fixture::new(frame, "", "");
+        let resolved = fixture
+            .context()
+            .with_table_styles(&styles)
+            .resolve_slide((10.0, 10.0))
+            .unwrap();
+        let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+            panic!("expected table");
+        };
+        assert_eq!(
+            table.rows[0].cells[0].fill,
+            Some(Paint::Solid(Color::from_hex("156082")))
+        );
+    }
+
+    #[test]
+    fn table_style_background_resolves_over_the_whole_table() {
+        // Themed Style 1 - Accent 1 fills the table from the theme's second
+        // fill style (a gradient) in accent 1 and adds a theme effect.
+        let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="254000" cy="127000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{3C2FFA5D-87B4-456A-9821-1D502468CF0F}</a:tableStyleId></a:tblPr><a:tblGrid><a:gridCol w="127000"/><a:gridCol w="127000"/></a:tblGrid><a:tr h="63500"><a:tc/><a:tc/></a:tr><a:tr h="63500"><a:tc/><a:tc/></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
+        let fixture = Fixture::new(frame, "", "");
+
+        let resolved = fixture.context().resolve_slide((20.0, 10.0)).unwrap();
+        let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+            panic!("expected table");
+        };
+
+        let Some(Paint::Linear { start, end, .. }) = &table.background else {
+            panic!("expected a gradient background, got {:?}", table.background);
+        };
+        // The gradient runs down the 20 by 10 point table box, as the theme's
+        // 90 degree fill style says.
+        assert!((start.x - 10.0).abs() < 1e-9 && (end.x - 10.0).abs() < 1e-9);
+        assert!(start.y.abs() < 1e-9 && (end.y - 10.0).abs() < 1e-9);
+        assert_eq!(
+            table.rows[0].cells[0].fill,
+            Some(Paint::Solid(Color::from_hex("156082")))
+        );
+        assert!(resolved.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "unsupported table background effect was ignored"
+        }));
+    }
+
+    #[test]
+    fn table_cell_shape_autofit_is_ignored_but_normal_values_are_retained() {
         let frame = r#"<p:graphicFrame><p:nvGraphicFramePr/><p:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="127000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblGrid><a:gridCol w="127000"/></a:tblGrid><a:tr h="127000"><a:tc><a:txBody><a:bodyPr><a:spAutoFit/></a:bodyPr><a:p><a:r><a:t>cell</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
         let fixture = Fixture::new(frame, "", "");
 
@@ -7197,6 +7915,28 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message
                     == "table cell autofit is unsupported and was ignored")
+        );
+        let normal = frame.replace(
+            "<a:spAutoFit/>",
+            "<a:normAutofit fontScale=\"62500\" lnSpcReduction=\"20000\"/>",
+        );
+        let fixture = Fixture::new(&normal, "", "");
+        let resolved = fixture.context().resolve_slide((10.0, 10.0)).unwrap();
+        let ResolvedContent::Table(table) = &resolved.shapes[0].content else {
+            panic!("expected table")
+        };
+        assert_eq!(
+            table.rows[0].cells[0].text.as_ref().unwrap().autofit,
+            ResolvedAutofit::Normal {
+                font_scale: Some(0.625),
+                line_spacing_reduction: Some(0.2)
+            }
+        );
+        assert!(
+            !resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("autofit"))
         );
     }
 
@@ -7260,15 +8000,35 @@ mod tests {
                 r#"<a:lin ang="0"/><a:tileRect l="10000"/>"#,
                 "gradient tile rectangle",
             ),
-            ("", r#"<a:path path="circle"/>"#, "circle path gradient"),
-            ("", r#"<a:path path="rect"/>"#, "rectangle path gradient"),
-            ("", r#"<a:path path="shape"/>"#, "shape path gradient"),
+            (
+                "",
+                r#"<a:path path="circle"/>"#,
+                "path gradient with non-centred fill rectangle",
+            ),
+            (
+                "",
+                r#"<a:path path="rect"/>"#,
+                "path gradient with non-centred fill rectangle",
+            ),
+            (
+                "",
+                r#"<a:path path="shape"/>"#,
+                "path gradient with non-centred fill rectangle",
+            ),
         ];
 
         for (attributes, geometry, expected) in variants {
             let details = format!(
                 r#"<a:xfrm><a:off x="0" y="0"/><a:ext cx="127000" cy="127000"/></a:xfrm><a:gradFill {attributes}><a:gsLst><a:gs pos="0"><a:srgbClr val="000000"/></a:gs><a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs></a:gsLst>{geometry}</a:gradFill>"#
             );
+            let details = if geometry.contains("a:path") {
+                details.replace(
+                    r#"<a:srgbClr val="000000"/>"#,
+                    r#"<a:schemeClr val="phClr"/>"#,
+                )
+            } else {
+                details
+            };
             let fixture = Fixture::new(&shape_with_details(None, None, &details, None), "", "");
             let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
 
@@ -7276,6 +8036,208 @@ mod tests {
             assert_eq!(resolved.shapes[0].unsupported, Some(expected));
             assert!(resolved.diagnostics[0].message.contains(expected));
         }
+    }
+
+    #[test]
+    fn fx205_path_and_pattern_fills_have_concrete_visible_paint() {
+        // Microsoft Open Specifications documents channel-directed gamma1.875
+        // only for endpoint pairs and mirrored three-stop lists, not all fills.
+        let a = Color {
+            r: 0.0,
+            g: 1.0,
+            b: 0.25,
+            a: 0.2,
+        };
+        let b = Color {
+            r: 1.0,
+            g: 0.0,
+            b: 0.25,
+            a: 0.8,
+        };
+        let stops = [
+            super::GradientStop {
+                offset: 0.0,
+                color: a,
+            },
+            super::GradientStop {
+                offset: 1.0,
+                color: b,
+            },
+        ];
+        let mid = super::path_gradient_color(&stops, 0.5);
+        let expected = 1.0 - 0.5_f64.powf(1.875);
+        assert!((mid.r - expected).abs() < 1e-12 && (mid.g - expected).abs() < 1e-12);
+        assert_eq!(mid.b, 0.25);
+        assert!((mid.a - 0.5).abs() < 1e-12);
+        let shifted = [
+            super::GradientStop {
+                offset: 0.1,
+                color: a,
+            },
+            super::GradientStop {
+                offset: 0.9,
+                color: b,
+            },
+        ];
+        assert!((super::path_gradient_color(&shifted, 0.5).r - 0.5).abs() < 1e-12);
+        assert_eq!(super::powerpoint_gradient_stops(&shifted).len(), 2);
+        let mirrored = [
+            stops[0],
+            super::GradientStop {
+                offset: 0.5,
+                color: b,
+            },
+            super::GradientStop {
+                offset: 1.0,
+                color: a,
+            },
+        ];
+        assert_eq!(
+            super::path_gradient_color(&mirrored, 0.25),
+            super::path_gradient_color(&mirrored, 0.75)
+        );
+        let geometry = r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#;
+        for kind in ["circle", "rect", "shape"] {
+            let fill = format!(
+                r#"<a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst><a:path path="{kind}"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path></a:gradFill>"#
+            );
+            let shape = shape_with_details(
+                None,
+                None,
+                &format!("{}{}{}", transform(0), geometry, fill),
+                None,
+            );
+            let resolved = Fixture::new(&shape, "", "")
+                .context()
+                .resolve_slide((720.0, 540.0))
+                .unwrap();
+            assert!(
+                resolved.shapes[0].fill.is_some(),
+                "FX205_VISIBLE_PATH: {kind}"
+            );
+            assert_eq!(resolved.shapes[0].unsupported, None);
+            let Some(Paint::Grid {
+                columns,
+                rows,
+                colors,
+                ..
+            }) = &resolved.shapes[0].fill
+            else {
+                panic!("path did not publish sampled colour paint");
+            };
+            assert_eq!((*columns, *rows), (128, 128));
+            let center = colors[64 * 128 + 64];
+            assert!(
+                center.r > 0.98 && center.b < 0.02,
+                "path centre lost first source stop"
+            );
+            assert!(colors[0].b > 0.98, "path boundary lost last source stop");
+        }
+        // Supported paths must resolve the producing style reference before paint.
+        let details = r#"<a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="1270000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:gradFill><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst><a:path path="rect"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path></a:gradFill>"#;
+        let style = r#"<p:style><a:lnRef idx="0"/><a:fillRef idx="0"><a:srgbClr val="FF0000"/></a:fillRef><a:effectRef idx="0"/><a:fontRef idx="minor"/></p:style>"#;
+        let shape = shape_with_details(None, None, details, None)
+            .replace("</p:sp>", &format!("{style}</p:sp>"));
+        let fixture = Fixture::new(&shape, "", "");
+        let before = fixture.slide.clone();
+        let resolved = fixture.context().resolve_slide((720.0, 540.0)).unwrap();
+        let Some(Paint::Grid { colors, .. }) = &resolved.shapes[0].fill else {
+            panic!("source-qualified path reference must paint");
+        };
+        assert!(colors[64 * 128 + 64].r > 0.98);
+        assert!(colors[0].b > 0.98);
+        assert!(resolved.diagnostics.is_empty());
+        assert_eq!(fixture.slide, before);
+
+        for preset in [
+            "cross",
+            "dkDnDiag",
+            "dkHorz",
+            "dkUpDiag",
+            "dkVert",
+            "dashDnDiag",
+            "dashHorz",
+            "dashUpDiag",
+            "dashVert",
+            "diagBrick",
+            "diagCross",
+            "divot",
+            "dotDmnd",
+            "dotGrid",
+            "dnDiag",
+            "horz",
+            "horzBrick",
+            "lgCheck",
+            "lgConfetti",
+            "lgGrid",
+            "ltDnDiag",
+            "ltHorz",
+            "ltUpDiag",
+            "ltVert",
+            "narHorz",
+            "narVert",
+            "openDmnd",
+            "pct10",
+            "pct20",
+            "pct25",
+            "pct30",
+            "pct40",
+            "pct5",
+            "pct50",
+            "pct60",
+            "pct70",
+            "pct75",
+            "pct80",
+            "pct90",
+            "plaid",
+            "shingle",
+            "smCheck",
+            "smConfetti",
+            "smGrid",
+            "solidDmnd",
+            "sphere",
+            "trellis",
+            "upDiag",
+            "vert",
+            "wave",
+            "weave",
+            "wdDnDiag",
+            "wdUpDiag",
+            "zigZag",
+        ] {
+            let fill = format!(
+                r#"<a:pattFill prst="{preset}"><a:fgClr><a:srgbClr val="FF0000"/></a:fgClr><a:bgClr><a:srgbClr val="0000FF"/></a:bgClr></a:pattFill>"#
+            );
+            let shape = shape_with_details(
+                None,
+                None,
+                &format!("{}{}{}", transform(0), geometry, fill),
+                None,
+            );
+            let resolved = Fixture::new(&shape, "", "")
+                .context()
+                .resolve_slide((720.0, 540.0))
+                .unwrap();
+            assert!(
+                resolved.shapes[0].fill.is_some(),
+                "FX205_VISIBLE_PATTERN: {preset}"
+            );
+            assert_eq!(resolved.shapes[0].unsupported, None);
+            let Some(Paint::Grid {
+                bounds,
+                columns,
+                rows,
+                colors,
+            }) = &resolved.shapes[0].fill
+            else {
+                panic!("pattern did not publish sampled colour paint");
+            };
+            assert_eq!((*columns, *rows), (64, 64));
+            assert_eq!((bounds.width, bounds.height), (8.0, 8.0));
+            assert!(colors.iter().any(|c| c.r == 1.0 && c.b == 0.0));
+            assert!(colors.iter().any(|c| c.r == 0.0 && c.b == 1.0));
+        }
+        assert!(super::native_pattern_rows("foreign-preset").is_none());
     }
 
     #[test]
@@ -7492,6 +8454,7 @@ mod tests {
 
         assert_eq!(stats.decks, EXPECTED_CORPUS_DECKS);
         assert_eq!(stats.contextual_errors, 0, "{}", stats.errors.join("\n"));
+        assert_eq!(stats.unresolved_members, 0, "{}", stats.errors.join("\n"));
         assert!(
             stats.preset_inputs > 0,
             "corpus exercised no preset geometry"
@@ -7511,6 +8474,7 @@ mod tests {
         slides: usize,
         resolved: usize,
         contextual_errors: usize,
+        unresolved_members: usize,
         theme_references: usize,
         preset_inputs: usize,
         preset_evaluated: usize,
@@ -7631,6 +8595,18 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{} {slide_part}: resolver panicked", path.display()));
                 match result {
                     Ok(resolved) => {
+                        stats.unresolved_members += resolved.unresolved_member_count;
+                        if resolved.unresolved_member_count > 0 {
+                            stats
+                                .errors
+                                .extend(resolved.diagnostics.iter().map(|diagnostic| {
+                                    format!(
+                                        "{} {slide_part}: {}",
+                                        path.display(),
+                                        diagnostic.message
+                                    )
+                                }));
+                        }
                         let debug = format!("{resolved:?}");
                         stats.theme_references += ["schemeClr", "sysClr", "scrgbClr", "prstClr"]
                             .into_iter()
@@ -8226,5 +9202,404 @@ mod tests {
 
     fn transform(x: i64) -> String {
         format!("<a:xfrm><a:off x=\"{x}\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm>")
+    }
+    fn fx206_recovery_shape(id: u32, props: &str, style: &str, placed: bool) -> String {
+        let transform = if placed {
+            r#"<a:xfrm><a:off x="127000" y="254000"/><a:ext cx="127000" cy="127000"/></a:xfrm>"#
+        } else {
+            ""
+        };
+        format!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="owner{id}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{transform}<a:prstGeom prst="rect"/>{props}</p:spPr>{style}</p:sp>"#
+        )
+    }
+
+    #[test]
+    fn fx206_recovery_semantic_errors_keep_siblings_and_count_boundsless_owners() {
+        let cases = [
+            (
+                "",
+                r#"<p:style><a:lnRef idx="0"/><a:fillRef idx="999"/><a:effectRef idx="0"/><a:fontRef idx="minor"/></p:style>"#,
+                "style index",
+            ),
+            (
+                r#"<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>"#,
+                "",
+                "phClr",
+            ),
+            (
+                r#"<a:solidFill><a:prstClr val="futureColour"/></a:solidFill>"#,
+                "",
+                "concrete value",
+            ),
+        ];
+        for (properties, style, reason) in cases {
+            for placed in [true, false] {
+                let red = fx206_recovery_shape(
+                    1,
+                    r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#,
+                    "",
+                    true,
+                );
+                let green = fx206_recovery_shape(
+                    3,
+                    r#"<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>"#,
+                    "",
+                    true,
+                );
+                let failed = fx206_recovery_shape(2, properties, style, placed);
+                let fixture = Fixture::new(&[red, failed, green].join(""), "", "");
+                let original = fixture.slide.clone();
+                let context = fixture.context();
+                let mut identities = Vec::new();
+                let (resolved, directions) = context
+                    .resolve_slide_inner_common(
+                        (100.0, 100.0),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&mut identities),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    resolved.unresolved_member_count, 1,
+                    "{reason}, placed={placed}"
+                );
+                assert_eq!(
+                    identities
+                        .iter()
+                        .map(|identity| identity.shape_id.unwrap())
+                        .collect::<Vec<_>>(),
+                    if placed { vec![1, 2, 3] } else { vec![1, 3] }
+                );
+                assert_eq!(directions.len(), resolved.shapes.len());
+                assert_eq!(
+                    resolved.shapes.first().unwrap().fill,
+                    Some(Paint::Solid(Color::from_hex("FF0000")))
+                );
+                assert_eq!(
+                    resolved.shapes.last().unwrap().fill,
+                    Some(Paint::Solid(Color::from_hex("00FF00")))
+                );
+                let messages = resolved
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.message.starts_with("unresolved member "))
+                    .collect::<Vec<_>>();
+                assert_eq!(messages.len(), 1);
+                assert!(messages[0].message.contains("shape 2 \"owner2\""));
+                assert!(messages[0].message.contains(reason));
+                assert!(messages[0].message.contains(if placed {
+                    "retained as bounds"
+                } else {
+                    "omitted without trustworthy finite bounds"
+                }));
+                if placed {
+                    assert_eq!(
+                        resolved.shapes[1].geometry,
+                        ResolvedGeometry::BoundsFallback
+                    );
+                    assert_eq!(resolved.shapes[1].content, ResolvedContent::None);
+                }
+                assert_eq!(fixture.slide, original);
+            }
+        }
+    }
+
+    #[test]
+    fn fx206_recovery_valid_zero_and_background_setup_remain_distinct() {
+        let fixture = Fixture::new(
+            &fx206_recovery_shape(
+                1,
+                r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#,
+                "",
+                true,
+            ),
+            "",
+            "",
+        );
+        let valid = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+        assert_eq!(valid.unresolved_member_count, 0);
+        assert!(valid.diagnostics.is_empty());
+        let xml = slide_xml_with(
+            "",
+            r#"<p:bg><p:bgRef idx="999"><a:schemeClr val="accent1"/></p:bgRef></p:bg>"#,
+            "",
+        );
+        let fixture = Fixture::from_xml(&xml, &layout_xml(""), &master_xml(""));
+        assert!(matches!(
+            fixture.context().resolve_slide((100.0, 100.0)),
+            Err(crate::ResolveError::StyleIndexOutOfRange { .. })
+        ));
+        assert!(CT_Slide::from_xml(b"<p:sld>").is_err());
+    }
+
+    #[test]
+    fn fx206_recovery_rejects_nonfinite_placement_without_hiding_the_failure() {
+        let fixture = Fixture::new(&fx206_recovery_shape(2, "", "", true), "", "");
+        let context = fixture.context();
+        let mut diagnostics = Vec::new();
+        let error = crate::ResolveError::ConcreteValue {
+            kind: "test semantic",
+            detail: "bad value".to_owned(),
+        };
+        let result = context.unresolved_shape_fallback(
+            super::ShapePlacement {
+                source: FlattenedSource::Slide,
+                group_scale: (1.0, 1.0),
+                group_transform: Transform {
+                    a: f64::INFINITY,
+                    ..Transform::IDENTITY
+                },
+            },
+            &fixture.slide.common_slide_data.shape_tree.children[0],
+            &error,
+            &mut diagnostics,
+        );
+        assert!(result.is_none());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("omitted without trustworthy finite bounds")
+        );
+    }
+
+    #[test]
+    fn fx206_recovery_alias_and_default_namespaces_keep_owned_failure_and_foreign_payload() {
+        let failed = fx206_recovery_shape(
+            2,
+            r#"<a:solidFill><a:schemeClr val="phClr"/></a:solidFill><f:solidFill xmlns:f="urn:foreign"><f:opaque/></f:solidFill>"#,
+            "",
+            true,
+        );
+        let original = slide_xml(&failed);
+        let conflicting = original
+            .replace("xmlns:p=", "xmlns:q=")
+            .replace("xmlns:a=", "xmlns:r=")
+            .replace("<p:", "<q:")
+            .replace("</p:", "</q:")
+            .replace("<a:", "<r:")
+            .replace("</a:", "</r:");
+        assert!(CT_Slide::from_xml(conflicting.as_bytes()).is_err());
+        let alias = original
+            .replace("xmlns:p=", "xmlns:q=")
+            .replace("xmlns:a=", "xmlns:d=")
+            .replace("<p:", "<q:")
+            .replace("</p:", "</q:")
+            .replace("<a:", "<d:")
+            .replace("</a:", "</d:");
+        let default = original.replace("<p:", "<").replace("</p:", "</").replacen(
+            "<sld ",
+            &format!("<sld xmlns=\"{P_NS}\" "),
+            1,
+        );
+        for xml in [original, alias, default] {
+            let fixture = Fixture::from_xml(&xml, &layout_xml(""), &master_xml(""));
+            let snapshot = fixture.slide.clone();
+            let resolved = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+            assert_eq!(resolved.unresolved_member_count, 1);
+            assert_eq!(resolved.shapes.len(), 1);
+            assert!(resolved.diagnostics[0].message.contains("phClr"));
+            assert_eq!(fixture.slide, snapshot);
+        }
+    }
+
+    #[test]
+    fn fx206_recovery_gradient_stop_errors_count_with_and_without_placement() {
+        for line in [false, true] {
+            for color in [
+                r#"<a:schemeClr val="phClr"/>"#,
+                r#"<a:prstClr val="futureColour"/>"#,
+            ] {
+                for placed in [false, true] {
+                    let gradient = format!(
+                        r#"<a:gradFill><a:gsLst><a:gs pos="0">{color}</a:gs><a:gs pos="100000"><a:srgbClr val="00FF00"/></a:gs></a:gsLst><a:lin ang="0" scaled="1"/></a:gradFill>"#
+                    );
+                    let properties = if line {
+                        format!("<a:ln>{gradient}</a:ln>")
+                    } else {
+                        gradient
+                    };
+                    let children = [
+                        fx206_recovery_shape(
+                            1,
+                            r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#,
+                            "",
+                            true,
+                        ),
+                        fx206_recovery_shape(2, &properties, "", placed),
+                        fx206_recovery_shape(
+                            3,
+                            r#"<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>"#,
+                            "",
+                            true,
+                        ),
+                    ]
+                    .join("");
+                    for namespace in 0..3 {
+                        let xml = match namespace {
+                            1 => slide_xml(&children)
+                                .replace("xmlns:a=", "xmlns:d=")
+                                .replace("<a:", "<d:")
+                                .replace("</a:", "</d:"),
+                            2 => slide_xml(&children)
+                                .replace("xmlns:a=", "xmlns=")
+                                .replace("<a:", "<")
+                                .replace("</a:", "</"),
+                            _ => slide_xml(&children),
+                        };
+                        let fixture = Fixture::from_xml(&xml, &layout_xml(""), &master_xml(""));
+                        let before = fixture.slide.clone();
+                        let resolved = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+                        assert_eq!(
+                            resolved.unresolved_member_count, 1,
+                            "line={line} placed={placed} namespace={namespace}"
+                        );
+                        assert_eq!(resolved.shapes.len(), if placed { 3 } else { 2 });
+                        assert_eq!(
+                            resolved.shapes[0].fill,
+                            Some(Paint::Solid(Color::from_hex("FF0000")))
+                        );
+                        assert_eq!(
+                            resolved.shapes.last().unwrap().fill,
+                            Some(Paint::Solid(Color::from_hex("00FF00")))
+                        );
+                        assert_eq!(resolved.diagnostics.len(), 1);
+                        assert!(
+                            resolved.diagnostics[0]
+                                .message
+                                .contains("shape 2 \"owner2\"")
+                        );
+                        assert!(resolved.diagnostics[0].message.contains(if placed {
+                            "retained as bounds"
+                        } else {
+                            "omitted without trustworthy finite bounds"
+                        }));
+                        assert_eq!(fixture.slide, before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fx206_recovery_unplaced_gradient_validation_keeps_supported_and_unsupported_boundaries() {
+        for (attributes, stops, geometry) in [
+            (
+                "",
+                r#"<a:gs pos="0"><a:srgbClr val="112233"/></a:gs>"#,
+                r#"<a:lin ang="0"/>"#,
+            ),
+            (
+                r#"rotWithShape="0""#,
+                r#"<a:gs pos="0"><a:schemeClr val="phClr"/></a:gs>"#,
+                r#"<a:lin ang="0"/>"#,
+            ),
+            (
+                r#"flip="x""#,
+                r#"<a:gs pos="0"><a:schemeClr val="phClr"/></a:gs>"#,
+                r#"<a:lin ang="0"/>"#,
+            ),
+            (
+                "",
+                r#"<a:gs pos="0"><a:schemeClr val="phClr"/></a:gs>"#,
+                r#"<a:path path="circle"/>"#,
+            ),
+            (
+                "",
+                r#"<a:gs pos="0"/><a:gs pos="100000"><a:schemeClr val="phClr"/></a:gs>"#,
+                r#"<a:lin ang="0"/>"#,
+            ),
+        ] {
+            let gradient = format!(
+                "<a:gradFill {attributes}><a:gsLst>{stops}</a:gsLst>{geometry}</a:gradFill>"
+            );
+            let fixture = Fixture::new(&fx206_recovery_shape(2, &gradient, "", false), "", "");
+            let before = fixture.slide.clone();
+            let resolved = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+            assert_eq!(
+                resolved.unresolved_member_count, 0,
+                "attributes={attributes:?}; stops={stops}; geometry={geometry}; diagnostics={:?}",
+                resolved.diagnostics
+            );
+            assert!(resolved.shapes.is_empty());
+            assert!(resolved.diagnostics.is_empty());
+            assert_eq!(fixture.slide, before);
+        }
+    }
+
+    #[test]
+    fn fx206_recovery_supported_gradient_phclr_before_missing_stop_still_counts() {
+        for placed in [false, true] {
+            let gradient = r#"<a:gradFill><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs><a:gs pos="100000"/></a:gsLst><a:lin ang="0"/></a:gradFill>"#;
+            let fixture = Fixture::new(&fx206_recovery_shape(2, gradient, "", placed), "", "");
+            let before = fixture.slide.clone();
+            let resolved = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+            assert_eq!(resolved.unresolved_member_count, 1);
+            assert_eq!(resolved.shapes.len(), usize::from(placed));
+            assert_eq!(resolved.diagnostics.len(), 1);
+            assert!(resolved.diagnostics[0].message.contains("phClr"));
+            assert!(resolved.diagnostics[0].message.contains(if placed {
+                "retained as bounds"
+            } else {
+                "omitted without trustworthy finite bounds"
+            }));
+            assert_eq!(fixture.slide, before);
+        }
+    }
+
+    #[test]
+    fn fx206_background_gradient_shape_rotation_does_not_hide_phclr_paint() {
+        let background = r#"<p:bg><p:bgPr><a:gradFill rotWithShape="0"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst><a:lin ang="0"/></a:gradFill></p:bgPr></p:bg>"#;
+        let fixture = Fixture::from_xml(
+            &slide_xml_with("", background, ""),
+            &layout_xml_with("", "", "", ""),
+            &master_xml_with("", "", ""),
+        );
+        let before = fixture.slide.clone();
+        let resolved = fixture.context().resolve_slide((40.0, 20.0)).unwrap();
+        let Some(ResolvedBackground::Paint(Paint::Linear { stops, .. })) = resolved.background
+        else {
+            panic!("expected supported background gradient");
+        };
+        assert_eq!(stops.len(), 259);
+        assert_eq!(stops.last().unwrap().color, Color::from_hex("0000FF"));
+        assert_eq!(resolved.unresolved_member_count, 0);
+        assert!(resolved.diagnostics.is_empty());
+        assert_eq!(fixture.slide, before);
+    }
+
+    #[test]
+    fn fx206_gradient_rotation_policy_keeps_placed_reference_and_rotated_boundary() {
+        for rotation in [0, 5_400_000] {
+            let gradient = r#"<a:gradFill rotWithShape="0"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst><a:lin ang="0"/></a:gradFill>"#;
+            let style = r#"<p:style><a:lnRef idx="0"/><a:fillRef idx="0"><a:srgbClr val="FF0000"/></a:fillRef><a:effectRef idx="0"/><a:fontRef idx="minor"/></p:style>"#;
+            let shape = fx206_recovery_shape(2, gradient, style, true)
+                .replace("<a:xfrm>", &format!("<a:xfrm rot=\"{rotation}\">"));
+            let fixture = Fixture::new(&shape, "", "");
+            let before = fixture.slide.clone();
+            let resolved = fixture.context().resolve_slide((100.0, 100.0)).unwrap();
+            assert_eq!(resolved.unresolved_member_count, 0);
+            assert_eq!(resolved.shapes.len(), 1);
+            if rotation == 0 {
+                let Some(Paint::Linear { stops, .. }) = &resolved.shapes[0].fill else {
+                    panic!("expected supported unrotated gradient");
+                };
+                assert_eq!(stops.len(), 259);
+                assert_eq!(stops[0].color, Color::from_hex("FF0000"));
+                assert_eq!(stops.last().unwrap().color, Color::from_hex("0000FF"));
+                assert!(resolved.diagnostics.is_empty());
+            } else {
+                assert!(resolved.shapes[0].fill.is_none());
+                assert!(resolved.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("gradient independent of shape rotation")
+                }));
+            }
+            assert_eq!(fixture.slide, before);
+        }
     }
 }

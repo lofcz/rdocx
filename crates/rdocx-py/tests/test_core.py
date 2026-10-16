@@ -2,6 +2,7 @@ import io
 import posixpath
 import re
 import struct
+import subprocess
 import time
 import zipfile
 import zlib
@@ -55,6 +56,105 @@ def _tracked_document():
     document = rdocx.Document.from_bytes(original.to_bytes())
     document.compare(edited, "Ada", "2026-01-02T03:04:05Z")
     return document
+
+
+def test_issue_253_python_render_views():
+    from pathlib import Path
+
+    import rdocx
+
+    original = rdocx.Document()
+    original.add_paragraph("Keep OLDWORD here.")
+    edited = rdocx.Document()
+    edited.add_paragraph("Keep NEWWORD here.")
+    original.compare(edited, "Reviewer", "2026-09-30T12:00:00Z")
+    accepted = original.to_pdf()
+    assert accepted == original.to_pdf(revision_view="accepted")
+    assert accepted != original.to_pdf(revision_view="tracked")
+    fonts = Path(__file__).parents[2] / "oxml-layout" / "fonts"
+    assert original.to_pdf(font_dir=fonts) == original.to_pdf(
+        font_dir=fonts, revision_view="accepted"
+    )
+    assert original.to_pdf(font_dir=fonts) != original.to_pdf(
+        font_dir=fonts, revision_view="tracked"
+    )
+    for render in (
+        lambda **view: original.render_page_to_png(0, 24.0, **view),
+        lambda **view: original.render_all_pages(24.0, **view),
+        lambda **view: original.render_pages(dpi=24.0, **view),
+    ):
+        assert render() == render(revision_view="accepted")
+        assert render() != render(revision_view="tracked")
+        with pytest.raises(ValueError, match="unknown revision view"):
+            render(revision_view="final")
+    with pytest.raises(ValueError, match="unknown revision view"):
+        original.to_pdf(revision_view="final")
+
+
+def test_revision_style_colours_only_the_tracked_view():
+    import rdocx
+
+    original = rdocx.Document()
+    original.add_paragraph("Keep OLDWORD here.")
+    edited = rdocx.Document()
+    edited.add_paragraph("Keep NEWWORD here.")
+    original.compare(edited, "Reviewer", "2026-09-30T12:00:00Z")
+    for render in (
+        lambda **view: original.to_pdf(**view),
+        lambda **view: original.render_page_to_png(0, 24.0, **view),
+        lambda **view: original.render_all_pages(24.0, **view),
+        lambda **view: original.render_pages(dpi=24.0, **view),
+    ):
+        plain = render(revision_view="tracked")
+        assert plain == render(revision_view="tracked", revision_style="plain")
+        assert plain != render(revision_view="tracked", revision_style="legal")
+        assert render() == render(revision_style="plain")
+        for view in ({}, {"revision_view": "accepted"}):
+            with pytest.raises(ValueError, match="revision_style applies only"):
+                render(revision_style="legal", **view)
+        with pytest.raises(ValueError, match="unknown revision style"):
+            render(revision_view="tracked", revision_style="color")
+
+
+def test_issue_253_selected_view_controls_page_count():
+    import rdocx
+
+    original = rdocx.Document()
+    original.add_paragraph("OLDWORD " * 1500)
+    edited = rdocx.Document()
+    edited.add_paragraph("NEWWORD " * 1500)
+    original.compare(edited, "Reviewer", "2026-09-30T12:00:00Z")
+    accepted = original.render_pages(dpi=24.0)
+    tracked = original.render_pages(dpi=24.0, revision_view="tracked")
+    assert len(tracked) > len(accepted)
+    assert tracked == original.render_all_pages(24.0, revision_view="tracked")
+
+
+def test_issue_253_pdf_text_view(tmp_path):
+    import rdocx
+
+    version = subprocess.run(
+        ["pdftotext", "-v"], capture_output=True, check=True, text=True
+    )
+    assert "pdftotext version 26.01.0" in version.stderr.splitlines()
+
+    original = rdocx.Document()
+    original.add_paragraph("Keep OLDWORD here.")
+    edited = rdocx.Document()
+    edited.add_paragraph("Keep NEWWORD here.")
+    original.compare(edited, "Reviewer", "2026-09-30T12:00:00Z")
+
+    def text(view):
+        path = tmp_path / "redline.pdf"
+        path.write_bytes(original.to_pdf(revision_view=view))
+        return subprocess.run(
+            ["pdftotext", str(path), "-"], capture_output=True, check=True, text=True
+        ).stdout
+
+    accepted = text("accepted")
+    tracked = text("tracked")
+    assert "NEWWORD" in accepted and "OLDWORD" not in accepted
+    assert "NEWWORD" in tracked and "OLDWORD" in tracked
 
 
 def test_revisions_are_snapshots_and_resolution_reports_counts():
@@ -437,7 +537,7 @@ def test_update_fields_on_open_sets_clears_and_removes_the_setting():
         assert document.to_bytes() == before
 
 
-def _one_pixel_png():
+def _one_pixel_png(pixel=b"\xff\xff\xff"):
     def chunk(kind, data):
         crc = struct.pack(">I", zlib.crc32(kind + data))
         return struct.pack(">I", len(data)) + kind + data + crc
@@ -446,9 +546,62 @@ def _one_pixel_png():
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
+        + chunk(b"IDAT", zlib.compress(b"\x00" + pixel))
         + chunk(b"IEND", b"")
     )
+
+
+def _body_images(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as package:
+        xml = package.read("word/document.xml").decode()
+        relationships = package.read("word/_rels/document.xml.rels").decode()
+        targets = {
+            re.search(r'Id="([^"]+)"', element).group(1): re.search(
+                r'Target="([^"]+)"', element
+            ).group(1)
+            for element in re.findall(r"<Relationship [^>]*>", relationships)
+        }
+        return [
+            package.read(posixpath.join("word", targets[embed]))
+            for embed in re.findall(r'r:embed="([^"]+)"', xml)
+        ]
+
+
+@pytest.mark.parametrize(
+    ("caption", "size"),
+    [
+        ("Figure 1. Caption.", (1, 0.66)),
+        ("Figure 1. New caption.", (1, 0.66)),
+        ("Figure 1. Caption.", (1.2, 0.8)),
+    ],
+)
+def test_compare_records_a_picture_whose_image_changed(caption, size):
+    import rdocx
+
+    red, blue = _one_pixel_png(b"\xff\x00\x00"), _one_pixel_png(b"\x00\x00\xff")
+
+    def document(image, caption="Figure 1. Caption.", size=(1, 0.66)):
+        document = rdocx.Document()
+        document.add_paragraph("Before the figure.")
+        document.add_picture(
+            image, "figure1.png", rdocx.Inches(size[0]), rdocx.Inches(size[1])
+        )
+        document.add_paragraph(caption)
+        return document
+
+    redline = document(red)
+    redline.compare(document(blue, caption, size), "Reviewer", "2026-09-30T12:00:00Z")
+    assert redline.revisions
+    tracked = redline.to_bytes()
+    assert _body_images(tracked) == [red, blue]
+    for resolve, image, text in (
+        ("accept_all", blue, caption),
+        ("reject_all", red, "Figure 1. Caption."),
+    ):
+        resolved = rdocx.Document.from_bytes(tracked)
+        getattr(resolved, resolve)()
+        assert _body_images(resolved.to_bytes()) == [image]
+        assert [paragraph.text for paragraph in resolved.paragraphs][-1] == text
 
 
 def test_add_picture_beside_a_content_control_ignores_an_unused_root_default():
@@ -472,7 +625,8 @@ def test_add_picture_beside_a_content_control_ignores_an_unused_root_default():
         size = {"width": rdocx.Inches(1), "height": rdocx.Inches(1)}
         after = document.add_picture(_one_pixel_png(), "x.png", after=control, **size)
         appended = document.add_picture(_one_pixel_png(), "x.png", **size)
-        assert after.kind == appended.kind == "paragraph"
+        assert isinstance(after, rdocx.Picture) and isinstance(appended, rdocx.Picture)
+        assert after.location.item_kind == appended.location.item_kind == "paragraph"
 
         xml = _document_xml(rdocx.Document.from_bytes(document.to_bytes()))
         assert xml.count(b"<w:drawing>") == 2
@@ -486,6 +640,38 @@ def test_add_picture_beside_a_content_control_ignores_an_unused_root_default():
             xml.rindex(b"<w:drawing>"),
         ]
         assert positions == sorted(positions)
+
+
+def test_drawings_of_one_part_that_repeat_an_id_open_and_accept_a_new_picture():
+    docx = pytest.importorskip("docx")
+    import rdocx
+
+    wp = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+    for repeated in ("0", "7"):
+        source = docx.Document()
+        for name in "AB":
+            source.add_paragraph(f"Picture {name}: ").add_run().add_picture(
+                io.BytesIO(_one_pixel_png()), width=914400
+            )
+        for doc_pr in source.element.body.iter(wp + "docPr"):
+            doc_pr.set("id", repeated)
+        buffer = io.BytesIO()
+        source.save(buffer)
+        with zipfile.ZipFile(buffer) as archive:
+            source_xml = archive.read("word/document.xml")
+
+        document = rdocx.Document.from_bytes(buffer.getvalue())
+        assert [p.text for p in document.paragraphs] == ["Picture A: ", "Picture B: "]
+        assert _document_xml(document) == source_xml
+
+        document.add_picture(_one_pixel_png(), "added.png", 12700, 12700)
+        saved = document.to_bytes()
+        rdocx.Document.from_bytes(saved)
+        with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+            xml = archive.read("word/document.xml")
+        ids = re.findall(rb'<wp:docPr\b[^>]*?\bid="(\d+)"', xml)
+        assert ids[:2] == [repeated.encode()] * 2
+        assert len(ids) == 3 and ids[2] != repeated.encode()
 
 
 def _relationship_target(document, part_name, relationship_id):
@@ -683,14 +869,8 @@ def test_a_stale_hyperlink_snapshot_never_edits_another_link():
     links = document.hyperlinks
     document.remove_hyperlink(links[0])
     before = document.to_bytes()
-    # The bold link moved to position 0, and the plain one now sits at the
-    # snapshot's position with the same fields. Neither is edited.
-    with pytest.raises(rdocx.RdocxError, match="re-fetch"):
-        document.remove_hyperlink(links[1])
-    assert document.to_bytes() == before
-
-    # A record rebuilt from the public fields equals the snapshot and resolves
-    # only when exactly one link matches it.
+    # Both remaining links have equal public fields, but only the original
+    # bold physical owner is addressed by the held captured link.
     fresh = document.hyperlinks
     rebuilt = [
         rdocx.Hyperlink(
@@ -706,11 +886,30 @@ def test_a_stale_hyperlink_snapshot_never_edits_another_link():
     assert rebuilt == list(fresh)
     with pytest.raises(rdocx.RdocxError, match="re-fetch"):
         document.set_hyperlink_url(rebuilt[0], "https://z/")
-    document.set_hyperlink_url(fresh[1], "https://plain/")
-    document.set_hyperlink_url(fresh[0], "https://bold/")
+    assert document.to_bytes() == before
+    with pytest.raises(rdocx.StaleElementError, match="Document.remove_hyperlink"):
+        document.set_hyperlink_url(links[0], "https://removed/")
+    assert document.to_bytes() == before
+    document.set_hyperlink_url(links[1], "https://bold/")
     assert [(link.text, link.url) for link in document.hyperlinks] == [
         ("here", "https://bold/"),
-        ("here", "https://plain/"),
+        ("here", "https://u/"),
+    ]
+    saved = document.to_bytes()
+    import xml.etree.ElementTree as ET
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        children = ET.fromstring(archive.read("word/document.xml")).findall(".//" + w + "hyperlink")
+        assert len(children) == 2
+        assert children[0].find(".//" + w + "b") is not None
+        assert children[1].find(".//" + w + "b") is None
+        targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in ET.fromstring(archive.read("word/_rels/document.xml.rels"))}
+        assert targets[children[0].attrib[r + "id"]] == "https://bold/"
+        assert targets[children[1].attrib[r + "id"]] == "https://u/"
+    reopened = rdocx.Document.from_bytes(saved)
+    assert [(link.text, link.url) for link in reopened.hyperlinks] == [
+        ("here", "https://bold/"), ("here", "https://u/"),
     ]
 
 
@@ -724,14 +923,14 @@ def test_set_picture_size_resizes_every_drawing_of_a_relationship():
     ).group(1).decode()
     # Both pictures share one image relationship, so both are resized.
     assert (
-        document.set_picture_size(
+        document.set_picture_sizes_for_relationship(
             relationship_id, width=rdocx.Inches(1), height=rdocx.Inches(1)
         )
         == 2
     )
     before = document.to_bytes()
     with pytest.raises(rdocx.RdocxError):
-        document.set_picture_size("rIdMissing", width=1, height=1)
+        document.set_picture_sizes_for_relationship("rIdMissing", width=1, height=1)
     assert document.to_bytes() == before
     saved = docx.Document(io.BytesIO(document.to_bytes()))
     assert [(shape.width, shape.height) for shape in saved.inline_shapes] == [
@@ -1695,6 +1894,46 @@ def test_rebuild_toc_accepts_identity_attributes_on_the_field_runs():
         assert identity in saved
 
 
+def test_rebuild_toc_keeps_the_field_markers_in_the_first_and_last_entries():
+    import rdocx
+
+    # Word and Google Docs write the field begin in the first entry paragraph
+    # and the end in the last one: a rebuild keeps them there.
+    def entry(text, first=False, last=False):
+        begin = (
+            '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            '<w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+            if first
+            else ""
+        )
+        end = '<w:r><w:fldChar w:fldCharType="end"/></w:r>' if last else ""
+        return (
+            f'<w:p><w:pPr><w:pStyle w:val="TOC1"/></w:pPr>{begin}'
+            f"<w:r><w:t>{text}</w:t></w:r>{end}</w:p>"
+        )
+
+    headings = ("One", "Two", "Three")
+    body = entry("One", first=True) + entry("Two") + entry("Three", last=True)
+    body += "".join(
+        f'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{heading}</w:t></w:r></w:p>'
+        for heading in headings
+    )
+    source = rdocx.Document()
+    source.add_paragraph("placeholder")
+    document = _replace_document_body(source, body)
+    before = len(document.paragraphs)
+
+    assert document.rebuild_toc().entry_count == 3
+    assert len(document.paragraphs) == before
+    toc = [
+        paragraph.text
+        for paragraph in document.paragraphs
+        if (paragraph.style or "").startswith("TOC")
+    ]
+    assert toc == ["One\t1", "Two\t1", "Three\t1"]
+
+
 def test_update_page_fields_writes_layout_page_numbers():
     import rdocx
 
@@ -1734,6 +1973,7 @@ def test_update_layout_backed_fields_returns_owned_report():
         source,
         """
         <w:p><w:fldSimple w:instr="PAGE"><w:r><w:t>stale page</w:t></w:r></w:fldSimple><w:fldSimple w:instr="NUMPAGES"><w:r><w:t>stale count</w:t></w:r></w:fldSimple></w:p>
+        <w:p><w:fldSimple w:instr="SECTION"><w:r><w:t>stale section</w:t></w:r></w:fldSimple><w:fldSimple w:instr="SECTIONPAGES"><w:r><w:t>stale section count</w:t></w:r></w:fldSimple></w:p>
         <w:p><w:fldSimple w:instr="PAGEREF destination"><w:r><w:t>stale target</w:t></w:r></w:fldSimple></w:p>
         <w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:bookmarkStart w:id="7" w:name="destination"/><w:r><w:t>Target</w:t></w:r><w:bookmarkEnd w:id="7"/></w:p>
         """,
@@ -1745,8 +1985,10 @@ def test_update_layout_backed_fields_returns_owned_report():
         num_pages_fields=1,
         page_reference_fields=1,
         diagnostics=report.diagnostics,
+        section_fields=1,
+        section_pages_fields=1,
     )
-    assert report.updated_count == 3
+    assert report.updated_count == 5
     assert report.diagnostic_count == len(report.diagnostics)
     with pytest.raises(AttributeError):
         report.page_fields = 0
@@ -1754,6 +1996,12 @@ def test_update_layout_backed_fields_returns_owned_report():
     assert b"stale page" not in xml
     assert b"stale count" not in xml
     assert b"stale target" not in xml
+    assert b"stale section" not in xml
+    legacy = rdocx.LayoutBackedFieldUpdateReport(page_fields=0, num_pages_fields=0, page_reference_fields=0, diagnostics=())
+    assert legacy.section_fields == legacy.section_pages_fields == 0
+    assert legacy.updated_count == 0
+    with pytest.raises(AttributeError):
+        report.section_fields = 0
 
 
 def test_pageref_to_a_bookmarked_run_range_is_filled_from_the_layout():
@@ -2197,7 +2445,7 @@ def test_insert_and_remove_section_restructure_the_body():
         _ = held.text
 
     assert [section.is_final for section in document.sections] == [False, True]
-    assert document.sections[1].margin_top is None
+    assert document.sections[1].margin_top == Inches(1)
     assert document.update_section(1, margin_top=Inches(1)).margin_right == Inches(1)
     document.update_section(
         1,
@@ -2308,6 +2556,49 @@ def test_header_footer_and_story_text_edit_the_section_stories():
     assert _story_paragraph_texts(reopened, "body") == ["body"]
 
 
+@pytest.mark.parametrize(
+    ("separator", "expected"),
+    [("add_tab", "left\tright"), ("add_break", "left\nright")],
+)
+def test_story_items_keep_run_tabs_and_breaks_in_the_body_header_and_footer(
+    separator, expected
+):
+    docx = pytest.importorskip("docx")
+    import rdocx
+
+    source = docx.Document()
+    section = source.sections[0]
+    for paragraph in (
+        source.add_paragraph(),
+        section.header.paragraphs[0],
+        section.footer.paragraphs[0],
+    ):
+        paragraph.add_run("left")
+        getattr(paragraph.add_run(), separator)()
+        paragraph.add_run("right")
+    buffer = io.BytesIO()
+    source.save(buffer)
+
+    document = rdocx.Document.from_bytes(buffer.getvalue())
+    kinds = ("body", "header", "footer")
+    for kind in kinds:
+        assert _story_paragraph_texts(document, kind) == [expected], kind
+
+    # The new text replaces the tab or the break too, and a tab or a line
+    # feed in it reads back as written.
+    for value in ("new", "a\tb\nc"):
+        for kind in kinds:
+            item = next(
+                item
+                for item in document.story_items
+                if item.story.kind == kind and item.kind == "paragraph"
+            )
+            document.set_story_text(item, value)
+        for kind in kinds:
+            assert _story_paragraph_texts(document, kind) == [value], kind
+        assert document.paragraphs[0].text == value
+
+
 def test_set_story_text_rejects_a_story_that_is_not_in_the_document():
     import rdocx
 
@@ -2378,22 +2669,27 @@ def test_footer_with_text_tab_and_page_fields_is_built_for_one_section():
     document.paragraphs[2].add_run("Page ").add_field("PAGE", "1")
     document.paragraphs[2].add_run(" of ").add_field("NUMPAGES", "1")
     fragment = document.pop_content(document.find_content_index("Confidential"))
+    with pytest.raises(rdocx.StaleElementError):
+        document.insert_content(footer, fragment)
+    footer = _default_footer(document, 1)
     document.insert_content(footer, fragment)
+    footer = _default_footer(document, 1)
     assert [paragraph.text for paragraph in document.paragraphs] == [
         "First section.",
         "Second section.",
     ]
-    assert _story_paragraph_texts(document, "footer") == ["ConfidentialPage 1 of 1"]
+    assert _story_paragraph_texts(document, "footer") == ["Confidential\tPage 1 of 1"]
 
     report = document.update_layout_backed_fields()
-    assert (report.page_fields, report.num_pages_fields) == (1, 1)
+    assert (report.page_fields, report.num_pages_fields) == (0, 0)
+    footer = _default_footer(document, 1)
     xml = _story_part(document, footer)
     assert re.search(rb"<w:t>Confidential</w:t>\s*<w:tab/>", xml)
     for instruction in (b"PAGE", b"NUMPAGES"):
         field = re.search(
             rb'w:instr="' + instruction + rb'"[^>]*>\s*<w:r>\s*<w:t>([^<]*)</w:t>', xml
         )
-        assert field is not None and field.group(1) == b"2"
+        assert field is not None and field.group(1) == b"1"
     body = _document_xml(document)
     first_section = body[: body.index(b"First section.")]
     assert b"footerReference" not in first_section
@@ -2408,7 +2704,11 @@ def test_section_stories_link_unlink_and_reject_bad_names_atomically():
     footer = document.create_section_story(1, "footer", "default")
     document.add_paragraph("Footer text")
     fragment = document.pop_content(document.find_content_index("Footer text"))
+    with pytest.raises(rdocx.StaleElementError):
+        document.insert_content(footer, fragment)
+    footer = _default_footer(document, 1)
     document.insert_content(footer, fragment)
+    footer = _default_footer(document, 1)
     before = document.to_bytes()
     for arguments, error in (
         ((1, "side", "default"), ValueError),
@@ -2429,15 +2729,21 @@ def test_section_stories_link_unlink_and_reject_bad_names_atomically():
         document.pop_content(footer)
     assert document.to_bytes() == before
 
-    assert document.link_section_story(0, "footer", "default", footer) == footer
+    linked = document.link_section_story(0, "footer", "default", footer)
+    footer = _default_footer(document, 1)
+    assert linked == footer
     assert _default_footer(document, 0) == footer
     copy = document.unlink_section_story(0, "footer", "default")
+    footer = _default_footer(document, 1)
     assert copy.part_name != footer.part_name
     assert _default_footer(document, 0) == copy
     assert _story_paragraph_texts(document, "footer") == ["Footer text", "Footer text"]
 
     [item] = [item for item in document.story_items if item.story == copy]
+    copy_part_name = copy.part_name
     popped = document.pop_content(item)
+    copy = next(story for story in document.stories if story.part_name == copy_part_name)
+    footer = _default_footer(document, 1)
     assert popped.kind == "paragraph"
     assert [item for item in document.story_items if item.story == copy] == []
     assert _default_footer(document, 1) == footer
@@ -2460,6 +2766,148 @@ def test_hyperlinks_are_added_to_paragraphs_and_stories():
         ("header", "home", "https://example.com/"),
     ]
     assert reopened.paragraphs[0].runs[1].font.bold is True
+
+
+def test_complex_field_story_snapshots_preserve_cached_text_and_revision():
+    import rdocx
+
+    field = (
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText> PAGE </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>7</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    )
+    seed = rdocx.Document()
+    seed.set_header("header")
+    seed.set_footer("footer")
+    section_xml = "<w:sectPr" + _document_xml(seed).decode().split("<w:sectPr", 1)[1].split("</w:body>", 1)[0]
+    document = _replace_document_body(
+        seed, f'<w:p>{field}</w:p><w:sdt><w:sdtPr/><w:sdtContent>'
+        f'<w:p>{field}</w:p></w:sdtContent></w:sdt>'
+        + section_xml,
+    )
+    related = {story.part_name.lstrip("/"): story.kind for story in document.stories
+               if story.kind in ("header", "footer")}
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as source, zipfile.ZipFile(result, "w") as output:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename in related:
+                root = "hdr" if related[info.filename] == "header" else "ftr"
+                data = (f'<w:{root} xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                        f'<w:p>{field}</w:p></w:{root}>').encode()
+            output.writestr(info, data)
+    document = rdocx.Document.from_bytes(result.getvalue())
+    before = document.to_bytes()
+    held = document.paragraphs[0]
+    snapshots = document.story_items
+    fields = [item for item in snapshots if item.kind == "field"]
+    assert [(item.story.kind, item.text) for item in fields] == [
+        ("body", "7"), ("body", "7"), ("header", "7"), ("footer", "7")]
+    assert [item.direct_body_index for item in fields] == [0, 1, None, None]
+    assert all(field.encode() in item.xml for item in fields)
+    assert len({item.revision for item in snapshots}) == 1
+    assert document.story_items == snapshots
+    assert document.to_bytes() == before
+    assert held.text == "7"
+    with zipfile.ZipFile(io.BytesIO(before)) as original:
+        expected_parts = {name: original.read(name) for name in original.namelist()}
+    reopened = rdocx.Document.from_bytes(before)
+    assert [(item.story.kind, item.index_path, item.text, item.xml, item.direct_body_index)
+            for item in reopened.story_items] == [
+        (item.story.kind, item.index_path, item.text, item.xml, item.direct_body_index)
+        for item in snapshots]
+    with zipfile.ZipFile(io.BytesIO(reopened.to_bytes())) as saved:
+        assert {name: saved.read(name) for name in saved.namelist()} == expected_parts
+
+
+def test_complex_field_nested_snapshots_keep_links_and_read_handles():
+    import rdocx
+
+    nested = (
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText> IF </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText> PAGE </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>7</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+        '<w:r><w:instrText> = 7 yes no </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>yes</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    )
+    seed = rdocx.Document()
+    paragraph = seed.add_paragraph("")
+    paragraph.add_hyperlink("seed", "https://example.test/field-owner")
+    relationship_id = seed.hyperlinks[0].relationship_id
+    document = _replace_document_body(seed,
+        f'<w:p><w:hyperlink r:id="{relationship_id}">{nested}</w:hyperlink>'
+        '<w:hyperlink w:anchor="neighbor"><w:r><w:t>neighbor</w:t></w:r></w:hyperlink></w:p>')
+    before = document.to_bytes()
+    held = document.paragraphs[0]
+    snapshots = document.story_items
+    fields = [item for item in snapshots if item.kind == "field"]
+    assert [item.text for item in fields] == ["yes", "7"]
+    assert all(item.revision == snapshots[0].revision for item in snapshots)
+    links = document.hyperlinks
+    assert [(link.text, link.url, link.anchor) for link in links] == [
+        ("yes", "https://example.test/field-owner", None), ("neighbor", None, "neighbor")]
+    assert links[0].relationship_id == relationship_id
+    assert document.hyperlinks == links
+    assert document.story_items == snapshots
+    assert held.text == "yesneighbor"
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert [(item.index_path, item.text, item.xml) for item in reopened.story_items] == [
+        (item.index_path, item.text, item.xml) for item in snapshots]
+    assert [(link.index_path, link.text, link.url, link.anchor) for link in reopened.hyperlinks] == [
+        (link.index_path, link.text, link.url, link.anchor) for link in links]
+
+
+@pytest.mark.parametrize("default_binding,ancestor_word", [(False, False), (False, True), (True, False), (True, True)])
+def test_complex_field_first_run_namespace_lifetimes_do_not_escape(default_binding, ancestor_word):
+    import rdocx
+
+    word = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ancestor = word if ancestor_word else "urn:producer"
+    local = "urn:producer" if ancestor_word else word
+    declaration = "xmlns" if default_binding else "xmlns:x"
+    prefix = "" if default_binding else "x:"
+    content = "8" if ancestor_word else "SHADOW"
+    expected = "87" if ancestor_word else "7"
+    header_xml = (f'<q:hdr xmlns:q="{word}" {declaration}="{ancestor}"><q:p>'
+        f'<q:r {declaration}="{local}"><q:fldChar q:fldCharType="begin"/></q:r>'
+        '<q:r><q:instrText> PAGE </q:instrText></q:r>'
+        '<q:r><q:fldChar q:fldCharType="separate"/></q:r>'
+        f'<q:r><{prefix}t>{content}</{prefix}t><q:t>7</q:t></q:r>'
+        '<q:r><q:fldChar q:fldCharType="end"/></q:r></q:p></q:hdr>').encode()
+    seed = rdocx.Document()
+    seed.add_paragraph("held")
+    seed.set_header("source")
+    header = next(story for story in seed.stories if story.kind == "header")
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(seed.to_bytes())) as source, zipfile.ZipFile(result, "w") as output:
+        for info in source.infolist():
+            data = header_xml if info.filename == header.part_name.lstrip("/") else source.read(info.filename)
+            output.writestr(info, data)
+    document = rdocx.Document.from_bytes(result.getvalue())
+    before = document.to_bytes()
+    held = document.paragraphs[0]
+    snapshots = document.story_items
+    fields = [item for item in snapshots if item.kind == "field" and item.story.kind == "header"]
+    assert len(fields) == 1
+    assert all(item.revision == snapshots[0].revision for item in snapshots)
+    assert document.story_items == snapshots
+    assert held.text == "held"
+    assert document.to_bytes() == before
+    with zipfile.ZipFile(io.BytesIO(before)) as archive:
+        assert archive.read(header.part_name.lstrip("/")) == header_xml
+    reopened = rdocx.Document.from_bytes(before)
+    assert [(item.story.kind, item.index_path, item.xml) for item in reopened.story_items] == [
+        (item.story.kind, item.index_path, item.xml) for item in snapshots]
+    assert fields[0].text == expected
 
 
 def test_story_item_xml_is_a_detached_snapshot():
@@ -2618,6 +3066,86 @@ def test_split_run_accepts_a_paragraph_handle_in_a_control_or_the_body():
     with pytest.raises(ValueError, match="different document"):
         document.split_run(other.paragraphs[0], 0, 1)
     assert document.to_bytes() == before
+
+
+def test_run_remove_keeps_markers_and_drops_emptied_wrappers():
+    import rdocx
+
+    # GitHub issue #168 asks for the python-docx idiom
+    # run._r.getparent().remove(run._r) as a method of the run.
+    document = _replace_document_body(
+        rdocx.Document(),
+        '<w:p><w:bookmarkStart w:id="1" w:name="kept"/>'
+        '<w:r><w:t xml:space="preserve">Keep </w:t></w:r>'
+        "<w:r><w:t>drop</w:t></w:r><w:bookmarkEnd w:id=\"1\"/>"
+        '<w:hyperlink w:anchor="kept"><w:r><w:t>link</w:t></w:r></w:hyperlink>'
+        '<w:ins w:id="2" w:author="Ada"><w:r><w:t>inserted</w:t></w:r></w:ins>'
+        "</w:p>",
+    )
+    paragraph = document.paragraphs[0]
+    runs = paragraph.runs
+    assert [run.text for run in runs] == ["Keep ", "drop", "link", "inserted"]
+    kept = runs[0]
+    runs[1].remove()
+    with pytest.raises(rdocx.StaleElementError):
+        kept.text
+    with pytest.raises(rdocx.StaleElementError):
+        paragraph.text
+    assert [run.text for run in document.paragraphs[0].runs] == [
+        "Keep ",
+        "link",
+        "inserted",
+    ]
+    document.paragraphs[0].runs[1].remove()
+    document.paragraphs[0].runs[1].remove()
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [run.text for run in reopened.paragraphs[0].runs] == ["Keep "]
+    xml = _document_xml(reopened).decode()
+    assert '<w:bookmarkStart w:id="1" w:name="kept"/>' in xml
+    assert '<w:bookmarkEnd w:id="1"/>' in xml
+    assert "hyperlink" not in xml
+    assert "w:ins" not in xml
+
+    table = document.add_table(1, 1)
+    table.cell(0, 0).text = "cell"
+    document.tables[0].cell(0, 0).paragraphs[0].runs[0].remove()
+    assert document.tables[0].cell(0, 0).paragraphs[0].text == ""
+
+
+def test_run_remove_refuses_part_of_a_field_or_a_comment_reference():
+    import rdocx
+
+    document = _replace_document_body(
+        rdocx.Document(),
+        '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> TOC </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        "<w:r><w:t>Entry</w:t></w:r></w:p>"
+        '<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+        "<w:p><w:r><w:t>Commented</w:t></w:r></w:p>",
+    )
+    comment_range = rdocx.RunRange(
+        start=rdocx.RunPosition(body_index=2, run_index=0),
+        end=rdocx.RunPosition(body_index=2, run_index=1),
+    )
+    document.add_comment(comment_range, author="Ada", text="Here")
+    before = document.to_bytes()
+    for paragraph, run, reason in (
+        (0, 0, "part of a complex field"),
+        (0, 2, "part of a complex field"),
+        (1, 0, "part of a complex field"),
+        (2, 1, "the reference of comment 0"),
+    ):
+        handle = document.paragraphs[paragraph].runs[run]
+        with pytest.raises(rdocx.RdocxError, match=reason):
+            handle.remove()
+        # A refused removal leaves the handles valid.
+        assert handle.text == ""
+    assert document.to_bytes() == before
+
+    document.paragraphs[0].runs[3].remove()
+    assert document.paragraphs[0].text == ""
+    assert [comment.text for comment in document.comments] == ["Here"]
 
 
 def test_story_comment_after_a_block_content_control_anchors_on_its_paragraph():
@@ -2874,8 +3402,10 @@ def test_python_round_three_authoring_and_inspection_is_typed_and_lossless():
     picture = document.add_picture(
         _one_pixel_png(), "pixel.png", rdocx.Inches(1), rdocx.Inches(1), after=anchor
     )
-    assert picture.kind == "paragraph"
-    assert b"<w:drawing>" in picture.xml
+    assert isinstance(picture, rdocx.Picture)
+    assert picture.location.item_kind == "paragraph"
+    owner = next(item for item in document.story_items if item.story.kind == picture.story.kind and item.index_path == picture.location.index_path)
+    assert b"<w:drawing>" in owner.xml
     before_bad_picture = document.to_bytes()
     with pytest.raises(rdocx.RdocxError):
         document.add_picture(
@@ -2941,9 +3471,9 @@ def test_paragraph_text_setter_replaces_runs_and_keeps_format_and_comments():
 
     paragraph.text = "Omega\tone\ntwo"
 
-    for stale in (lambda: paragraph.text, lambda: run.text):
-        with pytest.raises(rdocx.StaleElementError):
-            stale()
+    assert paragraph.text == "Omega\tone\ntwo"
+    with pytest.raises(rdocx.StaleElementError):
+        _ = run.text
     paragraph = document.paragraphs[0]
     assert paragraph.text == "Omega\tone\ntwo"
     assert paragraph.style == "Heading1"
@@ -3162,3 +3692,4119 @@ def test_core_properties_create_a_missing_part_with_its_relationship():
         '<Override PartName="/docProps/core.xml" '
         'ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
     ) in _package_part(document, "[Content_Types].xml")
+
+
+def test_fx153_run_remove_survives_save_and_reopen():
+    import rdocx
+
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("Keep")
+    paragraph.add_run(" Drop").remove()
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.paragraphs[0].text == "Keep"
+
+
+def test_issue_168_complete_edit_save_reopen_layout_and_render(tmp_path):
+    import importlib.metadata
+    from pathlib import Path
+
+    import docx
+    from lxml import etree
+    import rdocx
+
+    assert importlib.metadata.version("python-docx") == "1.2.0"
+    document = rdocx.Document()
+    document.add_paragraph("Report {{name}}. See ")
+    document.add_paragraph("Target phrase {{date}}")
+    table = document.insert_table(1, 3, 3)
+    table.set_cell_grid_span(0, 0, 2)
+    table = document.tables[0]
+    table.set_cell_vertical_merge(1, 2, "restart")
+    table.set_cell_vertical_merge(2, 2, "continue")
+    table.set_borders("single", size=4, color="000000")
+    table.set_cell_margins(top=0, right=63500, bottom=12700, left=127000)
+    table.grid_widths = [1371600, 1828800, 1828800]
+    table.cell(1, 0).shading = "D9D9D9"
+    table.cell(1, 0).set_margins(top=12700, right=0, bottom=25400, left=6350)
+    table.cell(1, 0).set_border("bottom", "double", size=6, color="auto")
+    table.rows[0].height = 254000
+    table.rows[0].cant_split = True
+    table.rows[0].is_header = True
+
+    document.add_style("Report Note", based_on="Normal", bold=True)
+    definition = document.add_numbering_definition([rdocx.ListLevel(format="decimal")])
+    instance = document.add_numbering_instance(definition)
+    document.link_style_to_numbering("Report Note", instance, 0)
+    document.paragraphs[1].style = "Report Note"
+    document.set_default_style("Report Note")
+    before_style_render = document.render_page_to_png(0, 72)
+    document.set_style("Report Note", bold=False, space_after=rdocx.Pt(6))
+    assert document.render_page_to_png(0, 72) != before_style_render
+    before_invalid_style = document.to_bytes()
+    with pytest.raises(KeyError):
+        document.set_style("Missing", bold=True)
+    assert document.to_bytes() == before_invalid_style
+    assert document.remove_style("Subtitle") is True
+    document.update_section(0, orientation="landscape", margin_left=rdocx.Inches(1.5))
+    document.insert_section(1)
+    document.add_paragraph("Second section {{state}}")
+    footer = document.create_section_story(1, "footer", "default")
+    footer_part = footer.part_name
+    document.add_paragraph("Confidential").runs[0].add_tab()
+    document.paragraphs[-1].add_run("Page ").add_field("PAGE", "1")
+    document.paragraphs[-1].add_run(" of ").add_field("NUMPAGES", "1")
+    fragment = document.pop_content(document.find_content_index("Confidential"))
+    footer = next(story for story in document.stories if story.part_name == footer_part)
+    document.insert_content(footer, fragment)
+
+    target_index = document.find_content_index("Target phrase")
+    document.split_run(target_index, 0, len("Target phrase"))
+    document.add_bookmark(
+        "target",
+        rdocx.RunRange(
+            start=rdocx.RunPosition(body_index=target_index, run_index=0),
+            end=rdocx.RunPosition(body_index=target_index, run_index=1),
+        ),
+    )
+    document.paragraphs[0].runs[0].add_field("PAGEREF target \\h", "?")
+    document.paragraphs[0].add_hyperlink("source", "https://example.com/old")
+    document.set_hyperlink_url(document.hyperlinks[0], "https://example.com/new")
+    document.paragraphs[0].add_hyperlink("remove", "https://example.com/remove")
+    document.remove_hyperlink(document.hyperlinks[-1])
+    document.add_picture(_one_pixel_png(), "pixel.png")
+    relationship_id = re.search(rb'r:embed="([^"]+)"', _document_xml(document)).group(1).decode()
+    assert document.set_picture_sizes_for_relationship(
+        relationship_id, width=rdocx.Inches(1), height=rdocx.Inches(1)
+    ) == 1
+
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    with pytest.raises(rdocx.ReplacementCountError) as mismatch:
+        document.replace_all(
+            [("{{name}}", "Ada", 1), ("{{date}}", "October", 2), ("{{state}}", "Done", 1)]
+        )
+    assert mismatch.value.index == 1
+    assert document.to_bytes() == before
+    assert held.text.startswith("Report {{name}}")
+    assert document.try_replace_text("{{missing}}", "x", expect=0) == 0
+    assert document.replace_all(
+        [("{{name}}", "Ada", 1), ("{{date}}", "October", 1), ("{{state}}", "Done", 1)]
+    ) == (1, 1, 1)
+    document.paragraphs[-1].text = "Second section Done"
+    document.paragraphs[1].add_run(" remove").remove()
+    comment_id = document.add_comment_on_text("Target phrase", author="Ada", text="Review")
+    assert _anchored_texts(document, comment_id) == ["Target phrase"]
+    report = document.update_layout_backed_fields()
+    assert (report.page_fields, report.num_pages_fields, report.page_reference_fields) == (
+        0, 0, 1
+    )
+
+    path = tmp_path / "issue-168.docx"
+    document.save(path)
+    # The accepted package-write escape hatch is an external lxml ZIP step.
+    # Change an existing unmodelled part without adding a typed binding writer.
+    changed = tmp_path / "issue-168-package-edited.docx"
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(changed, "w") as output:
+        for member in source.infolist():
+            data = source.read(member.filename)
+            if member.filename == "docProps/app.xml":
+                root = etree.fromstring(data)
+                application = root.find(
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Application"
+                )
+                assert application is not None
+                application.text = "Issue 168 workflow"
+                data = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+            output.writestr(member, data)
+    path = changed
+    reopened = rdocx.Document(path)
+    with zipfile.ZipFile(path) as package:
+        assert package.testzip() is None
+        assert b"<w:tab/>" in package.read(footer.part_name.lstrip("/"))
+        assert b"Issue 168 workflow" in package.read("docProps/app.xml")
+    assert [style.style_id for style in reopened.styles if style.is_default] == ["ReportNote"]
+    assert docx.Document(str(path)).styles["Report Note"].font.bold is False
+    assert [(link.text, link.url) for link in reopened.hyperlinks] == [
+        ("source", "https://example.com/new")
+    ]
+    assert reopened.comments[0].text == "Review"
+    assert reopened.tables[0].rows[0].is_header is True
+    assert reopened.layout_page(0).width == 792.0
+    fonts = Path(__file__).parents[2] / "oxml-layout" / "fonts"
+    assert reopened.to_pdf(font_dir=fonts).startswith(b"%PDF")
+    with zipfile.ZipFile(io.BytesIO(reopened.to_bytes())) as package:
+        assert b"Issue 168 workflow" in package.read("docProps/app.xml")
+    oracle = docx.Document(str(path))
+    assert oracle.paragraphs[0].text.startswith("Report Ada. See ")
+    assert [(link.text, link.url) for link in oracle.paragraphs[0].hyperlinks] == [
+        ("source", "https://example.com/new")
+    ]
+    assert oracle.tables[0].cell(1, 0).text == ""
+    assert oracle.sections[1].footer.paragraphs[0].text.startswith("Confidential")
+
+
+# Issue 282, hadim: ownership checks happen before publication or invalidation.
+def test_comment_removal_paths_preserve_atomicity_and_revisions():
+    import rdocx
+
+    def commented(kind, wrapped=False):
+        document = rdocx.Document()
+        document.add_paragraph("body anchor")
+        document.add_paragraph("retained")
+        if kind == "cell":
+            document.add_table(2, 1).cell(0, 0).text = "cell anchor"
+        item = next(item for item in document.story_items
+                    if item.kind == "paragraph"
+                    and item.story.kind == ("table_cell" if kind == "cell" else "body")
+                    and item.text == ("cell anchor" if kind == "cell" else "body anchor"))
+        root = document.add_comment(rdocx.StoryRunRange(
+            start=rdocx.StoryRunPosition(item=item, run_index=0),
+            end=rdocx.StoryRunPosition(item=item, run_index=1),
+        ), author="Ada", text="root")
+        reply = document.reply_to(root, author="Ben", text="reply")
+        document.reply_to(reply, author="Cyd", text="grandchild")
+        if wrapped:
+            xml = _document_xml(document).decode()
+            body = xml[xml.index("<w:body>") + len("<w:body>"):xml.index("</w:body>")]
+            start = body.index("<w:p")
+            end = body.index("</w:p>", start) + len("</w:p>")
+            body = (body[:start] + '<w:sdt><w:sdtPr><w:tag w:val="goog_rdk_ownership"/></w:sdtPr>'
+                    '<w:sdtContent>' + body[start:end] + '</w:sdtContent></w:sdt>' + body[end:])
+            document = _replace_document_body(document, body)
+        return document
+
+    for wrapped in (False, True):
+        document = commented("body", wrapped)
+        held = document.paragraphs[-1]
+        before = document.to_bytes()
+        with pytest.raises(rdocx.RdocxError, match="comment"):
+            document.pop_content(0)
+        assert document.to_bytes() == before
+        assert held.text == "retained"
+        assert document.remove_content(0) is True
+        assert document.comments == ()
+        with pytest.raises(rdocx.StaleElementError):
+            held.text
+        reopened = rdocx.Document.from_bytes(document.to_bytes())
+        assert reopened.comments == ()
+        assert [p.text for p in reopened.paragraphs] == ["retained"]
+
+    document = commented("cell")
+    held = document.paragraphs[0]
+    removed_cell = document.tables[0].cell(0, 0)
+    removed_run = removed_cell.paragraphs[0].runs[0]
+    document.tables[0].remove_row(0)
+    assert document.comments == ()
+    assert held.text == "body anchor"
+    for retired in (lambda: removed_cell.text, lambda: removed_run.text):
+        with pytest.raises(rdocx.StaleElementError):
+            retired()
+    assert rdocx.Document.from_bytes(document.to_bytes()).comments == ()
+
+    document = commented("cell")
+    held = document.tables[0].cell(0, 0)
+    replaced_run = held.paragraphs[0].runs[0]
+    held.text = "replacement"
+    assert len(document.comments) == 3
+    assert held.text == "replacement"
+    with pytest.raises(rdocx.StaleElementError):
+        _ = replaced_run.text
+    assert document.tables[0].cell(0, 0).text == "replacement"
+    assert len(rdocx.Document.from_bytes(document.to_bytes()).comments) == 3
+
+    document = rdocx.Document()
+    document.add_paragraph("first")
+    document.add_paragraph("last")
+    document.add_comment(rdocx.RunRange(
+        start=rdocx.RunPosition(body_index=0, run_index=0),
+        end=rdocx.RunPosition(body_index=1, run_index=1),
+    ), author="Ada", text="partial")
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError, match="comment"):
+        document.remove_content(0)
+    assert document.to_bytes() == before
+    assert held.text == "first"
+
+
+def test_comment_anchor_fields_preserve_constructor_compatibility():
+    import rdocx
+
+    detached = rdocx.Comment(id=7, author="Ada", initials=None, date=None,
+                             text="Review", parent_id=None, resolved=False)
+    assert detached.anchor_text is None
+    assert detached.anchor is None
+    document = rdocx.Document()
+    document.add_paragraph("Alpha stays.")
+    document.add_paragraph("Delta goes away.")
+    document.add_comment(rdocx.RunRange(
+        start=rdocx.RunPosition(body_index=1, run_index=0),
+        end=rdocx.RunPosition(body_index=1, run_index=1),
+    ), author="Ada", text="Review Delta")
+    comment = document.comments[0]
+    assert comment.anchor_text == "Delta goes away."
+    assert isinstance(comment.anchor, rdocx.StoryRunRange)
+    assert comment.anchor.start.item.direct_body_index == 1
+
+    with pytest.raises(AttributeError):
+        comment.anchor_text = "changed"
+    explicit = rdocx.Comment(id=8, author=None, initials=None, date=None,
+                             text="detached", parent_id=None, resolved=False,
+                             anchor_text=comment.anchor_text, anchor=comment.anchor)
+    assert explicit.anchor == comment.anchor
+    assert explicit.anchor_text == comment.anchor_text
+    preserved = comment.anchor_text
+    document.add_comment(comment.anchor, author="Ben", text="Same span")
+    assert document.comments[-1].anchor_text == preserved
+    assert comment.anchor_text == preserved
+    with pytest.raises(rdocx.StaleElementError, match="document revision"):
+        document.add_comment(comment.anchor, author="Ben", text="Stale span")
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [item.anchor_text for item in reopened.comments] == [preserved, preserved]
+
+
+@pytest.mark.parametrize("kind", ["body", "table_cell", "header", "footer"])
+def test_comment_anchor_typed_related_ranges_are_owned_and_reusable(kind):
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("body anchor")
+    document.add_table(1, 1).cell(0, 0).text = "cell anchor"
+    document.set_header("header anchor")
+    document.set_footer("footer anchor")
+    item = next(item for item in document.story_items
+                if item.story.kind == kind and item.kind == "paragraph")
+    span = rdocx.StoryRunRange(
+        start=rdocx.StoryRunPosition(item=item, run_index=0),
+        end=rdocx.StoryRunPosition(item=item, run_index=1))
+    document.add_comment(span, author="Ada", text="Review")
+    before = document.to_bytes()
+    comment = document.comments[0]
+    assert comment.anchor_text == item.text
+    assert comment.anchor.start.item.story.kind == kind
+    assert comment.anchor.start.item.direct_body_index == (0 if kind == "body" else None)
+    assert document.to_bytes() == before
+    document.add_comment(comment.anchor, author="Ben", text="Same span")
+    assert document.comments[-1].anchor_text == comment.anchor_text
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_comment_anchor_block_control_paragraph_endpoints_are_real_typed_ranges(multi):
+    import rdocx
+
+    seed = rdocx.Document()
+    seed.add_paragraph("seed")
+    identity = seed.add_comment(rdocx.RunRange(
+        start=rdocx.RunPosition(body_index=0, run_index=0),
+        end=rdocx.RunPosition(body_index=0, run_index=1)), author="Ada", text="Review")
+    middle = "</w:p><w:p/><w:p>" if multi else ""
+    body = (f'<w:sdt><w:sdtPr><w:tag w:val="goog_rdk_test"/></w:sdtPr><w:sdtContent>'
+            f'<w:p><w:commentRangeStart w:id="{identity}"/><w:r><w:t>A</w:t></w:r>'
+            f'{middle}<w:r><w:t>B</w:t></w:r><w:commentRangeEnd w:id="{identity}"/>'
+            f'<w:r><w:commentReference w:id="{identity}"/></w:r></w:p></w:sdtContent></w:sdt>')
+    document = _replace_document_body(seed, body)
+    before = document.to_bytes()
+    comment = document.comments[0]
+    assert comment.anchor_text == ("A\n\nB" if multi else "AB")
+    assert comment.anchor.start.item.index_path == (0, 0)
+    assert comment.anchor.end.item.index_path == (0, 2 if multi else 0)
+    assert comment.anchor.start.item.direct_body_index == 0
+    assert comment.anchor.start.item.kind == "paragraph"
+    assert isinstance(comment.anchor.start.item.xml, bytes)
+    assert document.to_bytes() == before
+    document.add_comment(comment.anchor, author="Ben", text="Same source")
+    assert document.comments[-1].anchor_text == comment.anchor_text
+
+    # Issue289: every path2 endpoint carries the actual paragraph snapshot.
+    import xml.etree.ElementTree as ET
+    prefixed = _replace_document_body(seed,
+        '<w:p><w:r><w:t>Plain paragraph.</w:t></w:r></w:p>' + body)
+    original = prefixed.to_bytes()
+    for current in [prefixed, rdocx.Document.from_bytes(original)]:
+        bounds = current.comments[0].anchor
+        for endpoint, path, text in [
+            (bounds.start, (1, 0), "A" if multi else "AB"),
+            (bounds.end, (1, 2 if multi else 0), "B" if multi else "AB"),
+        ]:
+            item = endpoint.item
+            assert item.story.kind == "body" and item.kind == "paragraph"
+            assert item.index_path == path and item.direct_body_index == 1
+            assert item.text == text and item.xml
+            assert ET.fromstring(item.xml).tag == (
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p")
+        held = current.paragraphs[1]
+        position = rdocx.StoryRunPosition(paragraph=held, run_index=0)
+        assert position.item == bounds.start.item
+        assert position.item.text == ("A" if multi else "AB")
+        assert position.item.xml
+        assert current.to_bytes() == original
+        retired_run = held.runs[0]
+        current.add_paragraph("Revision changes")
+        survivor = rdocx.StoryRunPosition(paragraph=held, run_index=0)
+        assert survivor.item.text == ("A" if multi else "AB")
+        assert survivor.item.xml == position.item.xml
+        with pytest.raises(rdocx.StaleElementError, match="document revision"):
+            _ = retired_run.text
+
+
+def test_comment_anchor_header_block_control_preserves_nonbody_identity():
+    import rdocx
+
+    seed = rdocx.Document()
+    seed.add_paragraph("body")
+    seed.set_header("header")
+    identity = seed.add_comment(rdocx.RunRange(
+        start=rdocx.RunPosition(body_index=0, run_index=0),
+        end=rdocx.RunPosition(body_index=0, run_index=1)), author="Ada", text="Review")
+    header = next(story for story in seed.stories if story.kind == "header")
+    body = _document_xml(seed)
+    for local in ["commentRangeStart", "commentRangeEnd", "commentReference"]:
+        body = body.replace(f'<w:{local} w:id="{identity}"/>'.encode(), b"")
+    xml = (f'<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           f'<w:sdt><w:sdtPr><w:tag w:val="goog_rdk_header"/></w:sdtPr><w:sdtContent>'
+           f'<w:p><w:commentRangeStart w:id="{identity}"/><w:r><w:t>HEADER</w:t></w:r>'
+           f'<w:commentRangeEnd w:id="{identity}"/><w:r><w:commentReference w:id="{identity}"/>'
+           f'</w:r></w:p></w:sdtContent></w:sdt></w:hdr>').encode()
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(seed.to_bytes())) as archive, zipfile.ZipFile(result, "w") as output:
+        for info in archive.infolist():
+            data = archive.read(info.filename)
+            if info.filename == "word/document.xml":
+                data = body
+            elif info.filename == header.part_name.lstrip("/"):
+                data = xml
+            output.writestr(info, data)
+    document = rdocx.Document.from_bytes(result.getvalue())
+    before = document.to_bytes()
+    comment = document.comments[0]
+    assert comment.anchor_text == "HEADER"
+    assert comment.anchor.start.item.index_path == (0, 0)
+    assert comment.anchor.start.item.story.kind == "header"
+    assert comment.anchor.start.item.story.part_name == header.part_name
+    assert comment.anchor.start.item.direct_body_index is None
+    assert document.to_bytes() == before
+    document.add_comment(comment.anchor, author="Ben", text="Same header")
+    assert document.comments[-1].anchor_text == "HEADER"
+
+
+def test_comment_moves_refuse_unknown_reply_and_invalid_ranges_atomically():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("SOURCE")
+    document.add_paragraph("TARGET TARGET")
+    identity = document.add_comment_on_text("SOURCE", author="Ada", initials="A",
+        text="Review", date="2026-10-08T12:00:00Z")
+    reply = document.reply_to(identity, author="Ben", text="Reply")
+    document.resolve_comment(identity)
+    metadata = document.comments
+    target = document.paragraphs[1]
+    bounds = rdocx.StoryRunRange(
+        start=rdocx.StoryRunPosition(paragraph=target, run_index=0),
+        end=rdocx.StoryRunPosition(paragraph=target, run_index=1))
+    held = document.paragraphs[0]
+    document.move_comment(identity, bounds)
+    assert document.comments == metadata
+    assert document.comments[0].anchor_text == "TARGET TARGET"
+    with pytest.raises(rdocx.StaleElementError):
+        held.text
+    document.move_comment_to_text(identity, "TARGET", occurrence=1)
+    assert document.comments == metadata
+    assert document.comments[0].anchor_text == "TARGET"
+    before = document.to_bytes()
+    current = document.comments[0].anchor
+    for selected in [999, reply]:
+        with pytest.raises(rdocx.RdocxError):
+            document.move_comment(selected, current)
+        assert document.to_bytes() == before
+    with pytest.raises(rdocx.RdocxError):
+        document.move_comment_to_text(identity, "absent")
+    assert document.to_bytes() == before
+    with pytest.raises(rdocx.StaleElementError):
+        document.move_comment(identity, bounds)
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert reopened.comments == metadata
+    assert reopened.comments[0].anchor_text == "TARGET"
+
+
+def test_scoped_replacement_count_guards_are_atomic():
+    import pickle
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("Ver").add_run("sion head")
+    document.add_paragraph("Version head")
+    held = document.paragraphs[0]
+    run = held.runs[0]
+    before = document.to_bytes()
+    for old, new, expect in [("absent", "x", 0), ("", "x", 0)]:
+        assert held.replace_text(old, new, expect=expect) == 0
+        assert held.text == "Version head"
+        assert run.text == "Ver"
+        assert document.to_bytes() == before
+    with pytest.raises(rdocx.ReplacementCountError) as raised:
+        held.replace_text("Version", "Release", expect=2)
+    error = raised.value
+    assert (error.index, error.expected, error.found) == (None, 2, 1)
+    copied = pickle.loads(pickle.dumps(error))
+    assert (copied.index, copied.expected, copied.found) == (None, 2, 1)
+    assert document.to_bytes() == before
+    assert held.text == "Version head"
+    with pytest.raises(rdocx.RdocxError):
+        held.replace_text("absent", "\x01")
+    assert document.to_bytes() == before
+    assert held.replace_text(old="Version", new="Release", expect=1) == 1
+    for stale in (held, run):
+        with pytest.raises(rdocx.StaleElementError):
+            stale.text
+    assert [p.text for p in document.paragraphs] == ["Release head", "Version head"]
+    with pytest.raises(rdocx.StaleElementError):
+        held.replace_text("Release", "Again")
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [p.text for p in reopened.paragraphs] == ["Release head", "Version head"]
+
+
+def test_scoped_cell_and_story_item_replacements_have_local_counts():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("Version outside")
+    table = document.add_table(1, 2)
+    table.cell(0, 0).text = "Version cell"
+    document.tables[0].cell(0, 1).text = "Version neighbor"
+    cell = document.tables[0].cell(0, 0)
+    cell.add_paragraph("Version second")
+    cell = document.tables[0].cell(0, 0)
+    paragraph = cell.paragraphs[1]
+    before = document.to_bytes()
+    assert cell.replace_text("absent", "x", expect=0) == 0
+    assert cell.text == "Version cell\nVersion second"
+    with pytest.raises(rdocx.ReplacementCountError) as raised:
+        cell.replace_text("Version", "Release", expect=1)
+    assert (raised.value.index, raised.value.found) == (None, 2)
+    assert document.to_bytes() == before
+    assert paragraph.replace_text("Version", "Release", expect=1) == 1
+    assert document.tables[0].cell(0, 0).text == "Version cell\nRelease second"
+    cell = document.tables[0].cell(0, 0)
+    assert cell.replace_text("Version", "Release", expect=1) == 1
+    assert document.tables[0].cell(0, 1).text == "Version neighbor"
+    assert document.paragraphs[0].text == "Version outside"
+    document.set_header("Version header")
+    item = next(item for item in document.story_items if item.story.kind == "header" and item.kind == "paragraph")
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    assert document.replace_text_at(item, "absent", "x", expect=0) == 0
+    assert document.to_bytes() == before
+    assert held.text == "Version outside"
+    assert document.replace_text_at(item, "Version", "Release", expect=1) == 1
+    with pytest.raises(rdocx.StaleElementError):
+        document.replace_text_at(item, "Release", "Again")
+    assert _story_paragraph_texts(document, "header") == ["Release header"]
+    assert document.paragraphs[0].text == "Version outside"
+
+
+def test_scoped_control_paragraph_handles_use_direct_owner_ordinals():
+    import rdocx
+
+    body = '<w:sdt><w:sdtPr/><w:sdtContent><w:sdt><w:sdtPr/><w:sdtContent><w:p><w:r><w:t>Version nested</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Version A</w:t></w:r></w:p><w:p><w:r><w:t>Version B</w:t></w:r></w:p></w:sdtContent></w:sdt>'
+    document = _replace_document_body(rdocx.Document(), body)
+    nested = rdocx.Document.from_bytes(document.to_bytes())
+    nested_before = nested.to_bytes()
+    held_nested = nested.paragraphs[0]
+    nested_unsupported = False
+    try:
+        nested.paragraphs[0].replace_text("Version", "Release", expect=1)
+    except IndexError:
+        nested_unsupported = True
+    count = document.paragraphs[1].replace_text("Version", "Release", expect=1)
+    texts = [paragraph.text for paragraph in document.paragraphs]
+    print(f"count={count}, nested_unsupported={nested_unsupported}, texts={texts!r}")
+    assert count == 1
+    assert texts == ["Version nested", "Release A", "Version B"]
+    assert nested_unsupported
+    assert nested.to_bytes() == nested_before
+    assert held_nested.text == "Version nested"
+
+
+@pytest.mark.parametrize("kind", ["header", "footer"])
+def test_whole_story_comment_refusals_preserve_bytes_and_revision(kind):
+    import rdocx
+
+    def fixture(partial=False, malformed=False):
+        document = rdocx.Document()
+        document.add_paragraph("main retained")
+        getattr(document, f"set_{kind}")("old story")
+        item = next(item for item in document.story_items
+                    if item.kind == "paragraph" and item.story.kind == kind)
+        root = document.add_comment(rdocx.StoryRunRange(
+            start=rdocx.StoryRunPosition(item=item, run_index=0),
+            end=rdocx.StoryRunPosition(item=item, run_index=1)),
+            author="Ada", text="root")
+        reply = document.reply_to(root, author="Ben", text="reply")
+        document.reply_to(reply, author="Cyd", text="grandchild")
+        if not partial and not malformed:
+            return rdocx.Document.from_bytes(document.to_bytes())
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as source:
+            with zipfile.ZipFile(output, "w") as target:
+                for info in source.infolist():
+                    data = source.read(info.filename)
+                    if partial:
+                        marker = f'<w:commentRangeStart w:id="{root}"/>'.encode()
+                        if info.filename.startswith(f"word/{kind}") and info.filename.endswith(".xml"):
+                            data = data.replace(marker, b"")
+                        if info.filename == "word/document.xml":
+                            data = data.replace(b"<w:p>", b"<w:p>" + marker, 1)
+                    if malformed and info.filename == "word/commentsExtended.xml":
+                        data = re.sub(rb'(w15:paraId=")[^"]+', rb'\g<1>DEADBEEF', data, count=1)
+                    target.writestr(info, data)
+        return rdocx.Document.from_bytes(output.getvalue())
+
+    document = fixture()
+    held = document.paragraphs[0]
+    getattr(document, f"set_{kind}")("new story")
+    assert document.comments == ()
+    with pytest.raises(rdocx.StaleElementError, match="revision 0.*revision 1"):
+        held.text
+    assert rdocx.Document.from_bytes(document.to_bytes()).comments == ()
+    for partial, malformed, text in ((True, False, "new"),
+                                     (False, True, "new"),
+                                     (False, False, "invalid \x01")):
+        document = fixture(partial, malformed)
+        held = document.paragraphs[0]
+        before = document.to_bytes()
+        with pytest.raises(rdocx.RdocxError):
+            getattr(document, f"set_{kind}")(text)
+        assert document.to_bytes() == before
+        assert held.text == "main retained"
+
+
+def test_scoped_alternate_text_box_refusal_is_rdocxerror_without_mutation():
+    import rdocx
+
+    content = '<w:txbxContent><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>box NEEDLE</w:t></w:r></w:p></w:txbxContent>'
+    body = (
+        '<w:p><w:r><w:t>held outside</w:t></w:r></w:p><w:p><w:r>'
+        '<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+        'xmlns:v="urn:schemas-microsoft-com:vml">'
+        '<mc:Choice Requires="wps"><w:drawing><wp:inline><wp:extent cx="914400" cy="457200"/>'
+        '<wp:docPr id="1" name="scoped box"/><a:graphic><a:graphicData '
+        'uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        f'<wps:wsp><wps:txbx>{content}</wps:txbx></wps:wsp>'
+        '</a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>'
+        f'<mc:Fallback><w:pict><v:shape id="fallback"><v:textbox>{content}</v:textbox></v:shape>'
+        '</w:pict><!--preserve alternate producer--></mc:Fallback></mc:AlternateContent></w:r></w:p>'
+    )
+    document = _replace_document_body(rdocx.Document(), body)
+    item = next(item for item in document.story_items
+                if item.story.kind == "text_box" and item.kind == "paragraph")
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    assert document.replace_text_at(item, "absent", "PIN", expect=0) == 0
+    with pytest.raises(rdocx.ReplacementCountError) as raised:
+        document.replace_text_at(item, "NEEDLE", "PIN", expect=2)
+    assert (raised.value.expected, raised.value.found) == (2, 1)
+    assert document.to_bytes() == before
+    assert held.text == "held outside"
+    assert document.replace_text_at(item, "NEEDLE", "PIN", expect=1) == 1
+    with pytest.raises(rdocx.StaleElementError):
+        _ = held.text
+    assert document.paragraphs[0].text == "held outside"
+    saved = document.to_bytes()
+    xml = _document_xml(document)
+    assert xml.count(b"box PIN") == 2 and b"NEEDLE" not in xml
+    assert b"<!--preserve alternate producer-->" in xml
+    reopened = rdocx.Document.from_bytes(saved)
+    assert _story_paragraph_texts(reopened, "text_box") == ["box PIN"]
+    assert _document_xml(reopened) == xml
+    fresh = next(entry for entry in reopened.story_items
+                 if entry.story.kind == "text_box" and entry.kind == "paragraph")
+    assert reopened.replace_text_at(fresh, "absent", "PIN", expect=0) == 0
+    assert reopened.to_bytes() == saved
+
+    # The corresponding source slot is not proved when the fallback text differs.
+    asymmetric = body.replace(
+        f"<v:textbox>{content}</v:textbox>",
+        f"<v:textbox>{content.replace('box NEEDLE', 'different text')}</v:textbox>",
+    )
+    assert asymmetric != body
+    refused = _replace_document_body(rdocx.Document(), asymmetric)
+    selected = next(entry for entry in refused.story_items
+                    if entry.story.kind == "text_box" and entry.kind == "paragraph")
+    original = refused.to_bytes()
+    outside = refused.paragraphs[0]
+    with pytest.raises(rdocx.RdocxError, match="asymmetric"):
+        refused.replace_text_at(selected, "NEEDLE", "PIN", expect=1)
+    assert refused.to_bytes() == original and outside.text == "held outside"
+
+
+def test_rebuild_toc_single_entry_preserves_opaque_properties_and_reopens():
+    import rdocx
+
+    body = (
+        '<w:p xmlns:f="urn:producer" w:rsidR="00ABCDEF">'
+        "<w:pPr f:keep='&#65;'><w:pStyle w:val=\"TOC1\"></w:pStyle>"
+        "<f:payload data='&#66;'/></w:pPr>"
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>Old entry</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Only</w:t></w:r></w:p>'
+    )
+    source = rdocx.Document()
+    source.add_paragraph("placeholder")
+    document = _replace_document_body(source, body)
+    for _ in range(2):
+        assert document.rebuild_toc().entry_count == 1
+        assert len(document.paragraphs) == 2
+        assert document.paragraphs[0].text == "Only\t1"
+        saved = _document_xml(document)
+        assert b"f:keep='&#65;'" in saved
+        assert b"<f:payload data='&#66;'/>" in saved
+        assert saved.count(b'w:fldCharType="begin"') == 1
+        assert saved.count(b'w:fldCharType="end"') == 1
+        document = rdocx.Document.from_bytes(document.to_bytes())
+        assert _document_xml(document) == saved
+
+
+def test_fx201_existing_section_geometry_positive_and_atomic_index():
+    import rdocx
+    from rdocx import Inches
+
+    document = rdocx.Document()
+    document.add_paragraph("section geometry")
+    updated = document.update_section(
+        0, page_width=Inches(8.5), page_height=Inches(11),
+        orientation="landscape", margin_top=Inches(0.75),
+        margin_right=Inches(0.8), margin_bottom=Inches(0.9),
+        margin_left=Inches(1.1), gutter=Inches(0.2),
+        header_distance=Inches(0.3), footer_distance=Inches(0.4),
+    )
+    assert (updated.page_width, updated.page_height) == (Inches(11), Inches(8.5))
+    assert updated.orientation == "landscape"
+    assert rdocx.Document.from_bytes(document.to_bytes()).sections[0] == updated
+    before = document.to_bytes()
+    with pytest.raises(IndexError, match="section index out of range"):
+        document.insert_section(2)
+    assert document.to_bytes() == before
+
+
+def test_fx201_inserted_section_inherits_resolved_geometry():
+    import rdocx
+    from rdocx import Inches
+
+    document = rdocx.Document()
+    document.add_paragraph("first section")
+    previous = document.update_section(
+        0, page_width=Inches(8.5), page_height=Inches(11),
+        orientation="landscape", margin_top=Inches(0.75),
+        margin_right=Inches(0.8), margin_bottom=Inches(0.9),
+        margin_left=Inches(1.1), gutter=Inches(0.2),
+        header_distance=Inches(0.3), footer_distance=Inches(0.4),
+        column_count=2, page_number_start=7, different_first_page=True,
+    )
+    assert previous.page_width == Inches(11)
+    assert previous.orientation == "landscape"
+    document.insert_section(1)
+    assert len(document.sections) == 2
+    inserted = document.sections[1]
+    fields = ("page_width", "page_height", "orientation", "margin_top",
+              "margin_right", "margin_bottom", "margin_left", "gutter",
+              "header_distance", "footer_distance")
+    assert tuple(getattr(inserted, f) for f in fields) == tuple(
+        getattr(previous, f) for f in fields
+    ), "F201 inserted section must inherit resolved geometry"
+    assert inserted.column_count is None
+    assert inserted.page_number_start is None
+    assert not inserted.different_first_page
+    assert rdocx.Document.from_bytes(document.to_bytes()).sections[1] == inserted
+
+
+def test_fx201_even_footer_creation_enables_setting_atomically():
+    import rdocx
+    from xml.etree import ElementTree as ET
+
+    document = rdocx.Document()
+    document.add_paragraph("section footer")
+    default = document.create_section_story(0, "footer", "default")
+    assert default.kind == "footer"
+    assert _story_part(document, default)
+    before = document.to_bytes()
+    with pytest.raises(IndexError, match="section index out of range"):
+        document.create_section_story(9, "footer", "even")
+    assert document.to_bytes() == before
+    even = document.create_section_story(0, "footer", "even")
+    assert even.kind == "footer"
+    assert _story_part(document, even)
+    variant = next(v for v in document.header_footer_variants
+                   if v.section_index == 0 and v.kind == "footer" and v.variant == "even")
+    assert variant.story == even and not variant.inherited
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        settings = ET.fromstring(archive.read("word/settings.xml"))
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    enabled = settings.find(word + "evenAndOddHeaders")
+    assert enabled is not None and enabled.get(word + "val", "1") not in (
+        "0", "false", "off"
+    ), "F201 even footer creation must enable evenAndOddHeaders"
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert any(v.section_index == 0 and v.variant == "even" and v.story is not None
+               for v in reopened.header_footer_variants)
+
+
+def test_fx201_twips_constructor_and_section_length_equivalence():
+    import rdocx
+
+    assert rdocx.Twips(1440) == rdocx.Inches(1)
+    assert rdocx.Twips(1.75) == 1111
+    assert rdocx.Twips(-1.75) == -1111
+    document = rdocx.Document()
+    document.add_paragraph("length control")
+    section = document.update_section(0, margin_top=rdocx.Twips(1440))
+    assert section.margin_top == rdocx.Pt(72)
+    before = document.to_bytes()
+    for bad in (True, 1.5, 2**64):
+        with pytest.raises((TypeError, OverflowError, ValueError, rdocx.RdocxError)):
+            document.update_section(0, margin_top=bad)
+        assert document.to_bytes() == before
+    assert document.update_section(0, margin_top=-635).margin_top == -635
+    assert document.update_section(0, margin_top=-1).margin_top == 0
+    assert document.update_section(0, margin_top=634).margin_top == 0
+    before = document.to_bytes()
+    for name in ("page_width", "page_height", "margin_top", "margin_right", "margin_bottom", "margin_left", "gutter", "header_distance", "footer_distance"):
+        with pytest.raises(TypeError):
+            setattr(document.section(0), name, None)
+        assert document.to_bytes() == before
+    with pytest.raises(TypeError):
+        document.section(0).orientation = None
+    assert document.to_bytes() == before
+
+
+def test_fx201_live_section_footer_uses_actual_related_owner():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("body retained")
+    section = document.section(0)
+    assert section.footer.paragraphs == ()
+    section.footer.is_linked_to_previous = False
+    footer = document.section(0).footer
+    paragraph = footer.add_paragraph("Page ")
+    paragraph.runs[0].font.bold = True
+    paragraph.add_run("1").add_field("PAGE", "1")
+    footer = document.section(0).footer
+    assert footer.paragraphs[0].text == "Page 11"
+    assert document.paragraphs[0].text == "body retained"
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        footers = [n for n in archive.namelist() if re.fullmatch(r"word/footer\d+\.xml", n)]
+        assert len(footers) == 1
+        assert b"PAGE" in archive.read(footers[0])
+        assert b"Page " not in archive.read("word/document.xml")
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.section(0).footer.paragraphs[0].text == "Page 11"
+
+
+def test_fx201_note_reference_creation_uses_checked_paragraph():
+    import rdocx
+
+    document = rdocx.Document()
+    reference = document.add_paragraph("reference")
+    retired_run = reference.runs[0]
+    note = document.add_footnote(reference, "note content")
+    assert note.paragraphs[0].text == "note content"
+    assert reference.text == "reference"
+    with pytest.raises(rdocx.StaleElementError):
+        _ = retired_run.text
+    saved = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        assert b"note content" in archive.read("word/footnotes.xml")
+        assert b"footnoteReference" in archive.read("word/document.xml")
+    note.delete()
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        assert b"footnoteReference" not in archive.read("word/document.xml")
+    before = document.to_bytes()
+    foreign = rdocx.Document().add_paragraph("foreign")
+    with pytest.raises(ValueError, match="different document"):
+        document.add_footnote(foreign, "refused")
+    assert document.to_bytes() == before
+
+
+def test_fx201_settings_and_run_break_are_owned():
+    import rdocx
+    from xml.etree import ElementTree as ET
+
+    document = rdocx.Document()
+    document.add_paragraph("break before").runs[0].add_break("page")
+    document.settings.odd_and_even_pages_header_footer = True
+    assert document.settings.odd_and_even_pages_header_footer
+    saved = document.to_bytes()
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        main = ET.fromstring(archive.read("word/document.xml"))
+        assert any(e.get(word + "type") == "page" for e in main.iter(word + "br"))
+        assert ET.fromstring(archive.read("word/settings.xml")).find(word + "evenAndOddHeaders") is not None
+    reopened = rdocx.Document.from_bytes(saved)
+    assert reopened.settings.odd_and_even_pages_header_footer
+
+
+def test_fx201_note_policy_scopes_preserve_notes_and_refuse_atomically():
+    import rdocx
+    from xml.etree import ElementTree as ET
+
+    document = rdocx.Document()
+    reference = document.add_paragraph("note reference")
+    document.add_footnote(reference, "retained footnote")
+    document.set_note_policy("footnote", format="lowerRoman", start=4, restart="eachPage", placement="beneathText")
+    section = document.section(0)
+    section.set_note_policy("endnote", format="upperLetter", start=2, restart="eachSect", placement="sectEnd")
+    saved = document.to_bytes()
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        notes = archive.read("word/footnotes.xml")
+        assert b"retained footnote" in notes
+        settings = ET.fromstring(archive.read("word/settings.xml"))
+        policy = settings.find(word + "footnotePr")
+        assert policy is not None
+        assert policy.find(word + "numFmt").get(word + "val") == "lowerRoman"
+        assert policy.find(word + "numStart").get(word + "val") == "4"
+        assert policy.find(word + "numRestart").get(word + "val") == "eachPage"
+        assert policy.find(word + "pos").get(word + "val") == "beneathText"
+        main = ET.fromstring(archive.read("word/document.xml"))
+        override = main.find(".//" + word + "sectPr/" + word + "endnotePr")
+        assert override is not None
+        assert override.find(word + "numFmt").get(word + "val") == "upperLetter"
+        assert override.find(word + "numStart").get(word + "val") == "2"
+    for bad in (True, 1.5, -1, 2**64, 0):
+        with pytest.raises((TypeError, ValueError, OverflowError, rdocx.RdocxError)):
+            document.set_note_policy("footnote", start=bad)
+        assert document.to_bytes() == saved
+    with pytest.raises(rdocx.RdocxError, match="placement is invalid"):
+        section.set_note_policy("footnote", placement="docEnd")
+    assert document.to_bytes() == saved
+    reopened = rdocx.Document.from_bytes(saved)
+    with zipfile.ZipFile(io.BytesIO(reopened.to_bytes())) as archive:
+        assert archive.read("word/footnotes.xml") == notes
+
+
+def test_fx201_nested_tables_use_actual_body_and_footer_cell_owners():
+    import rdocx
+    from xml.etree import ElementTree as ET
+
+    document = rdocx.Document()
+    document.add_paragraph("body retained")
+    table = document.add_table(1, 1)
+    nested = table.cell(0, 0).add_table(1, 1)
+    nested.cell(0, 0).text = "nested body"
+    assert document.tables[0].cell(0, 0).tables[0].cell(0, 0).text == "nested body"
+    footer = document.section(0).footer
+    table = footer.add_table(1, 1)
+    nested = table.cell(0, 0).add_table(1, 1)
+    nested.cell(0, 0).text = "nested footer"
+    before = document.to_bytes()
+    cell = document.section(0).footer.tables[0].cell(0, 0)
+    with pytest.raises(rdocx.RdocxError, match="dimensions must be positive"):
+        cell.add_table(0, 1)
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert reopened.paragraphs[0].text == "body retained"
+    assert reopened.tables[0].cell(0, 0).tables[0].cell(0, 0).text == "nested body"
+    assert reopened.section(0).footer.tables[0].cell(0, 0).tables[0].cell(0, 0).text == "nested footer"
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(before)) as archive:
+        footers = [n for n in archive.namelist() if re.fullmatch(r"word/footer\d+\.xml", n)]
+        assert len(footers) == 1
+        for name in ("word/document.xml", footers[0]):
+            for cell in ET.fromstring(archive.read(name)).iter(word + "tc"):
+                assert list(cell)[-1].tag == word + "p"
+
+
+def test_fx201_live_page_border_edges_and_page_color_preserve_source():
+    import rdocx
+    from rdocx import Document
+    document = Document()
+    document.add_paragraph("page body remains")
+    section = document.section(0)
+    for edge in ("top", "left", "bottom", "right"):
+        section.set_page_border(edge, style="double", width=16, space=4, color="123456")
+    document.set_page_color("AABBCC")
+    saved = document.to_bytes()
+    from lxml import etree
+    import zipfile
+    import io
+    root = etree.fromstring(zipfile.ZipFile(io.BytesIO(saved)).read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert root.find("w:background", ns).get("{%s}color" % ns["w"]) == "AABBCC"
+    borders = root.find("w:body/w:sectPr/w:pgBorders", ns)
+    assert borders is not None
+    assert [etree.QName(child).localname for child in borders] == ["top", "left", "bottom", "right"]
+    for border in borders:
+        assert border.get("{%s}val" % ns["w"]) == "double"
+        assert border.get("{%s}sz" % ns["w"]) == "16"
+    section = document.section(0)
+    with pytest.raises(rdocx.RdocxError, match="page border width"):
+        section.set_page_border("top", width=1)
+    assert document.to_bytes() == saved
+    assert Document.from_bytes(saved).to_bytes() == saved
+
+
+def test_fx201_section_drawingml_text_watermark_preserves_real_text_and_refusals():
+    import rdocx
+    from rdocx import Document
+    import io
+    import zipfile
+    from lxml import etree
+    document = Document()
+    document.add_paragraph("body stays")
+    section = document.section(0)
+    section.header.add_paragraph("other header")
+    section = document.section(0)
+    section.set_text_watermark("CONFIDENTIAL", width=4572000, height=1143000,
+                               font_size=609600, font_family="Carlito", opacity=0.5)
+    saved = document.to_bytes()
+    package = zipfile.ZipFile(io.BytesIO(saved))
+    header = next(name for name in package.namelist() if name.startswith("word/header") and name.endswith(".xml"))
+    root = etree.fromstring(package.read(header))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+          "w14": "http://schemas.microsoft.com/office/word/2010/wordml",
+          "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+          "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+          "v": "urn:schemas-microsoft-com:vml"}
+    assert root.xpath("count(.//w:t[text()='CONFIDENTIAL'])", namespaces=ns) == 1
+    assert root.xpath("count(.//w14:alpha[@w14:val='50000'])", namespaces=ns) == 1
+    assert root.xpath("count(.//wp:anchor[@behindDoc='1'])", namespaces=ns) == 1
+    choices = root.xpath(".//mc:AlternateContent/mc:Choice", namespaces=ns)
+    assert [choice.get("Requires") for choice in choices] == ["wps w16"]
+    assert choices[0].nsmap["w16"] == "http://schemas.microsoft.com/office/word/2018/wordml"
+    assert choices[0].xpath("count(.//w14:solidFill)", namespaces=ns) == 1
+    assert root.xpath(".//mc:Fallback//v:textpath/@string", namespaces=ns) == ["CONFIDENTIAL"]
+    assert root.xpath(".//mc:Fallback//v:fill/@opacity", namespaces=ns) == ["0.5"]
+    assert root.xpath("count(.//mc:Fallback//v:shapetype[@o:spt='136'])", namespaces={**ns, "o": "urn:schemas-microsoft-com:office:office"}) == 1
+    assert "other header" in "".join(root.xpath(".//w:t/text()", namespaces=ns))
+    assert Document.from_bytes(saved).to_bytes() == saved
+    for unsupported in (0.0, 0.25, 1.0):
+        with pytest.raises(rdocx.RdocxError, match="^DrawingML text watermark opacity other than 0\\.5 is unsupported by the qualified native text-fill representation$"):
+            section.set_text_watermark("bad", width=4572000, height=1143000, font_size=609600, opacity=unsupported)
+        assert document.to_bytes() == saved
+        absent = Document()
+        absent.add_paragraph("no header")
+        absent_saved = absent.to_bytes()
+        with pytest.raises(rdocx.RdocxError, match="^DrawingML text watermark opacity other than 0\\.5 is unsupported by the qualified native text-fill representation$"):
+            absent.section(0).set_text_watermark("bad", width=4572000, height=1143000, font_size=609600, opacity=unsupported)
+        assert absent.to_bytes() == absent_saved
+    for invalid in (float("nan"), -0.1, 1.1):
+        with pytest.raises(rdocx.RdocxError, match="watermark opacity"):
+            section.set_text_watermark("bad", width=4572000, height=1143000, font_size=609600, opacity=invalid)
+        assert document.to_bytes() == saved
+    with pytest.raises(TypeError):
+        section.set_text_watermark("bad", width=True, height=1143000, font_size=609600)
+    assert document.to_bytes() == saved
+    section.set_text_watermark("REPLACED", width=4572000, height=1143000, font_size=609600)
+    replaced = document.to_bytes()
+    root = etree.fromstring(zipfile.ZipFile(io.BytesIO(replaced)).read(header))
+    assert root.xpath("count(.//w:t[text()='REPLACED'])", namespaces=ns) == 1
+    assert not root.xpath(".//w:t[text()='CONFIDENTIAL']", namespaces=ns)
+
+
+@pytest.mark.parametrize("style_mode", ("standard", "localized", "absent"))
+def test_fx201_all_six_story_slots_resolve_real_paragraph_style_ids(style_mode):
+    import rdocx
+    from rdocx import Document
+    from lxml import etree
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    document = Document()
+    document.add_paragraph("body unchanged")
+    source = io.BytesIO(document.to_bytes())
+    result = io.BytesIO()
+    header_id = "Kopfzeile" if style_mode == "localized" else "Header"
+    footer_id = "PiedDePage" if style_mode == "localized" else "Footer"
+    title_id = "TitreLocal" if style_mode == "localized" else "Title"
+    title_name = "Titre local" if style_mode == "localized" else "Title"
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(result, "w") as changed:
+        for info in original.infolist():
+            data = original.read(info.filename)
+            if info.filename == "word/styles.xml":
+                root = etree.fromstring(data)
+                for style in list(root):
+                    if style.tag == word + "style" and style.get(word + "styleId") in ("Header", "Footer", "Title"):
+                        root.remove(style)
+                values = [(title_id, title_name)]
+                if style_mode != "absent":
+                    values.extend(((header_id, "Header"), (footer_id, "Footer")))
+                for style_id, name in values:
+                    style = etree.SubElement(root, word + "style", {word + "type": "paragraph", word + "styleId": style_id})
+                    etree.SubElement(style, word + "name", {word + "val": name})
+                data = etree.tostring(root)
+            changed.writestr(info, data)
+    document = Document.from_bytes(result.getvalue())
+    slots = ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer")
+    for slot in slots:
+        owner = getattr(document.section(0), slot)
+        assert owner.paragraphs == ()
+        owner.add_paragraph(slot + " default")
+        owner = getattr(document.section(0), slot)
+        owner.add_paragraph(slot + " explicit", style=title_name)
+        saved = document.to_bytes()
+        owner = getattr(document.section(0), slot)
+        with pytest.raises(KeyError, match="missing paragraph style"):
+            owner.add_paragraph("not published", style="missing paragraph style")
+        assert document.to_bytes() == saved
+    saved = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        all_paragraphs = []
+        for name in archive.namelist():
+            if re.fullmatch(r"word/(header|footer)\d+\.xml", name):
+                all_paragraphs.extend(etree.fromstring(archive.read(name)).iter(word + "p"))
+        for slot in slots:
+            for suffix in ("default", "explicit"):
+                expected = slot + " " + suffix
+                matches = [p for p in all_paragraphs if "".join(p.itertext()) == expected]
+                assert len(matches) == 1
+                style = matches[0].find(word + "pPr/" + word + "pStyle")
+                expected_id = title_id if suffix == "explicit" else None if style_mode == "absent" else header_id if "header" in slot else footer_id
+                assert (None if style is None else style.get(word + "val")) == expected_id
+        assert b"body unchanged" in archive.read("word/document.xml")
+    reopened = Document.from_bytes(saved)
+    assert reopened.to_bytes() == saved
+    for slot in slots:
+        texts = [p.text for p in getattr(reopened.section(0), slot).paragraphs]
+        assert slot + " default" in texts and slot + " explicit" in texts
+
+
+@pytest.mark.parametrize("host", ("footer", "footer-cell", "footnote", "endnote", "body-cell"))
+def test_fx201_owned_rich_picture_is_inserted_with_its_owner_relationship(host):
+    import rdocx
+    from rdocx import Document
+    from lxml import etree
+    document = Document()
+    document.add_paragraph("body retained")
+    if host == "footer":
+        paragraph = document.section(0).footer.add_paragraph("owner text")
+    elif host == "footer-cell":
+        table = document.section(0).footer.add_table(1, 1)
+        table.cell(0, 0).text = "owner text"
+        paragraph = document.section(0).footer.tables[0].cell(0, 0).paragraphs[0]
+    elif host == "body-cell":
+        table = document.add_table(1, 1)
+        table.cell(0, 0).text = "owner text"
+        paragraph = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        reference = document.paragraphs[0].runs[0]
+        note = getattr(document, "add_" + host)(reference, "owner text")
+        paragraph = note.paragraphs[0]
+    run = paragraph.runs[0]
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError, match="image"):
+        run.add_picture(b"not an image", "invalid.png", width=127000, height=127000)
+    assert document.to_bytes() == before
+    image = _one_pixel_png(b"\xff\x00\x00")
+    run.add_picture(image, "owner.png", width=127000, height=127000)
+    with pytest.raises(rdocx.StaleElementError):
+        _ = run.text
+    saved = document.to_bytes()
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main", "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    relationship_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        owner = "word/document.xml" if host == "body-cell" else "word/footnotes.xml" if host == "footnote" else "word/endnotes.xml" if host == "endnote" else next(n for n in archive.namelist() if re.fullmatch(r"word/footer\d+\.xml", n))
+        root = etree.fromstring(archive.read(owner))
+        embeds = root.xpath(".//a:blip/@r:embed", namespaces=ns)
+        assert len(embeds) == 1
+        rel_name = posixpath.dirname(owner) + "/_rels/" + posixpath.basename(owner) + ".rels"
+        rels = etree.fromstring(archive.read(rel_name))
+        matching = [rel for rel in rels if rel.tag == relationship_ns + "Relationship" and rel.get("Id") == embeds[0]]
+        assert len(matching) == 1 and matching[0].get("Type").endswith("/image")
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(owner), matching[0].get("Target")))
+        assert archive.read(target) == image
+        assert b"owner text" in archive.read(owner)
+        if host != "body-cell":
+            assert b"owner text" not in archive.read("word/document.xml")
+        assert b"body retained" in archive.read("word/document.xml")
+    assert Document.from_bytes(saved).to_bytes() == saved
+
+
+def test_fx201_rich_footer_keeps_page_and_total_fields_separate():
+    import rdocx
+    from rdocx import Document
+    from lxml import etree
+    document = Document()
+    document.add_paragraph("body retained")
+    document.section(0).footer.add_paragraph("Page ")
+    paragraph = document.section(0).footer.paragraphs[0]
+    paragraph.runs[0].font.bold = True
+    paragraph.add_run("").add_field("PAGE", "1")
+    paragraph = document.section(0).footer.paragraphs[0]
+    paragraph.add_run(" of ")
+    paragraph = document.section(0).footer.paragraphs[0]
+    paragraph.add_run("").add_field("NUMPAGES", "1")
+    paragraph = document.section(0).footer.paragraphs[0]
+    paragraph.add_run(" logo").add_picture(_one_pixel_png(b"\xff\x00\x00"), "footer-logo.png", width=127000, height=127000)
+    document.section(0).footer.add_table(1, 1).cell(0, 0).text = "footer table"
+    document.add_footnote(document.paragraphs[0].runs[0], "footnote retained")
+    document.add_endnote(document.paragraphs[0].runs[0], "endnote retained")
+    saved = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        footer = next(n for n in archive.namelist() if re.fullmatch(r"word/footer\d+\.xml", n))
+        word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        root = etree.fromstring(archive.read(footer))
+        instructions = [node.get(word + "instr").strip() for node in root.iter(word + "fldSimple")]
+        assert instructions == ["PAGE", "NUMPAGES"]
+        assert ["".join(node.itertext()) for node in root.iter(word + "fldSimple")] == ["1", "1"]
+        assert len(list(root.iter(word + "r"))) >= 7
+        assert root.find(".//" + word + "rPr/" + word + "b") is not None
+        assert b"PAGE" not in archive.read("word/document.xml")
+    assert Document.from_bytes(saved).to_bytes() == saved
+    svg = document.render_page_to_svg(0)
+    assert svg is not None and "Page" in svg.svg and "footer" in svg.svg and "table" in svg.svg
+    import os
+    directory = os.environ.get("RDOCX_FX201_NATIVE_OUTPUT_DIR")
+    if directory:
+        from pathlib import Path
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "installed-rich-footer-notes.docx").write_bytes(saved)
+        (target / "installed-rich-footer-notes.svg").write_text(svg.svg)
+
+
+def test_fx201_image_watermark_repeat_removal_and_invalid_opacity_are_owned():
+    import rdocx
+    from rdocx import Document
+    document = Document()
+    document.add_paragraph("body retained")
+    document.section(0).header.add_paragraph("unrelated header")
+    section = document.section(0)
+    image = _one_pixel_png()
+    for opacity in (0.5, 0.0, 1.0):
+        section.set_image_watermark(image, "mark.png", width=1524000, height=762000, rotation=30.0, opacity=opacity)
+        saved = document.to_bytes()
+        with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+            header = next(n for n in archive.namelist() if re.fullmatch(r"word/header\d+\.xml", n))
+            xml = archive.read(header)
+            assert b"unrelated header" in xml
+            assert f'amt="{round(opacity * 100000)}"'.encode() in xml
+            assert b'rot="1800000"' in xml
+            assert len([n for n in archive.namelist() if n.startswith("word/media/")]) == 1
+        assert Document.from_bytes(saved).to_bytes() == saved
+    for opacity in (float("nan"), -0.1, 1.1):
+        with pytest.raises(rdocx.RdocxError, match="geometry or opacity"):
+            section.set_image_watermark(image, "bad.png", width=1524000, height=762000, opacity=opacity)
+        assert document.to_bytes() == saved
+    section.remove_watermark()
+    removed = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(removed)) as archive:
+        assert b"unrelated header" in archive.read(header)
+        assert b"RDOCX DrawingML Watermark" not in archive.read(header)
+        assert not [n for n in archive.namelist() if n.startswith("word/media/")]
+    section.remove_watermark()
+    assert document.to_bytes() == removed
+
+
+def test_fx201_all_six_story_slots_keep_inherited_and_unlinked_physical_owners():
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("body retained")
+    document.insert_section(1)
+    document.insert_section(2)
+    slots = ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer")
+    for slot in slots:
+        getattr(document.section(0), slot).add_paragraph(slot + " original")
+        inherited = getattr(document.section(1), slot)
+        assert inherited.is_linked_to_previous
+        assert slot + " original" in [p.text for p in inherited.paragraphs]
+        inherited.add_paragraph(slot + " shared")
+        assert slot + " shared" in [p.text for p in getattr(document.section(0), slot).paragraphs]
+        held = getattr(document.section(0), slot).paragraphs[0]
+        local = getattr(document.section(1), slot)
+        local.is_linked_to_previous = False
+        assert not getattr(document.section(1), slot).is_linked_to_previous
+        getattr(document.section(1), slot).add_paragraph(slot + " local")
+        assert slot + " local" not in [p.text for p in getattr(document.section(0), slot).paragraphs]
+        assert slot + " local" in [p.text for p in getattr(document.section(2), slot).paragraphs]
+        with pytest.raises(rdocx.StaleElementError):
+            _ = held.text
+        local = getattr(document.section(1), slot)
+        local.is_linked_to_previous = True
+        assert getattr(document.section(1), slot).is_linked_to_previous
+        assert slot + " local" not in [p.text for p in getattr(document.section(2), slot).paragraphs]
+    saved = document.to_bytes()
+    reopened = rdocx.Document.from_bytes(saved)
+    assert reopened.to_bytes() == saved
+    for slot in slots:
+        assert slot + " shared" in [p.text for p in getattr(reopened.section(2), slot).paragraphs]
+    assert reopened.settings.odd_and_even_pages_header_footer
+
+
+@pytest.mark.parametrize("family", ("footnote", "endnote"))
+def test_fx201_checked_note_cell_boundary_preserves_other_owners_and_refuses_stale_and_header(family):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("body retained")
+    table = document.add_table(1, 1)
+    table.cell(0, 0).text = "cell reference"
+    reference = document.tables[0].cell(0, 0).paragraphs[0].runs[0]
+    note = getattr(document, "add_" + family)(reference, family + " content")
+    assert note.paragraphs[0].text == family + " content"
+    before = document.to_bytes()
+    with pytest.raises(rdocx.StaleElementError):
+        getattr(document, "add_" + family)(reference, "stale refused")
+    assert document.to_bytes() == before
+    note.delete()
+    assert family.encode() + b"Reference" not in _document_xml(document)
+    header = document.section(0).header.add_paragraph("not a note host")
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError, match="body or body-table"):
+        getattr(document, "add_" + family)(header, "header refused")
+    assert document.to_bytes() == before
+    foreign = rdocx.Document().add_paragraph("foreign")
+    with pytest.raises(ValueError, match="different document"):
+        getattr(document, "add_" + family)(foreign, "foreign refused")
+    assert document.to_bytes() == before
+    assert rdocx.Document.from_bytes(before).to_bytes() == before
+
+
+@pytest.mark.parametrize("operation", [
+    "to_html", "to_markdown", "text", "text_report", "to_odt", "to_rtf", "to_epub",
+    "word_count", "character_count", "page_count", "validate", "content_controls",
+])
+def test_fx203_installed_document_operation_has_deciding_result(operation):
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("Alpha beta")
+    result = getattr(document, operation)()
+    if operation in ("to_html", "to_markdown", "text"):
+        assert "Alpha beta" in result
+    elif operation == "text_report":
+        assert "Alpha beta" in result.text
+        assert result.revision_view == "accepted"
+        assert isinstance(result.diagnostics, tuple)
+    elif operation in ("to_odt", "to_rtf", "to_epub"):
+        assert isinstance(result.bytes, bytes) and result.bytes
+        assert isinstance(result.diagnostics, tuple)
+    elif operation == "word_count":
+        assert result == 2
+    elif operation == "character_count":
+        assert result == 10
+    elif operation == "page_count":
+        assert result == 1
+    elif operation == "validate":
+        assert result.is_valid
+        assert isinstance(result.findings, tuple)
+    else:
+        assert result == ()
+
+
+def test_fx203_installed_template_and_checked_insertion_have_real_results():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("Hello {{ name }}")
+    assert document.render_template({"name": "Ada"}) == 1
+    assert document.paragraphs[0].text == "Hello Ada"
+    source = rdocx.Document()
+    source.add_paragraph("Imported")
+    before = source.to_bytes()
+    document.insert_document(source, at=1)
+    assert [p.text for p in document.paragraphs] == ["Hello Ada", "Imported"]
+    assert source.to_bytes() == before
+
+
+def test_fx203_installed_properties_and_tracking_are_live_and_typed():
+    import rdocx
+
+    document = rdocx.Document()
+    document.custom_properties.set("Approved", True)
+    assert document.custom_properties.get("Approved").value is True
+    assert document.custom_properties.get("Approved").type == "bool"
+    document.app_properties.company = "Example"
+    assert document.app_properties.company == "Example"
+    document.settings.track_revisions = True
+    assert document.settings.track_revisions is True
+    document.settings.track_revisions = None
+    assert document.settings.track_revisions is None
+
+
+def test_fx203_installed_equation_snapshot_keeps_conversion_boundary():
+    import rdocx
+
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("")
+    inserted = paragraph.add_equation("x+1", format="latex")
+    assert isinstance(inserted.diagnostics, tuple)
+    equations = document.paragraphs[0].equations()
+    assert len(equations) == 1
+    result = equations[0].to_latex()
+    assert result.is_display is False
+    assert len(result.equations) == 1
+    assert "x" in result.equations[0].value
+
+
+def test_fx203_installed_settings_tracking_has_presence_and_live_owner():
+    from rdocx import Document
+    document = Document()
+    paragraph = document.add_paragraph("kept")
+    settings = document.settings
+    assert settings.track_revisions is None
+    settings.track_revisions = False
+    assert settings.track_revisions is False
+    settings.track_revisions = True
+    assert document.settings.track_revisions is True
+    settings.track_revisions = None
+    assert settings.track_revisions is None
+    assert paragraph.text == "kept"
+
+
+def test_fx203_installed_app_properties_are_live_and_counts_are_metadata():
+    from rdocx import Document
+    document = Document()
+    document.add_paragraph("one two")
+    properties = document.app_properties
+    properties.company = "Example"
+    properties.manager = "Owner"
+    assert document.app_properties.company == "Example"
+    assert document.app_properties.manager == "Owner"
+    assert document.word_count() == 2
+
+
+def test_fx203_installed_module_validation_does_not_require_open_document():
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("visible")
+    before = document.to_bytes()
+    report = rdocx.validate_bytes(before)
+    assert report.is_valid
+    assert isinstance(report.findings, tuple)
+    assert document.to_bytes() == before
+
+
+def test_fx203_installed_fragment_policy_exposes_three_independent_toggles():
+    import rdocx
+    policy = rdocx.FragmentConflictPolicy.reuse_equivalent()
+    assert policy.with_style_reuse(False) is not policy
+    assert policy.with_numbering_reuse(False) is not policy
+    assert policy.with_related_part_reuse(False) is not policy
+    assert rdocx.FragmentConflictPolicy.rename_all() is not policy
+
+
+def test_fx203_installed_content_control_setter_owns_qualified_text():
+    from rdocx import Document
+    document = _replace_document_body(Document(), '<w:sdt><w:sdtPr><w:tag w:val="customer"/><w:alias w:val="Name"/><w:text/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>old</w:t></w:r></w:p></w:sdtContent></w:sdt>')
+    assert document.set_content_control_value_by_tag("customer", "new") == 1
+    assert document.set_content_control_value_by_alias("Name", "final") == 1
+    assert document.content_controls()[0].text == "final"
+
+
+def test_fx203_custom_property_snapshots_dates_bounds_and_atomic_noops():
+    import rdocx
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("live")
+    properties = document.custom_properties
+    assert properties.get("missing") is None
+    before = document.to_bytes()
+    assert properties.delete("missing") is False
+    assert document.to_bytes() == before
+    properties.set("Approved", True)
+    original = properties.get("Approved")
+    assert original.type == "bool" and original.value is True
+    properties.set("Approved", False)
+    assert original.value is True
+    assert properties.get("Approved").pid == original.pid
+    assert properties.get("Approved").fmtid == original.fmtid
+    date = "2024-02-29T23:59:59.123+05:30"
+    properties.set("When", rdocx.CustomFileTime(date))
+    assert properties.get("When").type == "filetime"
+    assert properties.get("When").value == date
+    for date in ["2023-02-29T00:00:00Z", "2024-01-01T00:00:60Z", "2024-01-01T00:00:00", "0000-01-01T00:00:00Z"]:
+        before = document.to_bytes()
+        with pytest.raises(ValueError):
+            properties.set("When", rdocx.CustomFileTime(date))
+        assert document.to_bytes() == before
+    for value, error in [(2**31, OverflowError), (-2**31 - 1, OverflowError), (float("inf"), ValueError), (float("nan"), ValueError), (object(), TypeError), (None, TypeError)]:
+        before = document.to_bytes()
+        with pytest.raises(error):
+            properties.set("Bad", value)
+        assert document.to_bytes() == before
+    before = document.to_bytes()
+    properties.set("Approved", False)
+    assert document.to_bytes() == before
+    assert paragraph.text == "live"
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.custom_properties.get("When").value == "2024-02-29T23:59:59.123+05:30"
+    assert properties.delete("Approved") is True
+    assert properties.get("Approved") is None
+
+
+def test_fx203_app_property_optional_latest_owner_and_failure_atomicity():
+    from rdocx import Document, RdocxError
+    document = Document()
+    paragraph = document.add_paragraph("live")
+    first = document.app_properties
+    second = document.app_properties
+    first.company = "Example"
+    second.manager = "Owner"
+    assert first.manager == "Owner" and second.company == "Example"
+    first.template = ""
+    assert second.template == ""
+    before = document.to_bytes()
+    second.company = "Example"
+    assert document.to_bytes() == before
+    with pytest.raises(RdocxError, match="application version"):
+        first.application_version = "invalid"
+    assert document.to_bytes() == before
+    first.company = None
+    assert second.company is None
+    assert paragraph.text == "live"
+    reopened = Document.from_bytes(document.to_bytes())
+    assert reopened.app_properties.manager == "Owner"
+    assert reopened.app_properties.template == ""
+
+
+def test_fx203_fragment_snapshot_physical_boundaries_and_empty_source_validation():
+    import rdocx
+    source = rdocx.Document()
+    source.add_paragraph("first")
+    source.add_paragraph("second")
+    body = next(story for story in source.stories if story.kind == "body")
+    start = rdocx.ContentLocation(body, "paragraph", [0])
+    end = rdocx.ContentLocation(body, "paragraph", [1])
+    fragment = rdocx.DocumentFragment.from_range(source, start, end)
+    source.paragraphs[0].text = "changed"
+    destination = rdocx.Document()
+    destination.add_paragraph("kept")
+    body = next(story for story in destination.stories if story.kind == "body")
+    destination.import_fragment(rdocx.ContentLocation.end(body), fragment)
+    assert [p.text for p in destination.paragraphs] == ["kept", "first"]
+    before = destination.to_bytes()
+    empty = rdocx.Document()
+    with pytest.raises(IndexError):
+        destination.insert_document(empty, at=99)
+    assert destination.to_bytes() == before
+    with pytest.raises(OverflowError):
+        destination.insert_document(source, at=-1)
+    assert destination.to_bytes() == before
+    with pytest.raises(TypeError):
+        destination.insert_document(source, at=True)
+    assert destination.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert [p.text for p in reopened.paragraphs] == ["kept", "first"]
+
+
+def test_fx203_content_control_snapshots_atomic_noop_and_duplicate_inventory():
+    from rdocx import Document
+    xml = '<w:sdt><w:sdtPr><w:tag w:val="same"/><w:alias w:val="Name"/><w:text/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>old</w:t></w:r></w:p></w:sdtContent></w:sdt>'
+    document = _replace_document_body(Document(), xml + xml)
+    controls = document.content_controls()
+    assert isinstance(controls, tuple) and len(controls) == 2
+    before = document.to_bytes()
+    assert document.set_content_control_value_by_tag("absent", "new") == 0
+    assert document.to_bytes() == before
+    assert document.set_content_control_value_by_tag("same", "old") == 2
+    assert document.to_bytes() == before
+    assert document.set_content_control_value_by_alias("Name", "new") == 2
+    assert [control.text for control in controls] == ["old", "old"]
+    assert [control.text for control in document.content_controls()] == ["new", "new"]
+    assert [control.text for control in Document.from_bytes(document.to_bytes()).content_controls()] == ["new", "new"]
+
+
+def test_fx203_equation_display_children_losses_and_source_snapshot_are_ordered():
+    import rdocx
+    ns = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    one = '<m:oMath f:keep="yes"><m:r><m:t>x</m:t></m:r><f:opaque/></m:oMath>'
+    body = f'<w:p><m:oMathPara xmlns:m="{ns}" xmlns:f="urn:foreign" f:keep="yes"><m:oMathParaPr><m:jc m:val="center"/></m:oMathParaPr>{one}{one}<m:oMath><m:r><m:t>y</m:t></m:r></m:oMath></m:oMathPara></w:p>'
+    document = _replace_document_body(rdocx.Document(), body)
+    before = document.to_bytes()
+    equations = document.paragraphs[0].equations()
+    assert isinstance(equations, tuple) and len(equations) == 1
+    equation = equations[0]
+    assert equation.is_display is True
+    for conversion in [equation.to_latex(), equation.to_mathml()]:
+        assert conversion.is_display is True
+        assert isinstance(conversion.equations, tuple) and len(conversion.equations) == 3
+        assert conversion.equations[0].value == conversion.equations[1].value
+        assert "x" in conversion.equations[0].value and "y" in conversion.equations[2].value
+        assert conversion.equations[0].diagnostics and conversion.equations[1].diagnostics
+        assert any("wrapper" in loss.message for loss in conversion.diagnostics)
+        assert any("justification" in loss.message for loss in conversion.diagnostics)
+    assert document.to_bytes() == before
+    document.paragraphs[0].add_equation("z+1", format="latex")
+    assert len(equation.to_latex().equations) == 3
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [eq.is_display for eq in reopened.paragraphs[0].equations()] == [True, False]
+    before = document.to_bytes()
+    with pytest.raises(ValueError, match="format"):
+        document.paragraphs[0].add_equation("bad", format="unknown")
+    assert document.to_bytes() == before
+
+
+def test_fx203_checkbox_font_glyph_and_opaque_owner_are_atomic_and_repeatable():
+    import rdocx
+    body = '<w:sdt><w:sdtPr><w:tag w:val="check"/><x:checkbox xmlns:x="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:f="urn:foreign"><f:checked f:val="opaque"/><x:checked x:val="0" f:keep="yes"/><x:checkedState x:val="0041" x:font="Carlito"/><x:uncheckedState x:val="0042" x:font="Selawik"/></x:checkbox></w:sdtPr><w:sdtContent><w:p><w:r><w:t>B</w:t></w:r></w:p></w:sdtContent></w:sdt>'
+    document = _replace_document_body(rdocx.Document(), body)
+    snapshot = document.content_controls()[0]
+    settings = document.settings
+    assert document.set_content_control_value_by_tag("check", "true") == 1
+    assert snapshot.text == "B"
+    assert document.content_controls()[0].text == "A"
+    xml = _document_xml(document)
+    assert b'<f:checked f:val="opaque"/>' in xml and b'f:keep="yes"' in xml
+    assert b'w:ascii="Carlito"' in xml and b'w:hAnsi="Carlito"' in xml
+    before = document.to_bytes()
+    assert document.set_content_control_value_by_tag("check", "true") == 1
+    assert document.to_bytes() == before
+    assert settings.track_revisions is None
+    assert document.set_content_control_value_by_tag("check", "false") == 1
+    assert document.content_controls()[0].text == "B"
+    assert b'w:ascii="Selawik"' in _document_xml(document)
+    assert rdocx.Document.from_bytes(document.to_bytes()).content_controls()[0].text == "B"
+
+
+@pytest.mark.parametrize("invalid", ["D800", "0000"])
+def test_fx203_checkbox_late_invalid_state_preserves_package_and_snapshots(invalid):
+    import rdocx
+    def control(code):
+        return f'<w:sdt><w:sdtPr><w:tag w:val="check"/><x:checkbox xmlns:x="http://schemas.microsoft.com/office/word/2010/wordml"><x:checkedState x:val="{code}" x:font="Carlito"/></x:checkbox></w:sdtPr><w:sdtContent><w:p><w:r><w:t>old</w:t></w:r></w:p></w:sdtContent></w:sdt>'
+    document = _replace_document_body(rdocx.Document(), control("0041") + control(invalid))
+    controls = document.content_controls()
+    paragraph = document.paragraphs[0]
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError, match="glyph"):
+        document.set_content_control_value_by_tag("check", "true")
+    assert document.to_bytes() == before
+    assert paragraph.text == "old"
+    assert [c.text for c in controls] == ["old", "old"]
+    assert [c.text for c in document.content_controls()] == ["old", "old"]
+
+
+def test_fx203_checkbox_default_namespace_has_qualified_glyph_font_and_repeat():
+    import rdocx
+    body = '<w:sdt><w:sdtPr><w:tag w:val="check"/><checkbox xmlns="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:q="http://schemas.microsoft.com/office/word/2010/wordml"><checked q:val="0"/><checkedState q:val="0044" q:font="Carlito"/></checkbox></w:sdtPr><w:sdtContent><w:p><w:r><w:t>old</w:t></w:r></w:p></w:sdtContent></w:sdt>'
+    document = _replace_document_body(rdocx.Document(), body)
+    assert document.content_controls()[0].type == "checkbox"
+    assert document.set_content_control_value_by_tag("check", "true") == 1
+    assert document.content_controls()[0].text == "D"
+    assert b'w:ascii="Carlito"' in _document_xml(document)
+    before = document.to_bytes()
+    assert document.set_content_control_value_by_tag("check", "true") == 1
+    assert document.to_bytes() == before
+    assert rdocx.Document.from_bytes(before).content_controls()[0].text == "D"
+
+
+def test_fx203_template_json_conversion_is_typed_and_atomically_preflighted():
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("{{ flag }} {{ large }} {{ name }}")
+    assert document.render_template({"flag": True, "large": 2**64 - 1, "name": "Ada"}) == 3
+    assert document.paragraphs[0].text == "true 18446744073709551615 Ada"
+    document = rdocx.Document()
+    document.add_paragraph("{{ name }}")
+    held = document.paragraphs[0]
+    cycle = []
+    cycle.append(cycle)
+    class Arbitrary:
+        def __str__(self):
+            raise AssertionError("arbitrary string conversion must never run")
+    for data, error in [
+        ({"name": cycle}, ValueError), ({"name": float("nan")}, ValueError),
+        ({"name": float("inf")}, ValueError), ({"name": 2**64}, ValueError),
+        ({"name": -(2**63)-1}, ValueError), ({"name": Arbitrary()}, TypeError),
+        ({1: "not a string key"}, TypeError), (["not a dict"], TypeError),
+    ]:
+        before = document.to_bytes()
+        with pytest.raises(error):
+            document.render_template(data)
+        assert document.to_bytes() == before
+        assert held.text == "{{ name }}"
+    assert document.render_template({"name": "Ada"}) == 1
+    assert rdocx.Document.from_bytes(document.to_bytes()).paragraphs[0].text == "Ada"
+
+
+def test_fx203_exports_keep_owned_payload_and_full_loss_records():
+    import rdocx
+    from xml.etree import ElementTree
+    document = rdocx.Document()
+    document.add_paragraph("Export α beta")
+    document.add_table(1, 1).cell(0, 0).text = "Cell Ω"
+    before = document.to_bytes()
+    odt, rtf, epub = document.to_odt(), document.to_rtf(), document.to_epub()
+    with zipfile.ZipFile(io.BytesIO(odt.bytes)) as archive:
+        root = ElementTree.fromstring(archive.read("content.xml"))
+        text_ns = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+        for element in root.iter(text_ns + "s"):
+            element.text = " " * int(element.get(text_ns + "c", "1"))
+        content = "".join(root.itertext())
+        assert "Export α beta" in content and "Cell Ω" in content
+    assert rtf.bytes.startswith(b"{\\rtf")
+    with zipfile.ZipFile(io.BytesIO(epub.bytes)) as archive:
+        assert archive.read("mimetype") == b"application/epub+zip"
+        content = "".join("".join(ElementTree.fromstring(archive.read(name)).itertext()) for name in archive.namelist() if name.endswith(".xhtml"))
+        assert "Export α beta" in content and "Cell Ω" in content
+    for result in (odt, rtf, epub):
+        assert isinstance(result.diagnostics, tuple)
+        for diagnostic in result.diagnostics:
+            assert isinstance(diagnostic.message, str) and diagnostic.message
+    assert document.to_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["inventory", "options", "cell", "heading_link"])
+def test_fx202_picture_and_heading_surface_on_installed_base(operation):
+    from rdocx import Document
+    document = Document()
+    if operation == "inventory":
+        document.add_picture(_one_pixel_png(), "pixel.png", width=127000, height=127000)
+        pictures = document.pictures()
+        assert len(pictures) == 1
+        document.set_picture_size(pictures[0], 254000, 254000)
+        assert len(Document.from_bytes(document.to_bytes()).pictures()) == 1
+    elif operation == "options":
+        from rdocx import PictureOptions
+        picture = document.add_picture(_one_pixel_png(), "pixel.png", width=127000, height=127000,
+                                       options=PictureOptions(description="owned description", title="owned title"))
+        assert picture.description == "owned description"
+        assert picture.title == "owned title"
+    elif operation == "cell":
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        picture = cell.add_picture(_one_pixel_png(), width=127000, height=127000)
+        assert picture.content_type == "image/png"
+    else:
+        document.add_paragraph("Target").style = "Heading1"
+        document.add_paragraph("See ")
+        document.add_heading_hyperlink(document.paragraphs[1], document.paragraphs[0], "target", tooltip="owned tip")
+        xml = _document_xml(document)
+        assert b'anchor="Heading_' in xml and b'owned tip' in xml
+
+@pytest.mark.parametrize("host", ("body", "header", "body-cell", "header-cell"))
+def test_fx202_configured_physical_picture_owner_and_frozen_mutation(host):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("body retained")
+    if host == "body":
+        paragraph = document.paragraphs[0]
+    elif host == "header":
+        paragraph = document.section(0).header.add_paragraph("owner text")
+    elif host == "body-cell":
+        document.add_table(1, 1).cell(0, 0).text = "owner text"
+        paragraph = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        document.section(0).header.add_table(1, 1).cell(0, 0).text = "owner text"
+        paragraph = document.section(0).header.tables[0].cell(0, 0).paragraphs[0]
+    run = paragraph.runs[0]
+    options = rdocx.PictureOptions(name="owned picture", title="literal <title>", description="owned & description", decorative=True, crop=(.1, 0., .2, 0.))
+    image = _one_pixel_png(b"\xff\x00\x00")
+    picture = run.add_picture(image, width=254000, height=127000, options=options)
+    assert isinstance(picture, rdocx.Picture)
+    assert (picture.width, picture.height) == (254000, 127000)
+    assert picture.bytes == image and picture.content_type == "image/png"
+    assert picture.title == "literal <title>" and picture.decorative
+    assert not picture.anchored
+    assert len(document.pictures()) == 1
+    saved = document.to_bytes()
+    with pytest.raises(rdocx.StaleElementError, match="different document"):
+        rdocx.Document().set_picture_size(picture, 1, 1)
+    assert document.to_bytes() == saved
+    document.set_picture_size(picture, 508000, 254000)
+    current = document.pictures()[0]
+    assert (current.width, current.height) == (508000, 254000)
+    assert current.bytes == image and current.title == picture.title
+    before = document.to_bytes()
+    with pytest.raises(rdocx.StaleElementError):
+        document.set_picture_size(picture, 1, 1)
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert reopened.pictures()[0].bytes == image
+    assert b"body retained" in _document_xml(reopened)
+
+@pytest.mark.parametrize("kwargs", [dict(crop=(float("nan"),0.,0.,0.)), dict(crop=(True,0.,0.,0.)), dict(placement="through"), dict(horizontal_offset=True), dict(placement="inline", horizontal_offset=1), dict(placement="square", horizontal_offset=1, horizontal_alignment="left")])
+def test_fx202_picture_options_reject_unsupported_operands(kwargs):
+    import rdocx
+    with pytest.raises((TypeError, ValueError, rdocx.RdocxError)):
+        rdocx.PictureOptions(**kwargs)
+
+def test_fx202_heading_links_reuse_bookmark_and_reject_foreign_stale_targets():
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("Target").style = "Heading1"
+    document.add_paragraph("See ")
+    heading, source = document.paragraphs[0], document.paragraphs[1]
+    inserted = document.add_heading_hyperlink(source, heading, "target", tooltip="owned tip")
+    assert inserted.text == "target"
+    with pytest.raises(rdocx.StaleElementError):
+        document.add_heading_hyperlink(source, heading, "stale")
+    document.add_heading_hyperlink(document.paragraphs[1], document.paragraphs[0], "again")
+    assert len(document.bookmarks) == 1
+    source = document.paragraphs[1]
+    name = document.bookmarks[0].name
+    source.add_hyperlink("anchor", "#" + name, tooltip="internal tip")
+    xml = _document_xml(document)
+    assert xml.count(b'w:anchor="Heading_1"') == 3
+    assert b"owned tip" in xml and b"internal tip" in xml
+    before = document.to_bytes()
+    foreign = rdocx.Document().add_paragraph("foreign")
+    with pytest.raises(ValueError, match="different document"):
+        document.add_heading_hyperlink(document.paragraphs[1], foreign, "bad")
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(before)
+    assert reopened.paragraphs[1].text == "See targetagainanchor"
+
+@pytest.mark.parametrize("host", ("header", "footer", "body-cell", "header-cell"))
+def test_fx202_related_source_heading_and_internal_links_publish_once(host):
+    import rdocx
+    from xml.etree import ElementTree
+    document = rdocx.Document()
+    document.add_paragraph("Target").style = "Heading1"
+    if host == "header":
+        source = document.section(0).header.add_paragraph("See ")
+    elif host == "footer":
+        source = document.section(0).footer.add_paragraph("See ")
+    elif host == "body-cell":
+        document.add_table(1, 1).cell(0, 0).text = "See "
+        source = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        document.section(0).header.add_table(1, 1).cell(0, 0).text = "See "
+        source = document.section(0).header.tables[0].cell(0, 0).paragraphs[0]
+    inserted = document.add_heading_hyperlink(source, document.paragraphs[0], "target", tooltip="related tip")
+    assert inserted.text == "target"
+    assert len(document.bookmarks) == 1
+    saved = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        owner = "word/document.xml" if host == "body-cell" else next(n for n in archive.namelist() if re.fullmatch("word/" + ("footer" if host == "footer" else "header") + r"\d+\.xml", n))
+        root = ElementTree.fromstring(archive.read(owner))
+        links = root.findall(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hyperlink")
+        assert len(links) == 1
+        assert links[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}anchor") == document.bookmarks[0].name
+        assert links[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tooltip") == "related tip"
+    assert rdocx.Document.from_bytes(saved).bookmarks[0].name == document.bookmarks[0].name
+
+def test_fx202_picture_snapshot_has_no_public_constructor():
+    import rdocx
+    with pytest.raises(TypeError):
+        rdocx.Picture()
+
+@pytest.mark.parametrize("host", ("header", "body-cell", "footer-cell"))
+def test_fx202_heading_destination_uses_supported_physical_owner(host):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("Source ")
+    if host == "header":
+        target = document.section(0).header.add_paragraph("Related target")
+    elif host == "body-cell":
+        document.add_table(1, 1).cell(0, 0).text = "Related target"
+        target = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        document.section(0).footer.add_table(1, 1).cell(0, 0).text = "Related target"
+        target = document.section(0).footer.tables[0].cell(0, 0).paragraphs[0]
+    target.style = "Heading1"
+    if host == "header":
+        target = document.section(0).header.paragraphs[-1]
+    elif host == "body-cell":
+        target = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        target = document.section(0).footer.tables[0].cell(0, 0).paragraphs[0]
+    inserted = document.add_heading_hyperlink(document.paragraphs[0], target, "target", tooltip="supported owner")
+    assert inserted.text == "target"
+    assert rdocx.Document.from_bytes(document.to_bytes()).paragraphs[0].text == "Source target"
+
+@pytest.mark.parametrize("host", ("body", "header"))
+def test_fx202_external_tooltip_xml_refusal_preserves_package_and_handle(host):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("Source ")
+    paragraph = document.paragraphs[0] if host == "body" else document.section(0).header.add_paragraph("Related ")
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        paragraph.add_hyperlink("invalid", "https://example.com/#fragment", tooltip="invalid\x00tooltip")
+    assert document.to_bytes() == before
+    assert paragraph.text in ("Source ", "Related ")
+    paragraph.add_hyperlink("valid", "https://example.com/#fragment", tooltip="valid & tooltip")
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert (reopened.paragraphs[0].text if host == "body" else reopened.section(0).header.paragraphs[-1].text).endswith("valid")
+
+@pytest.mark.parametrize("host", ("document", "run", "cell"))
+def test_fx202_malformed_explicit_size_picture_preserves_held_owner(host):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("retained")
+    if host == "run":
+        owner = document.paragraphs[0].runs[0]
+    elif host == "cell":
+        document.add_table(1, 1)
+        owner = document.tables[0].cell(0, 0)
+    else:
+        owner = document
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        owner.add_picture(b"not an image", width=127000, height=127000)
+    assert document.to_bytes() == before
+    assert len(document.pictures()) == 0
+    if host == "run":
+        assert owner.text == "retained"
+    elif host == "cell":
+        assert owner.text == ""
+
+
+def test_fx204_counted_regex_preserves_failed_noop_and_empty_handles():
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("a12 a34")
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    assert document.replace_all_regex_expected([]) == ()
+    assert document.to_bytes() == before
+    assert held.text == "a12 a34"
+    assert document.replace_all_regex_expected([(r"missing", "x", 0)]) == (0,)
+    assert held.text == "a12 a34"
+    assert document.replace_all_regex_expected([(r"a([0-9]+)", "a$1", 2)]) == (2,)
+    assert held.text == "a12 a34"
+    with pytest.raises(rdocx.ReplacementCountError):
+        document.replace_all_regex_expected([(r"a([0-9]+)", "b$1", 2), ("b", "c", 1)])
+    assert document.to_bytes() == before
+    assert held.text == "a12 a34"
+    with pytest.raises(rdocx.RdocxError):
+        document.replace_all_regex_expected([("a", "b"), ("[", "c")])
+    assert document.to_bytes() == before
+    assert held.text == "a12 a34"
+    assert document.replace_all_regex_expected([(r"a([0-9]+)", "b$1", 2), ("b", "c", 2)]) == (2, 2)
+    assert rdocx.Document.from_bytes(document.to_bytes()).paragraphs[0].text == "c12 c34"
+    with pytest.raises(rdocx.StaleElementError):
+        _ = held.text
+
+
+def test_fx204_tag_fill_keeps_alias_and_late_refusal_atomic():
+    import rdocx
+    document = _replace_document_body(rdocx.Document(), '<w:sdt><w:sdtPr><w:tag w:val="client"/><w:alias w:val="alias"/><w:text/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>before</w:t></w:r></w:p></w:sdtContent></w:sdt>')
+    before = document.to_bytes()
+    for pairs in [[("client", "x"), ("missing", "y")], [("client", "x"), ("client", "y")], [("alias", "x")]]:
+        with pytest.raises(rdocx.RdocxError):
+            document.fill_content_control_tags(pairs)
+        assert document.to_bytes() == before
+    assert document.fill_content_control_tags([]) == ()
+    assert document.to_bytes() == before
+    assert document.fill_content_control_tags([("client", "Ada")]) == (1,)
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.content_controls()[0].text == "Ada"
+
+
+def test_fx204_combined_fields_keeps_explicit_and_omitted_time_policy():
+    import datetime
+    import rdocx
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("Page ")
+    paragraph.add_run("").add_field("PAGE", "9")
+    document.paragraphs[0].add_run("").add_field("NUMPAGES", "9")
+    document.paragraphs[0].add_run("").add_field('DATE \\@ "yyyy-MM-dd"', "1999-01-01")
+    raw = document.to_bytes()
+    omitted = rdocx.Document.from_bytes(raw)
+    report = omitted.update_all_fields()
+    ordinary, pages = report.ordinary_updated, report.layout
+    assert isinstance(report, rdocx.FieldsUpdateReport)
+    assert isinstance(ordinary, int)
+    assert isinstance(pages, rdocx.LayoutBackedFieldUpdateReport)
+    assert report.total_updated == ordinary + pages.updated_count
+    assert [evaluation.field_index for evaluation in report.evaluations] == [0, 1, 2]
+    assert [evaluation.cached_result for evaluation in report.evaluations] == ["9", "9", "1999-01-01"]
+    assert [evaluation.outcome["kind"] for evaluation in report.evaluations] == ["deferred_pagination", "deferred_pagination", "keep_stored"]
+    assert report.diagnostics and "header-footer" in report.saved_cache_scope
+    assert pages.page_fields == 1 and pages.num_pages_fields == 1
+    assert omitted.paragraphs[0].text.endswith("1999-01-01")
+    explicit = rdocx.Document.from_bytes(raw)
+    report = explicit.update_all_fields(now=datetime.datetime(2026, 10, 10, 8, 30))
+    ordinary, pages = report.ordinary_updated, report.layout
+    assert ordinary >= 1 and pages.page_fields == 1
+    assert report.total_updated == ordinary + pages.updated_count
+    assert report.evaluations[2].outcome == {"kind": "resolved", "text": "2026-10-10"}
+    assert isinstance(report.evaluations[2], rdocx.FieldEvaluation)
+    assert explicit.paragraphs[0].text == "Page 112026-10-10"
+    assert rdocx.Document.from_bytes(explicit.to_bytes()).paragraphs[0].text == "Page 112026-10-10"
+
+
+def test_fx204_picture_media_facts_match_saved_owner():
+    from rdocx import Document
+    document = Document()
+    image = _one_pixel_png()
+    document.add_picture(image, "pixel.png", width=127000, height=127000)
+    picture = document.pictures()[0]
+    assert picture.media_part_name and picture.external_url is None
+    assert picture.bytes == image
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        assert archive.read(picture.media_part_name.lstrip("/")) == image
+    reopened = Document.from_bytes(document.to_bytes()).pictures()[0]
+    assert reopened.media_part_name == picture.media_part_name
+    assert reopened.external_url is None and reopened.bytes == image
+
+
+def test_fx204_field_report_allocation_failure_discards_candidate(monkeypatch):
+    import datetime
+    import json
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("retained ").add_run("").add_field('DATE \\@ "yyyy-MM-dd"', "1999-01-01")
+    held = document.paragraphs[0]
+    before, text = document.to_bytes(), held.text
+
+    def refuse_report_allocation(*args, **kwargs):
+        raise MemoryError("injected prepublication evaluation result allocation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", refuse_report_allocation)
+        with pytest.raises(MemoryError, match="prepublication"):
+            document.update_all_fields(now=datetime.datetime(2026, 10, 10))
+        assert document.to_bytes() == before and held.text == text
+
+    report = document.update_all_fields(now=datetime.datetime(2026, 10, 10))
+    assert isinstance(report, rdocx.FieldsUpdateReport)
+    assert report.evaluations[0].cached_result == "1999-01-01"
+    assert report.evaluations[0].outcome == {"kind": "resolved", "text": "2026-10-10"}
+    assert rdocx.Document.from_bytes(document.to_bytes()).paragraphs[0].text == "retained 2026-10-10"
+
+    empty = rdocx.Document()
+    empty.add_paragraph("still live")
+    held = empty.paragraphs[0]
+    before = empty.to_bytes()
+    report = empty.update_all_fields()
+    assert report.total_updated == 0 and report.evaluations == ()
+    assert held.text == "still live" and empty.to_bytes() == before
+
+
+def test_fx222_public_empty_comment_and_noop_fields_preserve_source():
+    import xml.etree.ElementTree as ET
+    import rdocx
+
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    seed = rdocx.Document()
+    seed.add_paragraph("Commented text")
+    comment_id = seed.add_comment_on_text("Commented", author="Ada", text="note")
+    assert len(seed.comments) == 1
+    source = io.BytesIO(seed.to_bytes())
+    output = io.BytesIO()
+    original_comments = None
+    with zipfile.ZipFile(source) as source_zip, zipfile.ZipFile(output, "w") as result_zip:
+        for info in source_zip.infolist():
+            data = source_zip.read(info.filename)
+            if info.filename == "word/comments.xml":
+                root_start = data.index(b"<w:comments")
+                content_start = data.index(b">", root_start) + 1
+                empty = (
+                    f'<q:comment xmlns:q="{namespace}" xmlns:x="urn:opaque" '
+                    f'q:id="{comment_id + 1}" q:author="Ada" x:keep="original"/>'
+                ).encode()
+                data = data[:content_start] + empty + data[content_start:]
+                parsed = ET.fromstring(data)
+                assert len(parsed.findall(f"{{{namespace}}}comment")) == 2
+                original_comments = data
+            result_zip.writestr(info, data)
+    assert original_comments is not None
+    document = rdocx.Document.from_bytes(output.getvalue())
+    held = document.paragraphs[0]
+    before = document.to_bytes()
+    comments = {comment.id: comment for comment in document.comments}
+    assert set(comments) == {comment_id, comment_id + 1}
+    assert comments[comment_id].text == "note"
+    assert comments[comment_id + 1].text == ""
+    assert comments[comment_id + 1].anchor is None
+    assert document.story_items
+    assert held.text == "Commented text"
+    assert document.update_page_fields() == 0
+    assert document.update_fields() == 0
+    assert document.rebuild_toc().entry_count == 0
+    assert held.text == "Commented text"
+    assert document.to_bytes() == before
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert {comment.id for comment in reopened.comments} == set(comments)
+    with zipfile.ZipFile(io.BytesIO(reopened.to_bytes())) as saved:
+        assert saved.read("word/comments.xml") == original_comments
+
+
+def test_fx217_public_html_markdown_construct_open_and_diagnostics(tmp_path):
+    import rdocx
+    import xml.etree.ElementTree as ET
+
+    image = _one_pixel_png()
+    html = '<h1>Title</h1><p>Plain <strong>bold</strong> <em>italic</em> <mark>marked</mark></p><table><tr><td>cell</td></tr></table><p><img src="face.png" alt="specimen"></p>'
+    document, diagnostics = rdocx.Document.from_html(html, images=(("face.png", image, "face.png"),))
+    assert diagnostics == () and isinstance(diagnostics, tuple)
+    assert len(document.tables) == 1 and document.tables[0].cell(0, 0).text == "cell"
+    assert document.paragraphs[0].text == "Title"
+    assert len(document.pictures()) == 1 and document.pictures()[0].bytes == image
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert root.find('.//w:b', ns) is not None and root.find('.//w:i', ns) is not None
+    shade = root.find('.//w:shd', ns)
+    assert shade is not None and shade.get('{'+ns['w']+'}fill') == 'FFFF00'
+    source = tmp_path / "source.html"
+    source.write_text(html)
+    opened, _ = rdocx.Document.open_html(source, images=(("face.png", image, "face.png"),))
+    assert opened.text() == document.text() and opened.pictures()[0].bytes == image
+    markdown = '# Title\n\n> Quote **bold**\n\n3. third\n4. fourth\n\n| A | B |\n| --- | --- |\n| x | y |\n\n```rust\nlet x = 1;\n```\n\n![specimen](face.png)\n\n<br>\n'
+    imported, notes = rdocx.Document.from_markdown(markdown, images=(("face.png", image, "face.png"),))
+    assert imported.paragraphs[0].text == "Title" and len(imported.tables) == 1
+    assert imported.pictures()[0].bytes == image and notes
+    assert all(isinstance(note, rdocx.HtmlDiagnostic) for note in notes)
+    assert all(note.location.startswith("bytes ") for note in notes)
+    with pytest.raises(AttributeError):
+        notes[0].message = "changed"
+    source = tmp_path / "source.md"
+    source.write_text(markdown)
+    opened, opened_notes = rdocx.Document.open_markdown(source, images=(("face.png", image, "face.png"),))
+    assert opened.text() == imported.text() and opened_notes == notes
+    canonical = rdocx.Document.from_bytes(imported.to_bytes()).to_markdown()
+    again, _ = rdocx.Document.from_markdown(canonical, images=(("face.png", image, "face.png"),))
+    assert rdocx.Document.from_bytes(again.to_bytes()).to_markdown() == canonical
+
+
+@pytest.mark.parametrize("owner", ("body", "cell", "header", "footer"))
+def test_fx217_public_insertion_has_checked_owner_and_atomic_failure(owner):
+    import rdocx
+    document = rdocx.Document()
+    document.add_paragraph("Target")
+    document.add_table(1, 1).cell(0, 0).text = "Cell target"
+    document.add_paragraph("End")
+    if owner == "body":
+        paragraph = document.paragraphs[0]
+    elif owner == "cell":
+        paragraph = document.tables[0].cell(0, 0).paragraphs[0]
+    else:
+        story = getattr(document.section(0), owner)
+        story.add_paragraph("Related target")
+        paragraph = story.paragraphs[-1]
+    before, text = document.to_bytes(), paragraph.text
+    foreign = rdocx.Document().add_paragraph("Foreign")
+    with pytest.raises(ValueError, match="live paragraph"):
+        document.insert_html("<p>must not insert</p>", after=foreign)
+    with pytest.raises(rdocx.RdocxError):
+        document.insert_html("<p>must not insert</p>", after=paragraph, images=(("bad", b"bad image", "bad.png"),))
+    assert document.to_bytes() == before and paragraph.text == text
+    assert document.insert_html("", after=paragraph) == ()
+    assert document.to_bytes() == before and paragraph.text == text
+    assert document.insert_html('<p>Inserted <strong>new</strong></p>', after=paragraph) == ()
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    if owner == "body":
+        assert [p.text for p in reopened.paragraphs] == ["Target", "Inserted new", "End"]
+        assert reopened.tables[0].cell(0, 0).text == "Cell target"
+    elif owner == "cell":
+        assert [p.text for p in reopened.tables[0].cell(0, 0).paragraphs] == ["Cell target", "Inserted new"]
+    else:
+        assert [p.text for p in getattr(reopened.section(0), owner).paragraphs][-2:] == ["Related target", "Inserted new"]
+    with pytest.raises(rdocx.StaleElementError):
+        _ = paragraph.text
+
+
+def test_fx217_public_markdown_template_preserves_graph_and_inputs(tmp_path):
+    import rdocx
+    template = rdocx.Document()
+    template.add_paragraph("Discard template body")
+    template.section(0).header.add_paragraph("Keep header")
+    template.section(0).footer.add_paragraph("Keep footer")
+    before = template.to_bytes()
+    path = tmp_path / "template.docx"
+    path.write_bytes(before)
+    for supplied in (template, path):
+        imported, _ = rdocx.Document.from_markdown("# Replacement\n\nBody", template=supplied)
+        assert "Discard template body" not in imported.text() and imported.paragraphs[0].text == "Replacement"
+        assert imported.section(0).header.paragraphs[-1].text == "Keep header"
+        assert imported.section(0).footer.paragraphs[-1].text == "Keep footer"
+        with zipfile.ZipFile(io.BytesIO(before)) as old, zipfile.ZipFile(io.BytesIO(imported.to_bytes())) as new:
+            for name in old.namelist():
+                if name.startswith(("word/header", "word/footer")):
+                    assert old.read(name) == new.read(name)
+    assert template.to_bytes() == before and path.read_bytes() == before
+    invalid = tmp_path / "invalid.md"
+    invalid.write_bytes(b"\xff")
+    with pytest.raises(ValueError, match="UTF-8"):
+        rdocx.Document.open_markdown(invalid, template=template)
+    assert template.to_bytes() == before
+
+
+def test_fx220_word_python_font_graph_snapshots_inputs_and_removal(tmp_path):
+    from pathlib import Path
+    from rdocx import Document, FontDefinition, FontEmbeddingLicense
+
+    source = Path(__file__).resolve().parents[2] / "oxml-layout/fonts/Selawik-Regular.ttf"
+    body = source.read_bytes()
+    license = FontEmbeddingLicense(authorized=True, identity="SIL Open Font License 1.1")
+    document = Document()
+    document.add_paragraph("font control")
+    document.set_font(FontDefinition("FX220 Python Word", alternate_name="control alias", family="swiss", pitch="variable"))
+    for kind, value in zip(("regular", "bold", "italic", "bold_italic"), (body, source, io.BytesIO(body), body)):
+        document.embed_font("FX220 Python Word", value, kind, license=license, subsetted=kind == "italic")
+    font = next(font for font in document.fonts if font.name == "FX220 Python Word")
+    assert isinstance(document.fonts, tuple) and isinstance(font.embedded_fonts, tuple)
+    assert font.alternate_name == "control alias" and font.family == "swiss" and font.pitch == "variable"
+    assert tuple(face.kind for face in font.embedded_fonts) == ("regular", "bold", "italic", "bold_italic")
+    for face in font.embedded_fonts:
+        assert face.data == body and face.license.authorized and face.license.identity == license.identity
+        assert face.font_key.startswith("{") and face.font_key.endswith("}")
+        with pytest.raises(AttributeError):
+            face.subsetted = False
+    assert font.embedded_fonts[2].subsetted
+    saved = document.to_bytes()
+    package = zipfile.ZipFile(io.BytesIO(saved))
+    font_parts = [name for name in package.namelist() if name.startswith("word/fonts/")]
+    assert len(font_parts) == 4 and all(package.read(name) != body for name in font_parts)
+    reopened = Document.from_bytes(saved)
+    assert next(font for font in reopened.fonts if font.name == "FX220 Python Word").embedded_fonts[0].data == body
+    held = document.paragraphs[0]
+    document.embed_font("FX220 Python Word", body, license=license)
+    assert document.to_bytes() == saved and held.text == "font control"
+    assert document.remove_embedded_font("FX220 Python Word", "italic").data == body
+    assert document.remove_embedded_font("FX220 Python Word", "italic") is None
+    removed = document.remove_font("FX220 Python Word")
+    assert len(removed.embedded_fonts) == 3
+    assert document.remove_font("FX220 Python Word") is None
+    output = tmp_path / "removed.docx"
+    document.save(output)
+    assert all(font.name != "FX220 Python Word" for font in Document(output).fonts)
+
+
+def test_fx220_word_python_license_flags_and_refusal_are_atomic():
+    from pathlib import Path
+    from rdocx import Document, FontDefinition, FontEmbeddingLicense
+
+    body = (Path(__file__).resolve().parents[2] / "oxml-layout/fonts/Selawik-Regular.ttf").read_bytes()
+    document = Document()
+    document.add_paragraph("held")
+    for name in ("embed_true_type_fonts", "embed_system_fonts", "save_subset_fonts"):
+        assert getattr(document, name) is None
+        for value in (False, True, None):
+            setattr(document, name, value)
+            assert getattr(document, name) is value
+    baseline = document.to_bytes()
+    held = document.paragraphs[0]
+    good = FontEmbeddingLicense(authorized=True, identity="OFL 1.1")
+    for value, kind, license, key in ((body, "regular", FontEmbeddingLicense(authorized=False, identity="OFL"), None), (body, "regular", FontEmbeddingLicense(authorized=True, identity=" "), None), (b"not a font", "regular", good, None), (body, "unknown", good, None), (body, "regular", good, "bad-key"), (io.StringIO("not bytes"), "regular", good, None)):
+        with pytest.raises(Exception):
+            document.embed_font("FX220 refusal", value, kind, license=license, font_key=key)
+        assert document.to_bytes() == baseline and held.text == "held"
+    class OversizedReader:
+        def read(self, size):
+            assert 0 < size <= 8192
+            return b"x" * (64 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError):
+        document.embed_font("FX220 refusal", OversizedReader(), license=good)
+    assert document.to_bytes() == baseline and held.text == "held"
+    document.set_font(FontDefinition("FX220 explicit"))
+    document.embed_font("FX220 explicit", body, license=good, font_key="{00112233-4455-6677-8899-AABBCCDDEEFF}")
+    assert next(font for font in document.fonts if font.name == "FX220 explicit").embedded_fonts[0].font_key == "{00112233-4455-6677-8899-AABBCCDDEEFF}"
+
+
+@pytest.mark.parametrize("mode", ["short_chunks", "later_type", "later_error", "cumulative_bound"])
+def test_fx220_rdocx_binary_readers_reach_real_eof_before_publication(mode):
+    from pathlib import Path
+    import rdocx
+
+    body = (Path(__file__).resolve().parents[2] / "oxml-layout/fonts/Selawik-Regular.ttf").read_bytes()
+    value = rdocx.Document()
+    value.add_paragraph("binary owner")
+    held = value.paragraphs[0]
+    baseline = value.to_bytes()
+    license = rdocx.FontEmbeddingLicense(authorized=True, identity="OFL 1.1")
+    class Reader:
+        def __init__(self):
+            self.calls = 0
+            self.offset = 0
+        def read(self, size):
+            self.calls += 1
+            if mode == "short_chunks":
+                part = body[self.offset:self.offset + min(size, 8192)]
+                self.offset += len(part)
+                return part
+            if self.calls == 1:
+                return body
+            if mode == "later_type":
+                return "invalid later text"
+            if mode == "later_error":
+                raise OSError("later font read failed")
+            return b"x" * (1024 * 1024)
+    reader = Reader()
+    if mode == "short_chunks":
+        value.embed_font("FX220 binary stream", reader, license=license)
+        assert reader.calls > 2 and reader.offset == len(body)
+        assert next(font for font in value.fonts if font.name == "FX220 binary stream").embedded_fonts[0].data == body
+    else:
+        if mode == "later_error":
+            expected, match = OSError, "later font read failed"
+        elif mode == "later_type":
+            expected, match = TypeError, "reader must return bytes"
+        else:
+            expected, match = ValueError, "64 MiB"
+        with pytest.raises(expected, match=match):
+            value.embed_font("FX220 binary stream", reader, license=license)
+        assert reader.calls > 1
+        assert value.to_bytes() == baseline and held.text == "binary owner"
+
+@pytest.mark.parametrize("method", ["pdf", "png", "svg", "all_pages", "selected_pages"])
+def test_fx220_word_embedded_faces_and_caller_override_reach_exports(method):
+    import base64
+    import re
+    from pathlib import Path
+    from rdocx import Document, FontEmbeddingLicense
+
+    directory = Path(__file__).resolve().parents[2] / "oxml-layout/fonts"
+    kinds = ("regular", "bold", "italic", "bold_italic")
+    styles = ("Regular", "Bold", "Italic", "BoldItalic")
+    embedded = [(directory / f"Caladea-{style}.ttf").read_bytes() for style in styles]
+    caller = [(directory / f"LiberationMono-{style}.ttf").read_bytes() for style in styles]
+    name = "FX220 deterministic export face"
+    document = Document()
+    for index in range(4):
+        run = document.add_paragraph("").add_run("iiiiWWWW font route")
+        run.font.name = name
+        run.font.bold = bool(index & 1)
+        run.font.italic = bool(index & 2)
+    license = FontEmbeddingLicense(authorized=True, identity="Apache License 2.0")
+    for kind, body in zip(kinds, embedded):
+        document.embed_font(name, body, kind, license=license)
+    source = document.to_bytes()
+    before = document.to_bytes()
+    held = document.paragraphs[0]
+    disabled = Document.from_bytes(source)
+    disabled.embed_true_type_fonts = False
+    missing = Document.from_bytes(source)
+    missing.remove_font(name)
+    reference = Document.from_bytes(missing.to_bytes())
+    for value in (document, disabled, missing, reference):
+        assert value.paragraphs[0].text == "iiiiWWWW font route"
+
+    def invoke(value, fonts):
+        if method == "pdf": return value.to_pdf(fonts=fonts)
+        if method == "png": return value.render_page_to_png(0, dpi=72.0, fonts=fonts)
+        if method == "svg": return value.render_page_to_svg(0, fonts=fonts).svg
+        if method == "all_pages": return value.render_all_pages(dpi=72.0, fonts=fonts)
+        return value.render_pages(pages=[0], dpi=72.0, fonts=fonts)
+
+    positive = invoke(document, [])
+    off = invoke(disabled, [])
+    absent = invoke(missing, [])
+    override = invoke(document, list(zip([name] * 4, caller)))
+    expected = invoke(reference, list(zip([name] * 4, embedded)))
+    expected_override = invoke(reference, list(zip([name] * 4, caller)))
+    assert positive != off and positive != override
+    assert off == absent
+    if method in ("png", "all_pages", "selected_pages"):
+        assert positive == expected
+        assert override == expected_override
+    elif method == "pdf":
+        assert positive.startswith(b"%PDF") and b"Caladea" in positive
+        assert b"LiberationMono" in override and b"Caladea" not in override
+        assert b"Caladea" not in off
+    else:
+        def bodies(svg):
+            return {base64.b64decode(value) for value in re.findall(r"base64,([A-Za-z0-9+/=]+)", svg)}
+        assert set(embedded) <= bodies(positive)
+        assert set(caller) <= bodies(override)
+        assert not set(embedded) & bodies(off)
+    assert document.to_bytes() == before and held.text == "iiiiWWWW font route"
+
+
+@pytest.mark.parametrize("kind", [51, 65])
+def test_fx215_word_public_creation_after_owner_and_atomic_refusal(kind):
+    from rdocx import Document, CategoryChartData, Inches, Paragraph, StaleElementError
+    data = CategoryChartData()
+    data.categories = ["East", "West"]
+    data.add_series("Sales", [11.0, 23.0])
+    doc = Document()
+    doc.add_paragraph("before")
+    doc.add_table(1, 1)
+    doc.add_paragraph("after")
+    held_tail = doc.paragraphs[1]
+    result = doc.add_chart(kind, data, Inches(4), Inches(2), after=doc.paragraphs[0])
+    assert isinstance(result, Paragraph)
+    assert result.element is result
+    returned_xml = result.element.xml
+    package = doc.to_bytes()
+    assert result.element.replace_xml(returned_xml) is None
+    assert result.element.xml == returned_xml and doc.to_bytes() == package
+    with pytest.raises(StaleElementError, match="Document.add_chart"):
+        _ = held_tail.text
+    assert doc.paragraphs[2].text == "after"
+    with zipfile.ZipFile(io.BytesIO(package)) as archive:
+        names = archive.namelist()
+        charts = [name for name in names if name.startswith("word/charts/chart") and name.endswith(".xml")]
+        assert len(charts) == 1
+        assert b"Sales" in archive.read(charts[0]) and b"23" in archive.read(charts[0])
+        assert any(name.startswith("word/embeddings/") for name in names)
+        from xml.etree import ElementTree as ET
+        body = ET.fromstring(archive.read("word/document.xml")).find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}body")
+        assert [element.tag.rsplit("}", 1)[-1] for element in list(body)[:4]] == ["p", "p", "tbl", "p"]
+    foreign = Document(); foreign.add_paragraph("foreign")
+    with pytest.raises(ValueError):
+        doc.add_chart(kind, data, Inches(4), Inches(2), after=foreign.paragraphs[0])
+    assert doc.to_bytes() == package
+    bad = CategoryChartData(); bad.categories = ["East"]; bad.add_series("Bad", [float("nan")])
+    with pytest.raises(Exception):
+        doc.add_chart(kind, bad, Inches(4), Inches(2))
+    assert doc.to_bytes() == package
+
+    assert result.element.xml == returned_xml
+    reopened = Document.from_bytes(package)
+    assert reopened.paragraphs[1].element.xml == returned_xml
+    assert [paragraph.text for paragraph in reopened.paragraphs] == ["before", "", "after"]
+
+    appended = Document()
+    held = appended.add_paragraph("append survivor")
+    held_xml = held.element.xml
+    appended_result = appended.add_chart(kind, data, Inches(4), Inches(2))
+    assert held.text == "append survivor" and held.element.xml == held_xml
+    appended_xml = appended_result.element.xml
+    appended_bytes = appended.to_bytes()
+    assert appended_result.element.replace_xml(appended_xml) is None
+    assert appended.to_bytes() == appended_bytes
+    with pytest.raises(Exception):
+        appended.add_chart(kind, bad, Inches(4), Inches(2))
+    assert appended.to_bytes() == appended_bytes
+    assert held.element.xml == held_xml and appended_result.element.xml == appended_xml
+    reopened_append = Document.from_bytes(appended_bytes)
+    assert reopened_append.paragraphs[0].text == "append survivor"
+    assert reopened_append.paragraphs[1].element.xml == appended_xml
+
+
+def test_fx215_word_chart_refuses_retired_and_non_body_after_handles():
+    from rdocx import Document, CategoryChartData, Inches, StaleElementError
+    data = CategoryChartData(); data.categories = ["A"]; data.add_series("Series", [7.0])
+    doc = Document(); doc.add_paragraph("body witness"); doc.add_paragraph("retire")
+    retired = doc.paragraphs[1]
+    assert doc.remove_content(doc.find_content_index(retired))
+    before = doc.to_bytes()
+    with pytest.raises(StaleElementError):
+        doc.add_chart(51, data, Inches(4), Inches(2), after=retired)
+    assert doc.to_bytes() == before
+    doc.add_table(1, 1)
+    cell = doc.tables[0].cell(0, 0).paragraphs[0]
+    before = doc.to_bytes()
+    with pytest.raises(ValueError, match="direct body"):
+        doc.add_chart(51, data, Inches(4), Inches(2), after=cell)
+    assert doc.to_bytes() == before
+    header = doc.section(0).header.add_paragraph("header witness")
+    before = doc.to_bytes()
+    with pytest.raises(ValueError, match="direct body"):
+        doc.add_chart(51, data, Inches(4), Inches(2), after=header)
+    assert doc.to_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["paragraph", "run", "table", "cell", "section"])
+def test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal(kind):
+    import xml.etree.ElementTree as ET
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("before")
+    document.add_table(1, 1)
+    document.tables[0].cell(0, 0).text = "cell-before"
+    owner = {
+        "paragraph": lambda: document.paragraphs[0],
+        "run": lambda: document.paragraphs[0].runs[0],
+        "table": lambda: document.tables[0],
+        "cell": lambda: document.tables[0].cell(0, 0),
+        "section": lambda: document.section(0),
+    }[kind]()
+    expected = {"paragraph": "p", "run": "r", "table": "tbl", "cell": "tc", "section": "sectPr"}[kind]
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    assert owner.element is owner
+    original_xml = owner.element.xml
+    assert isinstance(original_xml, str)
+    assert ET.fromstring(original_xml).tag == "{" + namespace + "}" + expected
+    before = document.to_bytes()
+    assert owner.element.replace_xml(original_xml) is None
+    assert owner.element.xml == original_xml
+    assert document.to_bytes() == before
+    snapshot = document.story_items[0]
+    malformed = [
+        '<x:' + expected + ' xmlns:x="urn:foreign"/>',
+        original_xml + '<w:p xmlns:w="' + namespace + '"/>',
+        '<!DOCTYPE x [<!ENTITY injected "external">]>' + original_xml,
+        original_xml[:-1],
+    ]
+    for xml in malformed:
+        with pytest.raises(rdocx.RdocxError):
+            owner.element.replace_xml(xml)
+        assert document.to_bytes() == before
+        assert owner.element.xml == original_xml
+    if kind == "section":
+        # Actual valid geometry mutation through the selected section owner.
+        xml = re.sub(r'(w:pgSz\b[^>]*w:w=")[0-9]+', r'\g<1>13000', original_xml, count=1)
+        assert xml != original_xml
+    else:
+        old = "cell-before" if kind in {"table", "cell"} else "before"
+        xml = original_xml.replace(old, "after")
+        assert xml != original_xml
+    owner.element.replace_xml(xml)
+    assert owner.element.xml != original_xml
+    with pytest.raises(rdocx.StaleElementError):
+        document.set_story_text(snapshot, "rejected stale snapshot")
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    if kind in {"paragraph", "run"}:
+        assert reopened.paragraphs[0].text == "after"
+    elif kind in {"table", "cell"}:
+        assert reopened.tables[0].cell(0, 0).text == "after"
+    else:
+        assert reopened.section(0).page_width == 13000 * 635
+    assert rdocx.Document.from_bytes(reopened.to_bytes()).to_bytes() == reopened.to_bytes()
+
+
+def test_fx211a_xml_child_views_retire_without_retiring_true_ancestors():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("selected")
+    document.add_paragraph("sibling")
+    paragraph = document.paragraphs[0]
+    sibling = document.paragraphs[1]
+    run = paragraph.runs[0]
+    font = run.font
+    color = font.color
+    properties = paragraph.paragraph_format
+    tabs = properties.tab_stops
+    xml = paragraph.element.xml
+    paragraph.element.replace_xml(xml)
+    assert run.text == "selected"
+    assert font.name is None
+    assert properties.alignment is None
+    with pytest.raises(rdocx.RdocxError):
+        paragraph.element.replace_xml('<w:p xmlns:w="urn:wrong"/>')
+    assert run.text == "selected"
+    paragraph.element.replace_xml(xml.replace("selected", "replacement"))
+    assert paragraph.text == "replacement"
+    assert sibling.text == "sibling"
+    for getter in [lambda: run.text, lambda: font.name, lambda: color.rgb, lambda: properties.alignment, lambda: len(tabs)]:
+        with pytest.raises(rdocx.StaleElementError):
+            getter()
+    fresh = paragraph.runs[0]
+    assert fresh.text == "replacement"
+    fresh_font = fresh.font
+    fresh.text = "ordinary"
+    assert paragraph.text == "ordinary"
+    assert fresh_font.name is None
+
+
+def test_fx211a_section_furniture_retirement_preserves_shared_physical_part():
+    import rdocx
+
+    document = rdocx.Document()
+    document.add_paragraph("body")
+    document.insert_section(1)
+    document.section(0).header.add_paragraph("shared header")
+    story = next(story for story in document.stories if story.kind == "header")
+    document.link_section_story(1, "header", "default", story)
+    first = document.section(0)
+    second = document.section(1)
+    first_header = first.header
+    second_header = second.header
+    selected = first_header.paragraphs[0]
+    unselected = second_header.paragraphs[0]
+    selected_run = selected.runs[0]
+    unselected_run = unselected.runs[0]
+    properties = selected.paragraph_format
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        physical_before = archive.read(story.part_name.lstrip("/"))
+    xml = first.element.xml
+    first.element.replace_xml(xml)
+    assert selected.text == unselected.text == "shared header"
+    with pytest.raises(rdocx.RdocxError):
+        first.element.replace_xml('<w:sectPr xmlns:w="urn:foreign"/>')
+    assert selected_run.text == unselected_run.text == "shared header"
+    replacement, count = re.subn(r'<w:headerReference\b[^>]*/>', "", xml, count=1)
+    assert count == 1
+    first.element.replace_xml(replacement)
+    for getter in [lambda: first_header.paragraphs, lambda: selected.text, lambda: selected_run.text, lambda: properties.alignment]:
+        with pytest.raises(rdocx.StaleElementError):
+            getter()
+    assert second.page_width is not None
+    assert second_header.paragraphs[0].text == "shared header"
+    assert unselected.text == unselected_run.text == "shared header"
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        assert archive.read(story.part_name.lstrip("/")) == physical_before
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.section(0).header.paragraphs == ()
+    assert reopened.section(1).header.paragraphs[0].text == "shared header"
+
+
+def test_fx211a_run_text_retires_picture_with_first_cause_and_keeps_rpr():
+    import rdocx
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b"")
+    document = rdocx.Document()
+    document.add_paragraph("before")
+    document.add_paragraph("sibling")
+    picture = document.paragraphs[0].runs[0].add_picture(png, "red.png", width=914400, height=914400)
+    paragraph = document.paragraphs[0]
+    sibling = document.paragraphs[1]
+    run = paragraph.runs[0]
+    font = run.font
+    font.bold = True
+    before = document.to_bytes()
+    with pytest.raises(TypeError):
+        run.text = object()
+    assert document.to_bytes() == before
+    assert run.text == "before"
+    assert font.bold is True
+    run.text = "replacement"
+    assert paragraph.text == run.text == "replacement"
+    assert sibling.text == "sibling"
+    assert font.bold is True
+    with pytest.raises(rdocx.StaleElementError, match="Run.text"):
+        document.set_picture_size(picture, width=457200, height=457200)
+    unchanged = document.to_bytes()
+    run.text = "replacement"
+    assert document.to_bytes() == unchanged
+    assert run.text == "replacement"
+    assert font.bold is True
+    current_run = document.add_paragraph("appended").runs[0]
+    with pytest.raises(rdocx.StaleElementError, match="Document.add_paragraph"):
+        _ = run.text
+    assert current_run.text == "appended"
+    assert paragraph.text == "replacement"
+    assert sibling.text == "sibling"
+
+
+def test_fx211a_imported_local_picture_run_xml_preserves_owned_media_and_opaque():
+    import xml.etree.ElementTree as ET
+    import rdocx
+
+    image = _one_pixel_png()
+    seed = rdocx.Document()
+    seed.add_paragraph("seed").runs[0].add_picture(image, "owned.png", width=152400, height=152400)
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    drawing = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    relationships = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    seed_root = ET.fromstring(_document_xml(seed))
+    rel_id = seed_root.find(".//{" + drawing + "}blip").get("{" + relationships + "}embed")
+    assert rel_id
+    opaque = '<x:payload xmlns:x="urn:producer" x:keep=\'yes\'/>'
+    source = f'<w:document xmlns:w="{namespace}"><w:body><w:p><w:r><w:t>before</w:t></w:r><w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="{drawing}" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="{relationships}"><wp:inline><wp:extent cx="152400" cy="152400"/><wp:docPr id="1" name="owned.png"/>{opaque}<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="owned.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{rel_id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="152400" cy="152400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/></w:body></w:document>'
+    package = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(seed.to_bytes())) as original:
+        with zipfile.ZipFile(package, "w") as output:
+            for member in original.infolist():
+                output.writestr(member, source.encode() if member.filename == "word/document.xml" else original.read(member.filename))
+    document = rdocx.Document.from_bytes(package.getvalue())
+    paragraph = document.paragraphs[0]
+    run = paragraph.runs[1]
+    xml = run.element.xml
+    root = ET.fromstring(xml)
+    assert root.tag == "{" + namespace + "}r"
+    assert root.find(".//{" + drawing + "}blip").get("{" + relationships + "}embed") == rel_id
+    assert root.find("{" + namespace + "}rPr") is None
+    assert opaque in xml
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        run.element.replace_xml(xml.replace(rel_id, "rId_missing"))
+    assert document.to_bytes() == before
+    insertion = xml.index(">") + 1
+    changed = xml[:insertion] + "<w:rPr><w:b/></w:rPr>" + xml[insertion:]
+    run.element.replace_xml(changed)
+    assert run.font.bold is True
+    assert paragraph.text == "before"
+    for _ in range(2):
+        payload = document.to_bytes()
+        assert opaque.encode() in _document_xml(document)
+        document = rdocx.Document.from_bytes(payload)
+        assert document.paragraphs[0].runs[1].font.bold is True
+        assert len(document.pictures()) == 1 and document.pictures()[0].bytes == image
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_fx211a_constructor_inventory_preserves_direct_control_and_cell_joins(structured):
+    import rdocx
+
+    def paragraph(text):
+        return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+    middle = paragraph("middle")
+    if structured:
+        middle = "<w:sdt><w:sdtPr/><w:sdtContent>" + middle + "</w:sdtContent></w:sdt>"
+    inner = "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w='1000'/></w:tblGrid><w:tr><w:tc><w:tcPr/>" + paragraph("inner") + "</w:tc></w:tr></w:tbl>"
+    field = "<w:p><w:fldSimple w:instr='PAGE'><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>"
+    table = "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w='1000'/></w:tblGrid><w:tr><w:tc><w:tcPr/>" + field + paragraph("cell-second") + inner + paragraph("cell-last") + "</w:tc></w:tr></w:tbl>"
+    document = _replace_document_body(rdocx.Document(), paragraph("first") + middle + table + paragraph("tail") + "<w:sectPr/>")
+    first, middle_owner, tail = document.paragraphs
+    outer = document.tables[0]
+    cell = outer.cell(0, 0)
+    second, last = cell.paragraphs[1:]
+    inner_owner = cell.tables[0].cell(0, 0).paragraphs[0]
+    assert [first.text, middle_owner.text, tail.text] == ["first", "middle", "tail"]
+    assert [second.text, last.text, inner_owner.text] == ["cell-second", "cell-last", "inner"]
+    document.add_paragraph("appended")
+    assert [first.text, middle_owner.text, tail.text] == ["first", "middle", "tail"]
+    assert [second.text, last.text, inner_owner.text] == ["cell-second", "cell-last", "inner"]
+    second.element.replace_xml(second.element.xml.replace("cell-second", "changed-second"))
+    assert first.text == "first" and middle_owner.text == "middle" and tail.text == "tail"
+    assert last.text == "cell-last" and inner_owner.text == "inner"
+    assert outer.cell(0, 0).paragraphs[1].text == "changed-second"
+    for _ in range(2):
+        document = rdocx.Document.from_bytes(document.to_bytes())
+        assert [p.text for p in document.paragraphs] == ["first", "middle", "tail", "appended"]
+        cell = document.tables[0].cell(0, 0)
+        assert [p.text for p in cell.paragraphs] == ["1", "changed-second", "cell-last"]
+        assert cell.tables[0].cell(0, 0).paragraphs[0].text == "inner"
+
+
+
+def test_fx211c_word_hyperlink_capture_survives_unrelated_append_and_reopens():
+    from rdocx import Document
+    document = Document()
+    paragraph = document.add_paragraph("")
+    paragraph.add_hyperlink("one", "https://example.com/one")
+    held = document.hyperlinks[0]
+    paragraph.add_hyperlink("two", "https://example.com/two")
+    document.set_hyperlink_url(held, "https://example.com/edited")
+    reopened = Document.from_bytes(document.to_bytes())
+    assert [link.url for link in reopened.hyperlinks] == ["https://example.com/edited", "https://example.com/two"]
+
+
+def test_fx211c_word_identical_hyperlink_removal_cannot_resurrect_capture():
+    from rdocx import Document
+    document = Document()
+    paragraph = document.add_paragraph("")
+    paragraph.add_hyperlink("same", "https://example.com/same")
+    paragraph.add_hyperlink("same", "https://example.com/same")
+    removed, survivor = document.hyperlinks
+    document.remove_hyperlink(removed)
+    paragraph.add_hyperlink("same", "https://example.com/same")
+    before = document.to_bytes()
+    with pytest.raises(Exception, match="removed|stale|hyperlink"):
+        document.set_hyperlink_url(removed, "https://example.com/unsafe")
+    assert document.to_bytes() == before
+    document.set_hyperlink_url(survivor, "https://example.com/survivor")
+    reopened = Document.from_bytes(document.to_bytes())
+    assert [link.url for link in reopened.hyperlinks] == ["https://example.com/survivor", "https://example.com/same"]
+
+
+def test_fx211c_word_table_append_preserves_owner_and_retires_old_grid():
+    from rdocx import Document, StaleElementError
+    document = Document()
+    table = document.add_table(1, 2)
+    cell = table.cell(0, 0)
+    cell.text = "before"
+    new_row = table.add_row()
+    assert len(table.rows) == 2
+    assert len(new_row.cells) == 2
+    before = document.to_bytes()
+    with pytest.raises(StaleElementError, match="Table.add_row"):
+        cell.text = "unsafe"
+    assert document.to_bytes() == before
+    reopened = Document.from_bytes(before)
+    assert len(reopened.tables[0].rows) == 2
+    assert reopened.tables[0].cell(0, 0).text == "before"
+
+
+
+def test_fx211c_word_captured_link_survives_append_with_fresh_paragraph_setup():
+    from rdocx import Document
+    document = Document()
+    document.add_paragraph("").add_hyperlink("one", "https://example.com/one")
+    held = document.hyperlinks[0]
+    document.paragraphs[0].add_hyperlink("two", "https://example.com/two")
+    document.set_hyperlink_url(held, "https://example.com/edited")
+    assert [link.url for link in document.hyperlinks] == ["https://example.com/edited", "https://example.com/two"]
+
+
+
+def test_fx211c_word_hyperlink_foreign_manual_and_noop_authority():
+    from rdocx import Document, Hyperlink
+    document = Document()
+    document.add_paragraph("").add_hyperlink("same", "https://example.com/same")
+    held = document.hyperlinks[0]
+    manual = Hyperlink(story=held.story, index_path=held.index_path, text=held.text, url=held.url,
+                      anchor=held.anchor, relationship_id=held.relationship_id)
+    assert manual == held
+    before = document.to_bytes()
+    document.set_hyperlink_url(manual, "https://example.com/same")
+    assert document.to_bytes() == before
+    foreign = Document()
+    foreign.add_paragraph("").add_hyperlink("same", "https://example.com/same")
+    foreign_before = foreign.to_bytes()
+    with pytest.raises(ValueError, match="different document"):
+        foreign.set_hyperlink_url(held, "https://example.com/unsafe")
+    assert foreign.to_bytes() == foreign_before
+    document.set_hyperlink_url(held, "https://example.com/changed")
+    document.set_hyperlink_url(held, "https://example.com/changed-again")
+    assert Document.from_bytes(document.to_bytes()).hyperlinks[0].url == "https://example.com/changed-again"
+
+
+def test_fx211c_word_removed_link_first_cause_survives_identical_replacements():
+    from rdocx import Document, StaleElementError
+    document = Document()
+    paragraph = document.add_paragraph("")
+    paragraph.add_hyperlink("same", "https://example.com/same")
+    removed = document.hyperlinks[0]
+    document.remove_hyperlink(removed)
+    paragraph.add_hyperlink("same", "https://example.com/same")
+    for i in range(32):
+        document.add_paragraph(str(i))
+    before = document.to_bytes()
+    with pytest.raises(StaleElementError) as error:
+        document.set_hyperlink_url(removed, "https://example.com/unsafe")
+    assert "Document.remove_hyperlink" in str(error.value)
+    assert "Document.add_paragraph" not in str(error.value)
+    assert document.to_bytes() == before
+    assert Document.from_bytes(before).hyperlinks[0].url == "https://example.com/same"
+
+
+def test_fx211c_word_run_keeps_first_global_cause_and_manual_item_equality():
+    from rdocx import Document, StaleElementError, StoryItem
+    document = Document()
+    paragraph = document.add_paragraph("old")
+    run = paragraph.add_run(" run")
+    item = document.story_items[0]
+    manual = StoryItem(story=item.story, kind=item.kind, index_path=item.index_path,
+                       direct_body_index=item.direct_body_index, text=item.text, xml=item.xml, revision=item.revision)
+    assert manual == item
+    before = document.to_bytes()
+    assert document.replace_text_at(manual, "absent", "unused", expect=0) == 0
+    with pytest.raises(Exception, match="count|expected"):
+        document.replace_text_at(item, "old", "unsafe", expect=2)
+    assert document.to_bytes() == before
+    foreign = Document()
+    foreign.add_paragraph("old run")
+    foreign_before = foreign.to_bytes()
+    with pytest.raises(ValueError, match="different document"):
+        foreign.replace_text_at(item, "old", "unsafe", expect=1)
+    assert foreign.to_bytes() == foreign_before
+    document.add_paragraph("first invalidating commit")
+    document.add_table(1, 1)
+    before = document.to_bytes()
+    with pytest.raises(StaleElementError) as error:
+        run.text = "unsafe"
+    assert "Document.add_paragraph" in str(error.value)
+    assert "Document.add_table" not in str(error.value)
+    assert document.to_bytes() == before
+    assert paragraph.text == "old run"
+    reopened = Document.from_bytes(before)
+    assert [p.text for p in reopened.paragraphs] == ["old run", "first invalidating commit"]
+
+
+def test_fx211c_word_grid_retirement_is_local_and_invalid_access_atomic():
+    from rdocx import Document, StaleElementError
+    document = Document()
+    first = document.add_table(1, 2)
+    second = document.add_table(1, 1)
+    second_cell = second.cell(0, 0)
+    second_cell.text = "unrelated"
+    old_cell = first.cell(0, 0)
+    first.add_row()
+    assert len(first.rows) == 2
+    assert second_cell.text == "unrelated" and len(second.rows) == 1
+    before = document.to_bytes()
+    with pytest.raises(StaleElementError, match="Table.add_row"):
+        old_cell.text = "unsafe"
+    assert document.to_bytes() == before
+    first.cell(1, 1).text = "new row"
+    before = document.to_bytes()
+    with pytest.raises(Exception):
+        first.cell(-100, 0).text = "unsafe"
+    assert document.to_bytes() == before
+    assert second_cell.text == "unrelated"
+    reopened = Document.from_bytes(before)
+    assert reopened.tables[0].cell(1, 1).text == "new row"
+    assert reopened.tables[1].cell(0, 0).text == "unrelated"
+
+
+@pytest.mark.parametrize("kind", ["table", "cell", "section"])
+def test_fx211d_opaque_word_owners_preserve_corpus_fragments(kind):
+    import xml.etree.ElementTree as ET
+    from rdocx import Document
+
+    document = Document()
+    table = document.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "XML seed"
+    document.add_paragraph("XML sibling preserved")
+    owner = table if kind == "table" else table.cell(0, 0) if kind == "cell" else document.section(0)
+    owner.element.replace_xml(ET.tostring(ET.fromstring(owner.element.xml), encoding="unicode"))
+    original = owner.element.xml
+    opening = re.search(r"<(?![?!])[^>]+>", original)
+    stamp = ' xmlns:corpus="urn:s91:corpus" corpus:stamp="opaque-attribute"'
+    seeded = original[:opening.end() - 1] + stamp + original[opening.end() - 1:]
+    opaque = '<corpus:keep key="one"/><corpus:keep key="two"/>'
+    closing = seeded.rfind("</")
+    owner.element.replace_xml(seeded[:closing] + opaque + seeded[closing:])
+    exact = owner.element.xml
+    assert 'corpus:stamp="opaque-attribute"' in exact and opaque in exact
+    if kind == "section":
+        changed = re.sub(r'((?:w:)?left=")[^"]+(" )', r'\g<1>1600\2', exact, count=1)
+        assert changed != exact
+    else:
+        changed = exact.replace("XML seed", "XML changed", 1)
+    owner.element.replace_xml(changed)
+    assert opaque in owner.element.xml
+    saved = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(saved)) as archive:
+        body = archive.read("word/document.xml")
+    assert opaque.encode() in body and b'corpus:stamp="opaque-attribute"' in body
+    assert b"XML sibling preserved" in body
+    reopened = Document.from_bytes(saved)
+    selected = reopened.tables[0] if kind == "table" else reopened.tables[0].cell(0, 0) if kind == "cell" else reopened.section(0)
+    assert opaque in selected.element.xml
+
+
+@pytest.mark.parametrize("case", ["margin", "header", "notes", "equation", "merge", "style"])
+def test_fx211d_word_current_compatibility_repairs(case):
+    from rdocx import Document, Inches
+
+    document = Document()
+    if case == "margin":
+        section = document.section(0)
+        section.left_margin = Inches(1.25)
+        assert int(section.left_margin) == int(Inches(1.25))
+        reopened = Document.from_bytes(document.to_bytes())
+        assert int(reopened.section(0).left_margin) == int(Inches(1.25))
+    elif case == "header":
+        section = document.section(0)
+        section.different_first_page_header_footer = True
+        section.header.add_paragraph("Default header")
+        section.first_page_header.add_paragraph("First header")
+        section.footer.add_paragraph("Footer")
+        with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+            assert any(b"Default header" in archive.read(name) for name in archive.namelist() if name.startswith("word/header"))
+            assert any(b"Footer" in archive.read(name) for name in archive.namelist() if name.startswith("word/footer"))
+    elif case == "notes":
+        paragraph = document.add_paragraph("Host ")
+        run = paragraph.add_run("reference")
+        document.add_footnote(run, "Footnote corpus")
+        document.add_endnote(paragraph, "Endnote corpus")
+        assert paragraph.text.startswith("Host")
+        with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+            assert b"Footnote corpus" in archive.read("word/footnotes.xml")
+            assert b"Endnote corpus" in archive.read("word/endnotes.xml")
+    elif case == "equation":
+        paragraph = document.add_paragraph("Equation ")
+        assert paragraph.add_equation("x^2", format="latex").diagnostics == ()
+        assert len(paragraph.equations()) == 1
+        with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+            assert b"oMath" in archive.read("word/document.xml")
+    elif case == "merge":
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "origin"
+        merged = table.cell(0, 0).merge(table.cell(1, 1))
+        merged.split()
+        reopened = Document.from_bytes(document.to_bytes())
+        assert len(reopened.tables[0].rows) == 2
+        assert all(len(row.cells) == 2 for row in reopened.tables[0].rows)
+        assert "origin" in reopened.tables[0].cell(0, 0).text
+    else:
+        table = document.add_table(rows=2, cols=2)
+        table.style = "Light Shading Accent 1"
+        assert table.style == "LightShading-Accent1"
+        reopened = Document.from_bytes(document.to_bytes())
+        assert reopened.tables[0].style == "LightShading-Accent1"
+        with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+            assert b'"LightShading-Accent1"' in archive.read("word/styles.xml")
+
+
+@pytest.mark.parametrize("kind", ["properties", "borders"])
+def test_fx211d_merge_opaque_refusal_preserves_package_and_owners(kind):
+    from rdocx import Document, RdocxError
+
+    document = Document()
+    table = document.add_table(1, 2)
+    first = table.cell(0, 0)
+    first.text = "first"
+    second = table.cell(0, 1)
+    second.text = "second"
+    opaque = '<x:keep xmlns:x="urn:opaque" marker="preserve"/>'
+    properties = '<w:tcBorders>' + opaque + '</w:tcBorders>' if kind == "borders" else opaque
+    xml = '<w:tc xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tcPr>' + properties + '</w:tcPr><w:p><w:r><w:t>second</w:t></w:r></w:p></w:tc>'
+    second.element.replace_xml(xml)
+    first = table.cell(0, 0)
+    before = document.to_bytes()
+    assert second.merge(second) is second
+    assert document.to_bytes() == before
+    with pytest.raises(RdocxError, match="opaque cell metadata"):
+        first.merge(second)
+    assert document.to_bytes() == before
+    assert first.text == "first" and second.text == "second"
+    assert len(table.rows[0].cells) == 2
+    assert opaque in second.element.xml
+    reopened = Document.from_bytes(before)
+    assert opaque in reopened.tables[0].cell(0, 1).element.xml
+
+
+@pytest.mark.parametrize("properties", [
+    '<w:tag w:val="goog_rdk_1"/><w:id w:val="1209466531"/>',
+    '<w:id w:val="-1482736121"/><w:docPartObj>'
+    '<w:docPartGallery w:val="Table of Contents"/><w:docPartUnique/></w:docPartObj>',
+])
+def test_preserved_control_paragraphs_keep_checked_source_and_ordinary_reads(properties):
+    import xml.etree.ElementTree as ET
+
+    import rdocx
+
+    body = (
+        '<w:p><w:r><w:t>outside</w:t></w:r></w:p>'
+        f'<w:sdt><w:sdtPr>{properties}</w:sdtPr><w:sdtContent>'
+        '<w:p><w:r><w:t>preserved</w:t></w:r></w:p>'
+        '</w:sdtContent></w:sdt>'
+    )
+    document = _replace_document_body(rdocx.Document(), body)
+    before = document.to_bytes()
+    before_xml = _document_xml(document)
+    assert [paragraph.text for paragraph in document.paragraphs] == ["outside", "preserved"]
+    held = document.paragraphs[1]
+    outside = document.paragraphs[0]
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    original_xml = held.element.xml
+    root = ET.fromstring(original_xml)
+    assert root.tag == "{" + namespace + "}p"
+    assert "".join(root.itertext()) == "preserved"
+    preserved_properties = re.search(rb"<w:sdtPr>.*?</w:sdtPr>", before_xml, re.S).group(0)
+    assert held.element.replace_xml(original_xml) is None
+    assert document.to_bytes() == before
+    for invalid in (
+        '<x:p xmlns:x="urn:foreign"/>',
+        original_xml + '<w:p xmlns:w="' + namespace + '"/>',
+    ):
+        with pytest.raises(rdocx.RdocxError):
+            held.element.replace_xml(invalid)
+        assert document.to_bytes() == before
+        assert held.element.xml == original_xml
+        assert held.text == "preserved" and outside.text == "outside"
+    # The physical two-segment route owns this paragraph, not its sdtPr wrapper.
+    alias = (
+        '<x:p xmlns:x="' + namespace + '">'
+        '<x:r><x:t>updated</x:t></x:r></x:p>'
+    )
+    assert held.element.replace_xml(alias) is None
+    assert held.text == "updated" and outside.text == "outside"
+    after_xml = _document_xml(document)
+    assert re.search(rb"<w:sdtPr>.*?</w:sdtPr>", after_xml, re.S).group(0) == preserved_properties
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [paragraph.text for paragraph in reopened.paragraphs] == ["outside", "updated"]
+    assert _document_xml(reopened) == after_xml
+    run = held.runs[0]
+    document.add_paragraph("later")
+    assert outside.text == "outside" and held.text == "updated"
+    with pytest.raises(rdocx.StaleElementError, match="Document.add_paragraph"):
+        _ = run.text
+    assert [paragraph.text for paragraph in document.paragraphs] == ["outside", "updated", "later"]
+
+
+def test_fx231_installed_word_html_whitespace_entrypoints(tmp_path):
+    import rdocx
+    import xml.etree.ElementTree as ET
+
+    html = '<p>a <b>b </b> c&nbsp;&nbsp;d</p><p><a href="https://example.test/">x </a><i> </i> y</p>'
+    source = tmp_path / "source.html"
+    source.write_text(html, encoding="utf-8")
+    inserted = rdocx.Document()
+    anchor = inserted.add_paragraph("anchor")
+    assert inserted.insert_html(html, after=anchor) == ()
+    created, diagnostics = rdocx.Document.from_html(html)
+    opened, opened_diagnostics = rdocx.Document.open_html(source)
+    assert diagnostics == opened_diagnostics == ()
+    for document in (created, opened, inserted):
+        output = tmp_path / "saved.docx"
+        document.save(output)
+        reopened = rdocx.Document(output)
+        with zipfile.ZipFile(io.BytesIO(reopened.to_bytes())) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+            relations = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = root.findall("./w:body/w:p", ns)[-2:]
+        first = [("".join(run.itertext()), run.find("w:rPr/w:b", ns) is not None) for run in paragraphs[0].findall("w:r", ns)]
+        assert first == [("a ", False), ("b ", True), ("c\u00a0\u00a0d", False)]
+        link = paragraphs[1].find("w:hyperlink", ns)
+        assert "".join(link.itertext()) == "x "
+        relation_id = link.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
+        assert next(item.attrib["Target"] for item in relations if item.attrib["Id"] == relation_id) == "https://example.test/"
+        assert "".join(paragraphs[1].itertext()) == "x y"
+
+
+def test_fx237_table_open_edit_and_fill_costs():
+    import hashlib
+    import json
+    import os
+    import platform
+    import statistics
+    import sys
+    from pathlib import Path
+    import rdocx
+
+    output = os.environ.get("FX237_TIMING_OUTPUT")
+    results = {}
+    for cells in (60, 120, 240):
+        rows = cells // 6
+        fills = []
+        # One discarded warm-up, then three measured fills for qualification.
+        for trial in range(4 if output else 1):
+            document = rdocx.Document()
+            document.add_table(rows, 6)
+            started = time.perf_counter()
+            for row in range(rows):
+                for column in range(6):
+                    document.tables[0].cell(row, column).text = f"r{row} c{column}"
+            elapsed = time.perf_counter() - started
+            if trial:
+                fills.append(elapsed)
+            data = document.to_bytes()
+            reopened = rdocx.Document.from_bytes(data)
+            assert [[reopened.tables[0].cell(row, column).text for column in range(6)]
+                    for row in range(rows)] == [[f"r{row} c{column}" for column in range(6)]
+                                               for row in range(rows)]
+        fill_output_sha256 = hashlib.sha256(data).hexdigest()
+        input_directory = os.environ.get("FX237_TIMING_INPUTS") if output else None
+        fixture_path = None
+        if input_directory:
+            directory = Path(input_directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            fixture_path = directory / f"{cells}-cells.docx"
+            if not fixture_path.exists():
+                assert not os.environ.get("FX237_TIMING_BASELINE"), "candidate must consume authenticated baseline input"
+                fixture_path.write_bytes(data)
+            data = fixture_path.read_bytes()
+        input_sha256 = hashlib.sha256(data).hexdigest()
+        opens, edits = [], []
+        for trial in range(6 if output else 1):
+            started = time.perf_counter()
+            document = rdocx.Document.from_bytes(data)
+            opened = time.perf_counter() - started
+            started = time.perf_counter()
+            document.tables[0].cell(0, 0).text = "edited"
+            edited = time.perf_counter() - started
+            assert rdocx.Document.from_bytes(document.to_bytes()).tables[0].cell(0, 0).text == "edited"
+            if trial:
+                opens.append(opened)
+                edits.append(edited)
+        if output:
+            results[str(cells)] = {"fill": fills, "open": opens, "edit": edits,
+                                   "input_sha256": input_sha256, "input_path": str(fixture_path) if fixture_path else None,
+                                   "fill_output_sha256": fill_output_sha256,
+                                   "medians": {"fill": statistics.median(fills),
+                                               "open": statistics.median(opens),
+                                               "edit": statistics.median(edits)}}
+    if output:
+        controls = {"no_table_open": [], "unrelated_replace_text": []}
+        plain = rdocx.Document()
+        plain.add_paragraph("control")
+        plain_data = plain.to_bytes()
+        related = rdocx.Document.from_bytes(data)
+        related.add_paragraph("unrelated control")
+        related_data = related.to_bytes()
+        for trial in range(6):
+            started = time.perf_counter()
+            assert rdocx.Document.from_bytes(plain_data).paragraphs[0].text == "control"
+            plain_time = time.perf_counter() - started
+            related = rdocx.Document.from_bytes(related_data)
+            paragraph = related.paragraphs[-1]
+            started = time.perf_counter()
+            paragraph.replace_text("unrelated", "changed")
+            related_time = time.perf_counter() - started
+            assert related.paragraphs[-1].text == "changed control"
+            if trial:
+                controls["no_table_open"].append(plain_time)
+                controls["unrelated_replace_text"].append(related_time)
+        from importlib.metadata import version
+        payload = {"version": version("rdocx"), "module": rdocx.__file__,
+                   "python": sys.version, "executable": sys.executable,
+                   "platform": platform.platform(), "machine": platform.machine(),
+                   "results": results, "controls": controls}
+        baseline_path = os.environ.get("FX237_TIMING_BASELINE")
+        if baseline_path:
+            baseline = json.loads(Path(baseline_path).read_text())
+            payload["baseline_comparison"] = {
+                cells: {phase: {"limit": max(3 * baseline["results"][cells]["medians"][phase], floor),
+                                "within_limit": actual["medians"][phase] <= max(3 * baseline["results"][cells]["medians"][phase], floor),
+                                "enforced": phase != "fill"}
+                        for phase, floor in (("open", .010), ("edit", .030), ("fill", .500))}
+                for cells, actual in results.items()
+            }
+        Path(output).write_text(json.dumps(payload, indent=2) + "\n")
+        if baseline_path:
+            baseline = json.loads(Path(baseline_path).read_text())
+            assert baseline["version"] == "0.16.0"
+            assert baseline["python"] == payload["python"]
+            assert baseline["platform"] == payload["platform"]
+            for cells, actual in results.items():
+                assert actual["input_sha256"] == baseline["results"][cells]["input_sha256"]
+                for phase, floor in (("open", .010), ("edit", .030), ("fill", .500)):
+                    limit = max(3 * baseline["results"][cells]["medians"][phase], floor)
+                    # Fill retains its former 3x comparison as diagnostic data.
+                    # The approved plan records the exact user-accepted result.
+                    if phase != "fill":
+                        assert actual["medians"][phase] <= limit, (cells, phase, actual, limit)
+
+
+def test_fx237_table_owner_inventory_preserves_physical_routes_and_generations():
+    import rdocx
+
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("unrelated")
+    outer = document.add_table(2, 2)
+    outer.cell(0, 0).text = "first"
+    outer.cell(0, 1).text = "same"
+    outer.cell(1, 1).text = "same"
+    outer.cell(0, 0).add_table(1, 1).cell(0, 0).text = "nested"
+    with pytest.raises(Exception, match="Cell.add_table|stale"):
+        _ = outer.cell(0, 0)
+    outer = document.tables[0]
+    paragraph = document.paragraphs[0]
+    nested = outer.cell(0, 0).tables[0].cell(0, 0).paragraphs[0]
+    sibling = outer.cell(0, 1).paragraphs[0]
+    selected = outer.cell(1, 1)
+    removed = selected.paragraphs[0]
+    old_run = sibling.runs[0]
+    selected.text = "changed"
+    assert selected.text == "changed" and sibling.text == "same"
+    assert nested.text == "nested" and paragraph.text == "unrelated"
+    with pytest.raises(Exception, match="Cell.text|stale"):
+        _ = removed.text
+    with pytest.raises(Exception, match="Cell.text|stale"):
+        _ = old_run.text
+    sibling.replace_text("same", "retained")
+    with pytest.raises(Exception, match="Paragraph.replace_text|stale"):
+        _ = nested.text
+    assert document.tables[0].cell(0, 0).tables[0].cell(0, 0).text == "nested"
+    assert document.paragraphs[0].text == "unrelated"
+    for _ in range(2):
+        document = rdocx.Document.from_bytes(document.to_bytes())
+        table = document.tables[0]
+        assert table.cell(1, 1).text == "changed"
+        assert table.cell(0, 1).text == "retained"
+        assert table.cell(0, 0).tables[0].cell(0, 0).text == "nested"
+        assert document.paragraphs[0].text == "unrelated"
+
+
+def test_fx237_owner_inventory_refusal_is_atomic(monkeypatch):
+    import datetime
+    import json
+    import rdocx
+
+    document = rdocx.Document()
+    table = document.add_table(1, 2)
+    table.cell(0, 0).text = "first"
+    table.cell(0, 1).text = "second"
+    first, second = table.cell(0, 0), table.cell(0, 1)
+    paragraph = first.paragraphs[0]
+    opaque = '<x:keep xmlns:x="urn:fx237" marker="preserve"/>'
+    xml = second.element.xml
+    start = xml.index(">") + 1
+    second.element.replace_xml(xml[:start] + "<w:tcPr>" + opaque + "</w:tcPr>" + xml[start:])
+    assert opaque in second.element.xml
+    document.add_paragraph("field ").add_run("").add_field('DATE \\@ "yyyy-MM-dd"', "1999-01-01")
+    # Refresh after the conservative append, then force a real report allocation
+    # refusal after native candidate preparation on a document with cell owners.
+    first, second = document.tables[0].cell(0, 0), document.tables[0].cell(0, 1)
+    paragraph = first.paragraphs[0]
+    baseline = document.to_bytes()
+    def refuse_report(*args, **kwargs):
+        raise MemoryError("fx237 prepublication report allocation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", refuse_report)
+        with pytest.raises(MemoryError, match="fx237 prepublication"):
+            document.update_all_fields(now=datetime.datetime(2026, 10, 10))
+    assert document.to_bytes() == baseline and paragraph.text == "first"
+    with pytest.raises(Exception):
+        first.merge(second)
+    assert document.to_bytes() == baseline
+    assert first.text == "first" and paragraph.text == "first"
+    assert opaque in second.element.xml
+    before = second.element.xml
+    second.element.replace_xml(before)
+    assert document.to_bytes() == baseline and paragraph.text == "first"
+    foreign = rdocx.Document().add_table(1, 1).cell(0, 0)
+    with pytest.raises(Exception):
+        first.merge(foreign)
+    assert document.to_bytes() == baseline
+
+
+@pytest.mark.parametrize("slot", ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer"))
+@pytest.mark.parametrize("cell", (False, True))
+def test_fx232_checked_header_footer_paragraph_and_run_reopen_atomically(slot, cell):
+    import rdocx
+    import xml.etree.ElementTree as ET
+
+    document = rdocx.Document()
+    document.add_paragraph("body witness")
+    owner = getattr(document.section(0), slot)
+    if cell:
+        owner.add_table(1, 1).cell(0, 0).text = "old owner text"
+    else:
+        owner.add_paragraph("old owner text")
+
+    def selected(doc):
+        story = getattr(doc.section(0), slot)
+        return story.tables[0].cell(0, 0).paragraphs[0] if cell else story.paragraphs[-1]
+
+    paragraph = selected(document)
+    assert ET.fromstring(paragraph.xml).tag.endswith("}p")
+    paragraph.replace_xml(paragraph.xml.replace("old owner text", "new owner text"))
+    run = selected(document).runs[0]
+    assert ET.fromstring(run.xml).tag.endswith("}r")
+    run.replace_xml(run.xml.replace("new owner text", "final owner text"))
+    for getter in (lambda: selected(document), lambda: selected(document).runs[0]):
+        target = getter()
+        before = document.to_bytes()
+        original = target.xml
+        target.replace_xml(original)
+        assert document.to_bytes() == before
+        with pytest.raises(rdocx.RdocxError):
+            target.replace_xml(original.replace("final owner text", "<unbound:bad/>"))
+        assert document.to_bytes() == before
+        assert getter().xml == original
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert selected(reopened).text == "final owner text"
+    assert reopened.paragraphs[0].text == "body witness"
+
+
+@pytest.mark.parametrize("where", ("svgBlip", "w:p"))
+def test_fx232_issue373_svg_namespace_ancestor_retains_the_picture_reference(where):
+    import rdocx
+    import xml.etree.ElementTree as ET
+
+    document = rdocx.Document()
+    document.add_picture(_one_pixel_png(b"\xff\x00\x00"), width=rdocx.Inches(.5), height=rdocx.Inches(.5))
+    document.add_picture(_one_pixel_png(b"\xff\x00\x00"), width=rdocx.Inches(.5), height=rdocx.Inches(.5))
+    first, second = [p.xml for p in document.paragraphs[:2]]
+    relationship = re.search(r'r:embed="([^"]+)"', second).group(1)
+    declaration = 'xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main"'
+    extension = ('<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">'
+                 '<asvg:svgBlip %s r:embed="%s"/></a:ext></a:extLst>' %
+                 (declaration if where == "svgBlip" else "", relationship))
+    if "</a:blip>" in first:
+        replacement = first.replace("</a:blip>", extension + "</a:blip>", 1)
+    else:
+        replacement = re.sub(r"(<a:blip\b[^>]*?)/>", lambda m: m.group(1) + ">" + extension + "</a:blip>", first, count=1)
+    if where == "w:p":
+        replacement = re.sub(r"^<w:p\b", "<w:p " + declaration, replacement, count=1)
+    document.paragraphs[0].replace_xml(replacement)
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    root = ET.fromstring(reopened.paragraphs[0].xml)
+    svg = root.find(".//{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip")
+    assert svg is not None
+    assert svg.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed") == relationship
+    before = reopened.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        reopened.paragraphs[0].replace_xml(replacement.replace(declaration, ""))
+    assert reopened.to_bytes() == before
+
+
+def test_fx246_word_legend_controls_live_owner_defaults_and_atomicity():
+    import rdocx
+    data = rdocx.CategoryChartData()
+    data.categories = ["Q1", "Q2"]
+    data.add_series("North", [12, 14])
+    data.add_series("South", [9, 11])
+    document = rdocx.Document()
+    paragraph = document.add_chart(51, data, rdocx.Inches(6), rdocx.Inches(2.6))
+    expected = {"visible": True, "position": "r", "overlay": False}
+    assert document.chart_legend(paragraph) == expected
+    before = document.to_bytes()
+    document.set_chart_legend(paragraph)
+    document.set_chart_legend(paragraph, visible=True, position="r", overlay=False)
+    assert document.to_bytes() == before
+    assert paragraph.xml
+    for position in ("r", "l", "t", "b", "tr"):
+        paragraph = document.paragraphs[0]
+        document.set_chart_legend(paragraph, position=position, overlay=True)
+        assert document.chart_legend(document.paragraphs[0]) == dict(expected, position=position, overlay=True)
+    paragraph = document.paragraphs[0]
+    document.set_chart_legend(paragraph, visible=False)
+    paragraph = document.paragraphs[0]
+    before = document.to_bytes()
+    document.set_chart_legend(paragraph, position="l", overlay=True)
+    assert document.to_bytes() == before
+    assert document.chart_legend(paragraph) == dict(expected, visible=False)
+    document.set_chart_legend(paragraph, visible=True, position="b", overlay=True)
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.chart_legend(reopened.paragraphs[0]) == dict(expected, position="b", overlay=True)
+    paragraph = document.paragraphs[0]
+    before = document.to_bytes()
+    for kwargs, error in (({"visible": 1}, TypeError), ({"overlay": "yes"}, TypeError), ({"position": "bad"}, ValueError), ({"position": 1}, TypeError)):
+        with pytest.raises(error):
+            document.set_chart_legend(paragraph, **kwargs)
+        assert document.to_bytes() == before
+    foreign = rdocx.Document()
+    foreign_paragraph = foreign.add_chart(51, data, rdocx.Inches(6), rdocx.Inches(2))
+    with pytest.raises(ValueError):
+        document.set_chart_legend(foreign_paragraph, visible=False)
+    assert document.to_bytes() == before
+    plain = document.add_paragraph("no chart")
+    before = document.to_bytes()
+    with pytest.raises(Exception):
+        document.set_chart_legend(plain, visible=True)
+    assert document.to_bytes() == before
+
+
+def test_fx246_word_legend_refuses_retired_related_and_ambiguous_owners():
+    import re
+    import rdocx
+    data = rdocx.CategoryChartData()
+    data.categories = ["A"]
+    data.add_series("North", [7])
+    document = rdocx.Document()
+    paragraph = document.add_chart(51, data, rdocx.Inches(4), rdocx.Inches(2))
+    # One-series authoring retains its existing absent legend default.
+    assert document.chart_legend(paragraph) == {"visible": False, "position": "r", "overlay": False}
+    retired = paragraph
+    assert document.remove_content(document.find_content_index(retired))
+    before = document.to_bytes()
+    with pytest.raises(rdocx.StaleElementError):
+        document.set_chart_legend(retired, visible=True)
+    assert document.to_bytes() == before
+    cell = document.add_table(1, 1).cell(0, 0).paragraphs[0]
+    header = document.section(0).header.add_paragraph("header witness")
+    for owner in (cell, header):
+        before = document.to_bytes()
+        with pytest.raises(ValueError, match="direct body"):
+            document.set_chart_legend(owner, visible=True)
+        assert document.to_bytes() == before
+    paragraph = document.add_chart(51, data, rdocx.Inches(4), rdocx.Inches(2))
+    xml = paragraph.xml
+    drawing = re.search(r"<w:r>.*?</w:r>", xml, re.S).group(0)
+    drawing = re.sub(r'(wp:docPr\s+id=")[0-9]+', r'\g<1>999', drawing, count=1)
+    paragraph.replace_xml(xml.replace("</w:p>", drawing + "</w:p>"))
+    paragraph = document.paragraphs[-1]
+    before = document.to_bytes()
+    with pytest.raises(Exception, match="exactly one"):
+        document.set_chart_legend(paragraph, visible=True)
+    assert document.to_bytes() == before
+
+
+@pytest.mark.parametrize("with_owned", (False, True))
+def test_fx246_word_opaque_ancestors_never_grant_chart_authority(with_owned):
+    import copy
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+    import rdocx
+    data = rdocx.CategoryChartData()
+    data.categories = ["A"]
+    data.add_series("North", [7])
+    document = rdocx.Document()
+    document.add_chart(51, data, rdocx.Inches(4), rdocx.Inches(2))
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    wp = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+    tree = ET.fromstring(parts["word/document.xml"])
+    run = tree.find(".//" + w + "r")
+    drawing = run.find(w + "drawing")
+    opaque = ET.Element("{urn:fx246:opaque}holder")
+    if with_owned:
+        extra = copy.deepcopy(drawing)
+        for node in extra.iter(wp + "docPr"):
+            node.set("id", "999")
+        opaque.append(extra)
+    else:
+        run.remove(drawing)
+        opaque.append(drawing)
+    run.append(opaque)
+    parts["word/document.xml"] = ET.tostring(tree)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, body in parts.items():
+            package.writestr(name, body)
+    document = rdocx.Document.from_bytes(buffer.getvalue())
+    paragraph = document.paragraphs[0]
+    before = document.to_bytes()
+    opaque_before = ET.tostring(ET.fromstring(paragraph.xml).find(".//{urn:fx246:opaque}holder"))
+    if with_owned:
+        document.set_chart_legend(paragraph, visible=True, position="b")
+        assert document.chart_legend(document.paragraphs[0])["position"] == "b"
+        assert ET.tostring(ET.fromstring(document.paragraphs[0].xml).find(".//{urn:fx246:opaque}holder")) == opaque_before
+    else:
+        for operation in (lambda: document.chart_legend(paragraph), lambda: document.set_chart_legend(paragraph, visible=True)):
+            with pytest.raises(Exception, match="exactly one"):
+                operation()
+            assert document.to_bytes() == before
+
+
+def test_fx246_word_shared_chart_retargets_only_selected_owned_attribute():
+    import copy
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+    import rdocx
+    data = rdocx.CategoryChartData()
+    data.categories = ["A"]
+    data.add_series("North", [7])
+    document = rdocx.Document()
+    document.add_chart(51, data, rdocx.Inches(4), rdocx.Inches(2))
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    c = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+    r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    wp = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+    tree = ET.fromstring(parts["word/document.xml"])
+    body = tree.find(w + "body")
+    paragraph = body.find(w + "p")
+    relationship = paragraph.find(".//" + c + "chart").get(r + "id")
+    other = copy.deepcopy(paragraph)
+    for node in other.iter(wp + "docPr"):
+        node.set("id", "999")
+    body.insert(1, other)
+    ET.SubElement(paragraph, "{urn:fx246:foreign}chart", {r + "id": relationship, "marker": "untouched"})
+    parts["word/document.xml"] = ET.tostring(tree)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, value in parts.items():
+            package.writestr(name, value)
+    document = rdocx.Document.from_bytes(buffer.getvalue())
+    document.set_chart_legend(document.paragraphs[0], visible=True, position="b")
+    current = ET.fromstring(document.paragraphs[0].xml)
+    assert current.find("{urn:fx246:foreign}chart").get(r + "id") == relationship
+    assert current.find(".//" + c + "chart").get(r + "id") != relationship
+    assert document.chart_legend(document.paragraphs[1])["visible"] is False
+    assert document.chart_legend(document.paragraphs[0])["position"] == "b"
+
+
+@pytest.mark.parametrize("trailer", (b"NOT_XML_DOCUMENT_CONTENT", b"<![CDATA[tail]]>", b"&amp;"))
+def test_fx246_word_malformed_chart_document_is_refused_atomically(trailer):
+    import io
+    import zipfile
+    import rdocx
+    data = rdocx.CategoryChartData()
+    data.categories = ["A"]
+    data.add_series("North", [7])
+    document = rdocx.Document()
+    document.add_chart(51, data, rdocx.Inches(4), rdocx.Inches(2))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as source, zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            value = source.read(info.filename)
+            if info.filename.startswith("word/charts/chart") and info.filename.endswith(".xml"):
+                value += trailer
+            target.writestr(info, value)
+    document = rdocx.Document.from_bytes(buffer.getvalue())
+    paragraph = document.paragraphs[0]
+    before = document.to_bytes()
+    for operation in (lambda: document.chart_legend(paragraph), lambda: document.set_chart_legend(paragraph, visible=True)):
+        with pytest.raises(Exception):
+            operation()
+        assert document.to_bytes() == before and paragraph.xml
+
+
+
+def _fx247_oracle_and_cases():
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    spec = importlib.util.spec_from_file_location("fx247_oracle", root / "scripts/officemath_oracle_harness.py")
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+    manifest = json.loads((root / "scripts/officemath_oracle_manifest.json").read_text())
+    return oracle, manifest["fx247"]["cases"]
+
+
+def _fx247_document():
+    import rdocx
+
+    oracle, cases = _fx247_oracle_and_cases()
+    document = rdocx.Document()
+    for source in cases:
+        converted = document.add_paragraph("").add_equation(source, format="latex")
+        assert converted.diagnostics == (), (source, converted.diagnostics)
+    return oracle, cases, document
+
+
+def test_fx247_all73_saved_semantics_and_public_reopen(tmp_path):
+    import rdocx
+
+    oracle, cases, document = _fx247_document()
+    path = tmp_path / "all73.docx"
+    document.save(path)
+    first = oracle.verify_fx247_package(path)
+    assert len(first["rows"]) == len(cases) == 73
+    reopened = rdocx.Document(path)
+    assert len(reopened.paragraphs) == 73
+    for paragraph in reopened.paragraphs:
+        equations = paragraph.equations()
+        assert len(equations) == 1
+        assert equations[0].to_latex().equations[0].diagnostics == ()
+        assert equations[0].to_mathml().equations[0].diagnostics == ()
+    reopened.save(path)
+    assert [row["semantics"] for row in oracle.verify_fx247_package(path)["rows"]] == [row["semantics"] for row in first["rows"]]
+
+
+@pytest.mark.parametrize("mutation,row", [
+    ("swap-fraction", 58), ("binomial-bar", 54), ("phi-variant", 9),
+    ("detach-script", 72), ("italic-function", 47), ("strip-text-space", 53),
+    ("collapse-quad", 57), ("collapse-semicolon", 71),
+])
+def test_fx247_saved_semantic_observer_rejects_real_mutations(tmp_path, mutation, row):
+    from xml.etree import ElementTree as ET
+
+    oracle, _, document = _fx247_document()
+    original = io.BytesIO(document.to_bytes())
+    result = tmp_path / (mutation + ".docx")
+    ns = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+    with zipfile.ZipFile(original) as source, zipfile.ZipFile(result, "w") as output:
+        for info in source.infolist():
+            raw = source.read(info.filename)
+            if info.filename == "word/document.xml":
+                root = ET.fromstring(raw)
+                equation = root.findall(".//" + ns + "oMath")[row - 1]
+                if mutation == "swap-fraction":
+                    fraction = equation.find(ns + "f")
+                    numerator = fraction.find(ns + "num")
+                    denominator = fraction.find(ns + "den")
+                    numerator.tag, denominator.tag = denominator.tag, numerator.tag
+                elif mutation == "binomial-bar":
+                    equation.find(".//" + ns + "type").set(ns + "val", "bar")
+                elif mutation == "phi-variant":
+                    equation.find(".//" + ns + "t").text = "φ"
+                elif mutation == "detach-script":
+                    equation.find(".//" + ns + "sSup/" + ns + "e/" + ns + "r/" + ns + "t").text = "4π"
+                elif mutation == "italic-function":
+                    equation.find(".//" + ns + "nor").set(ns + "val", "0")
+                elif mutation == "strip-text-space":
+                    equation.find(".//" + ns + "t").text = "if"
+                else:
+                    text = equation.find(".//" + ns + "t")
+                    text.text = text.text.replace("\u2001", "\u2009").replace("\u2004", "\u2009")
+                raw = ET.tostring(root, encoding="utf-8")
+            output.writestr(info, raw)
+    with pytest.raises(ValueError, match=f"row{row} saved semantics differ"):
+        oracle.verify_fx247_package(result)
+
+
+def test_fx247_literal_caps_refuse_atomically_and_opaque_source_survives(tmp_path):
+    import rdocx
+
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("before")
+    before = document.to_bytes()
+    for source in [r"\text{bad{nested}}", r"\text{bad\unknown}", r"\text{" + "x" * 100_001 + "}"]:
+        with pytest.raises(rdocx.RdocxError):
+            paragraph.add_equation(source, format="latex")
+        assert document.to_bytes() == before
+    opaque = '<x:opaque xmlns:x="urn:fx247" data="untouched">  kept </x:opaque>'
+    body = '<w:p><w:r><w:t>before</w:t></w:r>' + opaque + '</w:p>'
+    document = _replace_document_body(document, body)
+    document.paragraphs[0].add_equation(r"\text{if }x+\binom{n}{k}", format="latex")
+    document = rdocx.Document.from_bytes(document.to_bytes())
+    with zipfile.ZipFile(io.BytesIO(document.to_bytes())) as archive:
+        assert opaque.encode() in archive.read("word/document.xml")
+
+
+
+def test_fx247_synthesized_mathml_text_space_cap_is_atomic(tmp_path):
+    import rdocx
+
+    document = rdocx.Document()
+    paragraph = document.add_paragraph("kept")
+    before = document.to_bytes()
+    namespace = "http://www.w3.org/1998/Math/MathML"
+    for prefix, suffix in [("", '<mspace width="0.333em"/>'), ('<mspace width="0.333em"/>', "")]:
+        source = f'<math xmlns="{namespace}">{prefix}<mtext>{"x" * 524_288}</mtext>{suffix}</math>'
+        with pytest.raises(rdocx.RdocxError):
+            paragraph.add_equation(source, format="mathml")
+        assert document.to_bytes() == before
+    source = f'<math xmlns="{namespace}"><mtext>{"x" * 524_287}</mtext><mspace width="0.333em"/></math>'
+    assert paragraph.add_equation(source, format="mathml").diagnostics == ()
+    path = tmp_path / "at-limit.docx"
+    document.save(path)
+    with zipfile.ZipFile(path) as archive:
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(archive.read("word/document.xml"))
+        texts = root.findall(".//{http://schemas.openxmlformats.org/officeDocument/2006/math}t")
+        assert sum(len(t.text or "") for t in texts) == 524_288
+        assert texts[-1].text.endswith(" ")
+
+
+def _fx241_legacy_text(name="legacy", text="old", maximum=40):
+    return (f'<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="{name}"/>'
+            f'<w:enabled/><w:calcOnExit w:val="0"/><w:textInput><w:default w:val="{text}"/>'
+            f'<w:maxLength w:val="{maximum}"/></w:textInput></w:ffData></w:fldChar></w:r>'
+            '<w:r><w:instrText> FORMTEXT </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+            f'<w:r><w:t>{text}</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>')
+
+
+def _fx241_control(tag, properties, text="old", alias=None):
+    alias_xml = f'<w:alias w:val="{alias}"/>' if alias else ''
+    return (f'<w:sdt><w:sdtPr><w:tag w:val="{tag}"/>{alias_xml}{properties}</w:sdtPr>'
+            f'<w:sdtContent><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:sdtContent></w:sdt>')
+
+
+def _fx241_five_kind_document():
+    import rdocx
+    body = _fx241_control("plain", "<w:text/>", alias="Plain alias")
+    body += _fx241_control("check", '<w14:checkbox xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w14:checked w14:val="0"/><w14:checkedState w14:val="2612" w14:font="MS Gothic"/><w14:uncheckedState w14:val="2610" w14:font="MS Gothic"/></w14:checkbox>', "☐")
+    body += _fx241_control("choice", '<w:dropDownList w:lastValue="one"><w:listItem w:displayText="One" w:value="one"/><w:listItem w:displayText="Two" w:value="two"/></w:dropDownList>', "one")
+    body += _fx241_control("date", '<w:date w:fullDate="2026-09-15T00:00:00Z"><w:dateFormat w:val="yyyy-MM-dd"/></w:date>', "2026-09-15")
+    return _replace_document_body(rdocx.Document(), body + _fx241_legacy_text() + '<w:sectPr/>')
+
+
+def test_fx241_python_fill_all_five_reported_form_kinds():
+    import rdocx
+    document = _fx241_five_kind_document()
+    frozen = document.content_controls()
+    old_legacy = document.legacy_form_fields()[0]
+    assert document.bind_content_controls({"plain": "Ada", "check": "true", "choice": "two", "date": "2026-10-16"}) == 4
+    result = document.set_legacy_form_field_value("legacy", "filled")
+    assert isinstance(result, rdocx.LegacyFormField)
+    assert result.value == "filled" and old_legacy.value == "old"
+    assert result.type == "text" and result.ordinal == 0
+    assert result.source_part == "/word/document.xml" and result.choices == ()
+    assert result.enabled and not result.calculate_on_exit
+    assert frozen[0].text == "old"
+    with pytest.raises(AttributeError):
+        result.value = "mutate"
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    controls = {item.tag: item for item in reopened.content_controls()}
+    assert [controls[key].text for key in ("plain", "choice", "date")] == ["Ada", "two", "2026-10-16"]
+    assert reopened.legacy_form_fields()[0].value == "filled"
+    _fx241_assert_five_kind_source(reopened.to_bytes())
+
+
+def _fx241_assert_five_kind_source(raw):
+    import xml.etree.ElementTree as ET
+    with zipfile.ZipFile(io.BytesIO(raw)) as package:
+        root = ET.fromstring(package.read('word/document.xml'))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main", "w14": "http://schemas.microsoft.com/office/word/2010/wordml"}
+    w = '{'+ns['w']+'}'
+    assert root.find('.//w14:checked', ns).get('{'+ns['w14']+'}val') == '1'
+    check = next(c for c in root.iter(w+'sdt') if c.find('w:sdtPr/w:tag', ns).get(w+'val') == 'check')
+    assert '☒' in ''.join(check.itertext())
+    fonts = check.find('.//w:rFonts', ns)
+    assert fonts.get(w+'ascii') == fonts.get(w+'hAnsi') == 'MS Gothic'
+    assert root.find('.//w:date', ns).get(w+'fullDate') == '2026-09-15T00:00:00Z'
+    assert root.find('.//w:dateFormat', ns).get(w+'val') == 'yyyy-MM-dd'
+    assert root.find('.//w:dropDownList', ns).get(w+'lastValue') == 'one'
+    assert [x.get(w+'value') for x in root.findall('.//w:dropDownList/w:listItem', ns)] == ['one', 'two']
+    legacy = root.find('.//w:ffData/w:textInput/w:default', ns)
+    assert legacy.get(w+'val') == 'filled'
+    field_paragraph = next(p for p in root.iter(w+'p') if p.find('.//w:ffData', ns) is not None)
+    assert ''.join(x.text or '' for x in field_paragraph.iter(w+'t')) == 'filled'
+
+
+def _fx241_legacy_typed(name, kind):
+    properties, instruction, cached = {
+        "checkbox": ('<w:checkBox><w:sizeAuto/><w:default w:val="0"/><w:checked w:val="0"/></w:checkBox>', "FORMCHECKBOX", "☐"),
+        "dropdown": ('<w:ddList><w:result w:val="0"/><w:listEntry w:val="one"/><w:listEntry w:val="two"/></w:ddList>', "FORMDROPDOWN", "one"),
+    }[kind]
+    return (f'<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="{name}"/>{properties}</w:ffData></w:fldChar></w:r>'
+            f'<w:r><w:instrText> {instruction} </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+            f'<w:r><w:t>{cached}</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>')
+
+
+def test_fx241_legacy_snapshots_typed_values_choices_and_qualified_unnamed():
+    import rdocx
+    import xml.etree.ElementTree as ET
+    body = _fx241_legacy_text() + _fx241_legacy_typed("flag", "checkbox") + _fx241_legacy_typed("pick", "dropdown")
+    body += _fx241_legacy_text().replace('<w:name w:val="legacy"/>', '')
+    document = _replace_document_body(rdocx.Document(), body + '<w:sectPr/>')
+    snapshots = document.legacy_form_fields()
+    assert isinstance(snapshots, tuple)
+    assert [x.type for x in snapshots] == ["text", "checkbox", "dropdown", "text"]
+    assert [type(x.value) for x in snapshots] == [str, bool, int, str]
+    assert snapshots[2].choices == ("one", "two") and snapshots[3].name is None
+    assert document.set_legacy_form_field_value("flag", True).value is True
+    assert document.set_legacy_form_field_value("pick", 1).value == 1
+    unnamed = document.set_legacy_form_field_value(None, "unnamed", source_part=snapshots[3].source_part, ordinal=3)
+    assert unnamed.name is None and unnamed.value == "unnamed"
+    assert snapshots[1].value is False and snapshots[2].value == 0
+    with pytest.raises(TypeError):
+        rdocx.LegacyFormField()
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert [x.value for x in reopened.legacy_form_fields()] == ["old", True, 1, "unnamed"]
+    w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    root = ET.fromstring(_document_xml(reopened))
+    assert root.find('.//'+w+'checkBox/'+w+'checked').get(w+'val') == '1'
+    assert root.find('.//'+w+'ddList/'+w+'result').get(w+'val') == '1'
+    assert 'two' in [x.text for x in root.iter(w+'t')]
+
+
+@pytest.mark.parametrize("name,value,kwargs", [
+    ("missing", "x", {}), (None, "x", {}), ("legacy", "x", {"source_part": "/word/document.xml"}),
+    ("legacy", "x", {"ordinal": 0}), ("legacy", "x", {"source_part": "/word/header9.xml", "ordinal": 0}),
+    ("stale", "x", {"source_part": "/word/document.xml", "ordinal": 0}),
+    ("legacy", "x", {"source_part": "/word/document.xml", "ordinal": True}),
+    ("legacy", "x", {"source_part": "/word/document.xml", "ordinal": -1}),
+    ("legacy", 1, {}), ("legacy", True, {}), ("legacy", "longer-than-four", {}),
+    ("flag", 1, {}), ("flag", "true", {}), ("pick", True, {}), ("pick", -1, {}), ("pick", 2, {}), ("pick", "one", {}),
+])
+def test_fx241_legacy_identity_and_value_refusals_are_atomic(name, value, kwargs):
+    import rdocx
+    document = _replace_document_body(rdocx.Document(), _fx241_legacy_text(maximum=4) + _fx241_legacy_typed("flag", "checkbox") + _fx241_legacy_typed("pick", "dropdown") + '<w:p><w:r><w:t>held</w:t></w:r></w:p><w:sectPr/>')
+    paragraph, section = document.paragraphs[-1], document.section(0)
+    story = next(x for x in document.stories if x.kind == "body")
+    before = document.to_bytes()
+    with pytest.raises((ValueError, TypeError, OverflowError, rdocx.RdocxError)):
+        document.set_legacy_form_field_value(name, value, **kwargs)
+    assert document.to_bytes() == before
+    assert paragraph.text == "held" and section.xml and story.kind == "body"
+    assert document.set_legacy_form_field_value("legacy", "safe").value == "safe"
+    assert paragraph.text == "held"
+
+
+def test_fx241_duplicate_names_refuse_but_current_qualified_identity_selects():
+    import rdocx
+    document = _replace_document_body(rdocx.Document(), _fx241_legacy_text() + _fx241_legacy_text() + '<w:sectPr/>')
+    before = document.to_bytes()
+    with pytest.raises(ValueError, match="ambiguous"):
+        document.set_legacy_form_field_value("legacy", "bad")
+    assert document.to_bytes() == before
+    selected = document.set_legacy_form_field_value("legacy", "second", source_part="/word/document.xml", ordinal=1)
+    assert selected.ordinal == 1
+    assert [x.value for x in document.legacy_form_fields()] == ["old", "second"]
+
+
+def test_fx241_bind_contract_priority_nested_noop_owners_and_late_failure():
+    import rdocx
+    first = _fx241_control("tag", '<w:text/>', alias="alias")
+    document = _replace_document_body(rdocx.Document(), first + '<w:p><w:r><w:t>held</w:t></w:r></w:p><w:sectPr/>')
+    paragraph, section = document.paragraphs[-1], document.section(0)
+    table = document.add_table(1, 1)
+    cell = table.cell(0, 0)
+    cell.text = "cell"
+    before = document.to_bytes()
+    for values in ({}, {"missing": "ignored"}, {"tag": "old"}):
+        count = document.bind_content_controls(values)
+        assert count == (1 if values.get("tag") else 0)
+        assert document.to_bytes() == before
+    for invalid in ({"tag": 12}, {"tag": True}, {1: "text"}, {"tag": "valid", "alias": None}):
+        with pytest.raises(TypeError):
+            document.bind_content_controls(invalid)
+        assert document.to_bytes() == before
+    assert document.bind_content_controls({"tag": "wins", "alias": "loses", "missing": "ignored"}) == 1
+    assert document.content_controls()[0].text == "wins"
+    assert paragraph.text == "held" and cell.text == "cell" and table.rows[0].cells[0].text == "cell" and section.xml
+    nested = '<w:sdt><w:sdtPr><w:tag w:val="outer"/><w:group/></w:sdtPr><w:sdtContent>' + _fx241_control("inner", '<w:text/>') + '</w:sdtContent></w:sdt>'
+    document = _replace_document_body(rdocx.Document(), first + nested + '<w:sectPr/>')
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        document.bind_content_controls({"tag": "early", "outer": "unsupported"})
+    assert document.to_bytes() == before
+    assert document.bind_content_controls({"inner": "nested"}) == 1
+    assert any(x.tag == "inner" and x.text == "nested" for x in document.content_controls())
+
+
+def _fx241_bound_document(missing=False):
+    import rdocx
+    binding = '<w:dataBinding w:storeItemID="{11111111-1111-1111-1111-111111111111}" w:xpath="/c:root/c:name" w:prefixMappings="xmlns:c=\'urn:customer\'"/>'
+    document = _replace_document_body(rdocx.Document(), _fx241_control("bound", binding+'<w:text/>') + _fx241_legacy_text() + '<w:p><w:r><w:t>held</w:t></w:r></w:p><w:sectPr/>')
+    source, result = io.BytesIO(document.to_bytes()), io.BytesIO()
+    with zipfile.ZipFile(source) as zin, zipfile.ZipFile(result, 'w') as zout:
+        for entry in zin.infolist():
+            raw = zin.read(entry.filename)
+            if entry.filename == 'word/_rels/document.xml.rels' and not missing:
+                raw = raw.replace(b'</Relationships>', b'<Relationship Id="rIdBound241" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item1.xml"/></Relationships>')
+            if entry.filename == '[Content_Types].xml' and not missing:
+                raw = raw.replace(b'</Types>', b'<Override PartName="/customXml/itemProps1.xml" ContentType="application/vnd.openxmlformats-officedocument.customXmlProperties+xml"/></Types>')
+            zout.writestr(entry, raw)
+        if not missing:
+            zout.writestr('customXml/item1.xml', '<c:root xmlns:c="urn:customer" opaque="keep"><c:name>old</c:name><c:other>untouched</c:other></c:root>')
+            zout.writestr('customXml/itemProps1.xml', '<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{11111111-1111-1111-1111-111111111111}"><ds:schemaRefs/></ds:datastoreItem>')
+            zout.writestr('customXml/_rels/item1.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="props" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps" Target="itemProps1.xml"/></Relationships>')
+    return rdocx.Document.from_bytes(result.getvalue())
+
+
+def test_fx241_bound_xml_values_source_preservation_and_late_refusal():
+    import rdocx
+    import xml.etree.ElementTree as ET
+    document = _fx241_bound_document()
+    before = document.to_bytes()
+    assert document.bind_content_controls({'bound': 'Ada & Co'}) == 1
+    after = document.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(before)) as old, zipfile.ZipFile(io.BytesIO(after)) as new:
+        assert set(old.namelist()) == set(new.namelist())
+        for name in old.namelist():
+            if name not in ('word/document.xml', 'customXml/item1.xml'):
+                assert old.read(name) == new.read(name), name
+        root = ET.fromstring(new.read('customXml/item1.xml'))
+        assert root.find('{urn:customer}name').text == 'Ada & Co'
+        assert root.find('{urn:customer}other').text == 'untouched' and root.get('opaque') == 'keep'
+    assert rdocx.Document.from_bytes(after).content_controls()[0].text == 'Ada & Co'
+    document = _fx241_bound_document(missing=True)
+    paragraph = document.paragraphs[-1]
+    before = document.to_bytes()
+    with pytest.raises(rdocx.RdocxError):
+        document.bind_content_controls({'bound': 'cannot resolve'})
+    assert document.to_bytes() == before and paragraph.text == 'held'
+
+
+def test_fx241_related_legacy_physical_part_and_noop_preserve_held_owners():
+    import rdocx
+    seed = rdocx.Document()
+    seed.add_paragraph('body held')
+    seed.section(0).header.add_paragraph('header held')
+    source, result = io.BytesIO(seed.to_bytes()), io.BytesIO()
+    with zipfile.ZipFile(source) as zin, zipfile.ZipFile(result, 'w') as zout:
+        header = next(name for name in zin.namelist() if re.fullmatch(r'word/header\d+\.xml', name))
+        for entry in zin.infolist():
+            raw = zin.read(entry.filename)
+            if entry.filename == header:
+                raw = raw.replace(b'</w:hdr>', (_fx241_legacy_text('headerField')+'</w:hdr>').encode())
+            zout.writestr(entry, raw)
+    document = rdocx.Document.from_bytes(result.getvalue())
+    paragraph, section = document.paragraphs[0], document.section(0)
+    header_paragraph = next(p for p in section.header.paragraphs if p.text == 'header held')
+    selected_story = next(x for x in document.stories if x.kind == 'header')
+    # Flush a prior live related-story edit through the existing provider first.
+    header_paragraph.text = 'header held edited'
+    assert header_paragraph.text == 'header held edited'
+    field = document.legacy_form_fields()[0]
+    assert field.source_part == '/'+header and field.ordinal == 0
+    with pytest.raises(rdocx.RdocxError):
+        document.replace_image_for_story(selected_story, 'missing', b'')
+    updated = document.set_legacy_form_field_value('headerField', 'changed', source_part=field.source_part, ordinal=0)
+    assert updated.value == 'changed' and field.value == 'old'
+    # Frozen Story metadata remains readable, but its old mutation epoch retires.
+    with pytest.raises(rdocx.StaleElementError):
+        document.replace_image_for_story(selected_story, 'missing', b'')
+    assert paragraph.text == 'body held' and header_paragraph.text == 'header held edited' and selected_story.kind == 'header' and section.xml
+    before = document.to_bytes()
+    assert document.set_legacy_form_field_value('headerField', 'changed').value == 'changed'
+    assert document.to_bytes() == before and header_paragraph.text == 'header held edited'
+    reopened = rdocx.Document.from_bytes(before)
+    assert reopened.legacy_form_fields()[0].source_part == field.source_part
+    assert reopened.legacy_form_fields()[0].value == 'changed'
+
+
+@pytest.mark.parametrize('broken', ['checkbox-state', 'legacy-default', 'legacy-cache'])
+def test_fx241_source_observer_rejects_semantic_state_disagreement(broken):
+    import xml.etree.ElementTree as ET
+    document = _fx241_five_kind_document()
+    document.bind_content_controls({'plain': 'Ada', 'check': 'true', 'choice': 'two', 'date': '2026-10-16'})
+    document.set_legacy_form_field_value('legacy', 'filled')
+    raw = document.to_bytes()
+    _fx241_assert_five_kind_source(raw)
+    w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    w14 = '{http://schemas.microsoft.com/office/word/2010/wordml}'
+    mutated = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as zin, zipfile.ZipFile(mutated, 'w') as zout:
+        for entry in zin.infolist():
+            data = zin.read(entry.filename)
+            if entry.filename == 'word/document.xml':
+                root = ET.fromstring(data)
+                if broken == 'checkbox-state':
+                    root.find('.//'+w14+'checked').set(w14+'val', '0')
+                elif broken == 'legacy-default':
+                    root.find('.//'+w+'ffData/'+w+'textInput/'+w+'default').set(w+'val', 'wrong')
+                else:
+                    field = next(p for p in root.iter(w+'p') if p.find('.//'+w+'ffData') is not None)
+                    next(field.iter(w+'t')).text = 'wrong'
+                data = ET.tostring(root)
+            zout.writestr(entry, data)
+    with pytest.raises(AssertionError):
+        _fx241_assert_five_kind_source(mutated.getvalue())
+
+
+def test_fx241_form_publication_retires_changed_owners_not_equal_text_routes():
+    import rdocx
+    document = _replace_document_body(rdocx.Document(), _fx241_legacy_text() + _fx241_legacy_text() + '<w:sectPr/>')
+    unchanged, changed = document.paragraphs[0], document.paragraphs[1]
+    old_run = unchanged.runs[0]
+    section = document.section(0)
+    section_xml = section.xml
+    document.set_legacy_form_field_value('legacy', 'second', source_part='/word/document.xml', ordinal=1)
+    assert unchanged.text == 'old' and section.xml == section_xml
+    with pytest.raises(rdocx.StaleElementError):
+        _ = changed.text
+    with pytest.raises(rdocx.StaleElementError):
+        _ = old_run.text
+    assert [x.value for x in document.legacy_form_fields()] == ['old', 'second']
+
+
+def test_fx241_changed_table_retires_cell_and_paragraph_descendants():
+    import rdocx
+    table_xml = '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:tcPr/>' + _fx241_legacy_text() + '</w:tc></w:tr></w:tbl>'
+    document = _replace_document_body(rdocx.Document(), table_xml + '<w:p><w:r><w:t>untouched</w:t></w:r></w:p><w:sectPr/>')
+    table = document.tables[0]
+    cell = table.cell(0, 0)
+    paragraph = cell.paragraphs[0]
+    outside = document.paragraphs[-1]
+    document.set_legacy_form_field_value('legacy', 'changed')
+    for access in (lambda: table.rows, lambda: cell.text, lambda: paragraph.text):
+        with pytest.raises(rdocx.StaleElementError):
+            access()
+    assert outside.text == 'untouched'
+    assert document.tables[0].cell(0, 0).text == 'changed'
+
+
+def test_fx241_retired_recreated_owner_is_never_revived_by_equal_source():
+    import rdocx
+    document = _replace_document_body(rdocx.Document(), '<w:p><w:r><w:t>equal</w:t></w:r></w:p>' + _fx241_control('plain', '<w:text/>') + '<w:sectPr/>')
+    retired = document.paragraphs[0]
+    assert document.remove_content(0)
+    current = document.add_paragraph('equal')
+    document.bind_content_controls({'plain': 'changed'})
+    with pytest.raises(rdocx.StaleElementError):
+        _ = retired.text
+    assert current.text == 'equal'
+
+
+def _fx240_material():
+    # Authentic existing native test identity, not a production or trusted key.
+    import base64
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[2] / "oxml-opc" / "src" / "signature.rs").read_text(encoding="utf-8")
+    def constant(name):
+        return base64.b64decode(re.search(r'const ' + name + r': &str = "([^"]+)";', source)[1], validate=True)
+    return constant("TEST_PRIVATE_KEY_PKCS8_BASE64"), constant("TEST_CERTIFICATE_DER_BASE64")
+
+
+def _fx240_zip_edit(source, part=None, old=None, new=None, extra=None):
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source)) as archive, zipfile.ZipFile(output, "w") as result:
+        for info in archive.infolist():
+            data = archive.read(info.filename)
+            if info.filename == part:
+                assert old in data
+                data = data.replace(old, new, 1)
+            result.writestr(info, data)
+        if extra:
+            result.writestr("word/uncovered.xml" if "rdocx" == "rdocx" else "ppt/uncovered.xml", b"<uncovered/>")
+    return output.getvalue()
+
+
+def test_fx240_sign_verify_owned_reports_pem_and_multisignatures():
+    import base64
+    import rdocx as product
+    owner = product.Document()
+    assert owner.verify_signatures() == ()
+    opaque = b'<unmodelled xmlns="urn:caller-owned"><payload a="keep">opaque</payload></unmodelled>'
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(owner.to_bytes())) as source, zipfile.ZipFile(output, "w") as result:
+        entries = [(item.filename, source.read(item.filename)) for item in source.infolist()]
+        for name, data in entries:
+            result.writestr(name, data)
+        result.writestr("custom/opaque.xml", opaque)
+    owner = product.Document.from_bytes(output.getvalue())
+    key, cert = _fx240_material()
+    def pem(label, value):
+        encoded = base64.b64encode(value)
+        return b" \r\n-----BEGIN " + label + b"-----\r\n" + b"\r\n".join(encoded[i:i+64] for i in range(0, len(encoded), 64)) + b"\r\n-----END " + label + b"-----\t\r\n"
+    report = owner.sign(pem(b"PRIVATE KEY", key), pem(b"CERTIFICATE", cert))
+    assert type(report) is dict and report["cryptographically_valid"] and report["coverage_complete"]
+    assert set(report) == {"signature_part", "signer", "cryptographically_valid", "coverage_complete", "covered_parts", "covered_relationships", "issues"}
+    assert set(report["signer"]) == {"subject", "issuer", "serial_number"}
+    assert "F-172 Test Signer" in report["signer"]["subject"]
+    assert report["issues"] == [] and report["covered_parts"] and report["covered_relationships"]
+    assert set(report["covered_relationships"][0]) == {"source_part", "relationship_id"}
+    report["covered_parts"].clear()
+    report["signer"]["subject"] = "mutated"
+    assert owner.verify_signatures()[0]["covered_parts"]
+    assert owner.verify_signatures()[0]["signer"]["subject"] != "mutated"
+    before = owner.to_bytes()
+    with zipfile.ZipFile(io.BytesIO(before)) as preserved:
+        assert preserved.read("custom/opaque.xml") == opaque
+    with pytest.raises(product.PackageError):
+        owner.sign(key, cert)  # The native provider refuses re-signing a signed graph.
+    assert owner.to_bytes() == before
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(before)) as archive, zipfile.ZipFile(output, "w") as result:
+        signature_bytes = archive.read("_xmlsignatures/sig1.xml")
+        for info in archive.infolist():
+            result.writestr(info, archive.read(info.filename))
+        result.writestr("_xmlsignatures/sig2.xml", signature_bytes)
+    reports = product.Document.from_bytes(output.getvalue()).verify_signatures()
+    assert type(reports) is tuple and len(reports) == 2
+    assert reports[1]["signer"] is None and not reports[1]["cryptographically_valid"]
+    assert reports[1]["issues"] == [{"kind": "orphan_signature_part", "details": {"part_name": "/_xmlsignatures/sig2.xml"}}]
+    assert not any(hasattr(product, name) for name in ("SignatureReport", "_SignatureReport", "_SignatureIssue"))
+
+
+def test_fx240_current_tamper_partial_unsigned_and_malformed():
+    import rdocx as product
+    owner = product.Document()
+    owner.add_paragraph("signed text")
+    key, cert = _fx240_material()
+    owner.sign(key, cert)
+    original = owner.to_bytes()
+    owner.paragraphs[0].text = "changed text"
+    reports = owner.verify_signatures()
+    assert len(reports) == 1 and not reports[0]["cryptographically_valid"]
+    issues = reports[0]["issues"]
+    changed = [issue for issue in issues if issue["kind"] == "changed_reference"]
+    assert any(issue["details"]["uri"].startswith("/word/document.xml?") for issue in changed)
+    assert all(set(issue["details"]) == {"uri", "expected_digest", "actual_digest"} for issue in changed)
+    partial = product.Document.from_bytes(_fx240_zip_edit(original, extra=True))
+    report = partial.verify_signatures()[0]
+    assert report["cryptographically_valid"] and not report["coverage_complete"]
+    assert {"kind": "uncovered_part", "details": {"part_name": "/word/uncovered.xml"}} in report["issues"]
+    malformed = _fx240_zip_edit(original, "_xmlsignatures/sig1.xml", b"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256", b"urn:unsupported-signature")
+    with pytest.raises(product.PackageError):
+        product.Document.from_bytes(malformed).verify_signatures()
+    assert product.Document().verify_signatures() == ()
+
+
+def test_fx240_refusal_preserves_current_bytes_and_held_authority():
+    import rdocx as product
+    owner = product.Document()
+    owner.add_paragraph("signed text")
+    paragraph = owner.paragraphs[0]; run = paragraph.runs[0]
+    before = owner.to_bytes()
+    key, cert = _fx240_material()
+    for bad in (b"", b"x" * (1024 * 1024 + 1), b"-----BEGIN RSA PRIVATE KEY-----Zg==-----END RSA PRIVATE KEY-----", key + b" "):
+        with pytest.raises(product.PackageError):
+            owner.sign(bad, cert)
+        assert owner.to_bytes() == before and owner.verify_signatures() == ()
+        assert paragraph.text == "signed text" and run.text == "signed text"
+    for value in ("not bytes", 123, None):
+        with pytest.raises(TypeError):
+            owner.sign(value, cert)
+    report = owner.sign(key, cert)
+    assert report["cryptographically_valid"]
+    assert paragraph.text == "signed text" and run.text == "signed text"
+    saved = owner.to_bytes()
+    assert owner.verify_signatures()[0]["cryptographically_valid"]
+    assert owner.to_bytes() == saved
+    assert paragraph.text == "signed text" and run.text == "signed text"
+
+
+def test_fx240_fill_then_sign_sign_then_fill_and_unchanged_story_owners():
+    import rdocx
+    key, cert = _fx240_material()
+    document = _fx241_five_kind_document()
+    document.bind_content_controls({"plain": "Ada", "check": "true", "choice": "two", "date": "2026-10-16"})
+    document.set_legacy_form_field_value("legacy", "filled")
+    assert document.sign(key, cert)["coverage_complete"]
+    reopened = rdocx.Document.from_bytes(document.to_bytes())
+    assert reopened.verify_signatures()[0]["cryptographically_valid"]
+    assert reopened.legacy_form_fields()[0].value == "filled"
+    reopened.bind_content_controls({"plain": "after signing"})
+    report = reopened.verify_signatures()[0]
+    assert not report["cryptographically_valid"]
+    assert any(issue["kind"] == "changed_reference" and issue["details"]["uri"].startswith("/word/document.xml?") for issue in report["issues"])
+
+    unchanged = _replace_document_body(rdocx.Document(), '<w:p><w:bookmarkStart w:id="0" w:name="anchor"/><w:r><w:t>held</w:t></w:r><w:bookmarkEnd w:id="0"/><w:hyperlink w:anchor="anchor"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p><w:sectPr/>')
+    paragraph = unchanged.paragraphs[0]
+    run = paragraph.runs[0]
+    link = unchanged.hyperlinks[0]
+    story = next(item for item in unchanged.stories if item.kind == "body")
+    snapshot = unchanged.story_items[0]
+    unchanged.sign(key, cert)
+    assert paragraph.text == "heldlink" and run.text == "held" and link.anchor == "anchor"
+    assert unchanged.verify_signatures()[0]["cryptographically_valid"]
+    assert snapshot.xml
+    unchanged.add_hyperlink_to_story(story, "still current", "https://example.com/after")
+    assert any(item.text == "still current" for item in unchanged.hyperlinks)
+    assert not unchanged.verify_signatures()[0]["cryptographically_valid"]
+
+
+def test_fx240_late_graph_refusal_preserves_link_run_story_and_raw_parts():
+    import rdocx
+    owner = rdocx.Document()
+    owner.add_paragraph("held").add_hyperlink("external", "https://example.com/")
+    paragraph = owner.paragraphs[0]
+    run = paragraph.runs[0]
+    link = owner.hyperlinks[0]
+    story = next(item for item in owner.stories if item.kind == "body")
+    before = owner.to_bytes()
+    key, cert = _fx240_material()
+    with pytest.raises(rdocx.PackageError, match="relationship"):
+        owner.sign(key, cert)
+    assert owner.to_bytes() == before and owner.verify_signatures() == ()
+    assert paragraph.text == "heldexternal" and run.text == "held" and link.url == "https://example.com/"
+    owner.add_hyperlink_to_story(story, "current", "https://example.com/after")
+    assert any(item.text == "current" for item in owner.hyperlinks)
+    changed = rdocx.Document()
+    changed.add_paragraph("same")
+    old_run = changed.paragraphs[0].runs[0]
+    paragraph = changed.paragraphs[0]
+    paragraph.replace_xml(paragraph.xml.replace("<w:r>", "<w:r><w:rPr><w:b/></w:rPr>", 1))
+    with pytest.raises(rdocx.StaleElementError):
+        _ = old_run.text
+    changed.sign(key, cert)
+    with pytest.raises(rdocx.StaleElementError):
+        _ = old_run.text

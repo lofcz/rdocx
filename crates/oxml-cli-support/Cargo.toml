@@ -2,7 +2,7 @@
 name = "oxml-cli-support"
 description = "Shared command-line helpers for OOXML tools"
 readme = "README.md"
-version = "0.12.1"
+version = "0.14.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,11 @@ publish = true
 shared-version = "incubating"
 tag-name = "rpptx-v{{version}}"
 
+[features]
+default = []
+digital-signatures = ["dep:oxml-opc", "oxml-opc/digital-signatures"]
+
 [dependencies]
+oxml-opc = { workspace = true, optional = true }
 serde_json.workspace = true
 thiserror.workspace = true

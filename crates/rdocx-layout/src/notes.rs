@@ -12,11 +12,15 @@
 
 use std::collections::HashMap;
 
+use rdocx_oxml::footnotes::NoteType;
 use rdocx_oxml::styles::CT_Styles;
 
 use crate::WordStory;
 use crate::block::ParagraphBlock;
-use crate::engine::{SourceRegistry, layout_paragraph_with_source_and_direction};
+use crate::engine::{
+    MainStoryLayoutItem, SourceRegistry, body_layout_items,
+    layout_paragraph_with_source_and_direction, sect_pr_to_geometry,
+};
 use crate::input::{LayoutInput, MediaRegistry};
 use crate::style_resolver::NumberingState;
 use oxml_layout::{
@@ -41,12 +45,15 @@ pub const SEPARATOR_WIDTH_FRACTION: f64 = 0.33;
 pub struct NoteLayout {
     /// The pre-shaped superscript number drawn at the start of the note.
     pub marker: TextSegment,
+    /// Special separator and notice stories supply all visible content themselves.
+    pub draw_marker: bool,
     /// How far above the baseline the marker sits.
     pub marker_rise: f64,
     /// The note's lines, flattened across its paragraphs.
     pub lines: Vec<LayoutLine>,
-    /// Line ranges belonging to paragraphs with a visible tracked revision.
-    pub revision_ranges: Vec<std::ops::Range<usize>>,
+    /// Line ranges belonging to paragraphs with a visible tracked revision,
+    /// with the colour of their change bar.
+    pub revision_ranges: Vec<(std::ops::Range<usize>, Color)>,
 }
 
 impl NoteLayout {
@@ -83,7 +90,8 @@ type NoteKey = (NoteRef, u64);
 #[derive(Debug, Clone, Default)]
 pub struct NoteRegistry {
     notes: HashMap<NoteKey, NoteEntry>,
-    continuation_separator: bool,
+    specials: HashMap<(NoteStream, NoteType, u64), NoteEntry>,
+    continuation_separator: [bool; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +102,7 @@ struct NoteEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NoteRenderParagraph {
+    pub border_gap_before: f64,
     pub block: ParagraphBlock,
     pub direction: TextDirection,
     pub lines: std::ops::Range<usize>,
@@ -119,7 +128,8 @@ impl NoteRegistry {
         sources: Option<&SourceRegistry>,
     ) -> Result<Self> {
         let mut notes = HashMap::new();
-        let mut continuation_separator = false;
+        let mut specials = HashMap::new();
+        let mut continuation_separator = [false; 2];
 
         // Each stream is keyed separately, so a document numbering a footnote
         // and an endnote alike keeps both.
@@ -130,14 +140,35 @@ impl NoteRegistry {
         .into_iter()
         .filter_map(|(kind, stream)| stream.map(|stream| (kind, stream)))
         {
-            if stream.has_continuation_separator() {
-                continuation_separator = true;
-            }
-
+            let family = usize::from(kind == NoteStream::Endnote);
+            let selected = input.note_defaults[family]
+                .as_ref()
+                .map(|properties| properties.special_references.as_slice())
+                .unwrap_or_default();
             for note in &stream.footnotes {
-                // `get_by_id` is the authority on what counts as a real note,
-                // so separators never reach the registry.
-                if stream.get_by_id(note.id).is_none() {
+                let special = (note.note_type != NoteType::Normal).then_some(note.note_type);
+                if let Some(record) = special {
+                    let conventional = match record {
+                        NoteType::Separator => -1,
+                        NoteType::ContinuationSeparator => 0,
+                        NoteType::ContinuationNotice => -2,
+                        NoteType::Normal => unreachable!(),
+                    };
+                    if !selected.contains(&note.id)
+                        && !(selected.is_empty() && note.id == conventional)
+                    {
+                        continue;
+                    }
+                    if record == NoteType::ContinuationSeparator {
+                        continuation_separator[family] = true;
+                    }
+                }
+                if special.is_some()
+                    && !note
+                        .paragraphs
+                        .iter()
+                        .any(|paragraph| !paragraph.text().trim().is_empty())
+                {
                     continue;
                 }
                 let note_ref = NoteRef {
@@ -155,7 +186,10 @@ impl NoteRegistry {
 
                 for &content_width in content_widths {
                     let key = (note_ref, content_width.to_bits());
-                    if notes.contains_key(&key) {
+                    if special.is_some_and(|record| {
+                        specials.contains_key(&(kind, record, content_width.to_bits()))
+                    }) || (special.is_none() && notes.contains_key(&key))
+                    {
                         continue;
                     }
                     if laid_out {
@@ -171,59 +205,154 @@ impl NoteRegistry {
                         NoteStream::Footnote => WordStory::Footnote { id: note.id },
                         NoteStream::Endnote => WordStory::Endnote { id: note.id },
                     };
-                    for (paragraph_index, paragraph) in note.paragraphs.iter().enumerate() {
-                        let source =
-                            sources.and_then(|sources| sources.id(&story, &[paragraph_index]));
-                        let (block, direction) = layout_paragraph_with_source_and_direction(
-                            paragraph,
-                            note_width,
-                            styles,
-                            input,
-                            media,
-                            fm,
-                            num_state,
-                            diagnostics,
-                            source,
-                            // Note text is page furniture at the bottom
-                            // margin, laid out against its own measure, so
-                            // the section grid does not reach it.
-                            None,
-                        )?;
-                        let first = lines.len();
-                        if block.has_visible_revision && !block.lines.is_empty() {
-                            revision_ranges.push(first..first + block.lines.len());
-                        }
-                        lines.extend(block.lines.iter().cloned());
-                        let last = lines.len();
-                        render_paragraphs.push(NoteRenderParagraph {
-                            block,
-                            direction,
-                            lines: first..last,
+                    let items = input
+                        .story_bodies
+                        .get(&story)
+                        .map(body_layout_items)
+                        .unwrap_or_else(|| {
+                            note.paragraphs
+                                .iter()
+                                .enumerate()
+                                .map(|(index, paragraph)| {
+                                    MainStoryLayoutItem::Paragraph(paragraph, vec![index])
+                                })
+                                .collect()
                         });
+                    for item in items {
+                        let laid_out_blocks = match item {
+                            MainStoryLayoutItem::Paragraph(paragraph, path) => {
+                                let source = sources.and_then(|sources| sources.id(&story, &path));
+                                let (mut block, direction) =
+                                    layout_paragraph_with_source_and_direction(
+                                        paragraph,
+                                        note_width,
+                                        styles,
+                                        input,
+                                        media,
+                                        fm,
+                                        num_state,
+                                        diagnostics,
+                                        source,
+                                        None,
+                                    )?;
+                                if let Some(registry) = sources {
+                                    registry.bind_text_boxes(&mut block, source)?;
+                                }
+                                vec![(block, direction)]
+                            }
+                            MainStoryLayoutItem::Table(table, path) => {
+                                let (table, semantics) =
+                                    crate::table::layout_table_with_provenance(
+                                        table,
+                                        note_width,
+                                        styles,
+                                        input,
+                                        media,
+                                        fm,
+                                        num_state,
+                                        diagnostics,
+                                        sources,
+                                        &story,
+                                        &path,
+                                        None,
+                                    )?;
+                                crate::paginator::story_table_rows(
+                                    &table,
+                                    &semantics,
+                                    &input
+                                        .document
+                                        .body
+                                        .sect_pr
+                                        .as_ref()
+                                        .map(sect_pr_to_geometry)
+                                        .unwrap_or_default(),
+                                    media.media(),
+                                )
+                                .into_iter()
+                                .map(|block| (block, TextDirection::Auto))
+                                .collect()
+                            }
+                        };
+                        for (block, direction) in laid_out_blocks {
+                            let first = lines.len();
+                            if let Some(color) = block.change_bar
+                                && !block.lines.is_empty()
+                            {
+                                revision_ranges.push((first..first + block.lines.len(), color));
+                            }
+                            lines.extend(block.lines.iter().cloned());
+                            let last = lines.len();
+                            render_paragraphs.push(NoteRenderParagraph {
+                                border_gap_before: 0.0,
+                                block,
+                                direction,
+                                lines: first..last,
+                            });
+                        }
                     }
 
-                    let Some(marker) = shape_marker(note.id, fm)? else {
+                    // Group normalization happens after the complete story is laid out,
+                    // leaving cached/source paragraphs and ordinary note paths intact.
+                    let groups = crate::block::paragraph_border_groups(
+                        &render_paragraphs
+                            .iter()
+                            .map(|paragraph| Some(&paragraph.block))
+                            .collect::<Vec<_>>(),
+                    );
+                    for index in 0..render_paragraphs.len() {
+                        let (top, bottom) = groups[index];
+                        let gap = if top {
+                            let previous = &render_paragraphs[index - 1].block;
+                            let current = &render_paragraphs[index].block;
+                            if input.do_not_use_html_paragraph_auto_spacing {
+                                previous.space_after + current.space_before
+                            } else {
+                                previous.space_after.max(current.space_before)
+                            }
+                        } else {
+                            0.0
+                        };
+                        let paragraph = &mut render_paragraphs[index];
+                        paragraph.block.remove_group_border_edges(top, bottom);
+                        paragraph.border_gap_before = gap;
+                        if let Some(first) = paragraph.block.lines.first_mut() {
+                            first.height += gap;
+                            first.ascent += gap;
+                        }
+                        lines[paragraph.lines.clone()].clone_from_slice(&paragraph.block.lines);
+                    }
+
+                    let marker_text = if special.is_some() {
+                        " ".to_owned()
+                    } else {
+                        num_state.note_label(note_ref)
+                    };
+                    let Some(marker) = shape_marker(&marker_text, fm)? else {
                         continue;
                     };
 
-                    notes.insert(
-                        key,
-                        NoteEntry {
-                            layout: NoteLayout {
-                                marker,
-                                marker_rise: NOTE_FONT_SIZE * 0.33,
-                                lines,
-                                revision_ranges,
-                            },
-                            paragraphs: render_paragraphs,
+                    let entry = NoteEntry {
+                        layout: NoteLayout {
+                            marker,
+                            draw_marker: special.is_none(),
+                            marker_rise: NOTE_FONT_SIZE * 0.33,
+                            lines,
+                            revision_ranges,
                         },
-                    );
+                        paragraphs: render_paragraphs,
+                    };
+                    if let Some(record) = special {
+                        specials.insert((kind, record, content_width.to_bits()), entry);
+                    } else {
+                        notes.insert(key, entry);
+                    }
                 }
             }
         }
 
         Ok(NoteRegistry {
             notes,
+            specials,
             continuation_separator,
         })
     }
@@ -245,15 +374,27 @@ impl NoteRegistry {
             .map(|entry| (&entry.layout, entry.paragraphs.as_slice()))
     }
 
-    /// Whether either stream defined the rule drawn above a carried note.
-    pub fn has_continuation_separator(&self) -> bool {
-        self.continuation_separator
+    /// A special record laid out at this section's width.
+    pub(crate) fn get_special(
+        &self,
+        stream: NoteStream,
+        record: NoteType,
+        content_width: f64,
+    ) -> Option<(&NoteLayout, &[NoteRenderParagraph])> {
+        self.specials
+            .get(&(stream, record, content_width.to_bits()))
+            .map(|entry| (&entry.layout, entry.paragraphs.as_slice()))
+    }
+
+    /// Whether the stream defines an authored continuation separator.
+    pub fn has_continuation_separator(&self, stream: NoteStream) -> bool {
+        self.continuation_separator[usize::from(stream == NoteStream::Endnote)]
     }
 }
 
 /// Shape a note's number as the superscript marker drawn beside it.
-fn shape_marker(id: i32, fm: &mut FontManager) -> Result<Option<TextSegment>> {
-    let text = id.to_string();
+fn shape_marker(text: &str, fm: &mut FontManager) -> Result<Option<TextSegment>> {
+    let text = text.to_owned();
     let size = NOTE_FONT_SIZE * 0.58;
 
     let Ok(font_id) = fm.resolve_font(Some("serif"), false, false) else {
@@ -288,6 +429,7 @@ fn shape_marker(id: i32, fm: &mut FontManager) -> Result<Option<TextSegment>> {
         field_kind: None,
         field_source: None,
         note: None,
+        note_reference_source: None,
     }))
 }
 
@@ -307,16 +449,25 @@ mod tests {
         );
 
         LayoutInput {
+            sequence_snapshot: None,
             revision_view: crate::input::RevisionView::Accepted,
+            revision_style: crate::input::RevisionStyle::Plain,
             automatic_hyphenation: false,
             mirror_margins: false,
             gutter_at_top: false,
             do_not_use_html_paragraph_auto_spacing: false,
             default_tab_stop: None,
+            clamp_tabs_past_margin: false,
+            legacy_table_positioning: false,
+            modern_footnote_layout: false,
+            footnote_layout_like_word8: false,
             math_properties: None,
+            note_defaults: [None, None],
             document: rdocx_oxml::document::CT_Document::new(),
             styles: CT_Styles::new_default(),
             numbering: None,
+            story_part_names: Default::default(),
+            story_bodies: Default::default(),
             headers: HashMap::new(),
             footers: HashMap::new(),
             images: HashMap::new(),
@@ -335,6 +486,7 @@ mod tests {
             endnotes: None,
             theme: None,
             fonts: Vec::new(),
+            embedded_fonts: Vec::new(),
         }
     }
 

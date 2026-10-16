@@ -176,6 +176,8 @@ pub struct TextSegment {
     pub field_source: Option<FieldSource>,
     /// If this segment is a note reference marker, which note it points at.
     pub note: Option<NoteRef>,
+    /// Structural source of a note reference, independent of generated glyph text.
+    pub note_reference_source: Option<SourceSpan>,
 }
 
 /// A single item positioned on a line.
@@ -189,6 +191,13 @@ pub enum LineItem {
         width: f64,
         /// Pre-shaped leader text to fill the tab gap (e.g., dots, hyphens).
         leader: Option<TextSegment>,
+        /// The stop's alignment. Text after a right, centre or decimal stop
+        /// is aligned on it up to the next tab or the end of the line.
+        align: TabAlign,
+        /// The width the tab would take if the text after it could start
+        /// before it. It is below `width` only when that text is too wide to
+        /// align on its stop.
+        gap: f64,
     },
     Image {
         width: f64,
@@ -239,6 +248,9 @@ pub enum ForcedBreakKind {
 pub struct LayoutLine {
     pub items: Vec<LineItem>,
     /// Total content width of the line.
+    ///
+    /// Spaces that end a line hang past its end, so they can take this past
+    /// `available_width`. See [`LayoutLine::hanging_space_counts`].
     pub width: f64,
     /// Maximum ascent on this line (above baseline).
     pub ascent: f64,
@@ -264,6 +276,58 @@ impl LayoutLine {
         let leading = self.height - self.ascent - self.descent;
         self.ascent + if leading >= 0.0 { leading / 2.0 } else { 0.0 }
     }
+
+    /// How many items at the visual start and at the visual end of the line
+    /// are spaces that end it logically.
+    ///
+    /// Those spaces hang past the line end, which is its visual right in
+    /// left-to-right text and its visual left in right-to-left text. Alignment
+    /// leaves them out of the width, and they may pass the available width.
+    ///
+    /// Plain text is never reordered, so its spaces hang at the visual end,
+    /// after an item that is not a space. Line breaking gives the spaces that
+    /// end a plain line an item of their own.
+    pub fn hanging_space_counts(&self) -> (usize, usize) {
+        let is_plain_space = |item: &LineItem| matches!(item, LineItem::Text(segment) if is_space_run(&segment.text));
+        let plain_end = self
+            .items
+            .iter()
+            .rev()
+            .take_while(|item| is_plain_space(item))
+            .count();
+        if plain_end > 0 && plain_end < self.items.len() {
+            return (0, plain_end);
+        }
+        let last_content = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                LineItem::MultilingualText(span) if !is_space_run(span.text()) => {
+                    Some(span.logical_index())
+                }
+                _ => None,
+            })
+            .max();
+        let hangs = |item: &LineItem| match (item, last_content) {
+            (LineItem::MultilingualText(span), Some(last)) => {
+                is_space_run(span.text()) && span.logical_index() > last
+            }
+            _ => false,
+        };
+        let start = self.items.iter().take_while(|item| hangs(item)).count();
+        let end = self.items[start..]
+            .iter()
+            .rev()
+            .take_while(|item| hangs(item))
+            .count();
+        (start, end)
+    }
+}
+
+/// Whether text is only U+0020 spaces, the one character UAX 14 classes SP,
+/// which is what hangs at a line end.
+fn is_space_run(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|character| character == ' ')
 }
 
 /// Parameters for line breaking.
@@ -300,6 +364,12 @@ pub struct LineBreakParams {
     /// Word calls this the default tab stop. `36.0`, half an inch, is the
     /// value used when a document says nothing.
     pub default_tab_interval_pt: f64,
+    /// Whether a tab stop past the right margin moves to the end of the line.
+    ///
+    /// Word 2013 and later do this, in a document whose `w:compatibilityMode`
+    /// is 15. Earlier versions keep such a stop, and the text after a stop at
+    /// or past the margin then runs on past it, which `false` gives.
+    pub clamp_tabs_past_margin: bool,
 }
 
 impl Default for LineBreakParams {
@@ -317,11 +387,17 @@ impl Default for LineBreakParams {
             jc: None,
             wrap: true,
             default_tab_interval_pt: 36.0,
+            clamp_tabs_past_margin: false,
         }
     }
 }
 
 /// Break inline items into lines using a greedy algorithm.
+///
+/// Tab stops are measured from the zero indent, the margin in Word, so a tab
+/// resolves against where its line starts rather than against the line's own
+/// origin. A right, centre or decimal tab takes its width from the text after
+/// it, up to the next tab or the end of the line.
 pub fn break_into_lines(
     items: &[InlineItem],
     params: &LineBreakParams,
@@ -344,20 +420,7 @@ pub fn break_into_lines(
     }
 
     let mut lines: Vec<LayoutLine> = Vec::new();
-    let mut current_items: Vec<LineItem> = Vec::new();
-    let mut current_width: f64 = 0.0;
-    let mut current_ascent: f64 = 0.0;
-    let mut current_descent: f64 = 0.0;
-    let mut current_natural_height: f64 = 0.0;
-    let mut current_font_size: f64 = 0.0;
-    // The line index drives the per-line reservations a floating drawing
-    // creates, so it is tracked rather than a plain first-or-not flag.
-    let mut line_index = 0usize;
-    let mut is_first_line = true;
-
-    let first_line_width = line_width_at(params, 0, true);
-
-    let mut line_avail = first_line_width;
+    let mut line = LineState::new(params, 0, true);
 
     // Track the most recent font context for shaping tab leaders
     let mut font_ctx: Option<(FontId, f64)> = None;
@@ -381,103 +444,35 @@ pub fn break_into_lines(
 
     while let Some(seg) = segments.pop_front() {
         match seg {
+            BreakableSegment::Items(seg_items) if matches!(seg_items[..], [InlineItem::Tab]) => {
+                line.settle_tab(fm);
+                let mut tab = line.next_tab(params);
+                if params.wrap && tab.wraps && !line.items.is_empty() {
+                    // A tab with no stop left on its line starts the next one.
+                    lines.push(line.break_line(params, fm, false, None));
+                    tab = line.next_tab(params);
+                }
+                line.push_tab(tab, fm, font_ctx);
+            }
             BreakableSegment::Items(seg_items) => {
-                let seg_width: f64 = seg_items.iter().map(inline_item_width).sum();
-
                 if params.wrap
-                    && !current_items.is_empty()
-                    && current_width + seg_width > line_avail + 0.01
+                    && !line.items.is_empty()
+                    && line.width_with(&seg_items, fm) > line.limit + 0.01
+                    && line.width_with(&seg_items, fm) - hanging_space_width(&seg_items, fm)?
+                        > line.limit + 0.01
                 {
-                    // Finish current line
-                    let indent = line_indent_at(params, line_index, is_first_line);
-                    let line_gap =
-                        effective_line_gap(current_ascent, current_descent, current_natural_height);
-                    lines.push(LayoutLine {
-                        items: std::mem::take(&mut current_items),
-                        width: current_width,
-                        ascent: current_ascent,
-                        descent: current_descent,
-                        line_gap,
-                        height: compute_line_height(
-                            current_ascent,
-                            current_descent,
-                            line_gap,
-                            current_font_size,
-                            params,
-                        ),
-                        indent_left: indent,
-                        available_width: line_avail,
-                        is_last: false,
-                        forced_break_after: None,
-                    });
-                    current_width = 0.0;
-                    current_ascent = 0.0;
-                    current_descent = 0.0;
-                    current_natural_height = 0.0;
-                    current_font_size = 0.0;
-                    is_first_line = false;
-                    line_index += 1;
-                    line_avail = line_width_at(params, line_index, false);
+                    lines.push(line.break_line(params, fm, false, None));
                 }
 
                 // Add segment items to current line
                 for item in &seg_items {
-                    if matches!(item, InlineItem::Tab) {
-                        // Tab stops are measured from the paragraph's left
-                        // margin, so resolve against the absolute x of the
-                        // caret (line indent + width so far), not the
-                        // placeholder width used for break decisions.
-                        let indent = line_indent_at(params, line_index, is_first_line);
-                        let (mut tab_width, leader_char) = resolve_tab_width(
-                            indent + current_width,
-                            &params.tab_stops,
-                            params.default_tab_interval_pt,
-                        );
-                        // Right / centre / decimal stops depend on the text
-                        // that follows the tab; start at zero width so that
-                        // text is not pushed onto the next line, and let
-                        // `align_trailing_tabs` widen the gap once the line
-                        // is complete.
-                        if matches!(
-                            next_tab_stop(indent + current_width, &params.tab_stops)
-                                .map(|stop| stop.align),
-                            Some(TabAlign::Right | TabAlign::Center | TabAlign::Decimal)
-                        ) {
-                            tab_width = 0.0;
-                        }
-                        let leader =
-                            leader_char.and_then(|ch| shape_leader(fm, font_ctx, ch, tab_width));
-                        current_width += tab_width;
-                        current_items.push(LineItem::Tab {
-                            width: tab_width,
-                            leader,
-                        });
-                        continue;
-                    }
-                    let (w, a, d, natural_height, font_size) = item_metrics(item);
-                    current_width += w;
-                    if a > current_ascent {
-                        current_ascent = a;
-                    }
-                    if d > current_descent {
-                        current_descent = d;
-                    }
-                    current_natural_height = current_natural_height.max(natural_height);
-                    current_font_size = current_font_size.max(font_size);
                     // Update font context from text segments
                     if let InlineItem::Text(seg) | InlineItem::Marker(seg) = item {
                         font_ctx = Some((seg.font_id, seg.font_size));
                     } else if let InlineItem::MultilingualText(seg) = item {
                         font_ctx = Some((seg.font_id(), seg.base().font_size));
                     }
-                    current_items.push(inline_to_line_item(
-                        item,
-                        current_width,
-                        &params.tab_stops,
-                        params.default_tab_interval_pt,
-                        fm,
-                        font_ctx,
-                    ));
+                    line.push(item, fm);
                 }
             }
             BreakableSegment::Hyphenated(boxed) => {
@@ -485,118 +480,43 @@ pub fn break_into_lines(
                     segment,
                     break_points,
                 } = *boxed;
-                let fits = current_width + segment.width <= line_avail + 0.01;
-                if !params.wrap || fits {
-                    let item = InlineItem::Text(segment);
-                    let (w, a, d, natural_height, font_size) = item_metrics(&item);
-                    current_width += w;
-                    current_ascent = current_ascent.max(a);
-                    current_descent = current_descent.max(d);
-                    current_natural_height = current_natural_height.max(natural_height);
-                    current_font_size = current_font_size.max(font_size);
-                    font_ctx = Some((segment_font_id(&item), segment_font_size(&item)));
-                    current_items.push(inline_to_line_item(
-                        &item,
-                        current_width,
-                        &params.tab_stops,
-                        params.default_tab_interval_pt,
-                        fm,
-                        font_ctx,
-                    ));
+                let hanging = terminal_u0020_width(&segment, fm)?;
+                let whole = InlineItem::Text(segment);
+                if !params.wrap
+                    || line.width_with(std::slice::from_ref(&whole), fm) <= line.limit + 0.01
+                    || line.width_with(std::slice::from_ref(&whole), fm) - hanging
+                        <= line.limit + 0.01
+                {
+                    font_ctx = Some((segment_font_id(&whole), segment_font_size(&whole)));
+                    line.push(&whole, fm);
                     continue;
                 }
+                let InlineItem::Text(segment) = whole else {
+                    unreachable!("built as text above")
+                };
 
                 if let Some(FittingHyphenation {
                     prefix,
                     hyphen,
                     remainder,
                     remaining_points,
-                }) = fitting_hyphenation(&segment, &break_points, current_width, line_avail, fm)?
+                }) =
+                    fitting_hyphenation(&segment, &break_points, line.used_width(), line.limit, fm)?
                 {
                     for text in [prefix, hyphen] {
                         let item = InlineItem::Text(text);
-                        let (w, a, d, natural_height, font_size) = item_metrics(&item);
-                        current_width += w;
-                        current_ascent = current_ascent.max(a);
-                        current_descent = current_descent.max(d);
-                        current_natural_height = current_natural_height.max(natural_height);
-                        current_font_size = current_font_size.max(font_size);
                         font_ctx = Some((segment_font_id(&item), segment_font_size(&item)));
-                        current_items.push(inline_to_line_item(
-                            &item,
-                            current_width,
-                            &params.tab_stops,
-                            params.default_tab_interval_pt,
-                            fm,
-                            font_ctx,
-                        ));
+                        line.push(&item, fm);
                     }
-
-                    let indent = line_indent_at(params, line_index, is_first_line);
-                    let line_gap =
-                        effective_line_gap(current_ascent, current_descent, current_natural_height);
-                    lines.push(LayoutLine {
-                        items: std::mem::take(&mut current_items),
-                        width: current_width,
-                        ascent: current_ascent,
-                        descent: current_descent,
-                        line_gap,
-                        height: compute_line_height(
-                            current_ascent,
-                            current_descent,
-                            line_gap,
-                            current_font_size,
-                            params,
-                        ),
-                        indent_left: indent,
-                        available_width: line_avail,
-                        is_last: false,
-                        forced_break_after: None,
-                    });
-                    current_width = 0.0;
-                    current_ascent = 0.0;
-                    current_descent = 0.0;
-                    current_natural_height = 0.0;
-                    current_font_size = 0.0;
-                    is_first_line = false;
-                    line_index += 1;
-                    line_avail = line_width_at(params, line_index, false);
+                    lines.push(line.break_line(params, fm, false, None));
                     segments.push_front(BreakableSegment::Hyphenated(Box::new(
                         HyphenatedSegment {
                             segment: remainder,
                             break_points: remaining_points,
                         },
                     )));
-                } else if !current_items.is_empty() {
-                    let indent = line_indent_at(params, line_index, is_first_line);
-                    let line_gap =
-                        effective_line_gap(current_ascent, current_descent, current_natural_height);
-                    lines.push(LayoutLine {
-                        items: std::mem::take(&mut current_items),
-                        width: current_width,
-                        ascent: current_ascent,
-                        descent: current_descent,
-                        line_gap,
-                        height: compute_line_height(
-                            current_ascent,
-                            current_descent,
-                            line_gap,
-                            current_font_size,
-                            params,
-                        ),
-                        indent_left: indent,
-                        available_width: line_avail,
-                        is_last: false,
-                        forced_break_after: None,
-                    });
-                    current_width = 0.0;
-                    current_ascent = 0.0;
-                    current_descent = 0.0;
-                    current_natural_height = 0.0;
-                    current_font_size = 0.0;
-                    is_first_line = false;
-                    line_index += 1;
-                    line_avail = line_width_at(params, line_index, false);
+                } else if !line.items.is_empty() {
+                    lines.push(line.break_line(params, fm, false, None));
                     segments.push_front(BreakableSegment::Hyphenated(Box::new(
                         HyphenatedSegment {
                             segment,
@@ -605,131 +525,469 @@ pub fn break_into_lines(
                     )));
                 } else {
                     let item = InlineItem::Text(segment);
-                    let (w, a, d, natural_height, font_size) = item_metrics(&item);
-                    current_width += w;
-                    current_ascent = current_ascent.max(a);
-                    current_descent = current_descent.max(d);
-                    current_natural_height = current_natural_height.max(natural_height);
-                    current_font_size = current_font_size.max(font_size);
                     font_ctx = Some((segment_font_id(&item), segment_font_size(&item)));
-                    current_items.push(inline_to_line_item(
-                        &item,
-                        current_width,
-                        &params.tab_stops,
-                        params.default_tab_interval_pt,
-                        fm,
-                        font_ctx,
-                    ));
+                    line.push(&item, fm);
                 }
             }
             BreakableSegment::ForcedBreak(break_kind) => {
-                let indent = line_indent_at(params, line_index, is_first_line);
-                let line_gap =
-                    effective_line_gap(current_ascent, current_descent, current_natural_height);
-                lines.push(LayoutLine {
-                    items: std::mem::take(&mut current_items),
-                    width: current_width,
-                    ascent: current_ascent,
-                    descent: current_descent,
-                    line_gap,
-                    height: compute_line_height(
-                        current_ascent,
-                        current_descent,
-                        line_gap,
-                        current_font_size,
-                        params,
-                    ),
-                    indent_left: indent,
-                    available_width: line_avail,
-                    is_last: matches!(break_kind, ForcedBreakKind::Page | ForcedBreakKind::Column),
-                    forced_break_after: Some(break_kind),
-                });
-                current_width = 0.0;
-                current_ascent = 0.0;
-                current_descent = 0.0;
-                current_natural_height = 0.0;
-                current_font_size = 0.0;
-                is_first_line = false;
-                line_index += 1;
-                line_avail = line_width_at(params, line_index, false);
+                let is_last = matches!(break_kind, ForcedBreakKind::Page | ForcedBreakKind::Column);
+                lines.push(line.break_line(params, fm, is_last, Some(break_kind)));
             }
         }
     }
 
     // Flush remaining items as the last line
-    let indent = line_indent_at(params, line_index, is_first_line);
-    let line_gap = effective_line_gap(current_ascent, current_descent, current_natural_height);
-    lines.push(LayoutLine {
-        items: current_items,
-        width: current_width,
-        ascent: current_ascent,
-        descent: current_descent,
-        line_gap,
-        height: compute_line_height(
-            current_ascent,
-            current_descent,
-            line_gap,
-            current_font_size,
-            params,
-        ),
-        indent_left: indent,
-        available_width: line_avail,
-        is_last: true,
-        forced_break_after: None,
-    });
+    lines.push(line.break_line(params, fm, true, None));
 
-    align_trailing_tabs(&mut lines, &params.tab_stops);
+    for line in &mut lines {
+        split_hanging_spaces(&mut line.items, fm)?;
+    }
+
     Ok(lines)
 }
 
-/// The explicit tab stop a tab at absolute `current_x` would jump to.
-fn next_tab_stop(current_x: f64, tab_stops: &[TabStop]) -> Option<&TabStop> {
-    tab_stops.iter().find(|stop| stop.pos_pt > current_x)
+/// Give the spaces that end a plain line an item of their own while retaining
+/// their glyph advances and source spans.
+fn split_hanging_spaces(items: &mut Vec<LineItem>, fm: &FontManager) -> Result<()> {
+    let Some(LineItem::Text(segment)) = items.last() else {
+        return Ok(());
+    };
+    if segment.field_kind.is_some() || segment.note.is_some() || is_space_run(&segment.text) {
+        return Ok(());
+    }
+    let Some(spaces) = trailing_spaces(segment, fm)? else {
+        return Ok(());
+    };
+    let Some(LineItem::Text(ink)) = items.last_mut() else {
+        unreachable!("the last item is text");
+    };
+    let glyphs = ink.glyph_ids.len() - spaces;
+    let advances = ink.advances.split_off(glyphs);
+    let width = advances.iter().sum::<f64>();
+    ink.width -= width;
+    let source = ink.source.as_mut().map(|source| {
+        source.char_end -= spaces as u32;
+        SourceSpan {
+            char_start: source.char_end,
+            char_end: source.char_end + spaces as u32,
+            ..*source
+        }
+    });
+    let hanging = TextSegment {
+        text: ink.text.split_off(ink.text.len() - spaces),
+        glyph_ids: ink.glyph_ids.split_off(glyphs),
+        advances,
+        width,
+        source,
+        hyperlink_url: ink.hyperlink_url.clone(),
+        ..*ink
+    };
+    items.push(LineItem::Text(hanging));
+    Ok(())
 }
 
-/// Widen tabs that jump to right / centre / decimal stops so the text that
-/// follows them ends at (or is centred on) the stop. Runs after line breaking
-/// because the width of that trailing text is only known once the line is
-/// complete; the gap is clamped so the line never exceeds its available width.
-fn align_trailing_tabs(lines: &mut [LayoutLine], tab_stops: &[TabStop]) {
-    if tab_stops
-        .iter()
-        .all(|stop| matches!(stop.align, TabAlign::Left | TabAlign::Bar))
-    {
-        return;
-    }
-    for line in lines.iter_mut() {
-        let mut x = line.indent_left;
-        let count = line.items.len();
-        for idx in 0..count {
-            let width = line.items[idx].width();
-            let Some(stop) = next_tab_stop(x, tab_stops) else {
-                x += width;
-                continue;
-            };
-            let is_tab = matches!(line.items[idx], LineItem::Tab { .. });
-            if !is_tab || matches!(stop.align, TabAlign::Left | TabAlign::Bar) {
-                x += width;
-                continue;
-            }
-            let trailing: f64 = line.items[idx + 1..]
-                .iter()
-                .take_while(|item| !matches!(item, LineItem::Tab { .. }))
-                .map(LineItem::width)
-                .sum();
-            let target = match stop.align {
-                TabAlign::Center => stop.pos_pt - x - trailing / 2.0,
-                _ => stop.pos_pt - x - trailing,
-            };
-            let room = (line.available_width - line.width).max(0.0);
-            let new_width = target.max(0.0).min(width + room);
-            if let LineItem::Tab { width: w, .. } = &mut line.items[idx] {
-                *w = new_width;
-            }
-            line.width += new_width - width;
-            x += new_width;
+/// The line `break_into_lines` is filling.
+struct LineState {
+    /// The line index drives the per-line reservations a floating drawing
+    /// creates, so it is tracked rather than a plain first-or-not flag.
+    index: usize,
+    /// Where the line starts, measured from the zero indent.
+    start: f64,
+    /// Width the line is laid out against.
+    available: f64,
+    /// Width the line may fill before its next segment wraps. It is
+    /// `available` unless a tab stop took the line past it.
+    limit: f64,
+    items: Vec<LineItem>,
+    width: f64,
+    ascent: f64,
+    descent: f64,
+    natural_height: f64,
+    font_size: f64,
+    /// A right, centre or decimal tab still waiting for the text after it.
+    pending: Option<PendingTab>,
+}
+
+impl LineState {
+    fn new(params: &LineBreakParams, index: usize, is_first_line: bool) -> Self {
+        let available = line_width_at(params, index, is_first_line);
+        LineState {
+            index,
+            start: line_indent_at(params, index, is_first_line),
+            available,
+            limit: available,
+            items: Vec::new(),
+            width: 0.0,
+            ascent: 0.0,
+            descent: 0.0,
+            natural_height: 0.0,
+            font_size: 0.0,
+            pending: None,
         }
     }
+
+    fn push(&mut self, item: &InlineItem, fm: &FontManager) {
+        let (width, ascent, descent, natural_height, font_size) = item_metrics(item);
+        self.ascent = self.ascent.max(ascent);
+        self.descent = self.descent.max(descent);
+        self.natural_height = self.natural_height.max(natural_height);
+        self.font_size = self.font_size.max(font_size);
+        match self.pending.as_mut() {
+            Some(tab) => {
+                tab.add(item, width, fm);
+                self.width = tab.start + tab.width() + tab.following;
+            }
+            None => self.width += width,
+        }
+        self.items.push(inline_to_line_item(item));
+    }
+
+    /// The line's width once `items` are appended to it.
+    fn width_with(&self, items: &[InlineItem], fm: &FontManager) -> f64 {
+        match self.pending {
+            Some(mut tab) => {
+                for item in items {
+                    tab.add(item, inline_item_width(item), fm);
+                }
+                tab.visible_line_width()
+            }
+            None => self.width + items.iter().map(inline_item_width).sum::<f64>(),
+        }
+    }
+
+    /// The width appended text starts from, once a waiting tab has given up
+    /// its gap to it.
+    fn used_width(&self) -> f64 {
+        self.width - self.pending.map_or(0.0, |tab| tab.width())
+    }
+
+    /// Where a tab appended to this line goes.
+    ///
+    /// The first explicit stop past the tab wins, in the order the stops are
+    /// listed as Word reads them, bar stops excepted. A hanging indent adds a
+    /// left stop at the left indent, which is where the tab after a list
+    /// number goes. Past the last explicit stop the tab takes the next
+    /// multiple of the default interval.
+    fn next_tab(&self, params: &LineBreakParams) -> ResolvedTab {
+        let x = self.start + self.width;
+        let line_end = self.start + self.available;
+        let margin = params.available_width;
+        let hanging = (params.ind_hanging > 0.0).then_some(TabStop {
+            pos_pt: params.ind_left,
+            align: TabAlign::Left,
+            leader: None,
+        });
+        let stops = || {
+            params
+                .tab_stops
+                .iter()
+                .copied()
+                .filter(|stop| stop.align != TabAlign::Bar)
+        };
+        let next = match (
+            stops().find(|stop| stop.pos_pt > x),
+            hanging.filter(|stop| stop.pos_pt > x),
+        ) {
+            (Some(listed), Some(hanging)) if hanging.pos_pt < listed.pos_pt => Some(hanging),
+            (listed, hanging) => listed.or(hanging),
+        };
+        if let Some(stop) = next {
+            // Word 2013 and later move a stop past the right margin to the
+            // end of the line. Earlier versions keep it, and the text after a
+            // stop at or past the margin then runs on past it. A stop past the
+            // right indent lets the text run to the margin. Text after a
+            // right, centre or decimal stop is pushed back so it ends at the
+            // margin, unless an earlier version keeps the stop at or past it.
+            let past_margin = stop.pos_pt > margin;
+            let pos = if past_margin && params.clamp_tabs_past_margin {
+                line_end
+            } else {
+                stop.pos_pt
+            };
+            let reach = if !params.clamp_tabs_past_margin && pos >= margin {
+                f64::INFINITY
+            } else if pos > line_end {
+                margin.max(line_end)
+            } else {
+                line_end
+            };
+            return ResolvedTab {
+                stop: pos,
+                align: stop.align,
+                leader: leader_char(stop.leader),
+                // Word 2013 moves a left tab that reaches the end of its line
+                // to a line of its own, and the text after it to the next.
+                wraps: params.clamp_tabs_past_margin
+                    && stop.align == TabAlign::Left
+                    && pos > reach - 0.01,
+                reach,
+                shift_limit: (params.clamp_tabs_past_margin || pos < margin)
+                    .then_some(margin.max(line_end)),
+            };
+        }
+        let interval = if params.default_tab_interval_pt > 0.0 {
+            params.default_tab_interval_pt
+        } else {
+            36.0
+        };
+        let last = stops()
+            .chain(hanging)
+            .map(|stop| stop.pos_pt)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let pos = ((x.max(last) / interval).floor() + 1.0) * interval;
+        ResolvedTab {
+            stop: pos,
+            align: TabAlign::Left,
+            leader: None,
+            // A default stop at or past the end of the line is no stop, unless
+            // an earlier stop took the line past its end.
+            wraps: pos > self.start + self.limit - 0.01,
+            reach: line_end,
+            shift_limit: None,
+        }
+    }
+
+    fn push_tab(&mut self, tab: ResolvedTab, fm: &FontManager, font_ctx: Option<(FontId, f64)>) {
+        self.limit = self.limit.max(tab.reach - self.start);
+        let start = self.width;
+        let stop = tab.stop - self.start;
+        if matches!(
+            tab.align,
+            TabAlign::Right | TabAlign::Center | TabAlign::Decimal
+        ) {
+            let pending = PendingTab {
+                index: self.items.len(),
+                start,
+                stop,
+                align: tab.align,
+                leader: tab.leader,
+                following: 0.0,
+                trailing: 0.0,
+                aligned: 0.0,
+                aligned_found: false,
+                in_number: false,
+                shift_limit: tab.shift_limit.map(|limit| limit - self.start),
+                font_ctx,
+            };
+            self.width = start + pending.width();
+            self.pending = Some(pending);
+            // The width is settled once the text after the tab is known.
+            self.items.push(LineItem::Tab {
+                width: 0.0,
+                leader: None,
+                align: tab.align,
+                gap: 0.0,
+            });
+        } else {
+            let width = (stop - start).max(0.0);
+            let leader = tab
+                .leader
+                .and_then(|ch| shape_leader(fm, font_ctx, ch, width));
+            self.items.push(LineItem::Tab {
+                width,
+                leader,
+                align: TabAlign::Left,
+                gap: width,
+            });
+            self.width += width;
+        }
+    }
+
+    /// Fix the width of a tab that was waiting for the text after it.
+    fn settle_tab(&mut self, fm: &FontManager) {
+        if let Some(tab) = self.pending.take() {
+            let width = tab.width();
+            let leader = tab
+                .leader
+                .and_then(|ch| shape_leader(fm, tab.font_ctx, ch, width));
+            self.items[tab.index] = LineItem::Tab {
+                width,
+                leader,
+                align: tab.align,
+                gap: tab.gap(),
+            };
+        }
+    }
+
+    /// Close this line and start the next one in its place.
+    fn break_line(
+        &mut self,
+        params: &LineBreakParams,
+        fm: &FontManager,
+        is_last: bool,
+        forced_break_after: Option<ForcedBreakKind>,
+    ) -> LayoutLine {
+        self.settle_tab(fm);
+        let next = LineState::new(params, self.index + 1, false);
+        let line = std::mem::replace(self, next);
+        let line_gap = effective_line_gap(line.ascent, line.descent, line.natural_height);
+        LayoutLine {
+            height: compute_line_height(
+                line.ascent,
+                line.descent,
+                line_gap,
+                line.font_size,
+                params,
+            ),
+            items: line.items,
+            width: line.width,
+            ascent: line.ascent,
+            descent: line.descent,
+            line_gap,
+            indent_left: line.start,
+            available_width: line.available,
+            is_last,
+            forced_break_after,
+        }
+    }
+}
+
+/// The stop a tab goes to, measured from the zero indent.
+struct ResolvedTab {
+    stop: f64,
+    align: TabAlign,
+    leader: Option<char>,
+    /// Whether the tab found no stop before the end of its line, so it moves
+    /// to the next one.
+    wraps: bool,
+    /// How far the line may reach once the tab is on it.
+    reach: f64,
+    /// The position text after a right, centre or decimal tab may not pass.
+    shift_limit: Option<f64>,
+}
+
+/// A right, centre or decimal tab, which takes its width from the text after
+/// it. Positions are measured from the start of the line.
+#[derive(Debug, Clone, Copy)]
+struct PendingTab {
+    /// Index of the tab among the line's items.
+    index: usize,
+    start: f64,
+    stop: f64,
+    align: TabAlign,
+    leader: Option<char>,
+    /// Width of the items after the tab.
+    following: f64,
+    /// Width of the spaces that end the items after the tab. Word aligns the
+    /// text without them, so text that wraps ends on its stop.
+    trailing: f64,
+    /// For a decimal tab, the width of the text before its alignment point.
+    aligned: f64,
+    aligned_found: bool,
+    /// Whether the text scanned so far ends inside a number.
+    in_number: bool,
+    shift_limit: Option<f64>,
+    font_ctx: Option<(FontId, f64)>,
+}
+
+impl PendingTab {
+    fn add(&mut self, item: &InlineItem, width: f64, fm: &FontManager) {
+        self.following += width;
+        self.trailing = match item {
+            InlineItem::Text(segment) | InlineItem::HyphenatedText { segment, .. }
+                if segment.text.chars().all(char::is_whitespace) =>
+            {
+                self.trailing + width
+            }
+            InlineItem::Text(segment) | InlineItem::HyphenatedText { segment, .. } => {
+                trailing_space_width(segment, fm)
+            }
+            _ => 0.0,
+        };
+        if self.align == TabAlign::Decimal && !self.aligned_found {
+            match decimal_alignment_offset(item, &mut self.in_number, fm) {
+                Some(offset) => {
+                    self.aligned += offset;
+                    self.aligned_found = true;
+                }
+                None => self.aligned += width,
+            }
+        }
+    }
+
+    /// The tab's width, which never goes negative: text too wide to end at
+    /// its stop starts where the tab does.
+    fn width(&self) -> f64 {
+        self.gap().max(0.0)
+    }
+
+    /// The tab's width before it is kept from going negative.
+    fn gap(&self) -> f64 {
+        let visible = self.following - self.trailing;
+        let before_stop = match self.align {
+            TabAlign::Center => visible / 2.0,
+            TabAlign::Decimal if self.aligned_found => self.aligned,
+            TabAlign::Decimal => self.aligned - self.trailing,
+            _ => visible,
+        };
+        let mut width = self.stop - self.start - before_stop;
+        if let Some(limit) = self.shift_limit {
+            width = width.min(limit - self.start - visible);
+        }
+        width
+    }
+
+    /// How wide the line is with this tab, less the spaces that end it,
+    /// which may run past the stop.
+    fn visible_line_width(&self) -> f64 {
+        self.start + self.width() + self.following - self.trailing
+    }
+}
+
+/// Where a decimal tab aligns within one item, as a width from its start.
+///
+/// Word aligns the first full stop, or else the end of the first number, a
+/// comma inside a number belonging to it whatever the document's decimal
+/// symbol. `in_number` carries a number from one item to the next.
+fn decimal_alignment_offset(
+    item: &InlineItem,
+    in_number: &mut bool,
+    fm: &FontManager,
+) -> Option<f64> {
+    let segment = match item {
+        InlineItem::Text(segment) | InlineItem::HyphenatedText { segment, .. } => segment,
+        _ => return in_number.then_some(0.0),
+    };
+    for (index, ch) in segment.text.char_indices() {
+        if ch == '.' || (*in_number && !ch.is_ascii_digit() && ch != ',') {
+            return Some(text_prefix_width(segment, index, fm));
+        }
+        *in_number |= ch.is_ascii_digit();
+    }
+    None
+}
+
+/// Width of the spaces that end a segment's text.
+fn trailing_space_width(segment: &TextSegment, fm: &FontManager) -> f64 {
+    let trimmed = segment.text.trim_end_matches(char::is_whitespace);
+    if trimmed.len() == segment.text.len() {
+        return 0.0;
+    }
+    segment.width - text_prefix_width(segment, trimmed.len(), fm)
+}
+
+/// Width of a segment's text before a byte offset.
+fn text_prefix_width(segment: &TextSegment, byte_index: usize, fm: &FontManager) -> f64 {
+    if byte_index == 0 {
+        return 0.0;
+    }
+    let prefix = &segment.text[..byte_index];
+    if segment.advances.len() == segment.text.chars().count() {
+        return segment.advances[..prefix.chars().count()].iter().sum();
+    }
+    fm.shape_text(segment.font_id, prefix, segment.font_size)
+        .map_or(segment.width, |shaped| shaped.width)
+}
+
+fn leader_char(leader: Option<TabLeader>) -> Option<char> {
+    leader.and_then(|leader| match leader {
+        TabLeader::Dot => Some('.'),
+        TabLeader::Hyphen => Some('-'),
+        TabLeader::Underscore => Some('_'),
+        TabLeader::MiddleDot => Some('\u{00B7}'),
+        TabLeader::Heavy => Some('_'),
+        TabLeader::None => None,
+    })
 }
 
 /// Break rich text in logical order, then reorder each completed line for painting.
@@ -1124,6 +1382,7 @@ fn split_text_subsegment(
         field_kind: seg.field_kind,
         field_source: seg.field_source,
         note: seg.note,
+        note_reference_source: seg.note_reference_source,
     }))
 }
 
@@ -1247,6 +1506,7 @@ fn generated_hyphen(segment: &TextSegment, spacing: f64, fm: &FontManager) -> Re
         field_kind: segment.field_kind,
         field_source: segment.field_source,
         note: segment.note,
+        note_reference_source: segment.note_reference_source,
     })
 }
 
@@ -1311,6 +1571,73 @@ fn split_text_at_break_opportunities(seg: &TextSegment) -> Vec<TextBreakInfo> {
     }
 
     breaks
+}
+
+/// Width of the spaces that end a group of text items.
+///
+/// They hang past the end of a line instead of wrapping the group, as Word and
+/// PowerPoint let them.
+fn hanging_space_width(items: &[InlineItem], fm: &FontManager) -> Result<f64> {
+    let mut width = 0.0;
+    for item in items.iter().rev() {
+        match item {
+            InlineItem::MultilingualText(segment) if is_space_run(segment.text()) => {
+                width += segment.width();
+            }
+            InlineItem::Text(segment) | InlineItem::HyphenatedText { segment, .. } => {
+                width += terminal_u0020_width(segment, fm)?;
+                if !is_space_run(&segment.text) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(width)
+}
+
+/// Width of the spaces that end a plain text segment.
+fn terminal_u0020_width(segment: &TextSegment, fm: &FontManager) -> Result<f64> {
+    Ok(trailing_spaces(segment, fm)?.map_or(0.0, |spaces| {
+        segment.advances[segment.advances.len() - spaces..]
+            .iter()
+            .sum()
+    }))
+}
+
+/// How many U+0020 spaces end a plain text segment, which are then as many
+/// glyphs at its end.
+///
+/// Plain text is shaped left to right, so its last glyphs are its last
+/// characters, whatever ligatures come before them. `None` when it ends with
+/// no space, holds a right-to-left character that would reverse its glyphs, or
+/// does not end with that many of the font's space glyph.
+fn trailing_spaces(segment: &TextSegment, fm: &FontManager) -> Result<Option<usize>> {
+    if segment.field_kind.is_some() || segment.note.is_some() {
+        return Ok(None);
+    }
+    let spaces = segment.text.len() - segment.text.trim_end_matches(' ').len();
+    let glyphs = segment.glyph_ids.len();
+    if spaces == 0
+        || glyphs < spaces
+        || segment.advances.len() != glyphs
+        || segment.text.chars().any(|character| {
+            matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let space = fm.shape_text(segment.font_id, " ", segment.font_size)?;
+    let [space_glyph] = space.glyph_ids[..] else {
+        return Ok(None);
+    };
+    Ok(segment.glyph_ids[glyphs - spaces..]
+        .iter()
+        .all(|glyph| *glyph == space_glyph)
+        .then_some(spaces))
 }
 
 fn inline_item_width(item: &InlineItem) -> f64 {
@@ -1378,29 +1705,20 @@ fn normalized_group_baseline(height: f64, baseline: Option<f64>) -> Option<f64> 
         .map(|value| value.clamp(0.0, upper))
 }
 
-fn inline_to_line_item(
-    item: &InlineItem,
-    current_x: f64,
-    tab_stops: &[TabStop],
-    default_tab_interval_pt: f64,
-    fm: &FontManager,
-    font_ctx: Option<(FontId, f64)>,
-) -> LineItem {
+fn inline_to_line_item(item: &InlineItem) -> LineItem {
     match item {
         InlineItem::Text(seg) | InlineItem::HyphenatedText { segment: seg, .. } => {
             LineItem::Text(seg.clone())
         }
         InlineItem::MultilingualText(seg) => LineItem::MultilingualText(seg.clone()),
         InlineItem::Marker(seg) => LineItem::Marker(seg.clone()),
-        InlineItem::Tab => {
-            let (tab_width, leader_char) =
-                resolve_tab_width(current_x, tab_stops, default_tab_interval_pt);
-            let leader = leader_char.and_then(|ch| shape_leader(fm, font_ctx, ch, tab_width));
-            LineItem::Tab {
-                width: tab_width,
-                leader,
-            }
-        }
+        // `LineState::push_tab` places tabs, so this is only a placeholder.
+        InlineItem::Tab => LineItem::Tab {
+            width: 0.0,
+            leader: None,
+            align: TabAlign::Left,
+            gap: 0.0,
+        },
         InlineItem::Image {
             width,
             height,
@@ -1426,20 +1744,15 @@ fn inline_to_line_item(
             alternate_text,
             structure_id,
         } => LineItem::Figure {
-            item: Box::new(inline_to_line_item(
-                item,
-                current_x,
-                tab_stops,
-                default_tab_interval_pt,
-                fm,
-                font_ctx,
-            )),
+            item: Box::new(inline_to_line_item(item)),
             alternate_text: alternate_text.clone(),
             structure_id: *structure_id,
         },
         InlineItem::LineBreak | InlineItem::PageBreak | InlineItem::ColumnBreak => LineItem::Tab {
             width: 0.0,
             leader: None,
+            align: TabAlign::Left,
+            gap: 0.0,
         },
     }
 }
@@ -1517,39 +1830,8 @@ fn shape_leader(
         field_kind: None,
         field_source: None,
         note: None,
+        note_reference_source: None,
     })
-}
-
-/// Resolve tab stop width and leader character based on current x position and defined stops.
-fn resolve_tab_width(
-    current_x: f64,
-    tab_stops: &[TabStop],
-    default_interval: f64,
-) -> (f64, Option<char>) {
-    // Find the next tab stop after the current position
-    for stop in tab_stops {
-        let stop_pos = stop.pos_pt;
-        if stop_pos > current_x {
-            let width = match stop.align {
-                TabAlign::Left => stop_pos - current_x,
-                TabAlign::Center => (stop_pos - current_x).max(0.0),
-                TabAlign::Right => (stop_pos - current_x).max(0.0),
-                _ => stop_pos - current_x,
-            };
-            let leader = stop.leader.and_then(|l| match l {
-                TabLeader::Dot => Some('.'),
-                TabLeader::Hyphen => Some('-'),
-                TabLeader::Underscore => Some('_'),
-                TabLeader::MiddleDot => Some('\u{00B7}'),
-                TabLeader::Heavy => Some('_'),
-                TabLeader::None => None,
-            });
-            return (width, leader);
-        }
-    }
-    // Implicit tab stops at the document interval, half an inch by default.
-    let next_stop = ((current_x / default_interval).floor() + 1.0) * default_interval;
-    (next_stop - current_x, None)
 }
 
 fn compute_first_line_width(params: &LineBreakParams) -> f64 {
@@ -1668,6 +1950,7 @@ mod tests {
             field_kind: None,
             field_source: None,
             note: None,
+            note_reference_source: None,
         }
     }
 
@@ -1709,6 +1992,7 @@ mod tests {
             field_kind: None,
             field_source: None,
             note: None,
+            note_reference_source: None,
         }
     }
 
@@ -2196,6 +2480,203 @@ mod tests {
     }
 
     #[test]
+    fn rich_lines_never_start_with_a_comma_a_space_or_a_hyphen() {
+        let mut fm = deterministic_font_manager();
+        let text = "Repainted in 3 weeks while still in service, or re-coated next spring";
+        let segment = shaped_text_segment(&mut fm, text, 0.0);
+        let items = fm
+            .shape_multilingual_paragraph(vec![(segment, None)], TextDirection::LeftToRight, false)
+            .unwrap()
+            .into_iter()
+            .map(InlineItem::MultilingualText)
+            .collect::<Vec<_>>();
+        let rich_text = |line: &LayoutLine| {
+            line.items
+                .iter()
+                .filter_map(|item| match item {
+                    LineItem::MultilingualText(span) => Some(span.text()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+
+        for width in (300..=1000).step_by(5) {
+            let lines = break_multilingual_into_lines(
+                &items,
+                &LineBreakParams {
+                    available_width: f64::from(width),
+                    ..Default::default()
+                },
+                &fm,
+                TextDirection::LeftToRight,
+            )
+            .unwrap();
+            let texts = lines.iter().map(rich_text).collect::<Vec<_>>();
+            assert_eq!(texts.concat(), text);
+            for line_text in &texts[1..] {
+                assert!(
+                    !line_text.starts_with([',', ' ', '-']),
+                    "{width}: {texts:?}"
+                );
+            }
+            for line in &lines {
+                let hanging = line
+                    .items
+                    .iter()
+                    .rev()
+                    .map_while(|item| match item {
+                        LineItem::MultilingualText(span) if span.text().trim().is_empty() => {
+                            Some(span.width())
+                        }
+                        _ => None,
+                    })
+                    .sum::<f64>();
+                assert!(
+                    line.width - hanging <= line.available_width + 0.01,
+                    "{width}: {texts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rich_line_lets_the_space_after_its_last_word_hang() {
+        let mut fm = deterministic_font_manager();
+        let first = "Repainted in 3 weeks while still in service,";
+        let segment = shaped_text_segment(&mut fm, &format!("{first} or re-coated"), 0.0);
+        let ink = shaped_text_segment(&mut fm, first, 0.0).width;
+        let items = fm
+            .shape_multilingual_paragraph(vec![(segment, None)], TextDirection::LeftToRight, false)
+            .unwrap()
+            .into_iter()
+            .map(InlineItem::MultilingualText)
+            .collect::<Vec<_>>();
+
+        // The comma fits and the space after it does not.
+        let lines = break_multilingual_into_lines(
+            &items,
+            &LineBreakParams {
+                available_width: ink + 1.0,
+                ..Default::default()
+            },
+            &fm,
+            TextDirection::LeftToRight,
+        )
+        .unwrap();
+
+        let LineItem::MultilingualText(last) = lines[0].items.last().unwrap() else {
+            panic!("the first line ends with rich text");
+        };
+        assert_eq!(last.text(), " ");
+        assert!((lines[0].width - last.width() - ink).abs() < 0.001);
+        assert!(lines[0].width > lines[0].available_width);
+        let LineItem::MultilingualText(next) = &lines[1].items[0] else {
+            panic!("the second line starts with rich text");
+        };
+        assert_eq!(next.text(), "or");
+    }
+
+    #[test]
+    fn a_plain_line_lets_the_spaces_after_its_last_word_hang() {
+        let mut fm = deterministic_font_manager();
+        let plain_text = |line: &LayoutLine| {
+            line.items
+                .iter()
+                .map(|item| match item {
+                    LineItem::Text(segment) => segment.text.as_str(),
+                    _ => panic!("plain lines hold plain text"),
+                })
+                .collect::<String>()
+        };
+        // The comma fits and the spaces after it do not. U+0020 hangs, and a
+        // no-break space stays part of its word. Carlito ligates the "ffi" of
+        // "office", so the word has fewer glyphs than characters.
+        let service = "Repainted in 3 weeks while still in service,";
+        let office = "Repainted in 3 weeks while still in office,";
+        let cases = [
+            (service, " ", format!("{service} "), "or "),
+            (service, "   ", format!("{service}   "), "or "),
+            (
+                service,
+                "\u{a0} ",
+                "Repainted in 3 weeks while still in ".to_owned(),
+                "service,",
+            ),
+            (office, " ", format!("{office} "), "or "),
+        ];
+        for (first, spaces, first_line, next_start) in cases {
+            let ink = shaped_text_segment(&mut fm, first, 0.0).width;
+            let text = format!("{first}{spaces}or re-coated");
+            let items = [InlineItem::Text(shaped_text_segment(&mut fm, &text, 0.0))];
+            let lines = break_into_lines(
+                &items,
+                &LineBreakParams {
+                    available_width: ink + 1.0,
+                    ..Default::default()
+                },
+                &fm,
+            )
+            .unwrap();
+
+            assert_eq!(plain_text(&lines[0]), first_line, "{text:?}");
+            assert!(plain_text(&lines[1]).starts_with(next_start), "{text:?}");
+            // The spaces are an item of their own, past the available width.
+            assert_eq!(lines[0].hanging_space_counts(), (0, 1), "{text:?}");
+            let LineItem::Text(last) = lines[0].items.last().unwrap() else {
+                unreachable!("plain lines hold plain text");
+            };
+            assert_eq!(last.text, first_line[first_line.trim_end().len()..]);
+            assert_eq!(last.glyph_ids.len(), last.text.chars().count());
+            assert!(lines[0].width - last.width <= lines[0].available_width + 0.01);
+        }
+        let ligated = shaped_text_segment(&mut fm, office, 0.0);
+        assert!(ligated.glyph_ids.len() < office.chars().count());
+    }
+
+    #[test]
+    fn hanging_spaces_sit_at_the_visual_end_of_their_direction() {
+        let mut fm = deterministic_font_manager();
+        let cases = [
+            ("שלום עולם זה טקסט ארוך", TextDirection::RightToLeft, (1, 0)),
+            (
+                "one two three four five",
+                TextDirection::LeftToRight,
+                (0, 1),
+            ),
+            // An ideographic space is not UAX 14 SP, so it does not hang.
+            (
+                "one\u{3000}two\u{3000}three",
+                TextDirection::LeftToRight,
+                (0, 0),
+            ),
+        ];
+        for (text, direction, wrapped) in cases {
+            let segment = shaped_text_segment(&mut fm, text, 0.0);
+            let items = fm
+                .shape_multilingual_paragraph(vec![(segment, None)], direction, false)
+                .unwrap()
+                .into_iter()
+                .map(InlineItem::MultilingualText)
+                .collect::<Vec<_>>();
+            let lines = break_multilingual_into_lines(
+                &items,
+                &LineBreakParams {
+                    available_width: 150.0,
+                    ..Default::default()
+                },
+                &fm,
+                direction,
+            )
+            .unwrap();
+            assert!(lines.len() > 1, "{text}");
+            for line in &lines[..lines.len() - 1] {
+                assert_eq!(line.hanging_space_counts(), wrapped, "{text}");
+            }
+            assert_eq!(lines.last().unwrap().hanging_space_counts(), (0, 0));
+        }
+    }
+
+    #[test]
     fn legacy_stable_source_fixture_compiles_unchanged_public_shapes() {
         let segment = make_text_segment("legacy", 42.0);
         let _inline = InlineItem::Text(segment.clone());
@@ -2213,6 +2694,7 @@ mod tests {
             line_prefix_widths: Vec::new(),
             line_suffix_widths: Vec::new(),
             default_tab_interval_pt: 36.0,
+            clamp_tabs_past_margin: false,
         };
         let _shaped = crate::ShapedText {
             glyph_ids: segment.glyph_ids.clone(),
@@ -2233,6 +2715,8 @@ mod tests {
             field_kind: segment.field_kind,
             field_source: segment.field_source,
             note: segment.note,
+            note_reference_source: segment.note_reference_source,
+            tab_aligned: None,
         };
     }
 
@@ -2429,38 +2913,410 @@ mod tests {
         assert!(first_indent < subseq_indent);
     }
 
+    fn text_item(text: &str, width: f64) -> InlineItem {
+        InlineItem::Text(make_text_segment(text, width))
+    }
+
+    /// A segment whose every character advances by `advance`.
+    fn even_text_item(text: &str, advance: f64) -> InlineItem {
+        let count = text.chars().count();
+        let mut segment = make_text_segment(text, advance * count as f64);
+        segment.glyph_ids = vec![0; count];
+        segment.advances = vec![advance; count];
+        InlineItem::Text(segment)
+    }
+
+    fn stop(pos_pt: f64, align: TabAlign) -> TabStop {
+        TabStop {
+            pos_pt,
+            align,
+            leader: None,
+        }
+    }
+
+    fn with_stops(tab_stops: Vec<TabStop>) -> LineBreakParams {
+        LineBreakParams {
+            tab_stops,
+            ..Default::default()
+        }
+    }
+
+    fn tab_widths(line: &LayoutLine) -> Vec<f64> {
+        line.items
+            .iter()
+            .filter_map(|item| match item {
+                LineItem::Tab { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tab widths on each line of `items`.
+    fn tab_widths_by_line(items: &[InlineItem], params: &LineBreakParams) -> Vec<Vec<f64>> {
+        break_into_lines(items, params, &deterministic_font_manager())
+            .unwrap()
+            .iter()
+            .map(tab_widths)
+            .collect()
+    }
+
+    fn assert_widths(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} != {expected:?}");
+        for (actual_width, expected_width) in actual.iter().zip(expected) {
+            assert!(
+                (actual_width - expected_width).abs() < 0.01,
+                "{actual:?} != {expected:?}"
+            );
+        }
+    }
+
     #[test]
     fn tab_stop_resolution() {
-        let stops = vec![TabStop {
-            pos_pt: 72.0,
-            align: TabAlign::Left,
-            leader: None,
-        }];
-        let (w, leader) = resolve_tab_width(36.0, &stops, 36.0);
-        assert!((w - 36.0).abs() < 0.01);
-        assert!(leader.is_none());
+        let widths = tab_widths_by_line(
+            &[
+                text_item("abc", 36.0),
+                InlineItem::Tab,
+                text_item("x", 10.0),
+            ],
+            &with_stops(vec![stop(72.0, TabAlign::Left)]),
+        );
+        assert_widths(&widths[0], &[36.0]);
     }
 
     #[test]
     fn default_tab_stops() {
-        let (w, _) = resolve_tab_width(10.0, &[], 36.0);
-        assert!((w - 26.0).abs() < 0.01); // next stop at 36pt
+        let items = [
+            text_item("a", 10.0),
+            InlineItem::Tab,
+            text_item("b", 5.0),
+            InlineItem::Tab,
+            text_item("c", 5.0),
+        ];
+        // The tab ends at the next half inch after where it starts, not
+        // after where a half-inch placeholder would end.
+        assert_widths(
+            &tab_widths_by_line(&items, &LineBreakParams::default())[0],
+            &[26.0, 31.0],
+        );
 
         // A document default tab stop moves every implicit stop with it.
-        let (w, _) = resolve_tab_width(10.0, &[], 72.0);
-        assert!((w - 62.0).abs() < 0.01);
+        let params = LineBreakParams {
+            default_tab_interval_pt: 72.0,
+            ..Default::default()
+        };
+        assert_widths(&tab_widths_by_line(&items, &params)[0], &[62.0, 67.0]);
     }
 
     #[test]
     fn tab_stop_with_dot_leader() {
-        let stops = vec![TabStop {
+        let mut fm = deterministic_font_manager();
+        let title = shaped_text_segment(&mut fm, "Title", 0.0);
+        let number = shaped_text_segment(&mut fm, "12", 0.0);
+        let (title_width, number_width) = (title.width, number.width);
+        let params = with_stops(vec![TabStop {
             pos_pt: 400.0,
             align: TabAlign::Right,
             leader: Some(TabLeader::Dot),
-        }];
-        let (w, leader) = resolve_tab_width(100.0, &stops, 36.0);
-        assert!((w - 300.0).abs() < 0.01);
-        assert_eq!(leader, Some('.'));
+        }]);
+        let lines = break_into_lines(
+            &[
+                InlineItem::Text(title),
+                InlineItem::Tab,
+                InlineItem::Text(number),
+            ],
+            &params,
+            &fm,
+        )
+        .unwrap();
+
+        // The text after a right stop ends at the stop.
+        let expected = 400.0 - title_width - number_width;
+        let LineItem::Tab {
+            width,
+            leader: Some(leader),
+            align: TabAlign::Right,
+            ..
+        } = &lines[0].items[1]
+        else {
+            panic!("a right stop with a dot leader shapes its leader");
+        };
+        assert!((width - expected).abs() < 0.01);
+        assert!((leader.width - expected).abs() < 0.01);
+        assert!(!leader.glyph_ids.is_empty());
+        assert!(leader.text.chars().all(|ch| ch == '.'));
+        assert!((lines[0].width - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn tab_stops_are_measured_from_the_zero_indent() {
+        let params = LineBreakParams {
+            ind_left: 36.0,
+            tab_stops: vec![stop(150.0, TabAlign::Left)],
+            ..Default::default()
+        };
+        let items = [
+            text_item("Title", 26.5),
+            InlineItem::Tab,
+            text_item("12", 18.0),
+        ];
+        let widths = tab_widths_by_line(&items, &params);
+        assert_widths(&widths[0], &[150.0 - 36.0 - 26.5]);
+
+        // Default stops too: Word puts them at multiples of the interval
+        // from the margin, not from the indent.
+        let params = LineBreakParams {
+            ind_left: 20.0,
+            ..Default::default()
+        };
+        let widths = tab_widths_by_line(&items, &params);
+        assert_widths(&widths[0], &[72.0 - 20.0 - 26.5]);
+    }
+
+    #[test]
+    fn centre_and_decimal_stops_align_the_text_after_them() {
+        let centred = tab_widths_by_line(
+            &[
+                text_item("T", 10.0),
+                InlineItem::Tab,
+                text_item("ABCDEF", 50.0),
+            ],
+            &with_stops(vec![stop(150.0, TabAlign::Center)]),
+        );
+        assert_widths(&centred[0], &[150.0 - 10.0 - 25.0]);
+
+        // The first full stop sits on the stop, or else the end of the
+        // first number, as Word aligns them.
+        for (text, before) in [
+            ("123.45", 3),
+            ("12345e", 5),
+            ("-12.5", 3),
+            ("12,5e", 4),
+            ("Ab12cd.5", 4),
+            (".5", 0),
+            ("abc", 3),
+        ] {
+            let widths = tab_widths_by_line(
+                &[
+                    text_item("T", 10.0),
+                    InlineItem::Tab,
+                    even_text_item(text, 6.0),
+                ],
+                &with_stops(vec![stop(150.0, TabAlign::Decimal)]),
+            );
+            assert_widths(&widths[0], &[150.0 - 10.0 - 6.0 * before as f64]);
+        }
+
+        // A number split across runs is still one number.
+        let widths = tab_widths_by_line(
+            &[
+                text_item("T", 10.0),
+                InlineItem::Tab,
+                even_text_item("12", 6.0),
+                even_text_item("34kg", 6.0),
+            ],
+            &with_stops(vec![stop(150.0, TabAlign::Decimal)]),
+        );
+        assert_widths(&widths[0], &[150.0 - 10.0 - 24.0]);
+    }
+
+    #[test]
+    fn text_too_wide_for_its_stop_starts_where_the_tab_does() {
+        for align in [TabAlign::Right, TabAlign::Center, TabAlign::Decimal] {
+            let widths = tab_widths_by_line(
+                &[
+                    text_item("Title", 26.5),
+                    InlineItem::Tab,
+                    text_item("wide", 136.0),
+                ],
+                &with_stops(vec![stop(60.0, align)]),
+            );
+            assert_widths(&widths[0], &[0.0]);
+        }
+    }
+
+    #[test]
+    fn bar_stops_neither_stop_a_tab_nor_clear_default_stops() {
+        let widths = tab_widths_by_line(
+            &[text_item("T", 10.0), InlineItem::Tab, text_item("12", 18.0)],
+            &with_stops(vec![stop(75.0, TabAlign::Bar)]),
+        );
+        assert_widths(&widths[0], &[26.0]);
+    }
+
+    #[test]
+    fn default_stops_start_after_the_last_explicit_stop() {
+        let params = with_stops(vec![
+            stop(20.0, TabAlign::Left),
+            stop(150.0, TabAlign::Left),
+        ]);
+        let widths = tab_widths_by_line(
+            &[
+                text_item("T", 10.0),
+                InlineItem::Tab,
+                text_item("A", 10.0),
+                InlineItem::Tab,
+                text_item("B", 10.0),
+                InlineItem::Tab,
+                text_item("C", 10.0),
+            ],
+            &params,
+        );
+        // 20, then 150 skipping the default stops before it, then 180.
+        assert_widths(&widths[0], &[10.0, 120.0, 20.0]);
+    }
+
+    #[test]
+    fn a_hanging_indent_is_a_stop_for_the_first_line() {
+        // Left 72, hanging 72: the first line starts at 0 and the tab after
+        // a list number goes to 72, not to the default stop at 36.
+        let params = LineBreakParams {
+            ind_left: 72.0,
+            ind_hanging: 72.0,
+            ..Default::default()
+        };
+        let items = [
+            text_item("1.", 12.0),
+            InlineItem::Tab,
+            text_item("Item", 30.0),
+        ];
+        assert_widths(&tab_widths_by_line(&items, &params)[0], &[60.0]);
+
+        // An explicit stop before the indent still comes first.
+        let params = LineBreakParams {
+            tab_stops: vec![stop(36.0, TabAlign::Left)],
+            ..params
+        };
+        assert_widths(&tab_widths_by_line(&items, &params)[0], &[24.0]);
+    }
+
+    #[test]
+    fn a_tab_with_no_default_stop_left_moves_to_the_next_line() {
+        let params = LineBreakParams {
+            available_width: 432.0,
+            ..Default::default()
+        };
+        let widths = tab_widths_by_line(
+            &[
+                text_item("x", 423.5),
+                InlineItem::Tab,
+                text_item("12", 18.0),
+            ],
+            &params,
+        );
+        assert_eq!(widths.len(), 2);
+        assert_widths(&widths[0], &[]);
+        assert_widths(&widths[1], &[36.0]);
+    }
+
+    #[test]
+    fn stops_past_the_right_margin_follow_the_compatibility_mode() {
+        let items = [text_item("T", 13.0), InlineItem::Tab, text_item("12", 18.0)];
+        let params = |align, clamp, ind_right| LineBreakParams {
+            available_width: 432.0,
+            ind_right,
+            tab_stops: vec![stop(500.0, align)],
+            clamp_tabs_past_margin: clamp,
+            ..Default::default()
+        };
+        // Word 2010 keeps the stop, Word 2013 ends the text at the margin,
+        // or at the right indent when there is one.
+        let widths = tab_widths_by_line(&items, &params(TabAlign::Right, false, 0.0));
+        assert_widths(&widths[0], &[500.0 - 31.0]);
+        let widths = tab_widths_by_line(&items, &params(TabAlign::Right, true, 0.0));
+        assert_widths(&widths[0], &[432.0 - 31.0]);
+        let widths = tab_widths_by_line(&items, &params(TabAlign::Right, true, 100.0));
+        assert_widths(&widths[0], &[332.0 - 31.0]);
+
+        // A left stop: Word 2010 keeps the text after it on the line, past
+        // the margin. Word 2013 moves the tab to a line of its own, where it
+        // reaches the end of the line, and the text to the line after.
+        let long = [
+            text_item("T", 13.0),
+            InlineItem::Tab,
+            text_item("aa ", 20.0),
+            text_item("bb", 20.0),
+        ];
+        let widths = tab_widths_by_line(&long, &params(TabAlign::Left, false, 0.0));
+        assert_eq!(widths.len(), 1);
+        assert_widths(&widths[0], &[487.0]);
+        let widths = tab_widths_by_line(&long, &params(TabAlign::Left, true, 0.0));
+        assert_eq!(widths.len(), 3);
+        assert_widths(&widths[0], &[]);
+        assert_widths(&widths[1], &[432.0]);
+        assert_widths(&widths[2], &[]);
+        // So does a left stop exactly at the end of the line.
+        let at_end = LineBreakParams {
+            tab_stops: vec![stop(432.0, TabAlign::Left)],
+            ..params(TabAlign::Left, true, 0.0)
+        };
+        assert_eq!(tab_widths_by_line(&long, &at_end).len(), 3);
+
+        // The spaces that end right-aligned text that wraps run past the
+        // stop, so the last word ends on it.
+        let mut fm = deterministic_font_manager();
+        let word = shaped_text_segment(&mut fm, "word ", 0.0);
+        let bare = fm
+            .shape_text(word.font_id, "word", word.font_size)
+            .unwrap()
+            .width;
+        let mut wrapped = vec![text_item("A", 10.0), InlineItem::Tab];
+        wrapped.extend((0..40).map(|_| InlineItem::Text(word.clone())));
+        let lines = break_into_lines(
+            &wrapped,
+            &LineBreakParams {
+                available_width: 432.0,
+                tab_stops: vec![stop(432.0, TabAlign::Right)],
+                clamp_tabs_past_margin: true,
+                ..Default::default()
+            },
+            &fm,
+        )
+        .unwrap();
+        // The final space now has its own hanging item and is not a word.
+        let words = lines[0].items.len() - 2 - lines[0].hanging_space_counts().1;
+        let tab = tab_widths(&lines[0])[0];
+        let end = 10.0 + tab + (words - 1) as f64 * word.width + bare;
+        assert!(
+            (end - 432.0).abs() < 0.01,
+            "{words} words, tab {tab}, {} {bare}, end {end}",
+            word.width
+        );
+
+        // A stop inside the margin but past the right indent keeps its place,
+        // and the text after it may run to the margin.
+        let params = LineBreakParams {
+            available_width: 432.0,
+            ind_right: 100.0,
+            tab_stops: vec![stop(400.0, TabAlign::Left)],
+            ..Default::default()
+        };
+        let widths = tab_widths_by_line(&items, &params);
+        assert_eq!(widths.len(), 1);
+        assert_widths(&widths[0], &[387.0]);
+    }
+
+    #[test]
+    fn text_after_a_centre_stop_is_pushed_back_inside_the_margin() {
+        let items = [
+            text_item("T", 13.0),
+            InlineItem::Tab,
+            text_item("CENTERED", 66.6),
+        ];
+        let params = |pos, clamp| LineBreakParams {
+            available_width: 432.0,
+            tab_stops: vec![stop(pos, TabAlign::Center)],
+            clamp_tabs_past_margin: clamp,
+            ..Default::default()
+        };
+        for clamp in [false, true] {
+            let widths = tab_widths_by_line(&items, &params(420.0, clamp));
+            assert_widths(&widths[0], &[432.0 - 13.0 - 66.6]);
+        }
+        // Word 2010 keeps a stop at the margin as it is.
+        let widths = tab_widths_by_line(&items, &params(432.0, false));
+        assert_widths(&widths[0], &[432.0 - 13.0 - 33.3]);
+        let widths = tab_widths_by_line(&items, &params(432.0, true));
+        assert_widths(&widths[0], &[432.0 - 13.0 - 66.6]);
     }
 
     #[test]
@@ -2627,54 +3483,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_stops_use_point_positions_and_owned_leaders() {
-        let mut fm = deterministic_font_manager();
-        let font_id = fm
-            .resolve_font(Some("Carlito"), false, false)
-            .expect("bundled Carlito should resolve");
-        let stop = TabStop {
-            pos_pt: 72.25,
-            align: TabAlign::Decimal,
-            leader: Some(TabLeader::Dot),
-        };
-
-        let item = inline_to_line_item(
-            &InlineItem::Tab,
-            12.0,
-            &[stop],
-            36.0,
-            &fm,
-            Some((font_id, 12.0)),
-        );
-
-        let LineItem::Tab {
-            width,
-            leader: Some(leader),
-        } = item
-        else {
-            panic!("owned dot leader should shape into a tab line item");
-        };
-        assert!((width - 60.25).abs() < 0.01);
-        assert!((leader.width - 60.25).abs() < 0.01);
-        assert!(!leader.glyph_ids.is_empty());
-        assert!(leader.text.chars().all(|ch| ch == '.'));
-    }
-
-    #[test]
     fn staged_image_types_use_media_id_instead_of_embed_id() {
         let media_id = crate::MediaId::from_bytes(b"image");
-        let item = inline_to_line_item(
-            &InlineItem::Image {
-                width: 10.0,
-                height: 20.0,
-                media_id,
-            },
-            0.0,
-            &[],
-            36.0,
-            &deterministic_font_manager(),
-            None,
-        );
+        let item = inline_to_line_item(&InlineItem::Image {
+            width: 10.0,
+            height: 20.0,
+            media_id,
+        });
         let LineItem::Image {
             media_id: actual, ..
         } = item
@@ -2805,9 +3620,7 @@ mod tests {
                     children: Vec::new(),
                 },
             };
-            let LineItem::Group { baseline, .. } =
-                inline_to_line_item(&item, 0.0, &[], 36.0, &deterministic_font_manager(), None)
-            else {
+            let LineItem::Group { baseline, .. } = inline_to_line_item(&item) else {
                 panic!("inline group should remain a group line item");
             };
             assert_eq!(baseline, expected);

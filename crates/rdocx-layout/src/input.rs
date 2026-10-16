@@ -10,7 +10,7 @@ use oxml_layout::Diagnostic;
 pub use oxml_layout::FontFile;
 use oxml_layout::MediaId;
 use rdocx_oxml::core_properties::CoreProperties;
-use rdocx_oxml::document::CT_Document;
+use rdocx_oxml::document::{CT_Body, CT_Document, CT_NoteProperties};
 use rdocx_oxml::footnotes::CT_Footnotes;
 use rdocx_oxml::header_footer::CT_HdrFtr;
 use rdocx_oxml::math::MathProperties;
@@ -18,6 +18,9 @@ use rdocx_oxml::numbering::CT_Numbering;
 use rdocx_oxml::styles::CT_Styles;
 use rdocx_oxml::theme::Theme;
 use rdocx_oxml::units::Twips;
+
+/// One checked physical embedded font body and its owned source aliases.
+pub type EmbeddedFontSource = (Vec<String>, Arc<[u8]>);
 
 /// The tracked-revision projection used for Word layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,6 +30,21 @@ pub enum RevisionView {
     Accepted,
     /// Render both sides of modeled revisions with tracked decorations.
     Tracked,
+}
+
+/// How the tracked view marks revisions. The accepted view shows none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RevisionStyle {
+    /// Insertions underlined, deletions struck through, change bars black,
+    /// all in the text colour of the run.
+    #[default]
+    Plain,
+    /// The colours of legal comparison tools: insertions blue with a double
+    /// underline, deletions red and struck through, moved text green, struck
+    /// through where it moved from and double underlined where it moved to.
+    /// A change bar takes the colour of its change, black for a property
+    /// change.
+    Legal,
 }
 
 /// Image data keyed by relationship/embed ID.
@@ -154,6 +172,11 @@ impl MediaRegistry {
 /// All inputs needed to lay out a DOCX document.
 #[derive(Debug, Clone)]
 pub struct LayoutInput {
+    /// Result-local sequence decisions supplied only by complete layout entry points.
+    /// Full layout regenerates this member from the current physical model.
+    /// Detached measurement ignores it.
+    #[doc(hidden)]
+    pub sequence_snapshot: Option<Arc<crate::WordSequenceSnapshot>>,
     /// The parsed document content.
     pub document: CT_Document,
     /// Whether document settings enable automatic hyphenation.
@@ -162,6 +185,16 @@ pub struct LayoutInput {
     ///
     /// `None` reproduces Word's half-inch default.
     pub default_tab_stop: Option<Twips>,
+    /// Whether the document's `w:compatibilityMode` is 15 or later, where Word
+    /// moves a tab stop past the right margin to the end of its line.
+    pub clamp_tabs_past_margin: bool,
+    /// Whether compatibility mode is absent or below 15, selecting legacy
+    /// positioning for eligible top-level tables.
+    pub legacy_table_positioning: bool,
+    /// Modern continuous-section footnote flow selected by compatibility mode 15.
+    pub modern_footnote_layout: bool,
+    /// Explicit `w:compat/w:footnoteLayoutLikeWW8` legacy flow override.
+    pub footnote_layout_like_word8: bool,
     /// Whether `w:mirrorMargins` makes even displayed pages swap their inside
     /// and outside margins.
     pub mirror_margins: bool,
@@ -174,12 +207,25 @@ pub struct LayoutInput {
     pub do_not_use_html_paragraph_auto_spacing: bool,
     /// Document-wide OfficeMath defaults from the settings part.
     pub math_properties: Option<MathProperties>,
+    /// Document-wide note policies from the settings part, footnotes then endnotes.
+    pub note_defaults: [Option<CT_NoteProperties>; 2],
     /// The tracked-revision projection to lay out.
     pub revision_view: RevisionView,
+    /// How the tracked view marks revisions.
+    pub revision_style: RevisionStyle,
     /// Style definitions.
     pub styles: CT_Styles,
     /// Numbering definitions (optional).
     pub numbering: Option<CT_Numbering>,
+    /// Physical OPC part names keyed by their modeled story identity.
+    ///
+    /// An absent mapping disables text-box provenance for that story.
+    pub story_part_names: HashMap<crate::WordStory, String>,
+    /// Rich block content keyed by physical story identity.
+    ///
+    /// A present entry replaces the paragraph-only header, footer or note
+    /// projection during layout. An absent entry retains the legacy projection.
+    pub story_bodies: HashMap<crate::WordStory, CT_Body>,
     /// Header parts keyed by relationship ID.
     pub headers: HashMap<String, CT_HdrFtr>,
     /// Footer parts keyed by relationship ID.
@@ -202,9 +248,10 @@ pub struct LayoutInput {
     pub endnotes: Option<CT_Footnotes>,
     /// Document theme (colors + fonts).
     pub theme: Option<Theme>,
-    /// User-provided or DOCX-embedded font files.
-    /// These are loaded before system fonts, so they take priority.
+    /// Genuine caller font files, with priority over embedded and fallback faces.
     pub fonts: Vec<FontFile>,
+    /// Checked physical embedded font bodies with every owned source alias.
+    pub embedded_fonts: Vec<EmbeddedFontSource>,
 }
 
 #[cfg(test)]

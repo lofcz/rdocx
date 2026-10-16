@@ -1,5 +1,45 @@
 # 03, Architecture
 
+## Owned publication and causal paths
+
+`oxml-py-support` owns captured path authority, owner scopes and prepared
+revision publication. It does not own native presentation objects or keep a
+second handle registry. Word bindings prepare a finite inventory of current
+physical paragraph, table, cell, section and captured hyperlink owners.
+Supported publication retains only proven surviving owners. Regular runs keep
+the conservative document epoch, while frozen Story and StoryItem captures
+also retain snapshot-inventory authority.
+Word owner inventories share source, owner and item qualification across full
+item, cell, paragraph XML and hyperlink projections in one operation. They
+materialize each source once and pair qualified physical owners with one traversal of each parsed outer table and its nested models.
+Physical coordinates retain row and cell vectors rather than logical grid
+columns. Candidate revision matching indexes current owner routes and retains
+all admissible parent matches until descendant matching completes. Body-slot
+and projection fallback classes remain distinct because their pairwise match
+relation is not transitive. Earliest matching old ownership determines retained
+scopes. No historical owner registry or persistent source cache is introduced.
+Namespace scans retain a frame per element and copy inherited maps only when
+the element declares a namespace. Attribute validation and scope restoration
+retain their checked source semantics.
+
+Presentation bindings capture concrete slide, shape, table-grid and text-owner
+scopes, then locate retained physical owners in their current source graph.
+Manual native snapshot constructors remain unbound and visible snapshot
+values retain their existing equality semantics.
+
+Table rows and columns collections bind their surviving physical table owner.
+Grid topology edits retire captured indexed rows, columns and cells while
+preserving those collections and the table and shape ancestors. Removing the
+parent owner retires its collections too.
+
+Bindings stage a native candidate and validate all conversions, source graph
+constraints and returned Python allocations before committing prepared scopes.
+The final native assignment cannot fail after publication. A rejected edit or
+an actual no-op leaves source, scope generations and live handles unchanged.
+First retirement records the exact public operation label for later stale
+errors. The native facades retain ownership of relationships, geometry and
+package authoring, while bindings reuse that publication protocol.
+
 ## Three families, one workspace
 
 ```
@@ -17,7 +57,7 @@ crates/
   oxml-cli-support   range parsing, JSON envelope, output-path defaulting
   oxml-chart         ChartML model and renderer
   oxml-py-support    content paths, revision checks, stale-domain errors,
-                     Length conversion helpers
+                     Length conversion helpers, shared PyO3 RGB input validation
 
   # WordprocessingML
   rdocx-opc          deprecated shim over oxml-opc
@@ -69,6 +109,16 @@ the side that owns its target type.
 
 ## Why these seams
 
+**Python RGB input belongs to `oxml-py-support`.** One concrete
+`rgb_channels(value: &Bound<PyAny>, parameter: &str) -> PyResult<(u8, u8, u8)>`
+serves both binding crates. This unpublished support crate takes the existing
+workspace PyO3 dependency without enabling `extension-module`. That feature
+stays in `rdocx-py` and `rpptx-py`. The facades and both WASM graphs do not
+consume the Python support crate. Each binding adapts the channels to its
+existing native colour representation and owns its surface-specific `None`
+and Word `auto` policy. Live colour formats keep document and content-path
+ownership in their binding, not in a second document or colour model.
+
 **`oxml-opc` does not depend on `oxml-core`.** It has its own small local-name
 handling. Staying independent means it is publishable first and consumable
 alone. `rdocx-wasm` consumes the complete `rdocx` facade rather than using this
@@ -81,8 +131,12 @@ creation and verification, and X.509 parsing in `oxml-opc`. `rdocx` and
 `rpptx` forward the native package reports and stage typed facade state before
 requesting package verification or signing. Both facades also forward the
 default-off `agile-encryption` feature for native encrypted opens and writes.
-Ordinary, Python, WASM, and CLI graphs do not include either security feature
-or its cryptographic dependencies.
+Native defaults and WASM do not select either security feature. Both Python
+bindings and both CLIs explicitly select digital signatures. The two Python
+consumers share concrete owned report conversion in oxml-py-support. The two
+CLIs select the default-off oxml-cli-support report feature even when their
+wrapper default features are disabled. Agile encryption remains unselected
+by Python, WASM and CLI consumers.
 
 **`oxml-media` has no dependencies at all.** It owns byte sniffing, image header
 probing, intrinsic EMU sizing through its local `NativeSize` value, safe MIME
@@ -92,11 +146,21 @@ It remains a leaf that anything can take cheaply without importing
 sniffed package metadata, and byte-first MIME inputs. The container checks do
 not claim a codec decoder.
 
+Inbound CommonMark also belongs to the `rdocx` facade. The pinned
+`pulldown-cmark` parser produces bounded events and an escaped HTML projection
+for the existing importer. Ordered diagnostics retain original source byte
+spans. Outbound Markdown derives from saved Word styles, numbering and content,
+without storing an input Markdown copy.
+
 **Inbound HTML belongs to the `rdocx` facade.** The private importer uses
 `scraper` for HTML5 document and fragment tree repair, then projects supported
 content directly into the one owned WordprocessingML document model. The edge
 does not enter `rdocx-html`, which remains an outbound emitter. This avoids a
 dependency cycle and avoids a second public intermediate document model.
+Semantic `mark` highlighting carries its final cascaded background through
+nested inline formatting. A child's own background takes precedence on that
+child, while ordinary CSS backgrounds remain scoped to their own elements.
+Nested marks choose their own highlight, and unmarked siblings inherit none.
 `Document::insert_html_fragment` reuses that importer against a staged document
 and emits concrete body content at a checked `ContentLocation`. Body and
 main-document cell destinations mutate their typed owners so retained sibling
@@ -255,9 +319,11 @@ and samples explicit segments, prepares the package, resolver, font, chart,
 picture, and media state once, then evaluates and lowers one timeline sample at
 a time. The completed opaque raster immediately enters either the facade-owned
 GIF encoder or the Motion JPEG AVI writer before the next sample is resolved.
-`gif`, `jpeg-encoder`, and `tiny-skia` are optional dependencies of the existing
-`rpptx` render feature. No codec edge enters `rpptx-layout`, `rpptx-render`, or
-an `oxml-*` crate, and audio and video package payloads are still never decoded.
+`jpeg-encoder` is an optional dependency of the existing `rpptx` render
+feature. The facade also uses `gif` and `tiny-skia` unconditionally for bounded
+image validation when rendering is disabled. No codec edge enters
+`rpptx-layout`, `rpptx-render`, or an `oxml-*` crate, and audio and video package
+payloads are still never decoded.
 
 The same boundary owns multilingual text mechanics. Rich segments retain
 logical text and source ranges while carrying script, language, direction,
@@ -344,8 +410,8 @@ The facade owns a separate deterministic-base engine for layouts where caller
 fonts override the bundled inventory. Missing families resolve from bundled
 faces without consulting system fonts. A caller font label that differs from
 its embedded family is a label-derived alias for that exact caller face. Native
-callers can also install byte-free family aliases. Resolution prefers an exact
-embedded family, then an explicit caller alias, then a label-derived alias,
+callers can also install byte-free family aliases. Within the caller tier, resolution prefers an exact
+sfnt family, then an explicit caller alias, then a label-derived alias,
 before existing mapped and generic fallbacks. Alias state retains a
 deterministic prefix of at most 256 mappings and 64 KiB of complete mapping and
 lookup identity. Checked transfer includes that exact bounded alias identity
@@ -413,6 +479,43 @@ PowerPoint edge. The all-target tree admits this test-only edge and retains the
 rule that no `oxml-*` crate depends on either facade family.
 
 ## What stays put
+Bibliography source authoring and formatting stay in the native
+`rdocx::bibliography` module. It owns qualified custom XML source inspection,
+checked source CRUD, document style/options and concrete measured citation and
+bibliography consumers. `rdocx::field` owns physical field discovery, recursive
+instruction spans, result replacement and structured paragraph/table cache
+boundaries. The facade stages a complete document and publishes only after
+source graph and output preparation succeed. An unfinished standard formatter
+aborts that transaction. Noncatalogue paths retain the owner with diagnostics.
+Normal save preserves caches and does not invoke this materializer.
+
+Source kind, contributor role and style metadata do not imply formatter parity.
+APA has 210 earned ordinary dense locale configurations with separately measured
+sparse, source-script and rich operations. Other bibliography styles retain
+lean numeric1033 Book admissions. Citation consumers remain separate. Actual
+source LCID, field locale and explicit application default select existing
+consumers without an en-US fallback. Multi-source non-ASCII sort keys refuse.
+The remaining catalogue and Word comparator are F-X192 backlog work, with no
+new collation dependency in this boundary.
+
+The bibliography table-width caller shares `rdocx_layout::engine::resolve_font_family`
+with the existing layout callers. Its public inputs must already contain the
+effective cascaded run properties. Font-slot and theme resolution retain the
+same concrete algorithm and deterministic font manager. Rich bibliography
+runs carry the measured font, language, script, italic and direction facts.
+They do not introduce a general Unicode font-coverage classifier.
+
+
+Generated-table source discovery and rebuilding stay in `rdocx::field`.
+Concrete XE and TA markers, INDEX, caption-selected TOC and numbered TOA options
+use the existing checked story inventory and shared dynamic owned-span scanner.
+The shared instruction grammar in `rdocx-oxml::text` owns bare and quoted
+operands, including INDEX LCIDs and TA/TOA categories. It distinguishes INDEX
+run-in and TOA heading flags from operands without changing other opcode rules.
+Source discovery excludes every generated cache and correlates accepted marker
+and caption paragraphs with their exact retained OPC owner. Source SEQ values
+come from the existing physical sequence snapshot rather than another counter
+interpreter. Existing `rebuild_toc` keeps its compatibility contract.
 
 `rdocx-oxml` remains a real crate holding the WordprocessingML grammar for
 text, properties, tables, styles, numbering, borders, headers and footers,
@@ -504,7 +607,10 @@ fields and the `w:glossaryDocument` root model. Typed form values and glossary
 properties are namespace aware, while retained XML remains the serialization
 source for every unsupported attribute and subtree. The `rdocx` facade owns
 relationship resolution, story-part identity, staged validation, and package
-commit for form-value and existing building-block replacement.
+commit for form values and the glossary lifecycle. Structural glossary edits
+retain untouched entry spans, container attributes and unsupported siblings.
+Glossary capture and insertion share the document-fragment dependency
+transaction, using the physical glossary part as relationship owner.
 
 Strict XML 1.0 lexical policy is shared by these glossary and facade scanners
 through `oxml_core::xml::validate_strict_xml_1_0`. The shared pass owns UTF-8,
@@ -591,6 +697,22 @@ carries it into `oxml-layout::LineBreakParams::default_tab_interval_pt`, whose
 `36.0` default is the exact literal it replaced, so a document that says
 nothing keeps Word's half-inch implicit tab grid.
 
+Tab stops resolve as Word resolves them. Positions are measured from the zero
+indent, not from where a line starts. A paragraph's `w:tabs` add to the stops
+of its styles and list level, a stop replacing an inherited one at its
+position and a `clear` stop removing it. A hanging indent is a left stop at
+the left indent. Bar stops stop no tab. Default stops start after the last
+explicit stop. A right, centre or decimal tab takes its width from the text
+after it, a decimal tab aligning the first full stop or else the end of the
+first number. `LayoutInput::clamp_tabs_past_margin`, set for a
+`w:compatibilityMode` of 15 or later, moves a stop past the right margin to
+the end of its line as Word 2013 does. Earlier modes keep the stop.
+The page-field tab adjustment crosses the shared layout boundary as
+`TabAlignedField` on `GlyphRun`. `LineBreakParams` and `LayoutInput` also expose
+`clamp_tabs_past_margin`. These additions are source compatible for callers
+using the existing defaults and methods. Existing public struct literals must
+supply the new fields when updating to these pre-1 crate versions.
+
 Two consecutive paragraphs of the body, or of one table cell, are separated by
 the larger of the first one's space after and the second one's space before,
 which is what Word does. The paginator reduces a paragraph's space before by
@@ -634,10 +756,25 @@ those runs and its fields are unchanged. Otherwise each field writes its own
 part of the span, so one field of a shared run can be updated alone. Direct-run and marker mutation rebuild the same read projection in
 memory. Simple and complex fields share one recursive
 `Field` grammar with a normalized name, text or
-nested arguments, switches, cached result, and optional dirty state. Its private
+nested arguments, switches, cached result, and optional dirty and lock states. Its private
 source records the original field form, run partition, and producer XML.
 Complex fields expose ordered cached-display segments with each segment's
-direct run properties. Tracked insertion projection retains inline paragraph
+direct run properties. Native callers construct either representation through
+checked raw instructions or typed arguments and switches, using `CT_R` values
+for ordered cached content. Typed operands cannot inject instruction tokens.
+Unknown switch operands are quoted on write and recognized as quoted or nested
+operands on read. Known flag switches keep their positional-operand grammar.
+This enriches the pre-1.0 projection of ambiguous unknown producer switches
+without changing preserved producer bytes. Cached page and column breaks remain
+typed XML controls rather than literal XML-invalid display characters. A nested
+field replacement invalidates the unchanged-source shortcut even when its
+display text stays equal. Lock edits rewrite only the physical simple owner or
+complex begin marker, retaining opaque subtrees and namespace bindings.
+Nested simple-cache projection reuses the producer's effective Word alias without
+replacing an occupied prefix. Cache writes retain aliased owner bindings and source text aliases. Only
+source-less generated result elements receive a local canonical binding. Foreign cached subtrees keep
+their original bytes and never become typed pagination identities.
+ Tracked insertion projection retains inline paragraph
 structure and nested revision boundaries, with a fixed depth ceiling checked
 before recursive projection.
 The mutable native run facade owns one logical ordered sequence of text, tabs,
@@ -654,14 +791,27 @@ raw XML, while unsupported valid fields retain their cached display. Dirty
 complex hyperlinks are not reported as `Document::links()` until the update
 policy defines how to handle them. The `rdocx` facade correlates bookmark ids
 and owns mutation across typed body paragraphs, including supported table and
-content-control traversal.
+content-control traversal. Its story-qualified range inventory also pairs
+bookmarks, comment endpoints, permission ranges and proofing ranges within one
+physical owner. Checked add, move and remove operations stage a candidate,
+validate accepted-view order and reopen the result before publication.
+Proofing pairs carry their spelling or grammar type without an invented id.
+Removing a comment range leaves its reference run and definition as a point
+comment. Moving a comment range moves its reference run with the pair.
 `rdocx-layout` resolves bookmark text and maps page targets, while the shared
 `oxml-layout` boundary exposes only format-neutral `Target` and `TargetPage`
 field kinds.
 
 The `rdocx` facade owns pure field evaluation over that recursive grammar. It
-walks every typed paragraph in main text, tables, content controls, distinct
-header and footer parts, footnotes, and endnotes. Package-backed inputs come
+registers physical typed field owners in main text, tables, content controls,
+distinct header and footer parts, notes, original annotations and selected
+text boxes. SEQ and REF use this expanded source scope. Other field kinds keep
+their established discovery scope, including direct related-story paragraphs.
+Hidden ordinary owners retain cache and dirty attributes. Public result indices
+number only visible evaluation records and are distinct from physical source
+IDs. Accepted revision selection uses the same initialized borrowed physical
+projection as layout, retaining deleted source IDs without evaluating them.
+Package-backed inputs come
 from unique bookmarks, styles, core and custom properties, and settings
 document variables. Date-time, filename, merge, and included-text values come
 only from an explicit caller context. Evaluation reports resolved text,
@@ -684,11 +834,54 @@ operand uses the shared recursive field grammar, including quoted escapes and
 nested fields. Barcode requests carry validated data, symbology, dimensions,
 correction, colour, and typed symbology-specific display options without
 generating renderer content. `CASE` retains its public spelling while using
-the same payload and case-style rules as `ITF14`. Sequence counters and
-mail-merge record state remain
-isolated by story. Mail-merge record and output sequence numbers come only from
-the explicit caller context. Raw text boxes and other untyped XML remain
-outside this evaluation boundary.
+the same payload and case-style rules as `ITF14`. Mail-merge record state remains isolated by story. Its record and output
+sequence numbers come only from the explicit caller context. SEQ uses one
+font-independent accepted-source snapshot owned by `rdocx-layout`. The facade
+and renderer consume its indexed counter events, field values and physical
+source identities. Selected text boxes participate in main-document order.
+Related-story increments produce the measured main-document-only error.
+Source-qualified note repeats use their document context, while shared
+furniture repeats resolve against actual page event boundaries. Pure evaluation
+retains caches when physical context is unavailable. Tracked views retain SEQ
+caches with diagnostics rather than joining accepted indices to tracked runs.
+Opaque fallback XML does not manufacture sequence sources. Producer instructions with unclosed
+quoting retain their cache and contribute no sequence event. The shared XML
+instruction quote validator honors quoted escapes before snapshot mutation.
+
+Snapshot equality includes retained field XML, effective instructions, inherited
+locks and selected owner projections before layout cache reuse. Rich selected
+text boxes bind exact physical source paths before shaping and restore local
+indices through the same injective map for the existing outer binding. Generated
+cache descendants cannot increment counters. Instruction descendants emit
+zero-width structural events at their owning accepted run. REF number and
+position projections also use the same source-only registration when no SEQ
+exists, so selected owners cannot alias local body indices.
+
+Ordinary REF target text and numbering use uniquely paired physical bookmark
+owners in the main story, headers, footers, notes and selected text boxes.
+The layout result exposes the existing resolved numbering for a uniquely paired
+bookmark, including nested table and control owners, without facade source-path
+reconstruction. Duplicate physical names and malformed ranges have no projection.
+Relative position uses the same registered physical owner, accepted paragraph
+path and actual run boundary in the shared source-only snapshot. Header and
+footer aliases share a physical part identity, while notes and selected boxes
+retain their actual owner identity. A field inside its target, an ambiguous range or an unavailable
+cross-story comparison retains the complete cache with a diagnostic, including
+combined numbering and position requests.
+
+The native facade authors checked captions, sequence fields and REF fields at
+accepted story boundaries. Caption insertion allocates separate whole-caption,
+label-and-number and number bookmark ranges atomically. REF numbering shares
+one resolved-numbering formatter with layout, including current-level, relative,
+full-context, text omission and current-leaf delimiter behavior.
+
+REF note and annotation copies freeze original source ownership before staged
+allocation. Typed cache runs and paragraph-sibling comment endpoints preserve
+rich payload and schema order. Unique cached copy owners may refresh from the
+original source without accumulating note, comment or companion graph entries.
+Ambiguous ownership or unsupported companion edges retain source caches and
+ordered diagnostics. Optional comment metadata parts remain absent when absent.
+Unmodelled XML and existing relationship scope remain authoritative.
 
 The facade also owns explicit field cache updates across that same typed story
 scope. It evaluates the complete field set before changing cloned document and
@@ -706,15 +899,45 @@ or malformed producer value stays unmodelled and byte-preserved, and an
 explicit mutation rejects that ambiguous ownership before publication. The two
 methods are additive pre-1.0 `rdocx` API.
 
-`Document::update_layout_backed_fields` is the separate pagination-aware entry
-point for PAGE, NUMPAGES, and resolved PAGEREF caches. It lays out one staged
-candidate deterministically, reads each placed field through its layout field
-identity, and writes only those caches through the same traversal and
-validated story patching. The owned report separates the three updated counts
-and retains ordered layout diagnostics. `Document::update_page_fields` is the
-count-only compatibility wrapper over that operation. Every unsupported or
-unplaced field keeps its cache and dirty spelling, and `update_fields` still
-defers every layout-backed field kind.
+`Document::update_layout_backed_fields` materializes PAGE, NUMPAGES, SECTION,
+SECTIONPAGES and resolved PAGEREF through one staged deterministic layout.
+Its immutable snapshot retains physical pages, displayed numbering, every section
+occupying a continuous page, bookmark target ownership and recursive field
+placements. Field indices follow preorder through instructions and cached results.
+Cached children have their own display placement. Instruction operands inherit
+only their owning field's placement. Locks propagate to descendants.
+
+Complete story-range discovery materializes each physical source once per operation.
+Owner, control and namespace scopes are discovered in batches, then paragraph
+excerpts reuse checked source offsets. Cache projection shares those owned
+source/span facts. The evaluator reuses one paragraph listing for range pairing
+and bookmark-name counts, with independent failure handling for each. This
+operation-local inventory adds no global cache or revision invalidation state.
+
+Physical source identity covers modeled paragraphs, tables, controls, headers,
+footers, notes and selected typed text boxes. Actual OPC names remain distinct
+from logical source paths. Rich related-story and text-box bodies replace their
+paragraph-only projections when present. Text-box source owner ordinals bind
+from actual namespace-qualified anchor occurrences before shaping, including
+identical anchors and earlier unregistered owners. Original DrawingML and opaque
+fallbacks remain serialization authorities. Cache staging validates the exact
+field source inside the matched physical owner before publishing atomically.
+Physical binding traverses all revision and raw owner slots before accepted
+selection. Opaque occurrences consume identity without becoming editable stories.
+Accepted revision projection metadata survives without serialization and reparsing.
+Authoritative rich story bodies and actual part names participate in reusable
+context and header/footer cache identity, including note-only invalidation.
+
+
+The report separates five counts and retains ordered diagnostics. The count-only
+`update_page_fields` wrapper uses the same operation. PAGE follows its field's
+section format and PAGEREF follows the target's format. A unique placed target
+permits unlocked PAGEREF updates in unused source stories. Other unplaced fields,
+missing or ambiguous targets, unsupported switches and locked fields retain their
+caches. Saved header and footer PAGE and NUMPAGES caches remain unchanged under
+the pinned Word policy, while dynamic rendering uses per-page values. Note PAGE
+and SECTION follow the unique body reference owner even when document-end note
+text is printed on a later physical page. No second layout resolves these facts.
 
 The native facade also rebuilds supported existing main-story table of
 contents fields. It reparses each owned instruction through the same recursive
@@ -905,8 +1128,27 @@ Accepting keeps insertions and move destinations, while rejecting keeps
 deletions and move sources and converts deleted text and deleted field codes
 (`w:delText` and `w:delInstrText`) back to ordinary text and field codes.
 Property rejection restores exactly one namespace-correct prior property
-value. Contextual markers act on their owning run, paragraph mark, numbering
-property, or row. Resolution stages every affected package part, resolves
+value. A `w:pPrChange` holds only the base paragraph properties, so rejecting
+it keeps the paragraph mark `w:rPr` and the `w:sectPr`, which resolve their
+own markers, `w:rPrChange`, and `w:sectPrChange`. Rejecting a mark
+`w:rPrChange` replaces the whole mark formatting, including unmodelled
+children, and keeps only the mark markers. Redlines from rdocx
+0.14 and earlier carry prior mark formatting as a `w:rPr` in the prior
+properties. That child replaces current mark formatting and retains current
+paragraph-mark markers that stay. A mark formatting change that stays has no
+owner in this form and is refused. When only the edited paragraph had mark
+formatting, the prior holds no `w:rPr` and reads like Word's form, so rejecting
+it keeps the edited mark formatting. Contextual markers act on their owning
+run, paragraph mark, numbering property, or row. A removed paragraph mark
+merges with the next paragraph across a table that immediately follows it when
+every row of that table is removed by the same resolution. Before a retained
+table, removal drops an emptied paragraph, permitting proofing markers but
+refusing retained content, opaque children or meaningful raw gaps atomically.
+A hyperlink whose selected revisions remove every child is dropped only when
+its resolved inner bytes contain no opaque content. Previously empty hyperlinks
+remain. A removed paragraph mark inside removed content, such as a cell paragraph of a removed row, needs
+no merge partner. The merged paragraph keeps the resolved properties of the
+last paragraph, whose mark remains. Resolution stages every affected package part, resolves
 selected descendants before their enclosing subtree, reparses the complete
 candidate package, and commits once only after validation succeeds.
 
@@ -915,12 +1157,27 @@ source index assigns stable public story categories and private owner paths to
 modeled paragraphs, tables, fields, and nested text boxes. A concrete
 hierarchical longest-common-subsequence alignment covers paragraphs, runs,
 table rows, nested tables, lists, and modeled content inside existing
-content-control shells. The default path retains whole-run behavior. An
+content-control shells. Changed gap owners pair by kind and in order, so a
+paragraph beside an edited table cannot force whole-table replacement. The
+default path retains whole-run behavior. An
 additive options value selects Unicode-scalar character units or maximal
 Unicode word, whitespace, and punctuation-or-symbol units, and applies
 left-biased ignores for formatting, textual whitespace, fields, comments, and
 selected story categories. Selected categories leave the original story bytes
 untouched and are excluded before shell checks and revision-id allocation.
+A linear post-pass groups word and character changes into consecutive deletions
+followed by insertions within each structural and formatting owner segment.
+Whitespace anchors between changes fold. Other anchors fold only when their
+joined word count is strictly smaller than both deleted and inserted word counts
+on each side. Character fragments carry word state across units, so an unchanged
+one-word anchor between one-word edits stays even when those words are long.
+Fields, drawings, ignored units, opaque children, bookmark and comment markers,
+hyperlinks, controls and formatting transitions stop grouping. Formatting-only
+changes and replacements using ignored formatting also stop it. Different runs
+retain their own formatting and coalescing ownership. Run granularity retains
+its existing alignment and revision output. Supported inline controls retain raw
+child run cuts before extraction, align Word and Character units within those
+shell segments and copy each shell before its first inserted unit.
 Non-text content remains atomic. Unmatched identical owners become move pairs
 only within one story. A changed run of consecutive paragraphs that holds a
 pair whose hyperlinks, bookmarks, comment ranges, preserved raw children, or
@@ -931,12 +1188,17 @@ neighbouring paragraphs until each side holds every complex field it begins or
 ends, so a table of contents, whose end Word writes in a paragraph of its own,
 is deleted and inserted whole, which Word needs to accept or reject it. A
 whole deleted, inserted, or moved paragraph carries its bookmarks and comment
-ranges inside its revision wrappers, and its hyperlinks and simple fields only
-inside a complex field deleted or inserted whole with it, since neither may
-sit in a revision wrapper and Word reads each as a field whose codes stay
-untracked. Comparison refuses otherwise, and when the two sides of such a run
-share a bookmark or comment range, or a moved paragraph holds one, since the
-redline would hold it twice. Deleted content writes a field code as
+ranges inside its revision wrappers. Hyperlink shells remain outside the
+wrappers, which track their own children, so whole hyperlink paragraphs can be
+inserted, deleted or moved. Simple fields still require a complex field carried
+whole around them. Empty whole-paragraph hyperlinks remain refused. Captured
+nested Word hyperlinks remain unsupported and are refused before deeper wrapping.
+Wrapper calls are bounded to the paragraph and one direct hyperlink owner. Comparison
+also refuses when the two sides of such a run share a bookmark or comment range,
+or a moved paragraph holds one, since the redline would hold it twice. Expanded
+Word names distinguish typed owners from foreign lookalikes, whose raw bytes
+remain opaque. Whole-owner wrappers retain comments and processing instructions
+in their original positions. Deleted content writes a field code as
 `w:delInstrText`, since Word refuses to open a deletion that holds
 `w:instrText`. A carried hyperlink whose target only the edited side has gets
 its relationship in the redline, and a paragraph mark lists its revision
@@ -944,13 +1206,18 @@ markers in schema order before its formatting.
 When a matched paragraph changes its comment range, hyperlink, inline control,
 or preserved child boundary without moving a bookmark, comparison writes a
 paired paragraph deletion and insertion. This also covers a TOC entry whose
-cached text becomes a hyperlink and PAGEREF field. Unmatched paragraphs with a
-hyperlink outside a carried complex field still refuse the pair.
+cached text becomes a hyperlink and PAGEREF field. Empty self-closing paragraphs
+are opened before granular properties or text are inserted. A paragraph before
+a retained table carries its own mark revision. Trailing deletion chains mark
+the kept predecessor once and retain accepted and rejected paragraph properties.
 Changed field results remain inside their field owner, while instruction or
 form changes replace that complete owner. Supported run, paragraph, table, and
 section properties emit property revisions that retain the original property
-sidecars. Unsupported formatting differences retain the original bytes and
-produce stable `ComparisonDiagnostic` values at the actual story path. Inputs
+sidecars. A changed paragraph records its prior base properties in
+`w:pPrChange` and its prior mark formatting in a `w:rPrChange` in the mark
+`w:rPr`, as Word's own Compare writes them. Unsupported formatting
+differences retain the original bytes and produce stable
+`ComparisonDiagnostic` values at the actual story path. Inputs
 with existing modeled revisions or differing story shells are rejected unless
 their story category is ignored. The root and owner start tags of a comment
 or note story compare as namespace-resolved trees, so a part written again
@@ -988,9 +1255,33 @@ paragraph mark as the story or control terminator. A self-closing original
 final paragraph expands around its marker without creating a raw sibling. This
 ownership lets acceptance retain every appended paragraph and rejection
 reconstruct the original without an empty terminal residue.
+When an inserted or deleted table stands between that boundary and a final
+inserted or deleted paragraph, the paragraph mark before the table carries the
+boundary, because resolving that change removes every row of the table.
+An inserted or deleted row carries its marker in `w:trPr`, and every cell
+paragraph mark and every cell run carries one too, nested tables included, as
+Word's own Compare writes it. Without the cell marks Word merges the adjacent
+paragraph into the first cell.
+A paragraph-mark marker is the first child of `w:rPr`, and a new `w:rPr` goes
+before `w:sectPr` and `w:pPrChange`, as the schema orders them.
+Removing the marked paragraph mark merges that paragraph into the final one,
+which keeps its own properties. When the two resolutions need different
+properties there, the final paragraph carries the accepted paragraph
+properties with a `w:pPrChange` that holds the rejected ones. When mark
+formatting differs, its mark `w:rPr` ends with a `w:rPrChange` that holds the
+rejected mark formatting, as Word's own Compare writes them. An inserted or
+moved-in paragraph therefore
+records the original properties of the paragraph before it, and a deleted or
+moved-out one the edited properties of that paragraph.
 Comparison patches only owned source spans, preserves every unowned byte,
 stages the complete package, proves that acceptance matches the edited policy
 projection and rejection matches the original, then commits once.
+Alignment leaves paragraph properties out so that a paragraph whose
+properties changed still matches, but the accept and reject projection adds
+the modeled properties of every paragraph of each story, including those in
+tables and content controls, unless formatting is ignored. A resolution that
+loses paragraph or mark formatting, apart from section breaks, therefore fails
+the postcondition.
 
 `rdocx-layout` owns the renderer-only revision projection. The
 `LayoutInput::revision_view` selector chooses an accepted or tracked view. The
@@ -1078,8 +1369,9 @@ one effective header variant without changing the caller-owned even-and-odd
 header setting. Every operation serializes and reopens the staged package
 before publishing it.
 
-Footnotes and endnotes are laid out into a `NoteRegistry` before pagination, and
-the paginator reserves, splits and draws them. Note placement is part of
+Footnotes, endnotes, and authored separator and continuation records are laid
+out into a `NoteRegistry` before pagination, and the paginator reserves, splits
+and draws them. Note placement is part of
 pagination rather than a pass that runs after it, because a page's body height
 depends on the note area it owes, and a note that does not fit continues on the
 following page. The registry pre-shapes each note's marker, so the paginator
@@ -1090,9 +1382,8 @@ per document, and is looked up by the width of the section drawing it. A note is
 broken to the measure of the section carrying its reference, since that is the
 measure it is drawn at, and reserve and render therefore still read the same
 lines. A document whose sections share a page size registers one width and lays
-each note out once, which is the common case. Endnotes are measured against the
-final section, because they are emitted after the last body page and drawn
-against that section's geometry wherever their references sit.
+each note out once, which is the common case. Section-end endnotes use their
+section's width, while document-end endnotes use the final section's width.
 
 The paginator also reflows a paragraph around any floating drawing that wraps,
 because whether a drawing overlaps a line is only known once the paragraph has a
@@ -1116,12 +1407,21 @@ paragraph can push a drawing to the next page, which shrinks the paragraph,
 which pulls the drawing back. Two passes give one answer, always.
 
 The two note streams are placed differently and are keyed apart. A footnote
-sits at the foot of the page carrying its reference and takes height from that
-page. An endnote costs its page nothing and is emitted after the last body
-page, where endnotes flow from the top of their own pages without a separator
-rule. A reference therefore carries a `NoteRef`, its stream and its number,
-because the streams number independently and a document may hold a footnote and
-an endnote sharing a number.
+sits at the foot of the page carrying its reference or immediately beneath
+body text when the effective policy selects that position. The paginator
+reserves its full note area before admitting body lines. Endnotes flow from the
+last page of their section or from the final body page, then continue on later
+pages as needed. The body and note marker use one label assigned at the first
+body reference under document and section policy. Page restarts use the
+reference's physical page after a bounded pagination pass. A custom mark does
+not consume the numeric stream. A reference carries a `NoteRef`, its stream
+and its package ID, because footnotes and endnotes can share an ID.
+
+The native document facade stages normal endnote creation, exact element
+reordering, and removal with matching body references. Endnotes use their own
+relationship-resolved part and ID allocation. Rich edits use the same checked
+story operations as footnotes, then reopen the candidate package before
+publication.
 
 ## Versioning
 
@@ -1234,6 +1534,22 @@ them. The families fold into a lockstep train once rpptx stabilises.
 
 ## Facade conventions
 
+Destructive Word facade edits stage the document and reconcile qualified raw
+comment ownership before publication. One inventory covers body, related
+stories, selected and opaque source owners, and linked comment companions.
+`try_remove_content` distinguishes an absent index from an unsafe cut, while
+its legacy boolean twin returns false for either. Complete owned threads may
+be removed. Note deletion, section story pruning and revision resolution use
+the same candidate boundary. Unchanged or increased source marker counts leave unrelated
+producer annotation metadata untouched rather than adding global save-time
+validation. Decreases of demonstrably undefined markers retain their legacy
+lifecycle because no owned definition can be orphaned, with absence proved from
+actual qualified raw definitions, malformed or ambiguous owned linkage refused,
+and CLI validation remaining strict. Partial ranges and commented fragment detaches refuse without
+changing the live package. Cell text edits retain checked paragraph anchors,
+and a document-unaware cell removes only a proven plain empty paragraph when
+another required paragraph remains.
+
 Both facades use the same borrow-handle idiom rdocx already has: a mutable
 `Foo<'a>` wrapping `&'a mut CT_Foo` and a read-only `FooRef<'a>`, with
 consuming builders for formatting so calls chain, `&mut self` methods for adding
@@ -1294,7 +1610,15 @@ second document tree. The facade resolves package owners and stable source
 order. The existing `rdocx-oxml` grammar remains the authority for admitting
 content controls, revisions, and fields as typed content. Content rejected by
 that grammar remains one opaque preserved boundary and cannot expose nested
-owners or editable text. Word writes a text box twice in a run's
+owners or editable text.
+
+Footnote creation and removal stage the note part and body references as one
+package candidate. Reorder moves the exact note element bytes and retains its
+internal ID. Common story content, relationship, and comment operations edit
+rich note bodies through the resolved note owner. Each successful mutation
+reopens the candidate before it replaces live state.
+
+Word writes a text box twice in a run's
 `mc:AlternateContent`, as DrawingML in `mc:Choice` and as VML in
 `mc:Fallback`. That text box is one text-box story, read from the first
 Choice that holds a text box, the one layout draws. Any other Choice and the
@@ -1316,7 +1640,14 @@ Owned story-item and story-link snapshots build the package source and owner
 inventory once per accessor. Namespace scopes for all selected owners, items,
 and hyperlink starts are collected in bounded source passes. Item and hyperlink
 text is then projected from namespace-complete fragments without restarting at
-the physical story root for each returned value.
+the physical story root for each returned value. Complex-field text and link
+excerpts share one namespace envelope around the exact sibling-run bytes.
+The envelope inherits the context before the first run. Each original element
+retains its local declarations, which never become sibling context. Single-root
+excerpts likewise keep their own declarations authoritative.
+Enclosing fields establish typed discovery admission but carry no local offsets
+into an isolated excerpt. Checked inverse translation restores hyperlink source
+positions before relationship lookup or smallest-owner deduplication.
 
 The Python projection materializes each story item as a frozen value with its
 exact XML bytes and the binding revision that produced it. Story mutation
@@ -1366,17 +1697,31 @@ owner. Clones allocate fresh document identities and drop the `w14:paraId` and
 fragments require the unchanged owner scope. Every operation serializes and
 reopens a staged candidate before publishing it.
 
-`DocumentFragment` owns a package-authoritative half-open main-body selection
-and its supported dependency source. Import closes only dependencies reachable
-from the selected body XML and selected comment threads. It computes style and
-numbering references to a fixpoint, preallocates relationship and part names,
-and rewrites bookmark, comment, drawing, field, style, numbering, and
-relationship identities only after every map exists. Exact retained body and
-comment XML remain authoritative. Reuse of equivalent style, numbering, and
-related-part graphs is caller-selected through `FragmentConflictPolicy`.
-Import applies all changes to one staged document and publishes only after the
-package serializes and reopens. External, dangling, malformed, incomplete, or
-exhausted dependency graphs leave the destination unchanged.
+`DocumentFragment` owns a package-authoritative half-open block selection from
+any supported story owner. Existing two-segment paragraph paths inside block
+controls resolve their enclosing control content. Source and destination keep
+their physical part's relationship scope. Inline items and split owners are
+invalid fragment boundaries.
+
+Import closes only dependencies reachable from selected XML and its required
+note and comment companions. Style and numbering references reach a fixpoint
+across those companions, including cyclic style links and numbering overrides.
+Custom XML stores carry item properties and receive fresh store IDs on
+collision. Notes, comment threads, bookmarks, paired endpoints and revisions
+receive deterministic new identities. REF targets share the bookmark-name map.
+Charts, diagrams, embeddings and opaque extensions use the existing OPC graph.
+Internal cycles retain exact payload bytes and part-local relationship IDs,
+with allocated part names and rewritten internal targets. External edges keep
+their target, type and mode without fetching resources. Reuse applies only to
+structurally equivalent styles, numbering and relationship-free leaf parts.
+
+One staged document serializes and reopens before publication. Insertion into
+a note or comment part retains companions imported into that same part.
+Dangling, malformed, split, exhausted and unsafe opaque-reference graphs fail
+without changing the live document. An integrity-bound package signature part
+that cannot survive remapping is rejected. Existing destination signature
+invalidation policy applies to changed coverage. Preserved opaque companions
+gain no new rendering or decoding support.
 
 Ordered Word section ownership also belongs to the `rdocx` facade. Concrete
 `SectionRef` and `Section` handles borrow the existing paragraph-level or
@@ -1401,6 +1746,10 @@ then publish once. First-page creation enables `titlePg`. Even-page selection
 is controlled separately by the typed document setting. Rich edits continue
 through the container-neutral story operations rather than a second header or
 footer content model.
+Comment authoring uses the same checked story run range in every header and
+footer variant. The facade anchors selected paragraphs in the owning related
+part on a staged package, retains untouched producer XML around those spans,
+then publishes the part and comment definition together after validation.
 
 Word layout retains that physical ownership. The facade loads header and
 footer images under the main-part relationship that selects the story plus the
@@ -1477,6 +1826,16 @@ wrapper it flattens or leaves out, and reports the losses of the content it
 writes as it does outside them.
 Each paragraph contributes the same accepted-view text as paragraph text, so
 tracked insertions are included and tracked deletions are left out.
+The OOXML model owns accepted structural visibility. A deleted or moved-away
+body paragraph mark joins its paragraph to the next direct body paragraph
+unless a section break or intervening block prevents that join. Text omits the
+joining newline, while HTML and Markdown emit one block with the following
+paragraph's block properties. Accepted layout omits an empty joining
+paragraph and lays out retained joined content in the following block.
+Deleted or moved-away table rows are absent from accepted text, JSON, HTML,
+Markdown, MHTML picture traversal and layout. A table whose rows are all
+removed contributes no accepted block or spacing. Source model rows and
+editing indices remain intact, and tracked layout still shows them.
 The WASM binding uses `Document::text` for its existing `getText` method and
 otherwise owns one complete `Document`. It never reaches into
 `rdocx-oxml` or maintains a second package representation.
@@ -1606,6 +1965,32 @@ content. `Document` validates both endpoints before mutation, allocates
 collision-free comment and paragraph ids, updates the comment parts and all
 three anchors together, then invalidates layout once. `CommentRef` is a
 read-only view over the typed comment and its comments-extended thread entry.
+Its checked `anchor()` and `anchor_text()` accessors share the document's
+qualified comment ownership proof. `Document::comment_anchor` returns an
+accepted-view `StoryRunRange`, and `comment_anchor_text` returns exactly the
+selected accepted display, with one newline between paragraphs. A known
+orphan returns no range or text, and a reference-only point returns no paired
+range with empty text. Replies do not inherit a fabricated parent range.
+Unknown identities and malformed, ambiguous or unprojectable selected sources
+return errors. Listing validates all owned definitions and companions, while
+raw marker ids proven absent from qualified definitions do not invent records
+or block established comparison reads. Strict deletion and CLI ownership
+validation still reject those undefined markers, and reads preserve their XML. Source-order temporary projections reuse the existing paragraph
+parser and accepted run axis without changing source XML. An interval around
+only a raw wrapper can display text while having zero accepted runs. Such an
+interval is explicitly unsupported when re-anchoring those coordinates cannot
+represent it faithfully. Supported controls, revisions and ordinary field
+caches retain accepted-view semantics. Multi-paragraph insertion qualifies both
+source endpoints before publishing either, retaining stale-owner checks.
+`Document::move_comment` selects a complete root range and reference through
+that same qualified proof. Replies, unknown ids and incomplete or ambiguous
+sources refuse atomically. Moving preserves thread identity and metadata,
+transports the original reference properties and opaque attributes, and leaves
+mixed-run neighbors in source order. Destination paragraph identity and run
+boundaries rebase after removal. Only newly empty pure Google marker controls
+are pruned. `move_comment_to_text` shares the existing recursive literal finder
+and splitter without allocating a temporary thread.
+Rich comment query restores main-part namespace context once through the existing strict declaration replay. Paired XML events prove that names, non-namespace attributes and payload remain identical, yielding exact physical boundary correspondence. The mapped canonical and restored story-owner inventories must be bijective in physical spans, kind and owner index before canonical paragraph paths receive actual namespace scopes. Additional or reinterpreted owners refuse instead of redirecting a query. The existing checked paragraph span traversal serves both discovery and projection, with paragraph scopes inventoried in a bounded pass. Canonical locations, fingerprints and accepted run indices remain authoritative. Imported paragraph and block-local alias fields retain rich A7B, source-byte purity and usable move/reopen endpoints. Comment destination anchoring replays retained declarations before replacing package authority, while other anchor kinds keep their existing path. Redundant declaration replay is omitted only for a unique exact owner whose complete non-namespace event payload and local declarations match, with identical resolved element and attribute namespace facts throughout that owner. Redundant child declarations on a transported reference do not require global replay to reinterpret its shape. This owner-local proof permits unrelated modeled source normalization. Needed declarations still use the unchanged strict replay. The private pre-removal endpoint probe validates the caller's exact accepted endpoints without publishing destination namespace context, while the real Comment destination always preserves that authority before replacing source. Same-owner modeled alias plus local raw-field fixtures that already fail initial save remain outside this correction. Supported controls include separate unrelated root-bound modeled aliases and normalized properties in the same package.
 `StoryRunPosition` and `StoryRunRange` add checked `ContentLocation` ownership
 for body and table-cell paragraphs without changing `RunPosition`. A body
 location can also name a paragraph inside a block content control with a
@@ -1614,9 +1999,21 @@ its paragraphs, which `Document::paragraph_story_location` returns for a
 paragraph index. The staged
 path validates both endpoints and edits cloned paragraphs before it creates
 comment relationships, so any path, run, or package failure publishes nothing.
-Replies follow paragraph-id parent linkage, resolution applies to the thread
-root, and removal deletes the selected comment plus descendant replies without
+Replies follow paragraph-id parent linkage through each comment's last
+paragraph, as `w15:commentEx` keys it, each line of a comment text is one
+paragraph. Resolution applies to the thread root, and removal deletes the
+selected comment plus descendant replies without
 deleting unrelated runs or producer XML.
+Whole-story header/footer setters stage the complete text, raw XML or image
+operation and reconcile removed comment ownership. A clone of that candidate
+prepares and reopens the complete output once before the original candidate
+publishes, preserving live authoring identities until save. Glossary deletion and body replacement reuse that same strict graph.
+The graph accepts an explicit physical main or glossary owner, so equal numeric
+ids never join unrelated review parts. Imported retired section parts stay in
+the package. Their qualified markers are removed only after every modeled,
+inherited and proved opaque physical use disappears. Unknown incoming use
+refuses. Glossary raw edits refresh the typed model before a later flush.
+
 The additive `add_comment_with_date` and `reply_to_with_date` operations own
 validated optional timestamps. The original operations delegate with no date.
 
@@ -1717,3 +2114,76 @@ Python properties use in-place mutation.
 ### Boxed mathematics
 
 MathML `menclose notation="box"` and LaTeX `\boxed` map to native Office Math `m:borderBox`. The base remains editable in DOCX. PDF layout draws four edges inside the measured bounds and reserves writing height for empty bases, including fraction and script positions. Unsupported border properties remain preserved and diagnosed rather than silently rendered as a different enclosure.
+
+## Shared Word document operations
+
+The native Word facade owns accepted-view text presentation and advisory package validation. Python and CLI callers consume the same TextReport and ValidationReport. The native crate has no CLI dependency. Plain text presentation groups readable related stories in physical inventory order and retains main text with one ordered omission diagnostic if extraction fails. Body counts use accepted content rather than presentation labels.
+
+Python template conversion admits explicit JSON scalar and container types before native mutation. Its existing workspace serde_json dependency edge introduces no separate converter model. Checked fragment publication and property mutation stage complete candidates, preserve the original on refusal and invalidate live handles only after changed publication. Markdown requests recursive physical-owner boundaries from the existing accepted projection. The default accepted view remains unchanged for its other consumers.
+
+## PowerPoint checked XML ownership
+
+The rpptx facade resolves checked XML against actual slide, layout or master
+parts and concrete physical owner paths. Existing rpptx-oxml and oxml-drawing
+parsers validate qualified roots and modeled child order. The facade stages
+package candidates, validates relationship target roles and MIME identities,
+and serializes and reparses before publication. Supported raster targets use
+the shared bounded PNG, JPEG, GIF, TIFF and BMP decoder in rpptx. Existing
+unsupported media facts may survive only with exact original target identity.
+
+The Python binding stages that native candidate and prepares returned handles
+and revision tokens before committing. Physical paragraph and run positions
+address current owners, never prove that removed children survived. Actual
+owner, text-body and XML-property child generations establish alias identity.
+Shared revision primitives remain owned by oxml-py-support.
+
+## Embedded font ownership
+
+Word owns its relationship-resolved font table and ODTTF parts. PowerPoint
+owns its source-preserving presentation font list and EOT parts. Both native
+facades stage font model, package bytes, relationships, content types and flags
+as one transaction. Shared source targets use copy-on-write and pruning removes
+only genuinely unreachable owned parts. Descriptive records and opaque producer
+source remain authoritative, and unsafe ambiguous edits refuse before publication.
+
+Both families require explicit caller authorization and exact nonempty license
+identity. Font bytes come from bounded caller inputs. Word checked listing
+bounds projected owned copies while retaining the legacy snapshot layout. Its
+indexed metadata reader resolves the actual part through the same checked
+relationship provider. PowerPoint decodes each distinct supported part once
+and shares its immutable body among aliases. Python preallocates immutable
+result snapshots before publishing the native candidate, and CLIs use those
+same native providers before staging outputs. No second ZIP/font/revision engine
+or low-level dependency on a facade is introduced.
+
+Native Office is an independent consumer of those package graphs, not a second
+font provider. PowerPoint qualifies actual regular and bold font use through
+source open, native save and normal reopen. Word's documented one-font-per-name
+behavior can synthesize styles and change saved embeddings. That native
+interoperability boundary does not change the four-face APIs, deterministic
+renderer selection or caller precedence. Native Word multi-face work belongs
+to F-X223.
+
+## Presentation semantic text projection
+
+The `rpptx` facade owns semantic HTML and Markdown projection in its existing
+HTML carrier. Python and CLI consumers call that projection without invoking
+font discovery, layout or rendering. Export options and detached results are
+concrete facade values. The source package and live owners remain unchanged.
+
+The facade directly uses the existing workspace `tiny-skia`, `gif`,
+`zune-jpeg` and `tiff` dependencies for bounded image validation, including
+when rendering and the default template are disabled. PNG and JPEG bodies are
+fully decoded, all GIF frames and TIFF pages are checked, and uncompressed BMP
+pixel extents are validated. The existing crate root owns the crate-private bounded picture-body validator.
+Semantic export attaches its source-path error context at the call site. The
+validator remains a concrete facade helper, with no dependency from a shared
+OXML crate into a facade.
+
+## ZIP package dependency
+
+The three direct ZIP consumers are oxml-opc, rdocx and rpptx. They use zip9.0.3 with disabled defaults and the existing Rust Deflate backend. No extra codec or dependency alias is selected. Native OPC errors expose the upstream zip9 error identity. Existing package and ODF validation owns admission after fallible decoded-name access.
+
+ZIP9 also selects its upstream macOS/BSD-only nix0.31.3 dependency with fs and
+disabled defaults, plus cfg_aliases0.2.2 for that dependency build. They do not
+add a ZIP codec and remain subject to actual target, license and MSRV checks.

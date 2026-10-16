@@ -1,8 +1,8 @@
-name: Python wheels
+name: Unified family release
 
 on:
   push:
-    tags: ["py-rdocx-v*", "py-rpptx-v*"]
+    tags: ["v*", "rpptx-v*"]
   workflow_dispatch:
 
 permissions:
@@ -25,16 +25,114 @@ jobs:
           - { label: macos-arm64, runner: macos-14, target: aarch64-apple-darwin, manylinux: off, install: native }
           - { label: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, manylinux: off, install: native }
     runs-on: ${{ matrix.platform.runner }}
+    env:
+      WHEEL_TEST_NODES: >-
+        {
+          "rdocx": [
+            "crates/rdocx-py/tests/test_core.py::test_core_text_mutations_survive_bytes_round_trip",
+            "crates/rdocx-py/tests/test_core.py::test_constructor_accepts_an_optional_input_path",
+            "crates/rdocx-py/tests/test_core.py::test_priority_word_operations_return_typed_snapshots_and_remain_atomic",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal[paragraph]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal[run]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal[table]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal[cell]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_five_checked_xml_owners_preserve_noop_and_atomic_refusal[section]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_hyperlink_capture_survives_unrelated_append_and_reopens",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_identical_hyperlink_removal_cannot_resurrect_capture",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_table_append_preserves_owner_and_retires_old_grid",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_run_keeps_first_global_cause_and_manual_item_equality",
+            "crates/rdocx-py/tests/test_core.py::test_hyperlinks_are_retargeted_or_removed_in_every_story",
+            "crates/rdocx-py/tests/test_core.py::test_a_stale_hyperlink_snapshot_never_edits_another_link",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_xml_child_views_retire_without_retiring_true_ancestors",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_section_furniture_retirement_preserves_shared_physical_part",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_run_text_retires_picture_with_first_cause_and_keeps_rpr",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_imported_local_picture_run_xml_preserves_owned_media_and_opaque",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_constructor_inventory_preserves_direct_control_and_cell_joins[False]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211a_constructor_inventory_preserves_direct_control_and_cell_joins[True]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_captured_link_survives_append_with_fresh_paragraph_setup",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_hyperlink_foreign_manual_and_noop_authority",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_removed_link_first_cause_survives_identical_replacements",
+            "crates/rdocx-py/tests/test_core.py::test_fx211c_word_grid_retirement_is_local_and_invalid_access_atomic",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_opaque_word_owners_preserve_corpus_fragments[table]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_opaque_word_owners_preserve_corpus_fragments[cell]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_opaque_word_owners_preserve_corpus_fragments[section]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[margin]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[header]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[notes]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[equation]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[merge]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_word_current_compatibility_repairs[style]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_merge_opaque_refusal_preserves_package_and_owners[properties]",
+            "crates/rdocx-py/tests/test_core.py::test_fx211d_merge_opaque_refusal_preserves_package_and_owners[borders]",
+            "crates/rdocx-py/tests/test_rendering_threads.py::test_fx211c_word_unknown_symbol_source_and_same_pass_diagnostics[symbol]",
+            "crates/rdocx-py/tests/test_rendering_threads.py::test_fx211c_word_unknown_symbol_source_and_same_pass_diagnostics[numbering]",
+            "crates/rdocx-py/tests/test_core.py::test_fx240_sign_verify_owned_reports_pem_and_multisignatures",
+            "crates/rdocx-py/tests/test_core.py::test_fx240_current_tamper_partial_unsigned_and_malformed",
+            "crates/rdocx-py/tests/test_core.py::test_fx240_refusal_preserves_current_bytes_and_held_authority",
+            "crates/rdocx-py/tests/test_core.py::test_fx240_fill_then_sign_sign_then_fill_and_unchanged_story_owners",
+            "crates/rdocx-py/tests/test_core.py::test_fx240_late_graph_refusal_preserves_link_run_story_and_raw_parts"
+          ],
+          "rpptx": [
+            "crates/rpptx-py/tests/test_documented_examples.py::test_python_round_three_authoring_and_inspection_is_typed_and_lossless",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_unit_constructors_truncate_fractional_values_toward_zero",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_structural_append_retires_slide_inventory_and_preserves_existing_owners",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_run_text_replaces_in_place_and_keeps_every_handle_live",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[shape]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[table]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[cell]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[body]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[paragraph]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[run]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[slide]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[layout]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_nine_physical_owners_are_checked_atomic_and_reopened[master]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211b_element_precisely_retires_replaced_children_and_preserves_unrelated_owners",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_paragraph_text_preserves_its_owner_and_retires_replaced_runs",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_row_cells_are_checked_live_grid_views",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_theme_name_is_live_and_preserves_source_parts",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_alt_text_and_highlight_alias_reach_saved_native_properties",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_aliases_and_foreign_refusals_are_atomic",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_absent_core_author_retains_none_and_roundtrips",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_autofit_approximation_facts_are_owned_and_deduplicated",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_bullet_char_alias_qualifies_numbering_four_families_and_render",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_bullet_char_invalid_alias_is_atomic_with_live_owners[]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_bullet_char_invalid_alias_is_atomic_with_live_owners[True]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_bullet_char_invalid_alias_is_atomic_with_live_owners[17]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_minimum_refusal_keeps_bytes_and_held_owners[align-1-selection-selection reference requires at least 2, got 1]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_minimum_refusal_keeps_bytes_and_held_owners[distribute-1-selection-selection reference requires at least 3, got 1]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_minimum_refusal_keeps_bytes_and_held_owners[distribute-2-selection-selection reference requires at least 3, got 2]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_minimum_refusal_keeps_bytes_and_held_owners[align-0-slide-no shapes were given]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_arrangement_minimum_refusal_keeps_bytes_and_held_owners[distribute-0-slide-no shapes were given]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_table_collections_keep_owner_authority_and_retire_indexed_grid_views[rows]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx211c_table_collections_keep_owner_authority_and_retire_indexed_grid_views[columns]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx206_grid_change_retires_cells_but_preserves_table_and_other_shapes",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_table_rows_and_columns_are_added_and_removed_like_python_pptx_add_tr",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_stale_shape_text_and_table_paths_report_exact_recovery",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_nested_group_paths_report_exact_recovery",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx216_foreign_layout_precedes_stale_collection_without_publication[add]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx216_foreign_layout_precedes_stale_collection_without_publication[add_at]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx216_foreign_layout_precedes_stale_collection_without_publication[single]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx216_foreign_layout_precedes_stale_collection_without_publication[diagnostics]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx216_foreign_layout_precedes_stale_collection_without_publication[batch]",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx240_sign_verify_owned_reports_pem_and_multisignatures",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx240_current_tamper_partial_unsigned_and_malformed",
+            "crates/rpptx-py/tests/test_documented_examples.py::test_fx240_refusal_preserves_current_bytes_and_held_authority"
+          ]
+        }
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
       - id: cp39
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.9"
       - name: Build cp39-abi3 wheel
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
         with:
           command: build
@@ -44,7 +142,7 @@ jobs:
           working-directory: crates/${{ matrix.package.crate }}
           args: --release --locked --compatibility pypi --out ../../dist
       - name: Validate wheel metadata
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         shell: bash
         run: |
           python - <<'PY'
@@ -60,7 +158,7 @@ jobs:
           assert "Tag: cp39-abi3-" in metadata, metadata
           PY
       - name: Install and test native wheel
-        if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))) && matrix.platform.install == 'native'
+        if: (github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))) && matrix.platform.install == 'native'
         shell: bash
         run: |
           "${{ steps.cp39.outputs.python-path }}" -m venv .wheel-venv
@@ -72,22 +170,22 @@ jobs:
           "$venv_python" -m pip install --upgrade pip
           "$venv_python" -m pip install dist/${{ matrix.package.distribution }}-*.whl pytest python-docx==1.2.0 python-pptx==1.0.2
           "$venv_python" -c "import ${{ matrix.package.module }}"
-          if [[ "${{ matrix.package.distribution }}" == "rdocx" ]]; then
-            "$venv_python" -m pytest \
-              crates/rdocx-py/tests/test_core.py \
-              crates/rdocx-py/tests/test_formatting_tables.py \
-              crates/rdocx-py/tests/test_shared.py \
-              crates/rdocx-py/tests/test_python_docx_parity.py
-          else
-            "$venv_python" -m pytest crates/rpptx-py/tests/test_documented_examples.py
-          fi
+          PACKAGE_DISTRIBUTION="${{ matrix.package.distribution }}" "$venv_python" - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          nodes = json.loads(os.environ["WHEEL_TEST_NODES"])[os.environ["PACKAGE_DISTRIBUTION"]]
+          subprocess.run([sys.executable, "-m", "pytest", *nodes], check=True)
+          PY
       - id: cp312
-        if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))) && matrix.platform.install == 'native'
+        if: (github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))) && matrix.platform.install == 'native'
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
       - name: Validate installed typing surface
-        if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))) && matrix.platform.install == 'native'
+        if: (github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))) && matrix.platform.install == 'native'
         shell: bash
         run: |
           "${{ steps.cp312.outputs.python-path }}" -m venv .typing-venv
@@ -107,7 +205,7 @@ jobs:
             "$typing_python" -m mypy.stubtest rpptx
           fi
       - name: Install and test musllinux wheel
-        if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))) && matrix.platform.install == 'musl'
+        if: (github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))) && matrix.platform.install == 'musl'
         shell: bash
         run: |
           docker run --rm \
@@ -116,6 +214,7 @@ jobs:
             -w /workspace \
             -e PACKAGE_DISTRIBUTION="${{ matrix.package.distribution }}" \
             -e PACKAGE_MODULE="${{ matrix.package.module }}" \
+            -e WHEEL_TEST_NODES \
             python:3.9-alpine \
             sh -euxc '
               python -m venv /tmp/wheel-venv
@@ -123,18 +222,23 @@ jobs:
               "$venv_python" -m pip install --upgrade pip
               "$venv_python" -m pip install /dist/${PACKAGE_DISTRIBUTION}-*.whl pytest python-docx==1.2.0 python-pptx==1.0.2
               "$venv_python" -c "import ${PACKAGE_MODULE}"
-              if [ "$PACKAGE_DISTRIBUTION" = rdocx ]; then
-                "$venv_python" -m pytest \
-                  crates/rdocx-py/tests/test_core.py \
-                  crates/rdocx-py/tests/test_formatting_tables.py \
-                  crates/rdocx-py/tests/test_shared.py \
-                  crates/rdocx-py/tests/test_python_docx_parity.py
-              else
-                "$venv_python" -m pytest crates/rpptx-py/tests/test_documented_examples.py
-              fi
+              "$venv_python" - << "PY"
+          import json
+          import os
+          import subprocess
+          import sys
+
+          nodes = json.loads(os.environ["WHEEL_TEST_NODES"])[os.environ["PACKAGE_DISTRIBUTION"]]
+          subprocess.run([sys.executable, "-m", "pytest", *nodes], check=True)
+          PY
             '
+      - name: Attest built artifact
+        if: github.event_name == 'push' && ((matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v')))
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - name: Upload wheel
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifact-wheel-${{ matrix.package.distribution }}-${{ matrix.platform.label }}
@@ -150,33 +254,42 @@ jobs:
         package:
           - { distribution: rdocx, crate: rdocx-py, module: rdocx }
           - { distribution: rpptx, crate: rpptx-py, module: rpptx }
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         with:
           python-version: "3.9"
       - name: Build source distribution
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
         with:
           command: sdist
           maturin-version: v1.13.3
           working-directory: crates/${{ matrix.package.crate }}
           args: --out ../../dist
+      - name: Attest built artifact
+        if: github.event_name == 'push' && ((matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v')))
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - name: Upload source distribution
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, format('refs/tags/py-{0}-v', matrix.package.distribution))
+        if: github.event_name == 'workflow_dispatch' || (matrix.package.distribution == 'rdocx' && startsWith(github.ref, 'refs/tags/v')) || (matrix.package.distribution == 'rpptx' && startsWith(github.ref, 'refs/tags/rpptx-v'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifact-sdist-${{ matrix.package.distribution }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
+  publish-pypi:
     name: Publish selected Python distribution
-    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/py-rdocx-v') || startsWith(github.ref, 'refs/tags/py-rpptx-v'))
-    needs: [build-wheels, build-sdists]
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/rpptx-v'))
+    needs: release-assets
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
@@ -189,8 +302,8 @@ jobs:
         shell: bash
         run: |
           case "${GITHUB_REF_NAME}" in
-            py-rdocx-v*) distribution=rdocx ;;
-            py-rpptx-v*) distribution=rpptx ;;
+            v*) distribution=rdocx ;;
+            rpptx-v*) distribution=rpptx ;;
             *) exit 1 ;;
           esac
           echo "distribution=${distribution}" >> "${GITHUB_OUTPUT}"
@@ -208,3 +321,621 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist
+
+  build-cli-assets:
+    name: CLI ${{ matrix.family }} ${{ matrix.platform.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["rdocx","rpptx"]' || startsWith(github.ref, 'refs/tags/rpptx-v') && '["rpptx"]' || '["rdocx"]') }}
+        platform:
+          - { label: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { label: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+          - { label: linux-musl-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, archive: tar.gz }
+          - { label: macos-x86_64, runner: macos-15-intel, target: x86_64-apple-darwin, archive: tar.gz }
+          - { label: macos-arm64, runner: macos-14, target: aarch64-apple-darwin, archive: tar.gz }
+          - { label: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, archive: zip }
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Select Rust release family
+        id: selected
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            binary="${{ matrix.family }}"
+            package="${binary}-cli"
+            version=$(python - "$package" <<'PY_VERSION'
+          from pathlib import Path
+          import re
+          import sys
+          import tomllib
+
+          manifest = tomllib.loads(Path(f"crates/{sys.argv[1]}/Cargo.toml").read_text())
+          version = manifest["package"]["version"]
+          if isinstance(version, dict):
+              assert version == {"workspace": True}, version
+              workspace = tomllib.loads(Path("Cargo.toml").read_text())
+              version = workspace["workspace"]["package"]["version"]
+          assert isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+          print(version)
+          PY_VERSION
+            )
+            if [[ "$binary" == "rdocx" ]]; then
+              selected_tag="v${version}"
+            else
+              selected_tag="rpptx-v${version}"
+            fi
+            python scripts/sprint_workflow.py unified-release-family "$selected_tag"
+            artifact="cli-asset-${binary}-${{ matrix.platform.label }}"
+          else
+            case "${GITHUB_REF_NAME}" in
+              v*) package=rdocx-cli; binary=rdocx; version=${GITHUB_REF_NAME#v} ;;
+              rpptx-v*) package=rpptx-cli; binary=rpptx; version=${GITHUB_REF_NAME#rpptx-v} ;;
+              *) exit 1 ;;
+            esac
+            [[ "$binary" == "${{ matrix.family }}" ]]
+            artifact="cli-asset-${{ matrix.platform.label }}"
+          fi
+          echo "package=${package}" >> "${GITHUB_OUTPUT}"
+          echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "artifact=${artifact}" >> "${GITHUB_OUTPUT}"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install musl toolchain
+        if: matrix.platform.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build selected CLI
+        shell: bash
+        run: |
+          build_args=()
+          if [[ "${{ matrix.platform.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            build_args+=(--no-default-features)
+          fi
+          cargo build --release --locked \
+            --package "${{ steps.selected.outputs.package }}" \
+            --target "${{ matrix.platform.target }}" \
+            "${build_args[@]}"
+      - name: Smoke-test selected CLI
+        shell: bash
+        run: |
+          binary_path="target/${{ matrix.platform.target }}/release/${{ steps.selected.outputs.binary }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            binary_path="${binary_path}.exe"
+          fi
+          version_output=$("$binary_path" --version)
+          [[ "$version_output" == "${{ steps.selected.outputs.binary }} ${{ steps.selected.outputs.version }}" ]]
+          "$binary_path" --help
+          "$binary_path" inspect --help
+      - name: Qualify selected CLI signing
+        shell: bash
+        env:
+          SIGNING_FAMILY: ${{ steps.selected.outputs.binary }}
+        run: |
+          export SIGNING_BINARY="target/${{ matrix.platform.target }}/release/${{ steps.selected.outputs.binary }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            export SIGNING_BINARY="${SIGNING_BINARY}.exe"
+          fi
+          python - <<'PY'
+          import ast
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          import zipfile
+
+          family = os.environ["SIGNING_FAMILY"]
+          assert family in ("rdocx", "rpptx")
+          binary = Path(os.environ["SIGNING_BINARY"]).resolve()
+          source = Path("crates/oxml-opc/src/signature.rs").read_text(encoding="utf-8")
+          def material(name):
+              return base64.b64decode(re.search(r'const ' + name + r': &str = "([^"]+)";', source)[1], validate=True)
+          def rewritten(data, mutate=None, extra=False):
+              output = io.BytesIO()
+              with zipfile.ZipFile(io.BytesIO(data)) as original, zipfile.ZipFile(output, "w") as result:
+                  entries = [(item.filename, original.read(item.filename)) for item in original.infolist()]
+                  for name, value in entries:
+                      result.writestr(name, mutate(name, value) if mutate else value)
+                  if extra:
+                      result.writestr("word/uncovered.xml" if family == "rdocx" else "ppt/uncovered.xml", b"<uncovered/>")
+              return output.getvalue()
+          with tempfile.TemporaryDirectory(prefix="signature-acceptance-", dir=os.environ.get("RUNNER_TEMP")) as temporary:
+              work = Path(temporary)
+              def run(args, status=0, structured=True):
+                  result = subprocess.run([str(binary), *map(str, args)], capture_output=True, text=True)
+                  assert result.returncode == status, (args[0], result.returncode, result.stderr)
+                  if structured:
+                      payload = json.loads(result.stdout)
+                      assert payload["schema"] == 1
+                      return payload
+                  return result
+              key = work / "key.der"; cert = work / "cert.der"
+              key.write_bytes(material("TEST_PRIVATE_KEY_PKCS8_BASE64"))
+              cert.write_bytes(material("TEST_CERTIFICATE_DER_BASE64"))
+              original = work / ("source.docx" if family == "rdocx" else "source.pptx")
+              if family == "rdocx":
+                  # Reuse the exact integrated five-kind source recipes without importing a wheel.
+                  tree = ast.parse(Path("crates/rdocx-py/tests/test_core.py").read_text(encoding="utf-8"))
+                  names = {"_fx241_control", "_fx241_legacy_text"}
+                  functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+                  assert {node.name for node in functions} == names
+                  scope = {}
+                  exec(compile(ast.Module(body=functions, type_ignores=[]), "five-kind-source", "exec"), scope)
+                  control = scope["_fx241_control"]
+                  body = control("plain", "<w:text/>")
+                  body += control("check", '<w14:checkbox xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w14:checked w14:val="0"/><w14:checkedState w14:val="2612" w14:font="MS Gothic"/><w14:uncheckedState w14:val="2610" w14:font="MS Gothic"/></w14:checkbox>', "☐")
+                  body += control("choice", '<w:dropDownList><w:listItem w:displayText="One" w:value="one"/><w:listItem w:displayText="Two" w:value="two"/></w:dropDownList>', "one")
+                  body += control("date", '<w:date><w:dateFormat w:val="yyyy-MM-dd"/></w:date>', "2026-09-15")
+                  body += scope["_fx241_legacy_text"]() + '<w:sectPr/>'
+                  with zipfile.ZipFile(original, "w") as result:
+                      result.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+                      result.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+                      result.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' + body + '</w:body></w:document>')
+              else:
+                  original.write_bytes(Path("crates/rpptx/assets/default.pptx").read_bytes())
+              original_hash = hashlib.sha256(original.read_bytes()).hexdigest()
+              assert run(["verify-signatures", original, "--json"], 1)["status"] == "unsigned"
+              signing_input = original
+              if family == "rdocx":
+                  values = work / "values.json"; values.write_text(json.dumps({"plain":"Ada", "check": True, "choice":"two", "date":"2026-10-16", "legacy":"filled"}))
+                  signing_input = work / "filled.docx"
+                  run(["fill", original, "--values", values, "-o", signing_input, "--json"])
+                  with zipfile.ZipFile(signing_input) as archive:
+                      xml = archive.read("word/document.xml")
+                      assert all(value in xml for value in (b"Ada", b"two", b"2026-10-16", b"filled", "☒".encode()))
+              signed = work / ("signed.docx" if family == "rdocx" else "signed.pptx")
+              signature = run(["sign", signing_input, "--key", key, "--cert", cert, "-o", signed, "--json"])["signature"]
+              assert signature["cryptographically_valid"] and signature["coverage_complete"]
+              assert "F-172 Test Signer" in signature["signer"]["subject"] and not signature["issues"]
+              checked = run(["verify-signatures", signed, "--json"])
+              assert checked["status"] == "valid" and len(checked["signatures"]) == 1
+              partial = work / "partial.zip"; partial.write_bytes(rewritten(signed.read_bytes(), extra=True))
+              checked = run(["verify-signatures", partial, "--json"], 1)
+              assert checked["status"] == "partial" and checked["signatures"][0]["cryptographically_valid"]
+              assert not checked["signatures"][0]["coverage_complete"]
+              def tamper(name, value):
+                  if family == "rdocx" and name == "word/document.xml":
+                      assert b"Ada" in value; return value.replace(b"Ada", b"Changed", 1)
+                  if family == "rpptx" and name == "docProps/core.xml":
+                      assert b"</cp:coreProperties>" in value
+                      return value.replace(b"</cp:coreProperties>", b"<dc:description>Changed</dc:description></cp:coreProperties>")
+                  return value
+              changed = work / "changed.zip"; changed.write_bytes(rewritten(signed.read_bytes(), tamper))
+              checked = run(["verify-signatures", changed, "--json"], 1)
+              assert checked["status"] == "invalid"
+              assert any(issue["kind"] == "changed_reference" for item in checked["signatures"] for issue in item["issues"])
+              if family == "rdocx":
+                  values.write_text(json.dumps({"plain":"After signing"}))
+                  after = work / "after.docx"
+                  run(["fill", signed, "--values", values, "-o", after, "--json"])
+                  checked = run(["verify-signatures", after, "--json"], 1)
+                  assert checked["status"] == "invalid"
+                  assert any(issue["kind"] == "changed_reference" and issue["details"]["uri"].startswith("/word/document.xml?") for item in checked["signatures"] for issue in item["issues"])
+              for label, path in ((b"PRIVATE KEY", key), (b"CERTIFICATE", cert)):
+                  encoded = base64.b64encode(path.read_bytes())
+                  path.write_bytes(b" \r\n-----BEGIN " + label + b"-----\r\n" + b"\r\n".join(encoded[i:i+64] for i in range(0, len(encoded), 64)) + b"\r\n-----END " + label + b"-----\r\n")
+              pem_signed = work / "pem.zip"
+              assert run(["sign", original, "--key", key, "--cert", cert, "-o", pem_signed, "--json"])["signature"]["coverage_complete"]
+              before = signed.read_bytes()
+              run(["sign", original, "--key", key, "--cert", cert, "-o", signed], 1, False)
+              assert signed.read_bytes() == before
+              key.write_bytes(b"x" * (1024 * 1024 + 1))
+              refused = work / "refused.zip"
+              run(["sign", original, "--key", key, "--cert", cert, "-o", refused], 1, False)
+              assert not refused.exists()
+              assert hashlib.sha256(original.read_bytes()).hexdigest() == original_hash
+              print(json.dumps({"family":family, "source_sha256":original_hash, "signed_sha256":hashlib.sha256(before).hexdigest(), "valid":True, "partial_refused":True, "tamper_refused":True, "pem":True, "material_bound_atomic":True}))
+          PY
+      - name: Package selected CLI
+        shell: bash
+        run: |
+          binary="${{ steps.selected.outputs.binary }}"
+          source="target/${{ matrix.platform.target }}/release/${binary}"
+          stage="${RUNNER_TEMP}/cli-package"
+          mkdir -p "$stage" dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source="${source}.exe"
+            cp "$source" "$stage/${binary}.exe"
+          else
+            cp "$source" "$stage/$binary"
+            chmod +x "$stage/$binary"
+          fi
+          cp "crates/${{ steps.selected.outputs.package }}/README.md" "$stage/README.md"
+          cp LICENSE "$stage/LICENSE"
+          archive_name="${binary}-${{ matrix.platform.target }}.${{ matrix.platform.archive }}"
+          archive_path="${GITHUB_WORKSPACE}/dist/${archive_name}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cd "$stage"
+            7z a -tzip "$archive_path" "${binary}.exe" README.md LICENSE
+          else
+            tar -C "$stage" -czf "$archive_path" "$binary" README.md LICENSE
+          fi
+      - name: Attest built artifact
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Upload selected CLI archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.selected.outputs.artifact }}
+          path: dist/${{ steps.selected.outputs.binary }}-${{ matrix.platform.target }}.${{ matrix.platform.archive }}
+          if-no-files-found: error
+
+  cli-assets:
+    name: Verify CLI release assets
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    needs: build-cli-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download CLI archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: cli-asset-*
+          merge-multiple: true
+      - name: Validate CLI archives
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              binaries = ["rdocx", "rpptx"]
+          elif tag.startswith("rpptx-v"):
+              binaries = ["rpptx"]
+          elif tag.startswith("v"):
+              binaries = ["rdocx"]
+          else:
+              raise AssertionError(f"unsupported Rust release tag {tag}")
+
+          expected_targets = {
+              "x86_64-unknown-linux-gnu": ".tar.gz",
+              "aarch64-unknown-linux-gnu": ".tar.gz",
+              "x86_64-unknown-linux-musl": ".tar.gz",
+              "x86_64-apple-darwin": ".tar.gz",
+              "aarch64-apple-darwin": ".tar.gz",
+              "x86_64-pc-windows-msvc": ".zip",
+          }
+          dist = Path("dist")
+          expected_names = {
+              f"{binary}-{target}{suffix}"
+              for binary in binaries
+              for target, suffix in expected_targets.items()
+          }
+          archives = sorted(path for path in dist.iterdir() if path.is_file())
+          assert {path.name for path in archives} == expected_names, archives
+
+          expected_license = Path("LICENSE").read_bytes()
+
+          def normalize_text(payload: bytes) -> bytes:
+              return payload.replace(b"\r\n", b"\n")
+
+          for archive in archives:
+              binary = next(name for name in binaries if archive.name.startswith(name + "-"))
+              expected_readme = Path(f"crates/{binary}-cli/README.md").read_bytes()
+              executable = f"{binary}.exe" if archive.suffix == ".zip" else binary
+              expected_members = {executable, "README.md", "LICENSE"}
+              if archive.suffix == ".zip":
+                  with zipfile.ZipFile(archive) as package:
+                      ordered_members = package.infolist()
+                      ordered_names = [info.filename for info in ordered_members]
+                      assert len(ordered_members) == len(expected_members), ordered_names
+                      assert len(ordered_names) == len(set(ordered_names)), ordered_names
+                      members = {info.filename: info for info in ordered_members}
+                      assert set(members) == expected_members, members
+                      payloads = {name: package.read(name) for name in members}
+              else:
+                  with tarfile.open(archive, "r:gz") as package:
+                      ordered_members = package.getmembers()
+                      ordered_names = [member.name for member in ordered_members]
+                      assert len(ordered_members) == len(expected_members), ordered_names
+                      assert len(ordered_names) == len(set(ordered_names)), ordered_names
+                      members = {member.name: member for member in ordered_members}
+                      assert set(members) == expected_members, members
+                      assert all(member.isfile() for member in members.values())
+                      assert members[executable].mode & 0o111
+                      payloads = {
+                          name: package.extractfile(member).read()
+                          for name, member in members.items()
+                      }
+              assert payloads[executable]
+              assert normalize_text(payloads["README.md"]) == normalize_text(expected_readme)
+              assert normalize_text(payloads["LICENSE"]) == normalize_text(expected_license)
+
+          PY
+      - name: Upload reviewed CLI assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ github.event_name == 'workflow_dispatch' && format('cli-rehearsal-assets-{0}', github.sha) || format('cli-release-assets-{0}', github.ref_name) }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release-assets:
+    name: Verify unified release assets
+    if: github.event_name == 'push'
+    needs: [cli-assets, build-wheels, build-sdists]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify tag points to the closed main merge
+        shell: bash
+        run: |
+          git fetch --tags origin main:refs/remotes/origin/main
+          main_sha="$(git rev-parse refs/remotes/origin/main)"
+          [[ "${GITHUB_SHA}" == "${main_sha}" ]]
+          sprint_tags="$(git tag --points-at "${GITHUB_SHA}" --list 's[0-9]*')"
+          [[ "$(printf '%s\n' "${sprint_tags}" | sed '/^$/d' | wc -l | tr -d ' ')" == 1 ]]
+          [[ "${sprint_tags}" =~ ^s[0-9]+(\.[0-9]+)?$ ]]
+          [[ "$(git cat-file -t "refs/tags/${sprint_tags}")" == tag ]]
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Verify exact selected publication set
+        run: python3 scripts/sprint_workflow.py unified-release-family "${{ github.ref_name }}"
+      - name: Select release family
+        id: selected
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            v*) distribution=rdocx; binary=rdocx ;;
+            rpptx-v*) distribution=rpptx; binary=rpptx ;;
+            *) exit 1 ;;
+          esac
+          echo "distribution=${distribution}" >> "${GITHUB_OUTPUT}"
+          echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
+      - name: Download reviewed CLI archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cli-release-assets-${{ github.ref_name }}
+          path: dist
+      - name: Download selected Python artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: python-dist
+          pattern: artifact-*-${{ steps.selected.outputs.distribution }}*
+          merge-multiple: true
+      - name: Validate thirteen subjects and write checksums
+        shell: bash
+        run: |
+          python3 scripts/sprint_workflow.py python-release-artifacts "${GITHUB_REF_NAME}" python-dist
+          python3 - <<'PY'
+          from hashlib import sha256
+          import os
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          binary = "rpptx" if tag.startswith("rpptx-v") else "rdocx"
+          cli = Path("dist")
+          python = Path("python-dist")
+          expected_cli = {
+              f"{binary}-{target}{suffix}"
+              for target, suffix in {
+                  "x86_64-unknown-linux-gnu": ".tar.gz",
+                  "aarch64-unknown-linux-gnu": ".tar.gz",
+                  "x86_64-unknown-linux-musl": ".tar.gz",
+                  "x86_64-apple-darwin": ".tar.gz",
+                  "aarch64-apple-darwin": ".tar.gz",
+                  "x86_64-pc-windows-msvc": ".zip",
+              }.items()
+          }
+          assert {path.name for path in cli.iterdir()} == expected_cli
+          assert len(list(python.iterdir())) == 7
+          assert not ({path.name for path in cli.iterdir()} & {path.name for path in python.iterdir()})
+          for path in python.iterdir():
+              path.rename(cli / path.name)
+          subjects = sorted(cli.iterdir())
+          assert len(subjects) == 13
+          (cli / "SHA256SUMS").write_text(
+              "".join(f"{sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in subjects),
+              encoding="utf-8",
+          )
+          PY
+          cd dist
+          sha256sum --check SHA256SUMS
+      - name: Verify producer attestations
+        shell: bash
+        run: |
+          for asset in dist/*; do
+            [[ "$asset" == dist/SHA256SUMS ]] && continue
+            gh attestation verify "$asset" -R tensorbee/rdocx \
+              --signer-workflow tensorbee/rdocx/.github/workflows/wheels.yml \
+              --source-digest "${GITHUB_SHA}"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify publication archives
+        run: |
+          cargo publish --workspace --dry-run \
+            --config 'patch.crates-io.oxml-core.path="crates/oxml-core"' \
+            --config 'patch.crates-io.oxml-drawing.path="crates/oxml-drawing"' \
+            --config 'patch.crates-io.oxml-layout.path="crates/oxml-layout"' \
+            --config 'patch.crates-io.oxml-media.path="crates/oxml-media"' \
+            --config 'patch.crates-io.oxml-opc.path="crates/oxml-opc"' \
+            --config 'patch.crates-io.oxml-pdf.path="crates/oxml-pdf"' \
+            --config 'patch.crates-io.oxml-sml.path="crates/oxml-sml"' \
+            --config 'patch.crates-io.oxml-cli-support.path="crates/oxml-cli-support"' \
+            --config 'patch.crates-io.oxml-chart.path="crates/oxml-chart"' \
+            --config 'patch.crates-io.rdocx.path="crates/rdocx"' \
+            --config 'patch.crates-io.rdocx-cli.path="crates/rdocx-cli"' \
+            --config 'patch.crates-io.rdocx-html.path="crates/rdocx-html"' \
+            --config 'patch.crates-io.rdocx-layout.path="crates/rdocx-layout"' \
+            --config 'patch.crates-io.rdocx-opc.path="crates/rdocx-opc"' \
+            --config 'patch.crates-io.rdocx-oxml.path="crates/rdocx-oxml"' \
+            --config 'patch.crates-io.rdocx-pdf.path="crates/rdocx-pdf"' \
+            --config 'patch.crates-io.rpptx.path="crates/rpptx"' \
+            --config 'patch.crates-io.rpptx-cli.path="crates/rpptx-cli"' \
+            --config 'patch.crates-io.rpptx-chart.path="crates/rpptx-chart"' \
+            --config 'patch.crates-io.rpptx-layout.path="crates/rpptx-layout"' \
+            --config 'patch.crates-io.rpptx-oxml.path="crates/rpptx-oxml"' \
+            --config 'patch.crates-io.rpptx-render.path="crates/rpptx-render"'
+
+      - name: Verify selected package inventory
+        shell: bash
+        run: |
+          python3 - <<'PYINVENTORY'
+          from pathlib import Path
+          import os
+          from scripts.sprint_workflow import validate_release_package_inventory
+
+          validate_release_package_inventory(
+              os.environ["GITHUB_REF_NAME"], Path("target/package")
+          )
+          PYINVENTORY
+      - name: Upload reviewed family assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: family-release-assets-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-crates:
+    name: Publish to crates.io
+    if: github.event_name == 'push'
+    needs: release-assets
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Verify output stability
+        run: python3 scripts/hash_harness.py --check
+
+      - name: Verify selected release family
+        run: python3 scripts/sprint_workflow.py unified-release-family "${{ github.ref_name }}"
+
+      - name: Verify published shared dependencies for stable release
+        if: startsWith(github.ref_name, 'v')
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          workspace = tomllib.loads(Path("Cargo.toml").read_text())
+          pins = workspace["workspace"]["dependencies"]
+          required = set()
+          for crate in ("rdocx-opc", "rdocx-oxml", "rdocx-layout", "rdocx-html", "rdocx-pdf", "rdocx", "rdocx-cli"):
+              manifest = tomllib.loads(Path("crates", crate, "Cargo.toml").read_text())
+              for section in ("dependencies", "build-dependencies"):
+                  for name in manifest.get(section, {}):
+                      if name.startswith("oxml-") and name in pins:
+                          required.add((name, pins[name]["version"]))
+          assert required, "stable family has no shared dependency inventory"
+          for name, version in sorted(required):
+              subprocess.run(["cargo", "info", f"{name}@{version}"], check=True)
+          PY
+
+      - name: Verify reviewed release notes
+        run: python3 scripts/sprint_workflow.py release-notes "${{ github.ref_name }}" --check
+
+      - name: Publish stable allowlist
+        if: startsWith(github.ref_name, 'v')
+        run: |
+          cargo publish -p rdocx-opc
+          sleep 60
+          cargo publish -p rdocx-oxml
+          sleep 60
+          cargo publish -p rdocx-layout
+          sleep 60
+          cargo publish -p rdocx-html
+          sleep 60
+          cargo publish -p rdocx-pdf
+          sleep 60
+          cargo publish -p rdocx
+          sleep 60
+          cargo publish -p rdocx-cli
+
+      - name: Publish incubating allowlist
+        if: startsWith(github.ref_name, 'rpptx-v')
+        run: |
+          cargo publish -p oxml-core
+          sleep 60
+          cargo publish -p oxml-opc
+          sleep 60
+          cargo publish -p oxml-media
+          sleep 60
+          cargo publish -p oxml-layout
+          sleep 60
+          cargo publish -p oxml-drawing
+          sleep 60
+          cargo publish -p oxml-pdf
+          sleep 60
+          cargo publish -p oxml-sml
+          sleep 60
+          cargo publish -p oxml-cli-support
+          sleep 60
+          cargo publish -p oxml-chart
+          sleep 60
+          cargo publish -p rpptx-oxml
+          sleep 60
+          cargo publish -p rpptx-chart
+          sleep 60
+          cargo publish -p rpptx-layout
+          sleep 60
+          cargo publish -p rpptx-render
+          sleep 60
+          cargo publish -p rpptx
+          sleep 60
+          cargo publish -p rpptx-cli
+
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push'
+    needs: [publish-crates, publish-pypi, release-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download reviewed CLI assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: family-release-assets-${{ github.ref_name }}
+          path: ${{ runner.temp }}/family-assets
+      - name: Verify selected registry publication
+        run: python3 scripts/sprint_workflow.py published-unified-release "${{ github.ref_name }}" "${RUNNER_TEMP}/family-assets"
+      - name: Create GitHub Release from reviewed notes
+        run: |
+          python3 scripts/sprint_workflow.py release-notes "${{ github.ref_name }}" --check
+          python3 scripts/sprint_workflow.py release-notes "${{ github.ref_name }}" --render > "$RUNNER_TEMP/release-notes.md"
+          python3 scripts/sprint_workflow.py release-notes "${{ github.ref_name }}" --render | cmp - "$RUNNER_TEMP/release-notes.md"
+          gh release create "${{ github.ref_name }}" "${RUNNER_TEMP}/family-assets/"* --notes-file "$RUNNER_TEMP/release-notes.md"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

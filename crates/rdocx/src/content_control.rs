@@ -64,6 +64,51 @@ impl ContentControlRef<'_> {
     }
 }
 
+#[derive(Clone)]
+struct ControlValue {
+    display: String,
+    bound: String,
+    checkbox: Option<(bool, String)>,
+}
+
+fn prepare_control_value(control: &CT_Sdt, value: &str) -> Result<ControlValue> {
+    let kind = control
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.control_type);
+    if kind == Some(SdtType::CheckBox) {
+        let checked = match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => {
+                return Err(Error::Other(
+                    "checkbox value must be true or false (also 1/0, yes/no)".to_owned(),
+                ));
+            }
+        };
+        let (glyph, font) = control
+            .properties
+            .as_ref()
+            .unwrap()
+            .checkbox_state(checked)?;
+        return Ok(ControlValue {
+            display: glyph.to_string(),
+            bound: checked.to_string(),
+            checkbox: Some((checked, font)),
+        });
+    }
+    if matches!(kind, Some(SdtType::Picture | SdtType::Group)) {
+        return Err(Error::Other(
+            "selected content-control kind does not support a text value".to_owned(),
+        ));
+    }
+    Ok(ControlValue {
+        display: value.to_owned(),
+        bound: value.to_owned(),
+        checkbox: None,
+    })
+}
+
 impl Document {
     /// Return every typed content control in document order.
     pub fn content_controls(&self) -> Vec<ContentControlRef<'_>> {
@@ -96,6 +141,34 @@ impl Document {
         self.apply_content_control_values(|control| {
             (control.tag() == Some(tag)).then(|| value.to_owned())
         })
+    }
+
+    /// Fill distinct tags atomically, refusing missing tags and invalid late owners.
+    /// Aliases do not participate. Counts retain the caller's order.
+    pub fn fill_content_control_tags(&mut self, pairs: &[(&str, &str)]) -> Result<Vec<usize>> {
+        let mut seen = std::collections::HashSet::new();
+        for &(tag, value) in pairs {
+            if !seen.insert(tag) {
+                return Err(Error::Other(format!(
+                    "duplicate content-control tag {tag:?}"
+                )));
+            }
+            oxml_core::xml::reject_non_xml_characters("content-control value", value)?;
+        }
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut candidate = self.clone_for_staging();
+        let mut counts = Vec::with_capacity(pairs.len());
+        for &(tag, value) in pairs {
+            let count = candidate.set_content_control_value_by_tag(tag, value)?;
+            if count == 0 {
+                return Err(Error::Other(format!("no content control has tag {tag:?}")));
+            }
+            counts.push(count);
+        }
+        self.commit_staged_mutation(candidate.prepare_and_reopen_staged()?);
+        Ok(counts)
     }
 
     /// Replace the display and bound custom XML value of controls with `alias`.
@@ -132,13 +205,13 @@ impl Document {
             .enumerate()
             .filter_map(|(index, inner)| {
                 let value = select(ContentControlRef { inner })?;
-                Some((
-                    index,
-                    value,
-                    inner.properties.as_ref()?.data_binding.clone(),
-                ))
+                let binding = inner
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.data_binding.clone());
+                Some(prepare_control_value(inner, &value).map(|value| (index, value, binding)))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         if selected.is_empty() {
             return Ok(0);
         }
@@ -158,7 +231,7 @@ impl Document {
                 continue;
             };
             let (part_name, edit) =
-                resolve_binding_edit(&staged_package, &self.doc_part_name, binding, value)?;
+                resolve_binding_edit(&staged_package, &self.doc_part_name, binding, &value.bound)?;
             edits_by_part.entry(part_name).or_default().push(edit);
         }
         for (part_name, edits) in edits_by_part {
@@ -219,7 +292,7 @@ fn collect_cell_text(cell: &CT_Tc, output: &mut String) {
 
 fn replace_document_controls(
     body: &mut CT_Body,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
 ) -> Result<()> {
     let expected_count = body.content_controls().len();
     let mut index = 0usize;
@@ -245,11 +318,22 @@ fn replace_document_controls(
 
 fn replace_one_control(
     control: &mut CT_Sdt,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     if let Some(value) = replacements.get(index) {
-        replace_display_text(control, value)?;
+        replace_display_text(
+            control,
+            &value.display,
+            value.checkbox.as_ref().map(|(_, font)| font.as_str()),
+        )?;
+        if let Some((checked, _)) = &value.checkbox {
+            control
+                .properties
+                .as_mut()
+                .unwrap()
+                .set_checkbox_checked(*checked)?;
+        }
     }
     *index = index
         .checked_add(1)
@@ -259,7 +343,7 @@ fn replace_one_control(
 
 fn replace_nested_controls(
     control: &mut CT_Sdt,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     for content in &mut control.content {
@@ -279,7 +363,7 @@ fn replace_nested_controls(
 
 fn replace_paragraph_controls(
     paragraph: &mut CT_P,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     for position in 0..=paragraph.runs.len() {
@@ -296,7 +380,7 @@ fn replace_paragraph_controls(
 
 fn replace_table_controls(
     table: &mut CT_Tbl,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     for position in 0..=table.rows.len() {
@@ -316,7 +400,7 @@ fn replace_table_controls(
 
 fn replace_row_controls(
     row: &mut CT_Row,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     for position in 0..=row.cells.len() {
@@ -336,7 +420,7 @@ fn replace_row_controls(
 
 fn replace_cell_controls(
     cell: &mut CT_Tc,
-    replacements: &HashMap<usize, String>,
+    replacements: &HashMap<usize, ControlValue>,
     index: &mut usize,
 ) -> Result<()> {
     for content in &mut cell.content {
@@ -353,9 +437,10 @@ fn replace_cell_controls(
     Ok(())
 }
 
-fn replace_display_text(control: &mut CT_Sdt, value: &str) -> Result<()> {
+fn replace_display_text(control: &mut CT_Sdt, value: &str, font: Option<&str>) -> Result<()> {
     let mut replacement = DisplayReplacement {
         value,
+        font,
         wrote_value: false,
         saw_run: false,
     };
@@ -364,6 +449,15 @@ fn replace_display_text(control: &mut CT_Sdt, value: &str) -> Result<()> {
         return Ok(());
     }
     if add_text_to_first_paragraph(control, value) {
+        if font.is_some() {
+            let mut replacement = DisplayReplacement {
+                value,
+                font,
+                wrote_value: false,
+                saw_run: false,
+            };
+            replace_sdt_display(control, &mut replacement);
+        }
         return Ok(());
     }
     Err(Error::Other(
@@ -373,6 +467,7 @@ fn replace_display_text(control: &mut CT_Sdt, value: &str) -> Result<()> {
 
 struct DisplayReplacement<'a> {
     value: &'a str,
+    font: Option<&'a str>,
     wrote_value: bool,
     saw_run: bool,
 }
@@ -393,6 +488,17 @@ fn replace_sdt_display(control: &mut CT_Sdt, replacement: &mut DisplayReplacemen
 fn replace_run_display(run: &mut CT_R, replacement: &mut DisplayReplacement<'_>) {
     let is_first_run = !replacement.saw_run;
     replacement.saw_run = true;
+    if is_first_run && let Some(font) = replacement.font {
+        let properties = run.properties.get_or_insert_with(Default::default);
+        properties.font_ascii = Some(font.to_owned());
+        properties.font_hansi = Some(font.to_owned());
+        properties.font_east_asia = Some(font.to_owned());
+        properties.font_cs = Some(font.to_owned());
+        properties.font_ascii_theme = None;
+        properties.font_hansi_theme = None;
+        properties.font_east_asia_theme = None;
+        properties.font_cs_theme = None;
+    }
     let insert_replacement = is_first_run
         && !replacement.wrote_value
         && !run
@@ -586,16 +692,41 @@ fn resolve_binding_edit(
     ))
 }
 
-fn resolve_custom_xml_part(
+pub(crate) fn resolve_custom_xml_part(
     package: &OpcPackage,
     document_part: &str,
     store_item_id: &str,
 ) -> Result<String> {
+    let matches = matching_custom_xml_parts(package, document_part, store_item_id)?;
+    match matches.as_slice() {
+        [part_name] => Ok(part_name.clone()),
+        [] => Err(Error::Other(format!(
+            "custom XML store item {store_item_id} was not found"
+        ))),
+        _ => Err(Error::Other(format!(
+            "custom XML store item {store_item_id} is ambiguous"
+        ))),
+    }
+}
+
+pub(crate) fn custom_xml_store_item_count(
+    package: &OpcPackage,
+    document_part: &str,
+    store_item_id: &str,
+) -> Result<usize> {
+    Ok(matching_custom_xml_parts(package, document_part, store_item_id)?.len())
+}
+
+fn matching_custom_xml_parts(
+    package: &OpcPackage,
+    document_part: &str,
+    store_item_id: &str,
+) -> Result<Vec<String>> {
     let expected = normalize_store_item_id(store_item_id);
     let mut matches = Vec::new();
-    let relationships = package
-        .get_part_rels(document_part)
-        .ok_or_else(|| Error::Other("document has no custom XML relationships".to_owned()))?;
+    let Some(relationships) = package.get_part_rels(document_part) else {
+        return Ok(matches);
+    };
     for relationship in relationships
         .items
         .iter()
@@ -619,18 +750,10 @@ fn resolve_custom_xml_part(
             matches.push(item_part);
         }
     }
-    match matches.as_slice() {
-        [part_name] => Ok(part_name.clone()),
-        [] => Err(Error::Other(format!(
-            "custom XML store item {store_item_id} was not found"
-        ))),
-        _ => Err(Error::Other(format!(
-            "custom XML store item {store_item_id} is ambiguous"
-        ))),
-    }
+    Ok(matches)
 }
 
-fn normalize_store_item_id(value: &str) -> String {
+pub(crate) fn normalize_store_item_id(value: &str) -> String {
     value
         .trim()
         .trim_start_matches('{')
@@ -638,7 +761,7 @@ fn normalize_store_item_id(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn parse_store_item_id(xml: &[u8]) -> Result<Option<String>> {
+pub(crate) fn parse_store_item_id(xml: &[u8]) -> Result<Option<String>> {
     let mut reader = NsReader::from_reader(xml);
     let mut buffer = Vec::new();
     loop {

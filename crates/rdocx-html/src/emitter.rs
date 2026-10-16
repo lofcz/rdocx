@@ -26,10 +26,10 @@ pub(crate) fn emit_body(
     let mut out = String::new();
     let mut list_stack: Vec<ListState> = Vec::new();
 
-    for block in body_blocks(&body.content) {
+    for block in body_blocks(body, false) {
         match block {
-            Block::Paragraph(p) => {
-                let list_info = detect_list(p, numbering);
+            Block::Paragraph(p, _) => {
+                let list_info = detect_list(&p, numbering);
 
                 // Close lists that are no longer active
                 while let Some(top) = list_stack.last() {
@@ -58,14 +58,14 @@ pub(crate) fn emit_body(
                         }
                     }
                     out.push_str("<li>");
-                    emit_paragraph_content(&mut out, p, styles, images, hyperlink_urls, options);
+                    emit_paragraph_content(&mut out, &p, styles, images, hyperlink_urls, options);
                     out.push_str("</li>\n");
                 } else {
                     // Close all remaining lists
                     while !list_stack.is_empty() {
                         close_list(&mut out, &mut list_stack);
                     }
-                    emit_paragraph(&mut out, p, styles, images, hyperlink_urls, options);
+                    emit_paragraph(&mut out, &p, styles, images, hyperlink_urls, options);
                 }
             }
             Block::Table(tbl) => {
@@ -451,6 +451,9 @@ fn emit_table(
     hyperlink_urls: &HashMap<String, String>,
     options: &HtmlOptions,
 ) {
+    if tbl.accepted_view_removes() {
+        return;
+    }
     let mut table_style = String::new();
 
     if let Some(props) = &tbl.properties {
@@ -486,7 +489,11 @@ fn emit_table(
     }
 
     // Rows and cells that content controls wrap are written in place.
-    let rows = tbl.rows();
+    let rows = tbl
+        .rows()
+        .into_iter()
+        .filter(|row| !row.accepted_view_removes())
+        .collect::<Vec<_>>();
     for (row_idx, row) in rows.iter().enumerate() {
         out.push_str("<tr>\n");
         for (col_idx, cell) in row.cells().into_iter().enumerate() {
@@ -560,8 +567,8 @@ fn emit_table(
 
             for block in cell_blocks(cell) {
                 match block {
-                    Block::Paragraph(p) => {
-                        emit_paragraph(out, p, styles, images, hyperlink_urls, options);
+                    Block::Paragraph(p, _) => {
+                        emit_paragraph(out, &p, styles, images, hyperlink_urls, options);
                     }
                     Block::Table(nested) => {
                         emit_table(out, nested, styles, images, hyperlink_urls, options);
@@ -596,7 +603,7 @@ fn count_vmerge_span(rows_below: &[&CT_Row], col_idx: usize) -> u32 {
 }
 
 /// Simple base64 encoding.
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
