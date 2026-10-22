@@ -48,6 +48,11 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
+try:
+    from . import prose_check
+except ImportError:
+    import prose_check
+
 SCHEMA_VERSION = 2
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1207,6 +1212,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         data = load(sprint)
         data["max_review_passes"] = args.max_review_passes
         data["max_workers"] = args.max_workers
+        reviewer = getattr(args, "reviewer", None)
+        if reviewer:
+            if data.get("reviewer") not in (None, reviewer) and data["reviews"]:
+                die("cannot replace the requested reviewer after review evidence exists")
+            data["reviewer"] = reviewer
         for f in features:
             feature = data["features"].setdefault(
                 f["fid"],
@@ -1237,6 +1247,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "phase": "design",
         "max_review_passes": args.max_review_passes,
         "max_workers": args.max_workers,
+        "reviewer": getattr(args, "reviewer", None),
         "features": {
             f["fid"]: {
                 "state": "pending",
@@ -1325,6 +1336,9 @@ def cmd_mark_feature(args: argparse.Namespace) -> int:
 def cmd_record_review(args: argparse.Namespace) -> int:
     data = load(args.sprint)
     head = git_head()
+    reviewer = getattr(args, "reviewer", None)
+    if data.get("reviewer") and reviewer != data["reviewer"]:
+        die(f"sprint review requires the requested reviewer {data['reviewer']}")
     bound = data.get("max_review_passes", MAX_REVIEW_PASSES)
     if args.passno > bound and not args.extend:
         die(
@@ -1339,6 +1353,7 @@ def cmd_record_review(args: argparse.Namespace) -> int:
             "should_fix": args.should_fix,
             "nice_to_have": args.nice_to_have,
             "head": head,
+            "reviewer": reviewer,
         }
     )
     save(args.sprint, data)
@@ -1349,51 +1364,151 @@ def cmd_record_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def capability_owner_problems(scope: str, backlog: str) -> list[str]:
+    """Check the capability ownership facts that completion metadata can change."""
+    statuses = {fid: status for fid, _, status in BACKLOG_ROW_RE.findall(backlog)}
+    problems = []
+    rows = [line for line in scope.splitlines() if line.startswith("| DOCX-")]
+    if not rows:
+        return ["capability matrix has no parseable DOCX rows"]
+    for line in rows:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 19:
+            problems.append(f"malformed capability row: {cells[0]}")
+            continue
+        capability, classification, owner = cells[0], cells[-3], cells[-1]
+        if classification in ("partial", "unsupported"):
+            status = statuses.get(owner)
+            if status not in ("pending", "in-progress"):
+                problems.append(f"{capability} incomplete capability owner {owner} is {status or 'missing'}")
+        elif owner != "-":
+            problems.append(f"{capability} resolved capability still has active owner {owner}")
+    return problems
+
+
+def metadata_reuse_problems(data: dict, head: str, record: dict) -> list[str]:
+    """Authenticate a finite delivery-only range against the latest actual full run."""
+    full = [(i, item) for i, item in enumerate(data["verifications"])
+            if item["scope"] == "full"]
+    if not full:
+        return ["metadata reuse requires an actual full verification attempt"]
+    index, latest = full[-1]
+    source = record.get("source_head", "")
+    if (record.get("full_attempt") != index or not latest["passed"]
+            or latest.get("head") != source):
+        return ["metadata reuse must anchor the latest passing full attempt"]
+    if not re.fullmatch(r"[0-9a-f]{40}", source) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return ["metadata reuse requires full commit identities"]
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=REPO, check=True,
+                              capture_output=True).stdout.decode("utf-8")
+
+    try:
+        if git("status", "--porcelain"):
+            return ["metadata reuse requires a clean worktree"]
+        git("merge-base", "--is-ancestor", source, head)
+        ledgers = {"docs/sprints/" + name + ".md" for name in
+                   ("CURRENT_SPRINT", "BACKLOG", "SPRINT_TRACKER", "AS_BUILT")}
+        own_reviews = {f".claude/reviews/{data['sprint']}-sprint-review-pass-{review['pass']}.md"
+                       for review in data.get("reviews", [])}
+        plans = {f".claude/plans/{fid}-design.md" for fid in data["features"]}
+        if git("rev-list", "--min-parents=2", f"{source}..{head}"):
+            return ["metadata reuse requires a linear delivery-only commit range"]
+        for commit in git("rev-list", "--reverse", f"{source}..{head}").splitlines():
+            if prose_check.check_text(git("log", "-1", "--format=%B", commit), "commit message"):
+                return [f"metadata reuse refuses invalid commit prose: {commit}"]
+            parent = git("rev-parse", f"{commit}^").strip()
+            paths = git("diff", "--name-only", "--no-renames", "-z", parent, commit).split("\0")
+            for path in filter(None, paths):
+                # Deletions, symlinks and mode changes cannot be delivery metadata.
+                after_entry = git("ls-tree", commit, "--", path).split()
+                before_entry = git("ls-tree", parent, "--", path).split()
+                if not after_entry or after_entry[0] != "100644":
+                    return [f"metadata reuse refuses deletion or non-regular file: {path}"]
+                if before_entry and before_entry[0] != "100644":
+                    return [f"metadata reuse refuses mode change: {path}"]
+                after = git("show", f"{commit}:{path}")
+                if prose_check.check_text(after, path):
+                    return [f"metadata reuse refuses invalid delivery prose: {path}"]
+                if path in own_reviews and not before_entry:
+                    continue
+                if not before_entry:
+                    return [f"metadata reuse refuses new file: {path}"]
+                before = git("show", f"{parent}:{path}")
+                if path in ledgers:
+                    if path.endswith("AS_BUILT.md") and not after.startswith(before):
+                        return ["metadata reuse requires append-only AS_BUILT.md"]
+                    if path.endswith("CURRENT_SPRINT.md") and not re.search(
+                            rf"^# Current Sprint, {re.escape(data['sprint'])}$", after, re.M):
+                        return ["metadata reuse cannot change the current sprint identity"]
+                    continue
+                if path in plans:
+                    old_lines, new_lines = before.splitlines(keepends=True), after.splitlines(keepends=True)
+                    if len(old_lines) != len(new_lines):
+                        return [f"metadata reuse refuses semantic plan edits: {path}"]
+                    for old, new in zip(old_lines, new_lines):
+                        if old == new or (old.startswith("- [ ] ") and new == old.replace("- [ ] ", "- [x] ", 1)):
+                            continue
+                        if (re.fullmatch(r"\*\*Status\*\*: (approved|in-progress|reviewed)\n?", old)
+                                and new == "**Status**: completed" + ("\n" if old.endswith("\n") else "")):
+                            continue
+                        return [f"metadata reuse refuses semantic plan edits: {path}"]
+                    continue
+                return [f"metadata reuse refuses non-delivery change: {path}"]
+        problems = capability_owner_problems(
+            (REPO / "docs/hld/02-scope-and-non-goals.md").read_text(encoding="utf-8"),
+            (REPO / "docs/sprints/BACKLOG.md").read_text(encoding="utf-8"),
+        )
+        if problems:
+            return problems
+    except (subprocess.CalledProcessError, UnicodeError, OSError) as error:
+        return [f"metadata reuse cannot authenticate commit range: {error}"]
+    return []
+
+
 def cmd_record_verification(args: argparse.Namespace) -> int:
     data = load(args.sprint)
     head = git_head()
-    data["verifications"].append(
-        {
-            "scope": args.scope,
-            "passed": args.passed,
-            "harness": args.harness,
-            "head": head,
-        }
-    )
+    record = {"scope": args.scope, "passed": args.passed,
+              "harness": args.harness, "head": head}
+    source = getattr(args, "reuse_from", None)
+    if args.scope == "metadata":
+        if not source:
+            die("metadata verification requires --reuse-from with the full source SHA")
+        full = [i for i, item in enumerate(data["verifications"]) if item["scope"] == "full"]
+        record.update(source_head=source, full_attempt=full[-1] if full else None)
+        problems = metadata_reuse_problems(data, head, record)
+        if problems:
+            die("; ".join(problems))
+    elif source:
+        die("--reuse-from is only valid for metadata verification")
+    data["verifications"].append(record)
     save(args.sprint, data)
-    print(
-        f"{args.sprint} verification recorded at {head[:12]}: "
-        f"{args.scope}, passed={args.passed}"
-    )
+    print(f"{args.sprint} verification recorded at {head[:12]}: "
+          f"{args.scope}, passed={args.passed}")
     return 0
 
 
 def closure_evidence_problems(data: dict, head: str) -> list[str]:
-    """Return stale or missing review and verification evidence for HEAD."""
+    """Return stale or missing evidence, with failures superseding prior green."""
     problems: list[str] = []
     if not data["reviews"]:
         problems.append("no sprint-review pass recorded")
     else:
         review = data["reviews"][-1]
         if review["blocking"] != 0:
-            problems.append(
-                f"last review pass has {review['blocking']} blocking finding(s)"
-            )
+            problems.append(f"last review pass has {review['blocking']} blocking finding(s)")
+        if data.get("reviewer") and review.get("reviewer") != data["reviewer"]:
+            problems.append(f"latest sprint review is not from requested reviewer {data['reviewer']}")
         if review.get("head") != head:
-            problems.append(
-                "latest sprint review covered "
-                f"{review.get('head') or 'an unrecorded HEAD'}, current HEAD is {head}"
-            )
-
-    verified = [
-        verification
-        for verification in data["verifications"]
-        if verification["scope"] == "full"
-        and verification["passed"]
-        and verification.get("head") == head
-    ]
-    if not verified:
+            problems.append("latest sprint review covered "
+                            f"{review.get('head') or 'an unrecorded HEAD'}, current HEAD is {head}")
+    acceptance = [item for item in data["verifications"] if item["scope"] in ("full", "metadata")]
+    if not acceptance or not acceptance[-1]["passed"] or acceptance[-1].get("head") != head:
         problems.append(f"no passing `/verify --full` recorded for current HEAD {head}")
+    elif acceptance[-1]["scope"] == "metadata":
+        problems.extend(metadata_reuse_problems(data, head, acceptance[-1]))
     return problems
 
 
@@ -1438,10 +1553,24 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     external = fields.get("External gates", "")
     test_gate = fields.get("Test gate", "")
     pending = any("external ci pending" in value.lower() for value in (verify, test_gate)) or bool(external)
-    if checkpoint and checkpoint != "external-ci-source-availability":
+    if checkpoint and checkpoint not in ("external-ci-source-availability", "sprint-final-acceptance"):
         problems.append("unknown handoff checkpoint")
     if pending and checkpoint != "external-ci-source-availability":
         problems.append("pending external CI requires its source-availability checkpoint")
+    final = fields.get("Final checks", "")
+    final_pending = any("final sprint checks pending" in value.lower() for value in (verify, test_gate)) or bool(final)
+    if final_pending and checkpoint != "sprint-final-acceptance":
+        problems.append("pending final sprint checks require their final-acceptance checkpoint")
+    if checkpoint == "sprint-final-acceptance":
+        if not re.fullmatch(r"[A-Za-z0-9/][A-Za-z0-9 ./_,:()=-]{2,400}, pending", final) or final[:-9].strip().lower() in ("checks", "gates", "final checks", "final sprint checks"):
+            problems.append("final checkpoint requires named actual final checks, pending")
+        if verify != f"{expected_verify}, local checks pass, final sprint checks pending":
+            problems.append("final checkpoint must distinguish local checks from pending sprint acceptance")
+        if (not test_gate.endswith(", pass") or len(test_gate[:-6].strip()) < 3
+                or re.search(r"\b(?:complet(?:e|ed)|pending)\b", test_gate, re.I)):
+            problems.append("final checkpoint requires named actual local regression checks, pass")
+        if external:
+            problems.append("final checkpoint cannot replace the external CI checkpoint")
     if checkpoint == "external-ci-source-availability":
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ./_-]{2,240}, pending", external) or external[:-9].strip().lower() in ("ci", "external ci", "gates"):
             problems.append("external checkpoint requires named actual gates, pending")
@@ -2157,12 +2286,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init"); p.add_argument("sprint"); p.add_argument("--force", action="store_true"); p.add_argument("--resume", action="store_true"); p.add_argument("--max-review-passes", type=int, default=MAX_REVIEW_PASSES); p.add_argument("--max-workers", type=int, default=None); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("init"); p.add_argument("sprint"); p.add_argument("--force", action="store_true"); p.add_argument("--resume", action="store_true"); p.add_argument("--max-review-passes", type=int, default=MAX_REVIEW_PASSES); p.add_argument("--max-workers", type=int, default=None); p.add_argument("--reviewer", help="required identity of the independent sprint reviewer"); p.set_defaults(fn=cmd_init)
     p = sub.add_parser("status"); p.add_argument("sprint", nargs="?"); p.add_argument("--workers", action="store_true", help="show branch, worktree and handoff per feature"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("set-phase"); p.add_argument("sprint"); p.add_argument("phase"); p.set_defaults(fn=cmd_set_phase)
     p = sub.add_parser("mark-feature"); p.add_argument("sprint"); p.add_argument("fid"); p.add_argument("state"); p.add_argument("--owner"); p.add_argument("--clear-owner", action="store_true"); p.add_argument("--wave", type=int); p.add_argument("--branch"); p.add_argument("--worktree"); p.add_argument("--base"); p.add_argument("--head"); p.add_argument("--handoff"); p.add_argument("--integration-commit"); p.set_defaults(fn=cmd_mark_feature)
-    p = sub.add_parser("record-review"); p.add_argument("sprint"); p.add_argument("passno", type=int); p.add_argument("--blocking", type=int, required=True); p.add_argument("--should-fix", type=int, default=0); p.add_argument("--nice-to-have", type=int, default=0); p.add_argument("--extend", action="store_true"); p.set_defaults(fn=cmd_record_review)
-    p = sub.add_parser("record-verification"); p.add_argument("sprint"); p.add_argument("--scope", choices=["fast", "scoped", "full"], required=True); p.add_argument("--passed", action="store_true"); p.add_argument("--harness", default="unchecked"); p.set_defaults(fn=cmd_record_verification)
+    p = sub.add_parser("record-review"); p.add_argument("sprint"); p.add_argument("passno", type=int); p.add_argument("--blocking", type=int, required=True); p.add_argument("--should-fix", type=int, default=0); p.add_argument("--nice-to-have", type=int, default=0); p.add_argument("--extend", action="store_true"); p.add_argument("--reviewer", help="actual reviewer identity, not the implementing runner"); p.set_defaults(fn=cmd_record_review)
+    p = sub.add_parser("record-verification"); p.add_argument("sprint"); p.add_argument("--scope", choices=["fast", "scoped", "full", "metadata"], required=True); p.add_argument("--reuse-from"); p.add_argument("--passed", action="store_true"); p.add_argument("--harness", default="unchecked"); p.set_defaults(fn=cmd_record_verification)
     p = sub.add_parser("validate-handoff"); p.add_argument("path"); p.add_argument("--fid", required=True); p.set_defaults(fn=cmd_validate_handoff)
     p = sub.add_parser("close-preflight"); p.add_argument("sprint"); p.set_defaults(fn=cmd_close_preflight)
     p = sub.add_parser("release-notes"); p.add_argument("tag"); mode = p.add_mutually_exclusive_group(required=True); mode.add_argument("--check", action="store_true"); mode.add_argument("--render", action="store_true"); p.set_defaults(fn=cmd_release_notes)

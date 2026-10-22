@@ -1,5 +1,33 @@
 # 12, Testing strategy
 
+## Numbering-aware navigation regression
+
+One source-built multilevel document compares visible markers, TOC, numbered
+STYLEREF/REF/PAGEREF, captions, physical outline sources and saved caches after
+mutation and final pagination. Focused local regressions distinguish body,
+cell and control owners, numbering suppression from outline suppression,
+actual page-local first/last selection, generated cache poison, preserved text
+beside partial caches, stale exclusion refusal and copied SEQ isolation.
+
+A multilevel STYLEREF regression compares n/r/r+t/w in the evaluator and actual
+positioned field text before update, after update and after save/reopen. Its
+literal level labels make relative and full context visibly different. A shared
+formatter alone does not prove that its consumers pass the same context.
+
+The native comparison belongs to the final integrated gate. It pins the actual
+Word build, source and update/save/reopen lifecycle and records per-placement
+painting separately from shared saved caches. Unavailable historical narrative
+is not native output evidence. Package, consumer and deterministic hash/pixel
+riders join that same final union rather than running per worker.
+
+The existing regression carrier optionally writes immutable actual DOCX inputs
+and per-input library-observation records through
+`RDOCX_F283_NATIVE_OUTPUT_DIR`. It shares the local regression fixtures, labels
+all six number modes, and emits real restart and generated-growth mutations.
+It never records an unperformed Word result. Existing malformed imported cache
+painting remains a local positive control beside strict outline and atomic
+rebuild refusal, including source-stamped failure freshness.
+
 ## Test taxonomy
 
 Six categories. Every story's design plan picks the applicable ones and names
@@ -86,6 +114,18 @@ reachable only on a producer document the caller never edited, where leaving
 the bytes as written is what the no-op save contract requires.
 `explicit_font_priority_divergence_from_word_is_deliberate` asserts our side so
 a later change cannot drop the decision silently.
+
+Typed content-control replacement and repetition are checked in source. The
+local tests observe child order, refusal, and repetition counts. They are not
+a Word oracle. The authentic Word differential for those controls stays pending
+until the repo records Word provenance, the Word version, and the input
+identity. A package this workspace writes is not that evidence.
+
+Custom XML store creation and binding are checked by round trip. The tests
+observe the item id, schema reference order, a free conventional name, the
+binding attributes, byte-identical unknown item spans, xpath refusal, and
+rollback of a failed sibling fill. They are not a Word oracle. The hash
+harness stays unchanged for a document that does not call the API.
 
 The table style and conditional formatting story compares against a pinned
 `w:tblStylePr` reference tree built as source XML, for the same reason. Word
@@ -1013,9 +1053,19 @@ order. Focused tests cover dotted and lexical lookup, loop shadowing and scope
 restoration, every JSON truthiness case, malformed and crossed controls, and
 atomic rejection. The round-trip test clones section-ending paragraphs and
 table rows, then proves their section properties and unmodelled XML remain in
-schema order after saving and reopening. Headers, footers, footnotes, endnotes,
-text boxes, and chart labels retain the scalar-only coverage shared with literal
-placeholder replacement. The repeating-table regression gate expands three
+schema order after saving and reopening. Grammar 1 regressions render the
+same payload in the body, a table cell, a header, a footer, a footnote, an
+endnote and a text box, including split-run formatting, filters, escapes and
+one evaluation of a shared header or footer. Repeated ranges keep unique
+drawing, bookmark, note, comment and relationship identities through the
+existing fragment transaction. Chart labels and unknown raw text boxes stay on
+the scalar boundary, and formatter mode refuses them before callbacks. Empty,
+single and multiple records exercise both implicit and explicit lexical lookup
+in legacy and grammar1 modes. Nested loop/if preflight retains unknown deferred
+item paths while known missing root members, wrong container kinds and malformed
+syntax refuse with unchanged document bytes. Word,
+LibreOffice and the full native gates remain the integrated union. The
+repeating-table regression gate expands three
 adjacent template rows over ten records and compares all thirty rows in order.
 It also checks banding, grid spans, vertical merge restarts and continuations,
 and atomic rejection of an invalid repeated numbering reference. The continuous
@@ -3289,7 +3339,152 @@ required, and no binary fixture enters the repository.
   background samples pin the remaining paint translations. These are
   deterministic unit tests with no golden files.
 
+TOC range-composition regressions compare inherited and direct outline levels
+against both endpoints, with h/z switches, no outline switch, outline-only and
+independent explicit custom-style selectors. They assert exact entry text/count
+after rebuild, save/reopen and a second rebuild. Native, installed Python and
+CLI observations remain distinct evidence, all bound to the integrated source.
+Reporter statements about Word are attributed rather than reclassified as a
+native oracle execution by this workspace.
+
 ## Binding tests
+
+`issue389_local_edits_do_not_scale_with_unrelated_package` runs in the
+`rdocx`, `rpptx`, `rdocx-py` and `rpptx-py` libraries. The Word packages hold
+50 and 800 paragraphs. The PowerPoint property packages hold one edited text
+box, or 40 slides of 40 text boxes. `add_textbox` is also run on a deck with
+one blank slide and on a deck that already holds 40 slides of 40 text boxes.
+Native counters record edited-slide or body-block traversal. Binding counters
+separately record owner/index traversal and calls into source-wide fallbacks.
+These are bounded-work controls, not a meter of every allocation or parser.
+A debug timing does not pass this gate. The release-build large-to-small ratio below 3 for the same
+seven operations is final-sprint evidence. The same test name in the existing
+Python files checks that the edited owner changes and an unrelated owner does
+not.
+
+Issue398 adds actual cold and repeated paragraph, row-cell and cell-paragraph
+creation on50paragraphs/twotables and400paragraphs/sixteentables, with four by
+three cells in each table. All three release ratios remain below3. Initial
+projection preparation is measured separately, rather than hidden in a warm-up.
+The batch/single native parity case includes nested tables and controlled
+content. Binding controls compare current text/counts after body, cell, nested,
+header, XML, property, row and removal/reinsertion edits, plus no-op/refusal and
+reopen. The deterministic read test records equal bounded selected-owner work
+on small and large inputs, and deliberately disables a projection to prove that
+the old source-wide fallback exceeds the bound. Facts and route indexes remain
+derived from current checked ownership, with no authority from matching text.
+Run-content controls cover held and fresh reads after tabs and breaks, including
+qualified paired text boxes and controlled/direct paragraphs in the same cell.
+The cell cases also check run and paragraph text setters and appended runs,
+unchanged neighbors and save/reopen. The first-run work control introduces a run
+into an empty paragraph, then edits it again. One-run and two-run lifecycle cases
+check newborn handles, no-op, refusal, stale content views, later tail removal
+and full publication. Section-refusal controls cross first-run, same-run and
+staged run-topology paths with self-closing, paired-empty and nonempty forms.
+Unchanged sections, qualified aliases and section removal get separate controls.
+Foreign root attributes on an admitted opaque Empty section must survive text
+edits exactly, while changed attributes and section removal refuse atomically.
+A retained paragraph alias with an opaque section dependency must either stage
+a savable edit or refuse atomically. Allocation and hashing are not universally metered.
+
+Issue 392 local tests cover placeholder idx gaps, ties-to-even percentage
+boundaries, generated `upArrow` geometry, painted table-row growth with
+unchanged stored height, `TextFrame.clear`, empty text followed by one new
+run, cell-run slide hyperlinks, point and percent bullet size, and
+kind-checked style removal. Installed `rpptx` suites, the pinned viewer, the
+PowerPoint pixel baseline, the wasm check, and the hash harness remain
+final-sprint evidence. The Word hash and the Word seven-pixel baseline stay
+unchanged.
+
+Content-control creation round-trips one rich or plain shell at block, row,
+cell, paragraph, and inline placements in a body, table, header, and text box.
+The same tests clear and restore tag, alias, lock, appearance, and placeholder
+on an imported control while an unmodelled property child, `sdtContent`, and a
+foreign `showingPlcHdr` stay. Move keeps the id. Clone allocates a new id and
+drops `w14:paraId`. A cross-story move and an illegal unwrap or cell-emptying
+removal return the original package. A created tag accepts the existing fill,
+and a missing tag rolls back. Checkbox, date, and repeating-section creation
+name F-286 and publish nothing. Python covers the same insert, metadata, fill,
+refusal, and remove surface on the frozen snapshot. The hash harness and the
+installed `rdocx` suite remain final-sprint evidence.
+
+Numbering replacement-level controls exercise both bullet-over-decimal refusal
+and decimal-over-bullet restart and continuation after reopen. A bounded native
+counter control requires one source build, owner discovery, item discovery and
+namespace traversal for both small and many-paragraph empty chart collections.
+The observer uses existing counters without a wall-clock threshold.
+
+Everyday Word chart, display-equation, list restart/font and note-reference/removal
+repairs use six unique local regressions with actual old-source RED and fixed-source
+GREEN observations. Independent saved-package XML observes physical chart order,
+precise type and cache values, math display boundaries, numbering overrides and
+marker font slots, both reference styles and current-id removal atomicity.
+Final integrated acceptance executes the five unchanged original Issue385 bodies
+from those four groups, with strict marker outcomes separate from body success.
+Complete installed suites, pinned structural comparisons, native appearance,
+WASM, hash/pixel and affected publication riders run in the final sprint union.
+No local regression result claims an unperformed final oracle pass.
+
+
+Word numeric qualification preserves the separate original Issue386 source and
+its four numeric rows. Tiny nonzero bare EMU spacing refuses, explicit lengths
+retain truncation, signed character spacing and intentional zero remain valid,
+and public section geometry requires explicit nonzero lengths. Live section
+EMU controls retain their existing path. Integer and float line multiples,
+absolute Length, exact range boundaries, adjacent quanta, unsupported types,
+nonfinite values and overflow have independent saved-package observations.
+Refusals retain signed bytes, held owners and later valid edits. Pinned
+python-docx1.2.0 structural comparisons distinguish line-multiple agreement,
+explicit refusal policy and off-grid rounding divergence. A Word-only worker
+runs an explicit four-row adapter. The untouched whole script runs against the
+paired final artifacts, with actual row observations rather than caught exit
+status. These rows do not replace the immutable Issue385 twelve-body union.
+
+Word invalid-value controls execute the five immutable original reporter
+bodies separately from their strict XFAIL or XPASS marker outcomes. Refusal
+checks preserve signed bytes, live paragraph/run/section owners and absent or
+existing outputs. Valid document variants and named binary streams, signed
+EMU truncation and native duplicate behavior, body Page/header Line, unchanged
+footer/Column behavior and valid/None language controls remain qualified.
+Renamed physical headers and their cell descendants distinguish relationship
+ownership from filename guesses, with a header-like body part as a negative.
+Imported duplicate tabs, language and breaks retain source through unrelated
+work.
+
+Authored font controls mutate only the actual name directory tag in an existing
+licensed face, retain a raw name sentinel and repair the full sfnt checksum.
+Independent pinned FontTools/Pillow observations authenticate directory and
+payload bounds, original reporter replacement positions, licenses and the
+finite authored-policy divergence from permissive font loading. Existing font
+graph, licensed face, signed-stream and unit controls remain required. Font CLI
+checks cover document/font aliases, hardlinks, symlinks, existing destinations,
+truthful diagnostics and staged-residue absence.
+
+Word typed control qualification compares independent saved-package XML with
+actual Word16.114 build16.114.26101123 selected-control edits and repair-free
+disk reopen. Explicit text, date and dateTime mappings, yyyy-MM-dd and
+dd/MM/yyyy display, declared dropdown display and binding, and qualified
+placeholder removal are separate observations. Selected date-only fullDate
+at UTC midnight is a deterministic API policy. Native unchanged-save timezone
+rewrites do not establish a global normalization rule.
+
+Schema-qualified absent mapping uses formatted text while Word rewrites the
+absent element to dateTime and produces a timezone-less bound timestamp.
+Absent val uses the schema text default without a separately observed native
+claim. Value-only dropdown display falls back to value under Part1 clause
+17.5.2.22, while observed native selection produced five spaces and an empty
+bound scalar. Tests retain these explicit divergences. Native lastValue cache
+updates are observed but not part of selected product mutation. Opaque native
+property losses do not authorize product losses.
+
+Focused controls cover leap years and finite formats, empty versus absent
+attributes, namespace aliases and shadows, qualified lookalikes, exact no-ops,
+metadata-only mutation, late binding failures, held-owner retirement and
+signatures. Individual KeyError and local InvalidValue-to-ValueError mapping
+have bulk and unrelated-error negative controls. Fresh retained public outputs
+use independent display, fullDate and relationship-resolved scalar observers,
+with actual mutated output packages proving observer sensitivity. Historical
+reporter bodies, native packages and predecessor artifacts remain immutable.
 
 Word HTML and CommonMark import controls exercise fresh installed constructors,
 file reads, immutable diagnostics and body, cell, header and footer insertion.
@@ -4211,7 +4406,43 @@ Text watermark opacity coverage includes exact named refusals for zero, one and 
 
 Missing-operation Base controls precede new public routes. Installed current-source controls verify typed payloads, atomic JSON conversion, live property ownership, immutable equation and fragment snapshots, and qualified checkbox scalar/font selection. Strict typing and stubtest run against the authenticated wheel while the complete installed PowerPoint distribution remains unchanged.
 
+Identified block-control regression controls execute CLI validate,
+Document.validate and module validate_file before and after save/reopen.
+Qualified paraId and textId are checked independently in saved XML, alongside
+exact opaque control payload. Native companions cover ordinary paragraphs,
+TOC content and nested controls, inherited aliases, namespace shadowing,
+default clearing and escaped producer URIs. Equal-count wrong-owner and
+malformed-source controls continue to refuse.
+
 Text controls compare accepted Paragraph and story snapshots across body, tables, controls and related stories. CLI plain and JSON views retain aliases, tabs, direct and simple-field newlines, and closed complex cached-field page and column controls. Nested instruction, deleted and moveFrom content stays suppressed. Malformed related stories retain main text and the existing ordered omission diagnostic. Markdown keeps literal whitespace and physical field, control, revision and hard-break boundaries. Export controls inspect owned ODT space elements and EPUB content rather than relying on lexical XML substrings.
+
+## PowerPoint names and finite language controls
+
+The exact six PowerPoint rows from Issue386 use a selected-row worker adapter
+against its authenticated current wheel. Root runs the unchanged complete
+reporter once against paired final family artifacts. Its caught exceptions and
+exit zero do not decide acceptance. These rows keep their own denominator and
+do not enlarge Issue385's twelve-body union or qualify Python3.14.
+
+Registered slide IDs are checked against imported noncontiguous registrations,
+reorder, save/reopen and retired physical owners. Color getter controls require
+actual enum identity for modeled choices and all sixteen scheme slots across
+fonts, fills, lines, borders, shadows, gradients and patterns. Direct nonscheme
+colors return NOT_THEME_COLOR, unset direct colors raise AttributeError on
+theme_color, and unknown scheme tokens or phClr refuse without changing XML.
+Existing theme string setters, transforms and opaque payload remain covered.
+
+The 216 language declarations match python-pptx 1.0.2 member values and supported
+tag conversion order. Both libraries read each other's en-US and fr-FR saved
+packages. Absent language returns NONE, and None/NONE clears. MIXED, bool,
+wrong types, unknown codes and unknown imported tags have byte and held-owner
+atomicity controls with a later valid assignment. Font.language retains its
+string admission, while finite language_id supports the pinned es-ES_tradnl
+tag. Master, layout, run and paragraph-default/table-cell owners are positive
+controls. Private shape/body XML names must validate their owner and provide
+the actual checked Element route, preserving causal stale errors and working
+Element replacement. Installed strict typing and stubtest consume the new
+module and exact enum returns.
 
 ## PowerPoint master and theme controls
 
@@ -4230,6 +4461,25 @@ source. Deterministic PDF/PNG, actual native repair-free open and pinned
 LibreOffice round-trip accompany appearance claims. Current wheel member/origin
 proofs, strict typing, stubtest, WASM, hashes and affected verified archives are
 separate required gates.
+
+The four-flag ordinary master/layout/slide visibility matrix is111,001,011,001
+for slide/layout true/true, false/true, true/false and false/false. Independent
+PowerPoint 16.113.4 build 16.113.26100421 and LibreOffice 26.2.5.2 agree at 150 dpi
+with predeclared interior color regions. Occupied placeholder text and styling
+survive every case, while uninstantiated templates remain absent. Explicit and
+absent true flags are equivalent. Actual Python PDF/PNG and CLI convert/render
+outputs use the same observations, with retained old-gate and over-suppression
+mutants required to fail their distinguishing controls.
+
+Chart metadata controls independently qualify imported 58, 52, 4 and 69, preserve
+the seven authored forms, distinguish direct qualified series markers and
+explosion from foreign or nested lookalikes, and reject ambiguous physical
+owners. Sparse caches and absent workbook references do not block type reads.
+Unsupported valid styles and combination plots return None. Installed strict
+typing consumes int or None, while malformed input, grouped owners, retired
+handles and unchanged source remain separately asserted. Ten thousand sparse
+series must fit the explicit metadata work budget. A real whole-inventory
+rescan mutation exhausts that same budget and fails the control.
 
 ## Word story inventory controls
 
@@ -4292,6 +4542,23 @@ source provenance. An absent required focused input fails qualification.
 
 ## PowerPoint checked XML qualification
 
+Finite admission regressions cover all four reported owner frontiers, required
+particles, order and multiplicity before and after typed projection. Raw
+foreign children that a parser might discard cannot evade the preparse gate.
+Imported invalid inputs remain readable and receive explicit part/path
+validation diagnostics. Controls retain unique unchanged opaque source during
+valid scalar edits and reject copied, moved or rebound frontier exceptions.
+Namespace aliases, default namespaces, exact-once URI decoding, declaration-time
+Ignorable grants, blank/additive scope, sibling restoration and Choice Requires
+meaning have independent controls. Safe bounded storage counters qualify shared
+namespace and route storage without large allocation or elapsed-time claims.
+
+Local story readiness uses unique in-repo RED/GREEN tests and microscope.
+Complete ordinary installed suites, strict typing/stubs, original reporter
+markers and bodies, native PowerPoint controls and pinned external comparisons
+run once in the final sprint union. Pending native acceptance is never inferred
+from package inspection or passing local tests.
+
 Native controls exercise all nine owners and five shape variants with actual
 source-part relationships, qualified aliases, opaque inherited namespaces,
 model child sequence and save/reopen facts. Negative controls verify wrong
@@ -4349,11 +4616,63 @@ Word's positive records actual regular use, synthetic bold and empty native
 saved bold parts under the approved one-font-per-name boundary. Fresh family
 and fresh UUID controls isolate the pre-save result, and a single bold-body
 control proves font loading without substituting for multi-face acceptance.
-That additional interoperability belongs to F-X223. Word's disabled control
+The historical single bold-body control stores that body in embedRegular with
+a plain run. It does not qualify the distinct proper embedBold-only control,
+which has no embedRegular and uses an ordinary bold run. That additional
+interoperability belongs to F-X223. Word's disabled control
 retains its first loaded-face PDF and the different reopened fallback PDF
 after native font-part removal. It does not falsely assert raster continuity.
 Changed-face controls built from one regular body can synthesize a bold
 variant and do not replace the genuine PowerPoint paired-face positive.
+
+The bounded Word multi-face matrix uses licensed authentic regular, bold,
+italic and bold-italic bodies with distinguishing unchanged outlines and
+metrics, fresh family identities and explicit keys. It includes the proper
+bold-slot-only discriminator, each regular-plus-other-face pair and all four
+roles, alongside missing-font, disabled-embedding, raw-storage and changed-Bold
+sensitivity cases. Every probe has the actual 15 characters
+`afmrW0123456789`. These cases retain initial, native-saved and known-close
+normal disk-reopened observations, actual app/build and source/output custody.
+Fresh native host admission checks both the test identities and source-face
+family/path availability. Preparation-time absence is not future admission or
+proof of the application's font-cache state.
+
+An independent PDF observer resolves the actual selected resource, character
+map and embedded program for every text show. It compares nonempty complete
+probe glyph outlines, contour flags and normalized advances/bearings against
+all four prepared faces, requiring a unique intended-face match rather than
+selecting a source by resource name. Active rendering mode, stroke width,
+text/graphics transforms and repeated paint distinguish genuine selection from
+synthesis. Declare metric tolerance rules before capture from source
+units-per-em and serialized PDF width and operand quantization. Preserve actual
+character/word spacing and TJ adjustments, rather than substituting summed
+source advances for painted text geometry.
+Unsupported font programs, encodings, forms or paint state require explicit
+refusal or a reviewed bounded observer extension, never guessed attribution.
+
+Native face-use evidence joins these PDF facts with authenticated source role
+relationships, fresh host/source-face availability and sensitivity outcomes.
+Name-only derivative outlines alone cannot exclude an identical installed
+fallback. Saved font-part emptiness, key/name changes and other normalization
+are separate observations. Disabled embedding can govern saving while an
+already loaded face remains usable, and raw storage can be handled differently
+by native consumers. Neither control has a predetermined failure outcome.
+Genuine multi-face acceptance requires the actual intended positive faces or
+an explicit separately accepted native-limit disposition. Preparation and
+historical observations do not grant that acceptance.
+
+The accepted Word16.114 build26101123 qualification is bounded. The proper
+Bold-only control has a unique genuine prepared-Bold match in all three
+phases. The paired Italic control has a unique Regular-outline match with
+shear and matching Regular advances in all three phases. Its saved Italic
+part is empty. These actual glyph facts distinguish synthetic slant from
+genuine Italic use. All27 phase captures retain custody. Thirteen observations
+completed, while14 refused unsupported PDF stroke colour-space state and
+therefore have no face verdict. Missing-font and raw-storage observations do
+not match a prepared face. Accepting this documented native limit completes
+the bounded investigation without qualifying the unsupported cells or genuine
+multi-face support. Native application resave normalization remains separate
+from unchanged library package and renderer contracts.
 
 Native application normalization remains separate from the library's exact
 unrelated-edit preservation controls. Known absent historical movie and PNG
@@ -4436,6 +4755,33 @@ strict typing and current public behavior. Both CLI formats, resource modes,
 existing rendering paths and both WASM graphs are qualified. Verified affected
 archives, scoped checks and unchanged deterministic hashes complete the gate.
 
+## Typed content-control native Word qualification
+
+F-286 external installed controls use `RDOCX_F286_WORD_PROVENANCE` to locate
+the independently retained native producer receipt. Each input is read from
+its recorded source and checked against its recorded SHA-256. The pinned
+producer is Word for Mac16.114(26101123). Binary fixtures are not committed.
+An absent bundle skips these controls and leaves native qualification pending.
+A skip is not a passed differential gate.
+
+`test_f286_native_word_replacement_preserves_typed_payloads` compares native
+expected replacements for rich/plain text, lists, checkbox and both date
+formats, plus atomic picture/group text refusal. Date fixtures must establish
+the actual stored format, since native assignment can restore a locale default.
+`test_f286_approved_repeat_matches_native_equivalent_operations` distinguishes
+first-item template selection using different item text and formatting, checks
+append order and old/new identities, and compares non-last deletion. Its native
+equivalent appends an item and copies the first item's FormattedText. Native
+default addressed-item cloning and whole-section last-item deletion are
+separate intentional differences approved in Q24, not default-parity
+successes. The equivalent-operation comparison and unchanged-byte last-item
+refusal remain required. Other native acceptance rows are unchanged.
+
+Native opening and saving of library-authored outputs is consumer acceptance,
+not original-oracle authorship. Record types, payloads, ids, text, image bytes
+and individual native normalizations. Do not turn no repair prompt into a
+claim of complete structural or behavioral equality.
+
 ## Word checked XML qualification
 
 Word XML controls use a freshly source-qualified release wheel with complete
@@ -4489,6 +4835,8 @@ the measurements. A separate fresh debug-guarded opt-level2 wheel executes the
 complete Word Python suite with its existing runtime and font prerequisites.
 Release timing does not replace guarded correctness acceptance.
 
+Word package preservation rows cover custom-property order, unmodelled style-root children, proved-unreachable picture media, plain embedded font bytes, an invalid header target, the three comment resolved states, declared root-attribute order, standalone story-item XML, read-only part inspection, default paragraph line rules, and a paired text-box paragraph edit. The private unreduced control-owner document stays unqualified. Six reduced rows do not close that report. Installed product suites, deterministic font render, both WASM graphs and the unchanged hash harness remain final-sprint evidence. A local row does not claim those gates.
+
 ## Notes owners and unit refusal qualification
 
 Notes controls distinguish absent parts, empty bodies, missing placeholders
@@ -4518,6 +4866,27 @@ Presentation acceptance and focused Word controls qualify changed consumers.
 
 
 ## First-draft Python name qualification
+
+Word compatibility controls independently qualify frozen Section.left_margin
+read and assignment alternatives, immutable tab alignment delete/readd,
+case-sensitive custom-property mapping and ownership-validated private XML
+names. Each refusal checks package bytes and held owners, followed by a saved
+and reopened supported operation. Missing mapping deletion and invalid keys or
+values retain exact checked-provider errors and absent-part behavior. Legacy
+dropdown controls distinguish actual received types from valid integer indices,
+with unchanged identities, bounds, snapshots and source no-ops.
+
+The concrete rdocx.enum.dml.MSO_COLOR_TYPE import and RGB/THEME/AUTO values
+compare against pinned python-docx1.2.0. Shared source packages retain cached
+RGB, theme tint/shade, automatic color and unset source through projection and
+save/reopen. Word type getters return enum members or None while theme_color
+retains its string contract. Mutable oracle section/tab owners and the Word
+custom-property extension remain explicit compatibility differences. Strict
+typing and stubtest qualify the source return migration and mapping operations.
+An explicitly labeled selected-row Issue386 adapter preserves original input
+identities. It does not replace the untouched paired final script or combine
+self-catching exits with saved-file acceptance.
+
 
 The separate PR333 corpus pins commit193819ca0a1dcf3415017c0be1186fe8df6bcb86:
 76 Word scripts,44 Presentation scripts and both original runners. Execution
@@ -4558,6 +4927,25 @@ documentation cases retain their declared adaptations. Body, input, source,
 interpreter, wheel, native library and first-attempt identities are pinned.
 Correct-file qualification requires at least90 percent of that unchanged
 denominator. Exit zero alone does not qualify a saved file or render.
+
+Checked Word paragraph admission uses separately authenticated ECMA-376
+fifth-edition CT_P/EG_PContent expansion and Part3 compatibility controls.
+All35 qualified direct names, pPr ordering, actual ancestor URI accumulation,
+sibling restoration, declaration rebinding and exact-once normalization have
+bounded controls. These primary schema facts do not claim native Word
+execution. Direct-child opaque exceptions distinguish exact no-op, valid
+scalar edits, stable repeated routes, copies, moves, changed ancestry and
+reinterpreted namespace/MC meaning. Existing nested host, DrawingML and OMML
+routes remain positive controls, with typed SDT metadata editable around an
+unchanged unsupported MC attribute. Retained Choice Requires rebinding refuses,
+while unchanged bindings permit scalar edits. Bounded deep delegated controls
+measure actual retained route and namespace/grant entries rather than timing.
+A finite long-URI/many-island positive measures retained namespace bytes,
+including diagnostic storage, without large allocation stress.
+Installed controls retain signed bytes, held owners, unrelated
+content, late relationship refusals, valid markers and math after reopen.
+Original reporter bodies retain their immutable identity, with body outcomes
+separate from strict XFAIL/XPASS marker accounting.
 
 Every required XML owner, lifetime and native/render obligation remains a hard
 gate. Typed observations bind actual and expected values to authenticated

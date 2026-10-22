@@ -110,6 +110,13 @@ defended.
 | S92 | M24, X | 6 | 6 | 0 | 15 to 18 | 1 | Six repair stories completed, including explicit Issue378 intake. Actual days count the single worked date2026-10-15, not person-effort. Final full verification at133ce33b passed all14 checks,49 unchanged hashes and22 verified archives. Independent review pass2 is clean. User accepted240-cell fill3.304061s with strict open/edit and linear-work gates retained. Future parity/forms planning is included without delivery credit. M24 continues to S99. No release prepared |
 | S93 | M24, X | 7 | 7 | 0 | 21 to 27 | 2 | Seven issue-repair contracts completed. Actual days count worked dates2026-10-15and2026-10-16, not person-effort. Fresh final full verification at55122db6 passes15checks,49hashes,7pixel checks and22verified archives. Native and1666installed Python members have explicit unchanged-input successor authentication. Reviewed18net unique hash changes and4pixel buffers are intentional. Independent review pass2 is clean after the HLD SVG wording correction. Issue365 stays open for pending F-X247/S94. M24 continues to S99. No release prepared |
 | S94 | M24, X | 5 | 5 | 0 | 14 to 19 | 1 | Five Python, CLI and finite conversion contracts completed. Actual days count the single worked date 2026-10-16, not person-effort. Independent sprint review pass2 has 0 blocking and 0 should-fix findings, with one optional formatting nit. Fresh reviewed-HEAD full verification at 588f2640 passed all 18 native/repository commands, 49 unchanged hashes, seven deterministic pixels and 22 verified archives, with authenticated installed, hosted and finite oracle evidence. Hosted acceptance remains the authenticated build-only 27-job run at 9cdbea00, with four publication guards skipped. M24 continues to S99. No release prepared |
+| S95 | M24, X | 9 | 9 | 0 | 22 to 31 | 1 | Nine contracts completed, including the user-approved Issue386 expansion and Word0.16.2/shared-PowerPoint0.14.2 release preparation. Actual days count the single worked date2026-10-16, not person-effort. Actual6b source has1908 installed tests with no skips, hosted27success4publicationSKIP/26payloads/172 runtime calls, public23, PPT four routes, Issue38619+16 and pinned reporter12strictXPASS/raw1 plus12bodies/raw0. Integrated native18commands,49hashes,7pixels and22verified archives pass at6b7c9798. Formal sprint review remains due. S95.11 scope remains future backlog, not S95 carries. Main merge, sprint close and separately approved publication have not occurred |
+
+| S95.11 | M24, X | 4 | 3 | 1 | 12 to 16 | 2 | F-X250/F-X254 repairs and F-X223 bounded native investigation completed. User accepted documenting Word's native limit, broader genuine multi-face use remains unqualified and fourteen observer refusals remain unsupported. F-X219 full-range opacity remains unfinished and is carried to S96, which has not started. Retained three-story estimate10 to13 developer-days. Actual source-bound verification at 05ba6cc8461a896fa751ca7dc1fe209a8fa70045 joins H3/H5/836/H7 observations, with6616 unique native passes/73ignored,11doctests,955Word/1007PPT installed plus typing/stubs,27 distinct Issue385 bodies,49hashes/7pixels and22verified package union. Actual developer effort not recorded. Close actuals count worked dates2026-10-16and17. No release or new version |
+
+| S95.2 | M24, X | 3 | 2 | 1 | 12 to 15 | 2 | F-283 numbering-aware navigation and F-284 versioned template grammar completed. F-X192 stays unfinished and is carried to S96, which has not started. Retained two-story estimate is 8 to 10 developer-days. Original three-story estimate was 12 to 15. Actual days are the worked dates 2026-10-17 and 2026-10-18, not person-effort. Full verification at b240cb3509a9641fe265ebfc605c987a3f35e143 passed with 49 unchanged hashes, seven pixel cases, 22 package inventories under 10 MiB, both WASM targets, installed Python typing and stubs, and pinned Word 16.114 plus LibreOffice 26.2.5.2 oracles. Actual developer effort not recorded. Issues 264 and 281 stay open. No release prepared. M24 continues through S99. |
+
+| S95.3 | M24, X | 8 | 8 | 0 | 34 to 49 | 3 | Eight contracts complete, no carries. Actual days are worked dates 2026-10-18, 19 and 22, not person-effort. Current source-qualified native 6,734/73 ignored, installed Word 1,066 and applicable PPT 1,028, 49 hashes/seven pixels, 22 verified archives and current hosted 39830343186 with 27 successes/four publication skips, 26 payloads, 172 priorities and six matrix calls pass. Historical failures remain. Final review and closure outcomes follow the actual reports and sprint tag. M24 continues to S99. No publication |
 
 ## Completed features
 
@@ -585,6 +592,23 @@ defended.
 
 | F-X185 | S90 | M | 2 | 1 | 2026-10-08 | Checked typed comment anchors and nested paragraph snapshots for hadim Issues283/289, clean ALL, native1761/XML629/CLI64 and current rebuilt Python93, hash49 unchanged |
 
+| F-X250 | S95.11 | L | 4 to 5 | not recorded | 2026-10-17 | Direct-main-body chart snapshots with finite data fields, display math, list restart/font and note style/removal. Independent clean feature reviews, five unchanged Word reporter bodies, independent XML and bounded native/own appearance. Shared accepted 05ba6cc8461a896fa751ca7dc1fe209a8fa70045 evidence retains H3/H5/836/H7 producer epochs and actual receipts, no duplicated full-suite or native claim |
+| F-X254 | S95.11 | L | 4 to 5 | not recorded | 2026-10-17 | Atomic PowerPoint value/XML/CLI refusals, ten unchanged reporter cases, native PowerPoint save/reopen and independent XML, affected native/CLI GREEN, explicit user-approved ValidationIssue enum exhaustive-match compatibility boundary. Shared 05ba6cc8461a896fa751ca7dc1fe209a8fa70045 verification and current H7 CLI genuine archive proof, no release |
+| F-X223 | S95.11 | M | 2 to 3 | not recorded | 2026-10-17 | User accepted documented Word limit after27 actual phases,13 finite observations/14unsupported refusals. Genuine properBold in3phases, pairedItalic Regular outlines with shear, native normalization and sensitivities retained. Bounded investigation complete, broader genuine paired/four-face consumption unqualified. No speculative writer repair or F-X223 carry |
+
+| F-283 | S95.2 | L | 4 to 5 | not recorded | 2026-10-18 | Numbered REF and STYLEREF follow the captured Word 16.114 context rules, including literal full context, unnumbered STYLEREF level results, and cross-instance sharing only for one definition without a start override. Clean microscope pass 2. 49 hashes unchanged |
+| F-284 | S95.2 | L | 4 to 5 | not recorded | 2026-10-18 | Opt-in grammar 1 renders one payload across body, table, header, footer, note, and text box, with legacy calls unchanged. Clean microscope pass 1. Word 16.114 and LibreOffice 26.2.5.2 preserved the declared text. 49 hashes unchanged |
+
+| F-X259 | S95.3 | M | 2 to 3 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-X260 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-X261 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-X262 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-285 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-286 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+| F-287 | S95.3 | L | 4 to 5 | not recorded | 2026-10-22 | Accepted bounded provider implementation and actual qualification. Clean feature microscopes.49hash/sevenpixel unchanged. F-X263 and final sprint gate remain due |
+
+| F-X263 | S95.3 | L | 3 to 5 additional | not recorded | 2026-10-22 | Exact patch families prepared, clean microscope, genuinely verified22archives and actual hosted27success/fourpublicationSKIP/26payloads. Downloaded priority172calls and strict typing/stubs pass. No publication |
+
 ## Velocity
 
 Recalculated at each sprint close. The backlog assumes about 2 stories per week
@@ -694,6 +718,12 @@ five working days.
 | S92 | 6 | 1 | 30.00 |
 | S93 | 7 | 2 | 17.50 |
 | S94 | 5 | 1 | 25.00 |
+| S95 | 9 | 1 | 45.00 |
+| S95.11 | 3 | 2 | 7.50 |
+| S95.2 | 2 | 2 | 5.00 |
+| S95.3 | 8 | 3 | 13.33 |
+
+S95.2 records two worked dates, 2026-10-17 and 2026-10-18. Its 5.00 stories per week counts two completed stories over those dates. It is calendar throughput, not person effort. F-X192 remains carried and is not counted as completed.
 
 S90 velocity measures calendar throughput for a parallel team. It does not
 measure person effort or establish a sustainable single-developer forecast.
@@ -713,6 +743,10 @@ S93 records two worked dates,2026-10-15and2026-10-16. Its17.50 stories per week 
 
 S94 records one worked date, 2026-10-16. Its 25.00 stories per week measures parallel calendar throughput, not person-effort or a sustainable single-developer forecast. The last three windows, S92, S93 and S94, total 18 stories over 4 worked-date units, or 22.50 stories per week. Shared dates are not person-days, and per-feature actual effort remains unrecorded. The 42.86 percent increase from S93 exceeds the 30 percent close-report escalation threshold. Retain the approved 14 to 19 developer-day effort estimate and the capacity-reviewed S95 through S95.4 repair and carryover boundaries. The new rolling window is 5.88 percent above the preceding 21.25 rate, but remains unsuitable as a person-effort forecast.
 
+S95 records one worked date,2026-10-16. Its45.00 stories per week measures parallel calendar throughput, not person-effort or a sustainable single-developer forecast. The last three windows,S93,S94andS95,total21stories over4worked-date units,or26.25stories per week. Shared dates are not person-days, and per-feature actual effort remains unrecorded. The80.00percent increase from S94 exceeds the30percent close-report escalation threshold. The rolling rate is16.67percent above the preceding22.50 rate. Retain the approved22to31 developer-day estimate for seven medium and two large stories. The user explicitly expanded S95 to include Issue386 before release preparation. Preserve the dependent S95.11 and later roadmap boundaries and their effort estimates. This summary does not claim sprint review, main merge, sprint close, tags or publication have occurred.
+
+S95.3 records three worked dates,2026-10-18,19and22. Eight stories over three date units give13.33stories/week,166.67percent above S95.2 and beyond the30percent escalation threshold. S95.11/S95.2/S95.3 total13completed stories over7worked-date units, or9.29stories/week. Shared calendar dates are not person-days. Feature effort is not recorded. Preserve the34to49developer-day expanded estimate, later sprint boundaries and explicit dependency gates. Final review and close remain due.
+
 ## Escalation record
 
 Logged when an escalation trigger from `.claude/WORKFLOW.md` fires, with what
@@ -720,6 +754,9 @@ was done about it. Empty is the expected state.
 
 | Date | Trigger | F-ID or sprint | Response |
 |------|---------|----------------|----------|
+| 2026-10-22 | Sprint throughput variance exceeds30percent | S95.3 | Record13.33stories/week,166.67percent above S95.2, as calendar throughput across three worked dates. Retain34to49estimated developer-days and later dependency/capacity boundaries. Do not infer person effort or a sustainable forecast |
+| 2026-10-17 | Sprint throughput variance exceeds30percent | S95.11 | Record7.50stories/week,83.33percent below S95, as parallel calendar throughput across two worked dates. Preserve S95.2/S95.3/S95.4 dependency boundaries and developer estimates. No person-effort or elapsed-time forecast is inferred |
+| 2026-10-16 | Sprint throughput variance exceeds30percent | S95 | Record45.00stories/week,80.00percent above S94,as parallel calendar throughput. The last three windows yield26.25stories/week. Preserve22to31developer-day effort estimates and the explicit user-approved expansion to nine stories. Retain S95.11 and later dependency boundaries without converting throughput into elapsed delivery promises. Formal review,close and publication remain separate |
 | 2026-10-16 | Sprint throughput variance exceeds30percent | S93 | Record17.50stories/week,41.67percent below S92, as parallel calendar throughput. The last three windows yield21.25stories/week, above the2story/week planning assumption. Preserve effort estimates and require the existing S95 capacity split before opening that sprint |
 | 2026-10-15 | Three-sprint throughput differs from the2-stories/week assumption by983percent | S91, S91.1, S92 | Record21.67 stories/week as parallel calendar throughput. Retain dependency-defined roadmap boundaries and developer-effort estimates. Do not convert this observation into elapsed delivery promises or invent person-effort actuals |
 | 2026-07-30 | Three-sprint velocity variance exceeded 30 percent | S01 to S03 | Reforecast 366 remaining estimated days to 45 to 50 active weeks, retain dependency-defined boundaries, and recalibrate after S06 |
@@ -1110,3 +1147,100 @@ At the user's request, prioritize seven new pending repairs over the eleven carr
 Reviewed sprint HEAD: 588f26407253655f9e85cf9f53499a9148b8deb2. Committed sprint review pass2 audits parent 76000663 and records 0 blocking, 0 should-fix and one retained optional formatting nit. Fresh full verification at the reviewed HEAD passed all 18 native/repository commands. Receipt `/private/tmp/S94-full-closure-588f2640-1/receipt.json` has SHA-256 `3cdceed380b24c22d6a66326a92e5fdb6d007423ef47d382634b24284c241eef`. Root and independent authentication confirm 5,493 default passes with 68 ignored, 6,579 overlapping all-feature passes with 73 ignored, 149 no-default font passes with one ignored, 183 policy tests with two expected skips, 49 unchanged hashes, seven pixel buffers, 22 genuinely verified publication dry runs and 22 retained archives below 10 MiB. The actual failed 3bb policy run is retained. Its decimal-sprint parsing error was repaired in the single existing policy test at 76000663 and the complete policy suite reran successfully. The private authentication helper needed workspace-inherited version resolution, with its failed predecessor retained, without changing product code or the successful gate.
 
 This close-only tracker successor follows successful preflight and gates. Its commit, main merge and exact tree comparison will be recorded in the root close receipt after those operations. It changes no product source, public surface, dependency, baseline or acceptance contract. Historical per-feature rows retain their original evidence qualifications. Installed 877 Word and 905 PowerPoint tests, 23 new public artifacts, strict typing and 27 hosted jobs remain actual producer 9cdbea, with four publication guards skipped. The authenticated 3,533-input successor inventory explicitly carries the prior test-only, archive-metadata and new policy-test exceptions rather than claiming universal source equality. All five contracts are done with no carries. New Issues384 and385 retain their S95 and S95.1 acceptance homes, without S94 delivery credit. The latest intake refresh found no newer open item or PR. All five clean worker directories were already removed after integration. Their recorded branches are cleanup targets only after main and s94 push successfully. Dirty, carried and unrelated worktrees remain protected. Issue reconciliation follows the successful main push, with exact decisions and comment links recorded then. No release or publication is part of this close.
+
+## S95 release dependency-prefix checkpoint
+
+Four integrated prerequisites complete through scoped evidence so the end-S95 release preparation can follow all five repairs. F-X252 remains in implementation and F-X255 pending. No full sprint gate, sprint review, publication or measured person-effort credit is claimed. The new release story extends the estimate to 14 to 20 developer-days without moving later sprint boundaries.
+
+| F-ID | Sprint | Size | Estimate days | Actual days | Completed | Evidence |
+|------|--------|------|---------------|-------------|-----------|----------|
+| F-X248 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped acceptance, independent clean feature review and integrated source authentication. Receipt SHA256 5cad8051b7f35b202c9c88ae9c452ce349cbb0b870ca2544df05da56ebd334fd. Final full sprint gate and review remain due |
+| F-X249 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped acceptance, independent clean feature review and integrated source authentication. Receipt SHA256 5d095be06d08d3e74acdac972f682f27a8354cff8464269b9b3117827798c5f2. Final full sprint gate and review remain due |
+| F-X251 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped acceptance, independent clean feature review and integrated source authentication. Receipt SHA256 6ce4af6b199c3c337a72f44f9927e8d245633b81aa1f6f8baf3d07a85621d6c3. Final full sprint gate and review remain due |
+| F-X253 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped acceptance, independent clean feature review and integrated source authentication. Receipt SHA256 54a4fc73d167e4b00e36a24d98dd4a7517c38a85e7927f86c539024468023a87. Final full sprint gate and review remain due |
+
+## Issue386 intake and capacity split, 2026-10-16
+
+Read-only GitHub refresh found new Issue386 and no open PRs. Its new Word unit,
+remaining Word names/legacy diagnostic and PowerPoint name/color/language
+contracts are pending F-X256, F-X257 and F-X258 in S95.1, totaling 8 to 11
+estimated developer-days. The former S95.1 F-X250/F-X254/F-X219/F-X223 group
+moves intact to S95.11, at 12 to 16 developer-days, before S95.2. This preserves
+all acceptance groups and the user's new-repair priority without extending
+S95 or making its release wait for future repairs. No implementation, runtime,
+completion or velocity credit is claimed. Historical references to the prior
+S95.1 allocation retain their original planning date. The canonical roadmap
+and backlog carry the revised homes. Issue385 and Issue386 remain open for
+their respective remaining acceptance unions. Exact input and source facts
+are retained in `/private/tmp/S95-issue386-intake-triage-1/triage.md` and its
+receipt SHA256 `8024b68da12ba4f7a1d7c12265ad7b3a80935954d74a16cc133822fb470b0fa0`.
+
+| F-X252 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped prerequisite acceptance: native3480/28ignored, installed45, typing/stub, policy181pass2skip, genuine affected publication, hash49/pixels7 unchanged. Independent correctness3 and numeric packaging4 clean. Integrated94cd8abb preserves all12 qualified files. Final six-story full gate and sprint review remain due |
+
+All five repair prerequisites are now complete. F-X255 can design and start
+release preparation for Word0.16.2 and shared/PowerPoint0.14.2. The actual
+full integrated gate, hosted artifacts and independent sprint review still
+follow the final versioned source. No publication has started.
+
+## S95 expanded dependency-prefix checkpoint, 2026-10-16
+
+The user expanded active S95 to nine stories. F-X256 and F-X258 now complete
+through scoped evidence and exact integrated product/test reconciliation.
+F-X257 follows the Word prefix, then F-X255 reconciles its preserved release
+preparation. Final integrated full verification and sprint review remain due.
+Historical S95.1 allocation statements above retain their original date.
+
+| F-ID | Sprint | Size | Estimate days | Actual days | Completed | Evidence |
+|------|--------|------|---------------|-------------|-----------|----------|
+| F-X256 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped Word933 and focused33 at successor3, current typing-only applicability and stub checks, clean independent pass5, exact integration f3291339. Policy181pass2skip, worker hash49/pixels7 unchanged. Final sprint gate due |
+| F-X258 | S95 | M | 2 to 3 | not recorded | 2026-10-16 | Scoped complete PPT961 with no skips, selected6 and typing/stub checks, clean independent pass1, exact integration8c9fb137. Policy181pass2skip, worker hash49/pixels7 unchanged. Final sprint gate due |
+
+| F-X257 | S95 | L | 4 to 5 | not recorded | 2026-10-16 | Scoped complete Word947/0skip, focused14, strict typing/stub8modules and selected6 observations. Two clean reviews,27 root-authenticated references, exact integration1afb1006. Policy181pass2skip, hash49/pixels7 unchanged. Final integrated gate remains due |
+
+All eight S95 repairs now complete through scoped dependency-prefix acceptance.
+Release preparation F-X255 remains in-progress for revised design and preserved
+WIP reconciliation. The final nine-story union, actual hosted acceptance and
+sprint review remain due. No publication or measured person-effort credit.
+
+| F-X255 | S95 | L | 4 to 5 | not recorded | 2026-10-16 | Exact Word0.16.2/shared-PPT0.14.2 preparation. Clean source/numeric reviews, scoped verified22 archives and actual6b final installed1908/no skips, hosted27success4publicationSKIP/26payloads/172 priority calls, public23, PPT four routes, Issue38619+16 and reporter12strictXPASS/raw1 plus12bodies/raw0. Integrated native18commands,49hashes,7pixels and22verified archives pass at6b7c9798. Formal sprint review and publication remain separate |
+
+## S95.11 close evidence
+
+Planned four contracts, completed F-X250/F-X254/F-X223 and carried F-X219 unfinished
+to S96. Original estimate12 to16 developer-days, retained completed scope10 to13.
+Actual worked calendar dates are2026-10-16and17, two dates, authenticated by
+`git log main..HEAD --format=%cs`. Feature developer-effort actuals remain not
+recorded. Existing calendar-throughput velocity is3/2*5 =7.50 stories/week,
+83.33percent below S95's45.00. This variance records observed parallel calendar
+throughput. Preserve the S95.2/S95.3/S95.4 capacity split and developer estimates,
+without deriving elapsed-time promises from this figure. The
+user's "document word limitation" disposition completes F-X223's bounded native
+investigation without broadening its genuine-face qualification or erasing14
+unsupported observer outcomes. No S96 implementation has started.
+
+Accepted full source 05ba6cc8461a896fa751ca7dc1fe209a8fa70045 binds actual H3/H5/836/H7 observations, rather than
+pretending all commands ran at one new metadata HEAD. Native union32 binaries
+contains6616 unique passes and73ignored, plus11complete doctests. Actual ordinary
+installed suites pass955Word and1007PowerPoint with strict typing and stubtest.
+Issue385's27 distinct bodies join12prior and15new, each epoch separately recording
+strict XPASS/raw1 and body PASS/raw0. Hash49/pixels7 unchanged. No-default fonts,
+WASM, documentation, README and deny observations remain source-applicable.
+Genuine package verification is21 applicable H5 crates plus current H7 CLI.
+Source/archive/recovered-wrapper distinctions and actual failures remain intact.
+F250 bounded Word/LO/own appearances and source XML are separate from F254 native
+PowerPoint custody/XML and F223's documented native limitation.
+
+Receipt identities: installed cff97a3605b2b32601881e5727cbc926b392294f66c79e02062fa0b6747d7805,
+reporter15 6109789870f72fa7b7a4892b27ce8f7adf583fa3b8c97b717201f54f06306070,
+runtime/doc partial99787cf314315b25f5e66d89812c15cc37423f133fd68b52b314b0a9b1e2dcda,
+build-tail partial921e51101707792aba8d34bbc8792af35e36906986ad988319dcfc47c12cdca2,
+and current CLI b656c2c672dc5ee6f3d18d6a82d457373d86715b8c6421d69c0d467f58789ea9.
+Partial receipts retain passed:false with their explicit stage flags. The final qualification receipt SHA256
+6bd76990051cb4e095fdbd673692aca7dfbc1398c3b7b2905f1dda29571b09d1
+records passed:true at05ba6cc8461a896fa751ca7dc1fe209a8fa70045 by joining
+actual external evidence, source correspondence and the user limitation
+disposition, without replaying any producer. Policy aggregate is188 tests,
+186 passes and two retained skips, with its original failed command retained. Formal sprint review and close operate against the
+actual final metadata/source correspondence. No release tag, publication or new
+version is part of this close. Fresh registry/publisher checks and separate final
+approval at the exact reviewed main SHA remain release obligations.

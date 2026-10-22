@@ -173,8 +173,10 @@ impl PyRun {
                 paragraph.edit_run(&self.run_path, edit)
             })
             .map_err(|error| crate::rdocx_to_pyerr(py, error))?;
-        document.inner = candidate;
-        Ok(())
+        let text = location
+            .read(&candidate, |paragraph| paragraph.text())
+            .map_err(|error| crate::rdocx_to_pyerr(py, error))?;
+        document.publish_run_content_candidate(candidate, self.owner.as_ref(), text)
     }
 }
 
@@ -199,6 +201,22 @@ impl PyRun {
             .run_element_xml(&location, &path)
             .map_err(|error| crate::rdocx_to_pyerr(py, error))?;
         String::from_utf8(bytes).map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    #[getter]
+    fn _r(&self, py: Python<'_>) -> PyResult<()> {
+        self.validate(py)?;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "read run.xml and write run.replace_xml(xml) instead of lxml",
+        ))
+    }
+
+    #[getter]
+    fn _element(&self, py: Python<'_>) -> PyResult<()> {
+        self.validate(py)?;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "read run.xml and write run.replace_xml(xml) instead of lxml",
+        ))
     }
 
     fn replace_xml(&self, py: Python<'_>, xml: &str) -> PyResult<()> {
@@ -348,6 +366,26 @@ impl PyRun {
                 ));
             }
         };
+        if kind == rdocx::BreakKind::Page {
+            let (location, _) = self.validate(py)?;
+            if let ParagraphLocation::Related(location) = location {
+                let document = self.document.borrow(py);
+                let in_header = document
+                    .inner
+                    .stories()
+                    .map_err(|error| crate::rdocx_to_pyerr(py, error))?
+                    .iter()
+                    .any(|story| {
+                        story.kind() == rdocx::StoryKind::Header
+                            && story.part_name() == location.story().part_name()
+                    });
+                if in_header {
+                    return Err(PyValueError::new_err(
+                        "a page break cannot be added inside a header",
+                    ));
+                }
+            }
+        }
         self.edit(py, |run| run.add_break(kind))
     }
 

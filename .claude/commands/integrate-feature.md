@@ -12,6 +12,22 @@ the canonical sprint worktree**, after the worker has run
 defers the sprint ledgers, the `done` status, consolidated verification and the
 push to the end of the sprint run.
 
+## Acceptance reconciliation
+
+Before consuming a worker's handoff, compare its A-ID evidence with the approved
+consumer map and test matrix. Verify the integrated callers still supply the
+same context and defaults. Qualify interactions introduced by neighboring
+stories with focused checks rather than assuming individually green workers
+compose. Keep unmet native, installed and corpus criteria pending in the
+existing records. A contributed patch's test count never substitutes for its
+linked issue's whole acceptance inventory.
+
+Compare the worker's acknowledged plan/instruction revisions with the current
+canonical contract before squash integration. If they differ, reconcile the
+material changes and affected evidence with the owner first. Do not let an
+older worker plan overwrite a newer approved plan merely because Git merges it
+without a conflict. Preserve current decisions and re-review semantic changes.
+
 ## Preconditions
 
 1. **Clean tree on `sprint/sNN`**, matching `docs/sprints/CURRENT_SPRINT.md`.
@@ -53,15 +69,18 @@ push to the end of the sprint run.
    re-reviewed with `/microscope F-XXX --working`, and the reconciliation is
    recorded. Any other conflict stops for a human decision.
 
-3. **Outside `--batch`, run `/verify`.** The full gate, or the scoped gate the
-   design plan documented. The worker's own result is evidence, not a
-   substitute. Two independently correct features can be jointly wrong, and this
-   is the first moment anything can see that.
+3. **Consume applicable local evidence.** Run only focused regressions earned
+   by integration reconciliation or invalidated source. Do not invoke a second
+   general `/verify`, full suite, oracle or risk rider. A semantic reconciliation
+   still needs independent microscope of its new material.
 
-4. **Outside `--batch`, follow `/complete-feature F-XXX` from step 3 onward.**
-   Update the HLD files the plan listed, append `AS_BUILT.md` and
-   `SPRINT_TRACKER.md`, set `done` in `BACKLOG.md` and `CURRENT_SPRINT.md`,
-   clear the `Owner` cell, and regenerate the AUTOGEN counts.
+4. **Complete only after actual final acceptance.** When final checks remain,
+   integrate in batch as reviewed, preserving the approved plan, pending checks
+   and in-progress delivery status, except an explicitly approved local
+   provider-prefix completion through run-sprint. That route alone can set
+   provider run/dependency status completed while plan/rider debt stays pending.
+   Source/HLD intent is already reviewed. Delivery ledgers wait for actual final
+   observations, with one entry per integrated story.
 
 5. **Consume the handoff.** Its durable facts, the harness result and the test
    gate, move into the AS_BUILT entry. Then delete
@@ -103,6 +122,16 @@ push to the end of the sprint run.
    else. It has not run yet. Write `Harness, deferred to sprint gate` when the
    worker's harness result has not been re-established on the integrated tree.
 4. Do not push. `/run-sprint` pushes once, after its gate and its review loop.
+
+### Final sprint acceptance handoff
+
+A `sprint-final-acceptance` handoff preserves named final checks in existing
+plan/progress/run state. Consume its local scoped evidence, integrate as
+reviewed and retain in-progress status. Do not mark a pending oracle passed or
+unblock formal dependencies through this marker alone. Only run-sprint's
+explicitly approved genuine LOCAL provider-prefix completion can satisfy that
+edge while named final rider debt remains. Complete after the union of
+actual final checks passes. This is distinct from external source availability.
 
 ### External CI source availability handoff
 

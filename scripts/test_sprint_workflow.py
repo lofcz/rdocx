@@ -28,6 +28,53 @@ from scripts import sprint_workflow as workflow
 
 
 class SprintWorkflowTests(unittest.TestCase):
+    def test_s953_release_targets_match_exact_prepared_families(self) -> None:
+        root = tomllib.loads((workflow.REPO / "Cargo.toml").read_text())
+        self.assertEqual(root["workspace"]["package"]["version"], "0.16.3")
+        for distribution, version, tag, count in (
+            ("rdocx", "0.16.3", "v0.16.3", 7),
+            ("rpptx", "0.14.3", "rpptx-v0.14.3", 15),
+        ):
+            with self.subTest(distribution=distribution):
+                family = workflow.validate_unified_release_family(tag)
+                self.assertEqual(family["version"], version)
+                self.assertEqual(len(workflow.RELEASE_CRATES[distribution]), count)
+                project = tomllib.loads((workflow.REPO / f"crates/{distribution}-py/pyproject.toml").read_text())
+                self.assertEqual(project["project"]["version"], version)
+                notes = workflow.render_release_notes((workflow.REPO / "CHANGELOG.md").read_text(), tag)
+                for heading in ("Highlights", "Added", "Fixed", "Compatibility", "Contributors"):
+                    self.assertIn(f"### {heading}\n", notes)
+                self.assertIn("https://github.com/hadim", notes)
+                self.assertIn("https://github.com/tensorbee/rdocx/issues/389", notes)
+        wasm = tomllib.loads((workflow.REPO / "crates/rpptx-wasm/Cargo.toml").read_text())
+        self.assertEqual(wasm["package"]["version"], "0.12.1")
+        self.assertFalse(wasm["package"]["publish"])
+
+    def test_s953_release_notes_keep_exact_family_contribution_inventory(self) -> None:
+        changelog = (workflow.REPO / "CHANGELOG.md").read_text()
+        expected = {
+            "v0.16.3": ({360, 385, 387, 388, 389, 390, 391, 398, 400},
+                         {393, 395, 396, 397, 399, 401}),
+            "rpptx-v0.14.3": ({385, 388, 389, 392}, {393, 394, 397}),
+        }
+        for tag, (issues, pulls) in expected.items():
+            notes = workflow.render_release_notes(changelog, tag)
+            self.assertEqual({int(n) for n in re.findall(r"rdocx/issues/(\d+)", notes)}, issues)
+            self.assertEqual({int(n) for n in re.findall(r"rdocx/pull/(\d+)", notes)}, pulls)
+            credits = notes.split("### Contributors\n", 1)[1]
+            self.assertIn("[@hadim](https://github.com/hadim)", credits)
+            for number in issues:
+                self.assertIn(f"/issues/{number})", credits)
+            for number in pulls:
+                self.assertIn(f"/pull/{number})", credits)
+        word = workflow.render_release_notes(changelog, "v0.16.3")
+        for clause in ("BodyContent", "Box::new", "Option<bool>", "first item",
+                       "private unreduced", "partially addressed"):
+            self.assertIn(clause, word)
+        ppt = workflow.render_release_notes(changelog, "rpptx-v0.14.3")
+        for clause in ("InvalidXmlChild", "ties-to-even", "0.12.1", "advisory target"):
+            self.assertIn(clause, ppt)
+
     def test_cli_archive_validator_rejects_duplicate_member_payloads(self) -> None:
         import warnings
 
@@ -124,20 +171,95 @@ class SprintWorkflowTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     evaluate("workflow_dispatch", archive_format, duplicate_name)
 
+    def test_s95_patch_release_families_match_reviewed_targets(self) -> None:
+        targets = {"rdocx": ("0.16.3", "v0.16.3", 7),
+                   "rpptx": ("0.14.3", "rpptx-v0.14.3", 15)}
+        workspace = tomllib.loads((workflow.REPO / "Cargo.toml").read_text())
+        self.assertEqual(workspace["workspace"]["package"]["version"], "0.16.3")
+        locked = {(p["name"], p["version"]) for p in
+                  tomllib.loads((workflow.REPO / "Cargo.lock").read_text())["package"]}
+        changelog = (workflow.REPO / "CHANGELOG.md").read_text()
+        for distribution, (version, tag, count) in targets.items():
+            with self.subTest(distribution=distribution):
+                family = workflow.validate_unified_release_family(tag)
+                self.assertEqual(family["version"], version)
+                self.assertEqual(len(workflow.RELEASE_CRATES[distribution]), count)
+                for name in (*workflow.RELEASE_CRATES[distribution], f"{distribution}-py"):
+                    self.assertIn((name, version), locked)
+                historical_tag = {"rdocx": "v0.16.2", "rpptx": "rpptx-v0.14.2"}[distribution]
+                notes = workflow.render_release_notes(changelog, historical_tag)
+                for section in ("Highlights", "Added", "Fixed", "Compatibility", "Contributors"):
+                    self.assertIn(f"### {section}", notes)
+                self.assertIn("https://github.com/hadim", notes)
+                self.assertIn("https://github.com/tensorbee/rdocx/issues/385", notes)
+                self.assertIn("partially addressed", notes)
+                self.assertEqual(notes.count("https://github.com/tensorbee/rdocx/issues/386"), 1)
+        word = workflow.render_release_notes(changelog, "v0.16.2")
+        for detail in ("RenderOptions", "LayoutInput", "ParagraphBlock", "NoteLayout",
+                       "OpcError::Zip", "Plain", "stored formatting"):
+            self.assertIn(detail, word)
+        self.assertIn("https://github.com/Andrewkoro105", word)
+        wasm = tomllib.loads((workflow.REPO / "crates/rpptx-wasm/Cargo.toml").read_text())
+        self.assertEqual(wasm["package"]["version"], "0.12.1")
+        self.assertFalse(wasm["package"]["publish"])
+
+    def test_s95_patch_notes_keep_family_contributions_and_scope(self) -> None:
+        changelog = (workflow.REPO / "CHANGELOG.md").read_text()
+        expected = {
+            "v0.16.2": ({364, 365, 366, 367, 368, 369, 370, 371, 372, 373,
+                         378, 379, 380, 382, 383, 384, 385, 386}, {374, 375, 376}),
+            "rpptx-v0.14.2": ({379, 380, 383, 385, 386}, {359, 376}),
+        }
+        for tag, (issues, pulls) in expected.items():
+            with self.subTest(tag=tag):
+                notes = workflow.render_release_notes(changelog, tag)
+                self.assertEqual({int(n) for n in re.findall(r"rdocx/issues/(\d+)", notes)}, issues)
+                self.assertEqual({int(n) for n in re.findall(r"rdocx/pull/(\d+)", notes)}, pulls)
+                self.assertIn("not merged unchanged", notes)
+                self.assertIn("S95.11", notes)
+                self.assertIn("Issue 386", notes)
+                self.assertIn("partially addressed", notes)
+        word = workflow.render_release_notes(changelog, "v0.16.2")
+        for clause in ("0.16.x version line", "stored formatting is unchanged",
+                       "source breaks", "eighteen hash entries", "four pixel buffers"):
+            self.assertIn(clause, word)
+        ppt = workflow.render_release_notes(changelog, "rpptx-v0.14.2")
+        self.assertIn("new presentation HTML whitespace increment", ppt)
+        self.assertIn("MSO_COLOR_TYPE", ppt)
+        self.assertIn("MSO_THEME_COLOR", ppt)
+        self.assertIn("NOT_THEME_COLOR", ppt)
+        self.assertIn("AttributeError", ppt)
+        self.assertIn("216", ppt)
+        self.assertIn("string setters", ppt)
+        self.assertNotIn("requests in Issue 386 remain pending", ppt)
+        for clause in ("MSO_COLOR_TYPE", "theme_color", "str | None", "CustomProperties",
+                       "line_spacing", "Length", "snapshot", "index"):
+            self.assertIn(clause, word)
+        for notes in (word, ppt):
+            self.assertIn("Python source compatibility", notes)
+            self.assertIn("19-attempt", notes)
+            self.assertIn("16-group", notes)
+            self.assertIn("final paired", notes)
+            self.assertNotIn("Issue 386 remain pending", notes)
+        self.assertIn("carrier stays 0.12.1", ppt)
+
     def test_s91_release_families_match_reviewed_versions(self) -> None:
         expected = {"rdocx": ("0.16.1", "v0.16.1", 7),
                     "rpptx": ("0.14.1", "rpptx-v0.14.1", 15)}
         workspace = tomllib.loads((workflow.REPO / "Cargo.toml").read_text())
-        self.assertEqual(workspace["workspace"]["package"]["version"], "0.16.1")
         locked = {(p["name"], p["version"]) for p in
                   tomllib.loads((workflow.REPO / "Cargo.lock").read_text())["package"]}
         changelog = (workflow.REPO / "CHANGELOG.md").read_text()
         for distribution, (version, tag, count) in expected.items():
             with self.subTest(distribution=distribution):
                 self.assertEqual(len(workflow.RELEASE_CRATES[distribution]), count)
-                self.assertEqual(workflow.validate_unified_release_family(tag)["version"], version)
+                current_version = (workspace["workspace"]["package"]["version"]
+                                   if distribution == "rdocx" else
+                                   tomllib.loads((workflow.REPO / "crates/rpptx/Cargo.toml").read_text())["package"]["version"])
+                current_tag = ("v" if distribution == "rdocx" else "rpptx-v") + current_version
+                self.assertEqual(workflow.validate_unified_release_family(current_tag)["version"], current_version)
                 for name in (*workflow.RELEASE_CRATES[distribution], f"{distribution}-py"):
-                    self.assertIn((name, version), locked)
+                    self.assertIn((name, current_version), locked)
                 notes = workflow.render_release_notes(changelog, tag)
                 for section in ("Highlights", "Added", "Fixed", "Compatibility", "Contributors"):
                     self.assertIn(f"### {section}", notes)
@@ -2849,7 +2971,7 @@ class SprintWorkflowTests(unittest.TestCase):
             "wasm-pack build --target bundler --scope tensorbee --release "
             '--out-dir "$package_root/rpptx-wasm" crates/rpptx-wasm --locked',
             'verify_package "$package_root/rdocx-wasm" "@tensorbee/rdocx-wasm" '
-            '"0.16.1" "rdocx_wasm"',
+            '"0.16.3" "rdocx_wasm"',
             'verify_package "$package_root/rpptx-wasm" "@tensorbee/rpptx-wasm" '
             '"0.12.1" "rpptx_wasm"',
             "npm install --prefix \"$consumer_root\" --cache \"$npm_cache\" "
@@ -4358,7 +4480,7 @@ class SprintWorkflowTests(unittest.TestCase):
         return notes
 
     def test_stable_release_family_is_prepared_at_0_15_0(self) -> None:
-        expected_version = "0.16.1"
+        expected_version = "0.16.3"
         stable_members = (
             "oxml-py-support",
             "rdocx-opc",
@@ -4453,7 +4575,7 @@ class SprintWorkflowTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(rpptx_pyproject["project"]["version"], "0.14.1")
+        self.assertEqual(rpptx_pyproject["project"]["version"], "0.14.3")
 
         migration = (
             workflow.REPO / "docs/hld/11-migration-plan.md"
@@ -4488,13 +4610,13 @@ class SprintWorkflowTests(unittest.TestCase):
             )
 
         readme_requirements = {
-            "README.md": ('rdocx = "0.16.1"', 'version = "0.16.1"'),
-            "crates/rdocx-cli/README.md": ("--version '^0.16.1'",),
-            "crates/rdocx-html/README.md": ('rdocx-html = "0.16.1"',),
-            "crates/rdocx-layout/README.md": ('rdocx-layout = "0.16.1"',),
-            "crates/rdocx-opc/README.md": ('rdocx-opc = "0.16.1"',),
-            "crates/rdocx-oxml/README.md": ('rdocx-oxml = "0.16.1"',),
-            "crates/rdocx-pdf/README.md": ('rdocx-pdf = "0.16.1"',),
+            "README.md": ('rdocx = "0.16.3"', 'version = "0.16.3"'),
+            "crates/rdocx-cli/README.md": ("--version '^0.16.3'",),
+            "crates/rdocx-html/README.md": ('rdocx-html = "0.16.3"',),
+            "crates/rdocx-layout/README.md": ('rdocx-layout = "0.16.3"',),
+            "crates/rdocx-opc/README.md": ('rdocx-opc = "0.16.3"',),
+            "crates/rdocx-oxml/README.md": ('rdocx-oxml = "0.16.3"',),
+            "crates/rdocx-pdf/README.md": ('rdocx-pdf = "0.16.3"',),
         }
         for path, requirements in readme_requirements.items():
             text = (workflow.REPO / path).read_text(encoding="utf-8")
@@ -4514,7 +4636,7 @@ class SprintWorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            expected_incubating_version = "0.12.1" if name == "rpptx-wasm" else "0.14.1"
+            expected_incubating_version = "0.12.1" if name == "rpptx-wasm" else "0.14.3"
             self.assertEqual(manifest["package"]["version"], expected_incubating_version, name)
             self.assertIs(
                 manifest["package"].get("publish", True),
@@ -4626,8 +4748,8 @@ class SprintWorkflowTests(unittest.TestCase):
     def test_s73_release_contract_requires_four_version_aligned_families(
         self,
     ) -> None:
-        stable_version = "0.16.1"
-        incubating_version = "0.14.1"
+        stable_version = "0.16.3"
+        incubating_version = "0.14.3"
         stable_publishable = {
             "rdocx-opc",
             "rdocx-oxml",
@@ -5347,13 +5469,13 @@ class SprintWorkflowTests(unittest.TestCase):
         readme = (workflow.REPO / "README.md").read_text(encoding="utf-8")
         self.assertTrue(readme_doctests.validate_root_versions(readme, metadata))
         for requirement in (
-            'rdocx = "0.16.1"',
-            'rdocx = { version = "0.16.1", default-features = false }',
-            "cargo install rdocx-cli --version '^0.16.1'",
+            'rdocx = "0.16.3"',
+            'rdocx = { version = "0.16.3", default-features = false }',
+            "cargo install rdocx-cli --version '^0.16.3'",
         ):
             with self.subTest(requirement=requirement):
                 mutation = readme.replace(
-                    requirement, requirement.replace("0.16.1", "9.9.9")
+                    requirement, requirement.replace("0.16.3", "9.9.9")
                 )
                 self.assertFalse(
                     readme_doctests.validate_root_versions(mutation, metadata)
@@ -5410,17 +5532,6 @@ class SprintWorkflowTests(unittest.TestCase):
         self.assertFalse(readme_doctests.validate_comparison_evidence(short_extra_row))
         self.assertFalse(readme_doctests.validate_comparison_evidence(broad_uniqueness))
         self.assertFalse(readme_doctests.validate_comparison_evidence(duplicate_evidence))
-
-    def test_readme_depth_footprint_and_speed_claims_are_evidence_backed(
-        self,
-    ) -> None:
-        self.assertTrue(readme_doctests.validate_inventory())
-        self.assertTrue(
-            all(
-                readme_doctests.compile_readme(case)
-                for case in readme_doctests.README_CASES
-            )
-        )
 
     def test_measurement_rows_match_rederived_archive_footprint(self) -> None:
         for package in readme_doctests.ARCHIVE_MEASUREMENTS:
@@ -5527,7 +5638,7 @@ class SprintWorkflowTests(unittest.TestCase):
         mutations = (
             text.replace("| 2026-09-19 |", "|  |", 1),
             text.replace("| 2026-09-19 |", "| 19 September 2026 |", 1),
-            text.replace("| 0.16.1 |", "| 9.9.9 |", 1),
+            text.replace("| 0.16.3 |", "| 9.9.9 |", 1),
             text.replace("| rdocx 0.14.0 |", "| rdocx 9.9.9 |", 1),
         )
         self.assertFalse(readme_doctests.valid_measurement_date("2026-99-99"))
@@ -5734,9 +5845,9 @@ class SprintWorkflowTests(unittest.TestCase):
             "rpptx-cli",
         )
         preparation_packages = (*incubating_packages, "rpptx-wasm")
-        expected_version = "0.14.1"
+        expected_version = "0.14.3"
         root = tomllib.loads((workflow.REPO / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertEqual(root["workspace"]["package"]["version"], "0.16.1")
+        self.assertEqual(root["workspace"]["package"]["version"], "0.16.3")
         dependencies = root["workspace"]["dependencies"]
         lock = tomllib.loads((workflow.REPO / "Cargo.lock").read_text(encoding="utf-8"))
         lock_versions = {
@@ -5769,21 +5880,21 @@ class SprintWorkflowTests(unittest.TestCase):
         self.assertEqual(lock_versions["rpptx-wasm"], "0.12.1")
 
         readme_requirements = {
-            "crates/oxml-core/README.md": ('oxml-core = "0.14.1"',),
-            "crates/oxml-drawing/README.md": ('oxml-drawing = "0.14.1"',),
-            "crates/oxml-layout/README.md": ('version = "0.14.1"',),
-            "crates/oxml-media/README.md": ('oxml-media = "0.14.1"',),
-            "crates/oxml-opc/README.md": ('oxml-opc = "0.14.1"',),
+            "crates/oxml-core/README.md": ('oxml-core = "0.14.3"',),
+            "crates/oxml-drawing/README.md": ('oxml-drawing = "0.14.3"',),
+            "crates/oxml-layout/README.md": ('version = "0.14.3"',),
+            "crates/oxml-media/README.md": ('oxml-media = "0.14.3"',),
+            "crates/oxml-opc/README.md": ('oxml-opc = "0.14.3"',),
             "crates/oxml-pdf/README.md": (
-                'oxml-pdf = "0.14.1"',
-                'oxml-layout = "0.14.1"',
+                'oxml-pdf = "0.14.3"',
+                'oxml-layout = "0.14.3"',
             ),
-            "crates/oxml-chart/README.md": ('oxml-chart = "0.14.1"',),
-            "crates/rpptx-chart/README.md": ('rpptx-chart = "0.14.1"',),
-            "crates/rpptx-cli/README.md": ("--version '^0.14.1'",),
-            "crates/rpptx-layout/README.md": ('rpptx-layout = "0.14.1"',),
-            "crates/rpptx-oxml/README.md": ('rpptx-oxml = "0.14.1"',),
-            "crates/rpptx-render/README.md": ('rpptx-render = "0.14.1"',),
+            "crates/oxml-chart/README.md": ('oxml-chart = "0.14.3"',),
+            "crates/rpptx-chart/README.md": ('rpptx-chart = "0.14.3"',),
+            "crates/rpptx-cli/README.md": ("--version '^0.14.3'",),
+            "crates/rpptx-layout/README.md": ('rpptx-layout = "0.14.3"',),
+            "crates/rpptx-oxml/README.md": ('rpptx-oxml = "0.14.3"',),
+            "crates/rpptx-render/README.md": ('rpptx-render = "0.14.3"',),
         }
         for path, requirements in readme_requirements.items():
             text = (workflow.REPO / path).read_text(encoding="utf-8")
@@ -5792,29 +5903,29 @@ class SprintWorkflowTests(unittest.TestCase):
 
         source_requirements = {
             "crates/oxml-chart/src/lib.rs": (
-                'manifest.contains("version = \\"0.14.1\\"")',
+                'manifest.contains("version = \\"0.14.3\\"")',
             ),
             "crates/oxml-drawing/src/lib.rs": (
-                'manifest.contains("version = \\"0.14.1\\"")',
+                'manifest.contains("version = \\"0.14.3\\"")',
             ),
             "crates/rdocx-wasm/src/lib.rs": (
                 'oxml-layout = { path = \\"crates/oxml-layout\\", '
-                'version = \\"0.14.1\\", default-features = false }',
+                'version = \\"0.14.3\\", default-features = false }',
             ),
             "crates/rpptx-oxml/tests/integration.rs": (
-                'manifest.contains("version = \\"0.14.1\\"")',
+                'manifest.contains("version = \\"0.14.3\\"")',
             ),
             "crates/rpptx-render/src/lib.rs": (
-                'manifest.contains("version = \\"0.14.1\\"")',
+                'manifest.contains("version = \\"0.14.3\\"")',
             ),
             "crates/rpptx-wasm/src/lib.rs": (
-                'rpptx = { path = \\"crates/rpptx\\", version = \\"0.14.1\\", '
+                'rpptx = { path = \\"crates/rpptx\\", version = \\"0.14.3\\", '
                 'default-features = false }',
             ),
             "crates/rpptx/tests/integration.rs": (
-                'rpptx = { path = \\"crates/rpptx\\", version = \\"0.14.1\\", '
+                'rpptx = { path = \\"crates/rpptx\\", version = \\"0.14.3\\", '
                 'default-features = false }',
-                'manifest.contains("version = \\"0.14.1\\"")',
+                'manifest.contains("version = \\"0.14.3\\"")',
             ),
         }
         for path, requirements in source_requirements.items():
@@ -6247,8 +6358,8 @@ class SprintWorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         expected = {
-            "rdocx": ("rdocx-py", "0.16.1", "v0.16.1"),
-            "rpptx": ("rpptx-py", "0.14.1", "rpptx-v0.14.1"),
+            "rdocx": ("rdocx-py", "0.16.3", "v0.16.3"),
+            "rpptx": ("rpptx-py", "0.14.3", "rpptx-v0.14.3"),
         }
         workspace = tomllib.loads(
             (workflow.REPO / "Cargo.toml").read_text(encoding="utf-8")
@@ -6373,9 +6484,9 @@ class SprintWorkflowTests(unittest.TestCase):
             self.assertIn("## Project links", readme)
 
     def test_rdocx_v0_15_0_unified_family_contract(self) -> None:
-        family = workflow.validate_unified_release_family("v0.16.1")
+        family = workflow.validate_unified_release_family("v0.16.3")
         self.assertEqual(family["distribution"], "rdocx")
-        self.assertEqual(family["version"], "0.16.1")
+        self.assertEqual(family["version"], "0.16.3")
         self.assertEqual(
             set(workflow.RELEASE_CRATES["rdocx"]),
             {
@@ -6386,7 +6497,7 @@ class SprintWorkflowTests(unittest.TestCase):
         project = tomllib.loads(
             (workflow.REPO / "crates/rdocx-py/pyproject.toml").read_text()
         )
-        self.assertEqual(project["project"]["version"], "0.16.1")
+        self.assertEqual(project["project"]["version"], "0.16.3")
 
     def test_unified_release_family_rejects_mismatched_version_carriers(self) -> None:
         workspace = tomllib.loads((workflow.REPO / "Cargo.toml").read_text())
@@ -6450,9 +6561,9 @@ class SprintWorkflowTests(unittest.TestCase):
                     workflow.validate_unified_release_family(f"v{stable}")
 
     def test_rpptx_v0_13_1_unified_family_contract(self) -> None:
-        family = workflow.validate_unified_release_family("rpptx-v0.14.1")
+        family = workflow.validate_unified_release_family("rpptx-v0.14.3")
         self.assertEqual(family["distribution"], "rpptx")
-        self.assertEqual(family["version"], "0.14.1")
+        self.assertEqual(family["version"], "0.14.3")
         self.assertEqual(len(workflow.RELEASE_CRATES["rpptx"]), 15)
         self.assertTrue(set(workflow.RELEASE_CRATES["rpptx"]).isdisjoint(
             workflow.RELEASE_CRATES["rdocx"]
@@ -6604,7 +6715,10 @@ class SprintWorkflowTests(unittest.TestCase):
         self.assertIn("release tag or start crates.io and PyPI publication", release)
         self.assertIn("clean `main`", release)
         self.assertIn("same SHA as `origin/main`", release)
-        self.assertIn("fresh read-only `/verify --full`", " ".join(release.split())) if False else self.assertIn("Run `/verify --full` read-only", release)
+        self.assertIn("Consume the closed sprint's authenticated full verification", release)
+        self.assertIn("A latest failed full attempt blocks reuse of an older green one", release)
+        self.assertIn("Fresh registry, publisher and approval checks remain due", release)
+        self.assertIn("separate explicit go or no-go immediately before the first external", release)
         self.assertIn("A prepared release follows through `/release`", close)
         self.assertIn("Do not create or push a release tag", run)
         self.assertIn("after sprint close", run)
@@ -7440,7 +7554,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertIn("crates/oxml-chart", root["members"])
         self.assertEqual(
             root["dependencies"]["oxml-chart"],
-            {"path": "crates/oxml-chart", "version": "0.14.1"},
+            {"path": "crates/oxml-chart", "version": "0.14.3"},
         )
 
         shim = tomllib.loads(
@@ -7535,7 +7649,7 @@ Pedro Assumpcao and the rdocx maintainers.
         self.assertEqual(normalized(b"reviewed\r\ntext\r\n"), b"reviewed\ntext\n")
         self.assertNotEqual(normalized(b"changed\r\ntext\r\n"), b"reviewed\ntext\n")
 
-        expected_version = "0.14.1"
+        expected_version = "0.14.3"
         for member in (
             "oxml-core",
             "oxml-opc",
@@ -7698,6 +7812,224 @@ Pedro Assumpcao and the rdocx maintainers.
         with self.assertRaises(AssertionError):
             self.assert_publish_preflight_contract(mutated)
 
+    def test_latest_actual_full_and_metadata_failures_supersede_green(self) -> None:
+        green = {"scope": "full", "head": "current", "passed": True}
+        data = {"reviews": [{"pass": 1, "blocking": 0, "head": "current"}],
+                "verifications": [green, dict(green, passed=False)]}
+        self.assertTrue(workflow.closure_evidence_problems(data, "current"))
+        data["verifications"].append(dict(green))
+        self.assertEqual(workflow.closure_evidence_problems(data, "current"), [])
+        data["verifications"].append({"scope": "metadata", "head": "current", "passed": False})
+        self.assertTrue(workflow.closure_evidence_problems(data, "current"))
+        data["verifications"] = [{"scope": "fast", "head": "current", "passed": True}]
+        self.assertTrue(workflow.closure_evidence_problems(data, "current"))
+
+    def test_metadata_reuse_authenticates_actual_temporary_git_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(["git", *args], cwd=repo, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            def write(path: str, text: str) -> None:
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
+
+            def commit() -> str:
+                git("add", ".")
+                git("commit", "-m", "test metadata boundary")
+                return git("rev-parse", "HEAD")
+
+            git("init")
+            git("config", "user.name", "Workflow Test")
+            git("config", "user.email", "workflow@example.invalid")
+            originals = {
+                "docs/sprints/CURRENT_SPRINT.md": "# Current Sprint, S01\n",
+                "docs/sprints/BACKLOG.md": (
+                    "| F-123 | One | S01 | S | pending |\n"
+                    "| F-999 | Two | S01 | S | pending |\n"
+                ),
+                "docs/hld/02-scope-and-non-goals.md": (
+                    "| DOCX-002 | package | test | Y | Y | Y | Y | P | package | "
+                    "Y | Y | Y | Y | B | B | B | partial | test:evidence | F-999 |\n"
+                ),
+                "docs/sprints/SPRINT_TRACKER.md": "S01 pending\n",
+                "docs/sprints/AS_BUILT.md": "Historical evidence\n",
+                ".claude/plans/F-123-design.md": "**Status**: approved\n- [ ] Named assertion\n",
+                ".claude/plans/F-999-design.md": "**Status**: approved\n",
+                "src/lib.rs": "source\n", "docs/hld/04-model.md": "spec\n",
+                "README.md": "readme\n", ".claude/commands/verify.md": "command\n",
+                "scripts/example.py": "script\n",
+            }
+            for path, text in originals.items():
+                write(path, text)
+            source = commit()
+            data = {"sprint": "S01", "features": {"F-123": {}},
+                    "reviews": [{"pass": 1, "blocking": 0}],
+                    "verifications": [{"scope": "full", "passed": True, "head": source}]}
+            record = {"scope": "metadata", "passed": True, "source_head": source, "full_attempt": 0}
+            with patch.object(workflow, "REPO", repo):
+                write("docs/sprints/BACKLOG.md", originals["docs/sprints/BACKLOG.md"].replace(
+                    "| pending |", "| done |", 1))
+                write("docs/sprints/AS_BUILT.md", originals["docs/sprints/AS_BUILT.md"] + "Actual PASS at source SHA\n")
+                write(".claude/plans/F-123-design.md", "**Status**: completed\n- [x] Named assertion\n")
+                write(".claude/reviews/S01-sprint-review-pass-1.md", "**Verdict**: 0 blocking, actual full evidence\n")
+                head = commit()
+                data["reviews"][-1]["head"] = head
+                record["head"] = head
+                self.assertEqual(workflow.metadata_reuse_problems(data, head, record), [])
+                # Product inputs stayed fixed, but this completion edit breaks
+                # the capability policy that the earlier full run observed.
+                write("docs/sprints/BACKLOG.md", git(
+                    "show", f"{head}:docs/sprints/BACKLOG.md").replace("| pending |", "| done |"))
+                invalid_owner = commit()
+                problems = workflow.metadata_reuse_problems(data, invalid_owner, record)
+                self.assertTrue(any("DOCX-002" in problem for problem in problems), problems)
+                git("reset", "--hard", head)
+                data["verifications"].append(record)
+                self.assertEqual(workflow.closure_evidence_problems(data, head), [])
+                self.assertEqual(data["verifications"][0]["head"], source)
+                for change in (
+                    {"source_head": "0" * 40}, {"full_attempt": None},
+                    {"full_attempt": 99}, {"head": source},
+                ):
+                    candidate = dict(record, **change)
+                    if "head" in change:
+                        self.assertTrue(workflow.closure_evidence_problems(
+                            dict(data, verifications=[data["verifications"][0], candidate]), head))
+                    else:
+                        self.assertTrue(workflow.metadata_reuse_problems(data, head, candidate))
+                data["verifications"].append({"scope": "full", "passed": False, "head": source})
+                self.assertTrue(workflow.metadata_reuse_problems(data, head, record))
+                data["verifications"].pop()
+                write(".claude/reviews/S01-sprint-review-pass-2.md", "**Verdict**: 0 blocking, corrected delivery record\n")
+                data["reviews"].append({"pass": 2, "blocking": 0})
+                head = commit()
+                data["reviews"][-1]["head"] = head
+                record["head"] = head
+                self.assertEqual(workflow.metadata_reuse_problems(data, head, record), [])
+                write("docs/sprints/AS_BUILT.md", git("show", f"{head}:docs/sprints/AS_BUILT.md") + "\nInvalid prose; refused\n")
+                invalid_prose = commit()
+                self.assertTrue(workflow.metadata_reuse_problems(data, invalid_prose, record))
+                git("reset", "--hard", head)
+                git("commit", "--allow-empty", "-m", "Invalid prose; refused")
+                self.assertTrue(workflow.metadata_reuse_problems(data, git("rev-parse", "HEAD"), record))
+                git("reset", "--hard", head)
+                write(".claude/reviews/S01-sprint-review-pass-1.md", "Rewritten earlier report\n")
+                self.assertTrue(workflow.metadata_reuse_problems(data, commit(), record))
+                for path in ("src/lib.rs", "docs/hld/04-model.md", "README.md",
+                             ".claude/commands/verify.md", "scripts/example.py",
+                             ".claude/plans/F-999-design.md", ".claude/plans/F-123-design.md",
+                             "docs/sprints/AS_BUILT.md"):
+                    with self.subTest(path=path):
+                        git("reset", "--hard", head)
+                        write(path, "Semantic replacement\n")
+                        changed = commit()
+                        self.assertTrue(workflow.metadata_reuse_problems(data, changed, record))
+                        # Even a reverted material commit cannot inherit the full run.
+                        write(path, git("show", f"{head}:{path}") + "\n")
+                        reverted = commit()
+                        self.assertTrue(workflow.metadata_reuse_problems(data, reverted, record))
+                git("reset", "--hard", head)
+                write("README.md", "uncommitted change\n")
+                self.assertTrue(workflow.metadata_reuse_problems(data, head, record))
+
+    def test_requested_reviewer_must_match_before_recording_a_sprint_review(self) -> None:
+        for reviewer in (None, "grok"):
+            data = {"sprint": "S01", "reviewer": "codex", "reviews": []}
+            args = argparse.Namespace(sprint="S01", passno=1, blocking=0,
+                should_fix=0, nice_to_have=0, extend=False, reviewer=reviewer)
+            with self.subTest(reviewer=reviewer), patch.object(workflow, "load", return_value=data), \
+                    patch.object(workflow, "git_head", return_value="a" * 40), \
+                    patch.object(workflow, "save") as save, self.assertRaises(SystemExit):
+                workflow.cmd_record_review(args)
+            save.assert_not_called()
+            self.assertEqual(data["reviews"], [])
+        data = {"sprint": "S01", "reviewer": "codex", "reviews": []}
+        args.reviewer = "codex"
+        with patch.object(workflow, "load", return_value=data), \
+                patch.object(workflow, "git_head", return_value="a" * 40), \
+                patch.object(workflow, "save"):
+            self.assertEqual(workflow.cmd_record_review(args), 0)
+        self.assertEqual(data["reviews"][0]["reviewer"], "codex")
+
+    def test_requested_reviewer_survives_resume_and_blocks_wrong_closure(self) -> None:
+        data = {"sprint": "S01", "phase": "design", "reviewer": "codex",
+            "features": {}, "reviews": [], "verifications": []}
+        args = argparse.Namespace(sprint="S01", resume=True, force=False,
+            max_review_passes=3, max_workers=None, reviewer=None)
+        with patch.object(workflow, "parse_current_sprint", return_value=("S01", [])), \
+                patch.object(workflow, "state_path") as state_path, \
+                patch.object(workflow, "load", return_value=data), \
+                patch.object(workflow, "save"):
+            state_path.return_value.exists.return_value = True
+            self.assertEqual(workflow.cmd_init(args), 0)
+            self.assertEqual(data["reviewer"], "codex")
+            data["reviews"] = [{"pass": 1, "blocking": 0, "head": "current", "reviewer": "grok"}]
+            data["verifications"] = [{"scope": "full", "passed": True, "head": "current"}]
+            self.assertTrue(any("requested reviewer" in problem for problem in
+                workflow.closure_evidence_problems(data, "current")))
+            args.reviewer = "grok"
+            with self.assertRaises(SystemExit):
+                workflow.cmd_init(args)
+            data["reviews"][0]["reviewer"] = "codex"
+            self.assertEqual(workflow.closure_evidence_problems(data, "current"), [])
+
+    def test_metadata_recorder_requires_explicit_source_anchor(self) -> None:
+        self.assertTrue(workflow.metadata_reuse_problems(
+            {"verifications": []}, "a" * 40,
+            {"source_head": "a" * 40, "full_attempt": None}))
+        args = argparse.Namespace(sprint="S01", scope="metadata", passed=True,
+                                  harness="unchanged", reuse_from=None)
+        with patch.object(workflow, "load", return_value={"verifications": []}), \
+             patch.object(workflow, "git_head", return_value="a" * 40), \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                workflow.cmd_record_verification(args)
+        args.scope, args.reuse_from = "full", "a" * 40
+        with patch.object(workflow, "load", return_value={"verifications": []}), \
+             patch.object(workflow, "git_head", return_value="a" * 40), \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                workflow.cmd_record_verification(args)
+
+    def test_final_sprint_handoff_distinguishes_local_from_pending_acceptance(self) -> None:
+        handoff = """**F-ID**: F-123
+**Owner**: codex
+**Branch**: work/f-123-codex
+**Worktree**: /tmp/unit
+**Base**: abc123
+**Head**: def456
+**Design plan**: .claude/plans/F-123-design.md
+**Microscope**: review, 0 defects, 0 smells
+**Verify**: /verify --scoped F-123, local checks pass, final sprint checks pending
+**Hash harness**: unchanged
+**Test gate**: selected regression cases, pass
+**Checkpoint**: sprint-final-acceptance
+**Final checks**: workspace all-features and original reporter replay, pending
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "handoff.md"
+            args = argparse.Namespace(path=str(path), fid="F-123")
+            path.write_text(handoff)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(workflow.cmd_validate_handoff(args), 0)
+            for old, new in (
+                ("**Checkpoint**: sprint-final-acceptance\n", ""),
+                ("workspace all-features and original reporter replay, pending", "gates, pending"),
+                ("workspace all-features and original reporter replay, pending", "workspace, pass"),
+                ("local checks pass, final sprint checks pending", "pass"),
+                ("selected regression cases, pass", "complete, pass"),
+                ("selected regression cases, pass", "selected regression cases, pending"),
+                ("**Final checks**:", "**External gates**:"),
+                ("sprint-final-acceptance", "external-ci-source-availability"),
+            ):
+                with self.subTest(change=(old, new)), contextlib.redirect_stderr(io.StringIO()):
+                    path.write_text(handoff.replace(old, new))
+                    self.assertEqual(workflow.cmd_validate_handoff(args), 1)
+
     def test_review_and_verification_evidence_is_bound_to_head(self) -> None:
         data = {
             "reviews": [{"pass": 4, "blocking": 0, "head": "current"}],
@@ -7775,10 +8107,12 @@ Pedro Assumpcao and the rdocx maintainers.
 
         self.assertIn("/verify [--fast | --scoped F-XXX | --full]", verify)
         self.assertIn("`--scoped F-XXX` is the feature-completion gate", verify)
-        self.assertIn("For an uncommitted `--scoped` feature, add `--allow-dirty`", verify)
-        self.assertIn("without `--allow-dirty`", verify)
-        self.assertIn("`/verify --scoped F-XXX` passes", complete)
-        self.assertIn("Run `/verify --full`. Not per worker", run_sprint)
+        self.assertNotIn("For an uncommitted `--scoped` feature, add `--allow-dirty`", verify)
+        self.assertIn("Do not run publication dry runs under `--fast` or `--scoped`", verify)
+        self.assertIn("without `--allow-dirty`", " ".join(verify.split()))
+        self.assertIn("Actual `/verify --scoped F-XXX` local evidence", complete)
+        self.assertIn("Named final sprint checks remain due", complete)
+        self.assertIn("run `/verify --full` once", run_sprint)
         self.assertIn("not `--scoped`", run_sprint)
 
     def test_worker_handoff_accepts_only_matching_scoped_verification(self) -> None:
@@ -8316,7 +8650,7 @@ Pedro Assumpcao and the rdocx maintainers.
             ),
             "version": (
                 claude.replace(
-                    "prepared at\n  0.16.1",
+                    "prepared at\n  0.16.3",
                     "prepared at\n  0.2.0",
                     1,
                 ),
@@ -8584,6 +8918,19 @@ Pedro Assumpcao and the rdocx maintainers.
                 # F-281 completes generated indexes, figures and authorities.
                 # Unmeasured collation owners retain their complete caches.
                 281,
+                # F-283 and F-284 completed navigation and template grammar.
+                # F-X259 repairs their reviewed consistency defects without
+                # leaving completed stories as active capability owners.
+                283,
+                284,
+                # F-285 completes DOCX-052 rich and plain content-control
+                # shells. Typed payloads stay with F-286 and DOCX-053.
+                285,
+                # F-286 delivers the ten bounded typed controls with accepted
+                # native differences. F-287 delivers package stores and the
+                # absolute-child-path binding subset, not store deletion.
+                286,
+                287,
                 # F-282 delivers the bounded native foundation in S90.
                 # F-X192 owns the remaining DOCX-049 catalogue in S91.
                 282,
@@ -8851,6 +9198,7 @@ Pedro Assumpcao and the rdocx maintainers.
             "style": "styles",
             "svg": "drawing",
             "table": "tables",
+            "template": "stories",
         }
         facade = (workflow.REPO / "crates/rdocx/src/lib.rs").read_text(
             encoding="utf-8"

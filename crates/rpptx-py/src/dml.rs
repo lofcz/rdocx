@@ -5,9 +5,11 @@
 //! single target.
 
 use oxml_py_support::ContentPath;
-use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyIndexError, PyNotImplementedError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyBool, PyList};
 use rpptx::{GradientFill, GradientGeometry, PathGradientKind};
 
 use crate::presentation::PyPresentation;
@@ -19,6 +21,18 @@ use crate::table::{cell_mut_at, cell_ref_at};
 use crate::{normalize_index, rpptx_to_pyerr, validate_path};
 
 const MAX_LINE_WIDTH_EMU: i64 = 20_116_800;
+
+/// Thousandths of a percent, matching python-pptx `int(round(value * 100000))`.
+pub(crate) fn percentage_thousandths(value: f64) -> i32 {
+    (value * 100_000.0).round_ties_even() as i32
+}
+
+fn finite_percentage(value: &Bound<'_, PyAny>, label: &str) -> PyResult<f64> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(format!("{label} rejects bool")));
+    }
+    value.extract()
+}
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyFillFormat>()?;
@@ -197,6 +211,20 @@ fn write_fill(
         return write_line(py, presentation, path, target, line);
     }
     let owner = fill_owner(presentation, path, target)?;
+    if matches!(target, FillTarget::Shape)
+        && !matches!(fill, rpptx::Fill::Blip(_))
+        && !matches!(
+            current_fill(presentation, path, target)?,
+            Some(rpptx::Fill::Blip(_))
+        )
+    {
+        let revision = presentation.prepare_local_property("FillFormat.fill")?;
+        presentation
+            .inner
+            .set_fill_at(&owner, fill)
+            .map_err(|error| rpptx_to_pyerr(py, error))?;
+        return presentation.commit_local_property(revision);
+    }
     let mut candidate = presentation.inner.clone();
     candidate
         .set_fill_at(&owner, fill)
@@ -563,7 +591,7 @@ impl PyFillFormat {
     }
 
     /// Sets a solid fill, keeping an existing solid fill and its colour.
-    fn solid(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn solid(&self, py: Python<'_>) -> PyResult<()> {
         if matches!(self.fill(py)?, Some(rpptx::Fill::Solid(_))) {
             return Ok(());
         }
@@ -649,7 +677,8 @@ impl PyFillFormat {
         Ok(Some(1.0 - opacity.clamp(0.0, 1.0)))
     }
     #[setter]
-    fn set_transparency(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+    fn set_transparency(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = finite_percentage(value, "transparency")?;
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err(PyValueError::new_err(
                 "transparency must be finite and from zero to one",
@@ -671,7 +700,7 @@ impl PyFillFormat {
                     | rpptx::ColorTransform::AlphaModulation(_)
             )
         });
-        let opacity = ((1.0 - value) * 100_000.0).trunc() as i32;
+        let opacity = percentage_thousandths(1.0 - value);
         if opacity != 100_000 {
             transforms.push(rpptx::ColorTransform::Alpha(rpptx::Percent1000(opacity)));
         }
@@ -937,8 +966,8 @@ impl PyGradientStops {
         state.tokens = tokens;
         Ok(())
     }
-    fn append(&self, py: Python<'_>, position: f64) -> PyResult<Py<PyGradientStop>> {
-        let position = stop_position(position)?;
+    fn append(&self, py: Python<'_>, position: &Bound<'_, PyAny>) -> PyResult<Py<PyGradientStop>> {
+        let position = stop_position(finite_percentage(position, "gradient stop position")?)?;
         let format = self.format(py);
         let mut tokens = format.stop_tokens(py)?;
         let token = self.presentation.borrow(py).next_gradient_stop;
@@ -991,7 +1020,7 @@ fn stop_position(position: f64) -> PyResult<i32> {
             "gradient stop position must be finite and from 0.0 to 1.0",
         ));
     }
-    Ok((position * 100_000.0).trunc() as i32)
+    Ok(percentage_thousandths(position))
 }
 
 #[pyclass(name = "GradientStop")]
@@ -1035,8 +1064,8 @@ impl PyGradientStop {
         Ok(f64::from(format.gradient_fill(py)?.stops[index].position.0) / 100_000.0)
     }
     #[setter]
-    fn set_position(&self, py: Python<'_>, value: f64) -> PyResult<()> {
-        let position = stop_position(value)?;
+    fn set_position(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let position = stop_position(finite_percentage(value, "gradient stop position")?)?;
         let format = self.format(py);
         let index = format.stop_index(py, self.token)?;
         format.edit_gradient(py, |fill| {
@@ -1295,21 +1324,42 @@ impl PyColorFormat {
     }
 
     #[getter(r#type)]
-    fn color_type(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
-        Ok(self.color(py)?.map(|color| match color {
-            rpptx::ColorChoice::Srgb { .. } => "rgb",
-            rpptx::ColorChoice::Scheme { .. } => "theme",
-            rpptx::ColorChoice::System { .. } => "system",
-            rpptx::ColorChoice::Preset { .. } => "preset",
-        }))
+    fn color_type(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.color(py)?
+            .map(|color| {
+                let value = match color {
+                    rpptx::ColorChoice::Srgb { .. } => 1,
+                    rpptx::ColorChoice::Scheme { .. } => 2,
+                    rpptx::ColorChoice::System { .. } => 104,
+                    rpptx::ColorChoice::Preset { .. } => 102,
+                };
+                dml_enum(py, "MSO_COLOR_TYPE", value)
+            })
+            .transpose()
     }
 
     #[getter]
-    fn theme_color(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        Ok(match self.color(py)? {
-            Some(rpptx::ColorChoice::Scheme { value, .. }) => Some(value),
-            _ => None,
-        })
+    fn theme_color(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let color = self.color(py)?.ok_or_else(|| {
+            PyAttributeError::new_err(format!(
+                "{} has no direct color; assign a theme reference before reading theme_color",
+                self.parameter("theme_color")
+            ))
+        })?;
+        let value = match color {
+            rpptx::ColorChoice::Scheme { value, .. } => THEME_COLORS
+                .iter()
+                .position(|token| *token == value)
+                .map(|index| index as i32 + 1)
+                .ok_or_else(|| {
+                    PyNotImplementedError::new_err(format!(
+                        "{} cannot project scheme token {value:?}; inspect preserved source through the owning element.xml or assign a supported theme_color string",
+                        self.parameter("theme_color")
+                    ))
+                })?,
+            _ => 0,
+        };
+        dml_enum(py, "MSO_THEME_COLOR", value)
     }
 
     #[setter]

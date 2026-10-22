@@ -2723,8 +2723,8 @@ Issue384 and Issue385 repairs and the eleven existing carryovers.
 #### Sprint S95, New validation, form and rendering repairs
 
 **Goal**: prioritize the new Issue384 and Issue385 repairs after S94 closes.
-Five stories total 10 to 15 developer-days. S95 does not close the whole Issue385
-union, whose remaining authoring and PowerPoint admission work is in S95.1.
+The user explicitly includes Issue386 in active S95. Seven medium repairs, one large repair and one large release preparation story total 22 to 31 developer-days. S95 does not close the whole Issue385
+union, whose remaining authoring and PowerPoint admission work is in S95.11.
 
 | F-ID | Title | Size |
 |------|-------|------|
@@ -2733,49 +2733,109 @@ union, whose remaining authoring and PowerPoint admission work is in S95.1.
 | F-X251 | Refuse invalid Word values before publication | M |
 | F-X252 | Refuse newly invalid Word raw XML atomically | M |
 | F-X253 | Honor imported chart types and hidden master shapes | M |
+| F-X255 | Prepare Word 0.16.2 and PowerPoint 0.14.2 patch releases | L |
 
-#### Sprint S95.1, Remaining everyday APIs and native interoperability
+F-X255 follows all eight completed repairs through scoped dependency-prefix
+checkpoints and prepares both Rust and Python patch families in the selected
+0.16.x and0.14.x lines. Its existing dirty worker and intermediate evidence are
+preserved while the three newly included stories complete. Revise its stale
+design and reconcile the preserved changes after those dependencies pass.
+Actual hosted build-only artifacts, final integrated full verification and
+independent sprint review precede close. Separate `/release` approval at the
+reviewed main merge SHA owns publication.
 
-**Goal**: complete the remaining Issue385 repairs and the two bounded native
-interoperability carryovers. Four stories total 12 to 16 developer-days.
+The former S95.1 intake boundary is absorbed into active S95 at the user's
+explicit request. This expands S95 to nine stories rather than deferring the
+new repairs. The original four-story carryover group remains in S95.11.
+
+| Additional S95 F-ID | Title | Size |
+|------|-------|------|
+| F-X256 | Refuse ambiguous Word numeric units and preserve line spacing | M |
+| F-X257 | Complete remaining Word names and legacy dropdown diagnostics | L |
+| F-X258 | Complete remaining PowerPoint names color and language contracts | M |
+
+Design bare-number/typed-length and enum/string compatibility choices before
+implementation. Preserve the exact Issue386 body and qualify individual rows
+through independent outcomes. Its self-catching script is not a passing gate.
+Existing list-style and picture refusals receive no duplicate credit. The
+reported Python3.14 environment is separate from release qualification.
+
+#### Sprint S95.11, Remaining everyday APIs and native interoperability
+
+**Goal**: complete the remaining Issue385 repairs and bounded native font
+interoperability. Three active stories total 10 to 13 developer-days.
 
 | F-ID | Title | Size |
 |------|-------|------|
 | F-X250 | Complete everyday Word chart equation list and note APIs | L |
 | F-X254 | Refuse invalid PowerPoint values XML and empty edits | L |
-| F-X219 | Qualify full-range text watermark interoperability | M |
 | F-X223 | Qualify native Word embedded multi-face interoperability | M |
 
-#### Sprint S95.2, Bibliography, navigation and template carryovers
+F-X219 is carried unfinished to S96 by explicit user approval. The bounded
+source investigation found no faithful full-range representation shared by Word
+and pinned LibreOffice. Preserve the0.5 restriction and failed endpoint evidence.
+This carry is not completion or native acceptance. Reopen its design at S96.
 
-**Goal**: resume F-X192 and F-283 and establish the stable template grammar.
-Three stories provisionally total 12 to 15 developer-days. F-X192 has a partial
-registered worker, not an absent disposable worktree. Preserve its surviving
-files, Git metadata/index/branch and native evidence before an authenticated
-resume. Missing original unstaged source and the exact unresolved whole-feature
-findings require a recovery/design checkpoint. This estimate is provisional
-until that uncertainty is resolved, not a claim of exact old source recovery.
+#### Sprint S95.2, Navigation and template carryovers
+
+**Goal**: complete F-283 and establish the stable template grammar. The original
+three-story scope was12 to15 developer-days. The user explicitly carries the
+unfinished full F-X192 catalogue to S96. The two retained stories total8 to10
+provisional developer-days, preserving the completed numbering and fragment
+providers and the normal integrated acceptance boundary.
 
 | F-ID | Title | Size |
 |------|-------|------|
-| F-X192 | Complete the remaining Word bibliography catalogue | L |
 | F-283 | Complete numbering-aware navigation fields | L |
 | F-284 | Stable container-wide template grammar | L |
 
-F-283 consumes completed F-X200 numbering without duplicate work. F-284 retains
-the existing S89 fragment-transaction foundation. Issues264 and281 remain open
-under their current contracts, not new repair acceptance.
+F-X192 is unfinished, not delivered by this scope change. Four old unstaged
+source files, five unenumerated findings and the exact native evidence bodies
+remain unavailable. No supported route establishes the remaining Word sorting
+and APA runtime authority. Preserve its old partial worker, index, branch,
+reviews and surviving notes without repair or pruning. Reset its design at S96
+and reassess its recovery, authority and capacity before starting. No catalogue
+acceptance or source reconstruction is claimed.
+
+F-283 consumes completed F-X200 numbering without duplicate work or a formal
+F-X192 completion barrier. F-284 retains the existing S89 fragment transaction.
+Issues264 and281 remain open under their current contracts. This carry opens no
+S96 work. Continue the authorized S95.3 and S95.4 boundaries before publication.
 
 #### Sprint S95.3, Content control foundations and typed values
 
-**Goal**: author the control lifecycle before typed values and XML bindings.
-Three stories total 12 to 15 developer-days.
+**Goal**: repair the reviewed consistency defects, resolve current contributions,
+then author the control lifecycle before typed values and XML bindings. The
+original three-story estimate remains 12 to 15 developer-days. User expansion
+on 2026-10-18 adds F-X259 through F-X262, provisionally 16 to 24 developer-days,
+for seven stories and 28 to 39 developer-days total. This is an expanded scope,
+not measured effort or an unchanged capacity promise. Current intake and exact
+acceptance ownership live in CURRENT_SPRINT and HLD14. Grok implements through
+`/run-sprint --reviewer codex`, then Codex independently reviews the union.
+
+On 2026-10-22 the user adds Issue398/PR399 read-only handle costs to F-X260,
+Issue400/PR401 TOC range composition to F-X259, and PR397 as another Issue389
+candidate. Keep seven stories and provisionally add 3 to 5 developer-days,
+for 31 to 44 total. Codex has taken over product implementation. Mechanical
+Grok documentation proposals require validation. Existing Word/font qualification
+debt and the exhausted three-pass sprint-review bound remain unchanged.
 
 | F-ID | Title | Size |
 |------|-------|------|
+| F-X259 | Repair reviewed consistency defects and strengthen acceptance gates | M |
+| F-X260 | Restore live handles and bound structural edit cost | L |
+| F-X261 | Resolve Word package preservation and inspection contributions | L |
+| F-X262 | Resolve PowerPoint authoring and table-render contributions | L |
 | F-285 | Content control creation and lifecycle | L |
 | F-286 | Rich, repeating, and typed content controls | L |
 | F-287 | Custom XML stores and data binding authoring | L |
+| F-X263 | Prepare Word 0.16.3 and PowerPoint 0.14.3 patch releases | L |
+
+The subsequent explicit release request adds F-X263 as an eighth story,
+provisionally another3to5 developer-days, for34to49total. This exceeds the
+normal seven-story planning cadence and is a visible release scope expansion.
+Prepare the release only after the seven provider checkpoints actually pass.
+Publication remains after acceptance, closure and separate final approval.
 
 Complete and integrate F-285 through its scoped dependency-prefix checkpoint
 before starting F-286 or F-287. Their shared source/resource leases may require
@@ -2800,9 +2860,10 @@ keeps its existing dependencies and may proceed only under distinct leases.
 Public-created forms/templates require save/reopen and explicit diagnostics for
 unavailable external mail-merge data. S96 follows the completed form programme.
 
-The five boundaries contain eighteen stories, seven new cross-cutting repairs
-and eleven existing stories, totalling54to72developer-days. These are effort
-ranges, not elapsed-time promises. Every boundary retains the normal complete
+The five boundaries retain twenty stories: eleven cross-cutting additions
+and nine existing stories, provisionally totalling60 to80 developer-days. The
+two original stories F-X219 and F-X192 are explicitly carried unfinished to S96.
+These are effort ranges, not elapsed-time promises. Every boundary retains the normal complete
 integrated gate and sprint review. Only the selected S95 opens after S94 closes.
 Later fractional boundaries open sequentially, without renumbering S96 through
 S110 or claiming future completion. Update any carried plan's current schedule
@@ -2812,7 +2873,7 @@ Restore the missing historical native PowerPoint timeline movie/frame and
 SmartArt PNG oracle inputs as later fixture infrastructure. Their four existing
 missing-input checks remain explicitly uncredited in S91. Regeneration must
 use actual independent producer output, with a separate infrastructure design
-when resumed. This is not extra unestimated acceptance inside these eighteen
+when resumed. This is not extra unestimated acceptance inside these retained
 stories and does not waive current source, schema or rendering gates.
 
 ##### New issue acceptance ownership
@@ -2844,6 +2905,7 @@ or hide the original strict-run outcomes when claiming repaired behavior.
 | 385, PowerPoint values accepted silently | F-X254 | Refuse wrong save format, out-of-range size, both flips on table/chart frames and unavailable style |
 | 385, PowerPoint raw XML | F-X254 | Four invalid owner mutations refuse atomically and validation diagnoses malformed imported inputs |
 | 385, master shapes in renders | F-X253 | PDF, PNG, convert and render omit hidden master shapes with native evidence and sensitive logo controls |
+| [386](https://github.com/tensorbee/rdocx/issues/386), new Word unit and compatibility groups | F-X256, F-X257, F-X258 in S95 | Exact new numeric/name/color/language and legacy diagnostic rows, with compatible behavior or actionable atomic refusal, separate from qualified list-style and picture alternatives |
 | 385, replace --map | F-X254 | Each zero-match pair without expect refuses without output, preserve explicit expect0 |
 | 385, CLI font existing-output wording | F-X251 Word, F-X254 PowerPoint | Both stop recommending unavailable --force, preserve no-overwrite |
 | 385, CLI absent font removal | F-X254 | rpptx font remove exits nonzero and publishes no pretend removal |
@@ -2877,13 +2939,18 @@ spreadsheet demand and broader Issue264 discussion are not added stories.
 
 **Goal**: export Word form controls as fillable AcroForm fields with an empty
 signature field, behind an opt-in option, while PDF/A and PDF/UA output stay
-valid. Three stories total about 13 developer-days.
+valid. F-X219 carries unfinished full-range text watermark interoperability,
+and F-X192 carries the full bibliography catalogue. Five stories provisionally
+total19 to21 developer-days. Both carried designs require reset and explicit
+capacity/technical reassessment before implementation. S96 remains unopened.
 
 | F-ID | Title | Size |
 |------|-------|------|
 | F-X242 | Form control geometry and AcroForm field model | L |
 | F-X243 | Field appearance streams, full-font resources and conformance | L |
 | F-X244 | Signature field, bindings and CLI option | M |
+| F-X219 | Qualify full-range text watermark interoperability | M |
+| F-X192 | Complete the remaining Word bibliography catalogue | L |
 
 Issue381 is accepted only when all three stories pass. F-X242 makes layout
 report each control's rectangle and maps text, rich text, checkbox,

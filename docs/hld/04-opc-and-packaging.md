@@ -991,6 +991,13 @@ element when needed, and retains every unrelated custom XML byte exactly.
 Display and custom-part changes are staged together and committed only after
 all selected bindings serialize and reparse successfully.
 
+Public store creation uses that same graph. `add_custom_xml_store` reserves
+`/customXml/item1.xml` and `/customXml/itemProps1.xml` when those names are
+free, and otherwise the next free name in each family. The properties root is
+`ds:datastoreItem` with attribute `ds:itemID`, then child `ds:schemaRefs`, then
+one `ds:schemaRef` per supplied URI. The item id is the braced uppercase form
+from the existing allocator. Schema URIs are stored and not fetched.
+
 ## Part naming
 
 **Numeric suffixes are allocated after the greatest positive parsed suffix,
@@ -1731,6 +1738,13 @@ document identities before insertion. Any value-kind, marker, relationship,
 identity, callback, allocation, serialization, or reopen failure discards the
 entire prospective result.
 
+Versioned template expansion uses that same staged fragment transaction for a
+repeated range in any checked physical owner. Each copy receives fresh
+bookmark, control, drawing, note, comment and relationship identities before
+publication. Drawing ids reserved for those copies stay occupied across the
+prepare that refreshes note and comment companions, so the next copy cannot
+reuse them. The live package is published once after every owner succeeds.
+
 Cross-document block fragments carry their source package so retained XML stays
 authoritative across every supported owner. Local namespace declarations and
 unrelated destination XML survive insertion. The closure starts at selected
@@ -1890,6 +1904,22 @@ DrawingML text watermark compatibility preserves one WPS choice and a real VML t
 
 ## Checked Word operation source ownership
 
+The bulk chart reader serializes only the main body once, without resolving
+unrelated story relationships. It discovers body owners and direct items once, then closes
+paragraph namespace scope from one batched traversal. Empty chart collections do
+not rescan or rebuild the complete body for each paragraph.
+
+Direct-body Word chart snapshots enumerate physical paragraph and drawing occurrences,
+including repeated references to shared targets. Only the qualified direct
+paragraph/run/drawing/inline-or-anchor/graphic/graphicData/chart chain grants
+read authority. Namespace URI references are normalized once. Unique internal
+relationships resolve from the actual document part with checked chart content
+types. Reads do not publish revisions or normalize retained chart source.
+Tables, related stories and opaque wrappers remain outside this finite collection.
+Numbering restart and note removal stage the existing native candidate and
+publish only after validation, preserving other physical owners on refusal.
+
+
 Captured hyperlink records bind the current physical owner and its ordinal.
 Unrelated link changes retain a proven surviving owner. Removing a link
 retires its captured record even when an identical public record remains or
@@ -1903,6 +1933,24 @@ that source or claiming an existing fallback glyph is missing.
 Document import closes the native fragment dependency graph before publication. Physical locations retain story identity, item kind and index path. Invalid destination indices refuse even when the imported document is empty. Reading properties or exporting text does not allocate package parts. Custom-property snapshots retain PID, fmtid, type and raw unsupported values. App-property mutations act on the latest owner and preserve unrelated producer fields.
 
 Checkbox admission and state selection use expanded Word2010 names, including qualified aliases and the default namespace. Only the selected qualified checked value changes. Foreign same-name elements, attributes, namespace declarations and opaque child order remain source-owned. The selected Unicode scalar and state font are admitted together before any matching control changes. Forbidden XML text and late invalid state values refuse the entire operation.
+
+Selected text, date and dropdown control values are prepared together with
+bound scalars before publication. Successful fills remove only the qualified
+Word showingPlcHdr property. Date fills update only the qualified fullDate
+attribute and preserve other metadata. Foreign lookalikes, opaque property
+slots and child order remain source-owned. Effective parser namespace context
+is separate from emitted declarations, including aliases and local shadows.
+Unselected controls do not gain declarations merely because their scope was
+read. Refusals and exact display, metadata and binding no-ops retain bytes.
+Dropdown lastValue remains producer-owned cache metadata.
+
+Validation probes for block content controls retain the complete effective
+namespace scope, including producer bindings needed by paraId and textId.
+Raw namespace declaration values are decoded once before entering the semantic
+scope carrier. Local shadowing and default namespace clearing retain their
+actual scope. Paragraph identifiers and opaque control payload remain owned
+source through save and reopen. The validation inventory still requires the
+same physical paragraph owners and refuses malformed source.
 
 Checked paragraph, regular-run, table, cell and section-property replacement
 first resolves the actual held physical owner. One complete expected expanded-
@@ -1920,6 +1968,38 @@ text-box cost16, resetting between siblings. Recognized tables retain the
 inclusive32 boundary. Iterative borrowed-model admission precedes staging
 clones and serialization. Opaque foreign routes do not consume modeled nesting
 authority.
+
+Checked paragraph replacement admits the finite fifth-edition Transitional
+CT_P particle:33 Word names, including optional single pPr first, plus
+qualified math oMath/oMathPara,35 expanded names in total. This is a direct paragraph
+boundary, not a recursive schema validator or Strict import extension. The
+renderer's modeled traversal list is not schema authority. Ordinary import
+retains unsupported source and exact source no-op remains the earliest path.
+
+MC Ignorable authority accumulates resolved namespace URIs from the actual
+selected physical source ancestors. Each declaration resolves prefixes at its
+own element. Local blank lists preserve inherited grants, rebinding does not
+retarget them and sibling exit restores scope. Qualified attribute names and
+namespace values use exact URI identity after one normalization. An understood
+Word namespace cannot grant permission for an unknown Word child. Unsupported
+new complex compatibility constructs refuse instead of implying general MC
+processing. Existing checked drawing and object providers keep their supported
+foreign vocabularies and branches.
+
+An imported opaque direct-child exception requires its selected physical
+owner, unique ordered structural ancestry, exact raw bytes and relevant
+namespace/MC interpretation. Matching bytes elsewhere do not authorize a
+copied, moved or reinterpreted exception, including a move into an already
+admitted wrapper. Stable repeated islands retain their proven individual
+routes. New ignored foreign direct children require an applicable grant.
+Nested typed content controls, fields, ruby, revisions, drawings and math
+retain their established providers. An unchanged unsupported MC attribute
+retains its own raw value and resolved declaration meaning at the physical
+route without freezing its typed owner. Retained Choice Requires prefixes keep
+their resolved declaration meaning. Traversal retains compact parent route IDs
+and namespace/grant undo deltas, with storage proportional to actual input.
+These checks precede candidate publication and preserve bytes and held authority
+on refusal.
 
 Checked table, cell and section replacement retains expanded root attribute
 names and decoded values, with the required namespace bindings. Attribute
@@ -1952,6 +2032,23 @@ contracts, and success JSON follows file publication.
 
 ## Checked PowerPoint XML transactions
 
+The finite admission gate checks both raw incoming XML spliced into its actual
+physical owning part and the typed candidate after parsing. Qualified shape-tree
+identity and the selected table, cell, body, paragraph or regular-run path locate
+the raw range without borrowing another owner's namespace authority. A parser
+cannot hide a newly invalid child by dropping or normalizing it before the gate.
+The owning part snapshot includes live typed edits and retained root scope.
+
+Only direct children of qualified sp, sld, prstGeom and text p at supported
+physical traversal frontiers receive the new grammar checks. Original opaque
+exceptions survive only at the same unique physical route and qualified
+enclosing shape identity, including enclosing group identities, with exact
+source and namespace/compatibility meaning. Whole-part replacement cannot
+transfer an exception by changing or swapping nonvisual shape IDs. Removing an invalid child can repair the
+source. Delegated payloads keep their existing providers, without a recursive
+unknown-element policy. Exact no-op precedes admission. The existing cloned
+transaction and relationship cleanup still publish once after all checks.
+
 Checked replacement resolves relationships from the selected physical owner
 part. Internal slide targets must be actual slide parts. Image targets must
 match their actual format and registered content type, with bounded complete
@@ -1978,6 +2075,12 @@ External references are never fetched. Cleanup stays inside the cloned
 transaction and completes before serialize, reopen and live publication.
 
 ## Embedded font package transactions
+
+Authored Word sfnt input requires the exact name table directory tag in
+addition to the existing bounded face and table checks. Unrelated payload bytes
+spelling name grant no directory authority. Refusal precedes derived keys,
+font records, settings and parts. Imported font payloads retain their existing
+opaque preservation and decoding behavior.
 
 Word writes checked single-face sfnt input as ODTTF with its explicit or
 deterministically derived uppercase OOXML GUID. Embedding can stage a missing
@@ -2016,6 +2119,21 @@ embedding can remove font parts on native save even while the already loaded
 document still paints an embedded face. A normal reopened copy can then use
 fallback. These observed native changes do not authorize the library to discard
 opaque source or reinterpret missing decoded bytes as a successfully used font.
+Four authored relationship slots describe the package graph, not a guarantee
+that native Word consumes all four faces. Initial, native-saved and normally
+reopened graph observations remain separate from PDF face-selection evidence.
+Word16.114 build26101123 can also empty the Italic part of a regular-plus-italic
+family on save. The corresponding native PDFs use Regular outlines with an
+affine slant before save and after normal reopen. This native normalization
+is not permission for the library to drop an authored face or its source bytes.
+
+A Word embedded face whose content type is a plain sfnt type is copied as stored, including when the font key is null. The accepted plain types are `application/x-font-ttf`, `application/x-font-otf`, `application/x-font-truetype` and `application/x-font-opentype`. Every other accepted face is deobfuscated with its font key. An unsupported content type names the part and the content type and supplies no face bytes.
+
+Picture removal drops a media part and its relationship only when the candidate package proves that owned part unreachable. Shared targets, a pop followed by reinsert, and caller-embedded unused media stay. The same proof is the range-removal rule. A private unreduced control-owner document stays unqualified. The reduced reachability checks do not close that case.
+
+`validate` names a header or footer relationship whose target is not a header or footer part, including the part name and content type. A valid header or footer story still saves.
+
+`Document::part_names` returns the package paths a save would write, each with a leading slash, in lexicographic order. The order includes parts with no relationship and does not move when a part is rewritten. `Document::part_xml` returns the UTF-8 text of one staged part. A missing, binary, or non-UTF-8 part returns an error that names the part and its content type. A UTF-8 BOM may be stripped. UTF-16 is not decoded. The read has no mutable handle and no WASM surface.
 
 ## Presentation semantic export resources
 

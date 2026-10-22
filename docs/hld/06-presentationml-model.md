@@ -36,6 +36,9 @@ opaque package content.
 
 `CT_Slide` and `CT_SlideLayout` expose the presence-sensitive
 `show_master_shapes` root attribute. An absent `showMasterSp` means true.
+Ordinary master shapes paint only when both slide and layout flags are true.
+Ordinary layout shapes require only the slide flag. These flags do not suppress
+slide-owned content or placeholder geometry and formatting inheritance.
 `CT_SlideLayout` and `CT_SlideMaster` expose their optional `p:hf` as
 `CT_HeaderFooter`, with presence-sensitive slide-number, header, footer, and
 date-time flags. Each absent flag means true. Boolean inputs accept both XML
@@ -127,6 +130,9 @@ are not added. The change is staged and publishes only after the staged
 package reopens.
 
 `SlideMut::set_notes_text` edits an existing notes slide and fails without one.
+An empty line keeps the notes body's first regular run, with empty text, so
+that run's formatting and unmodelled content stay. A line with text uses that
+same run.
 `Presentation::set_notes_text` also creates the notes slide when it is absent,
 as python-pptx does. The new part relates to the notes master and back to the
 slide, carries `p:clrMapOvr` with `a:masterClrMapping`, and clones the master
@@ -433,7 +439,9 @@ values on preset geometry. `ShapeMut::set_auto_shape_type(preset)` replaces an
 ordinary shape's or picture's geometry in the same `a:spPr` slot, removes
 custom geometry, and resets adjustments to defaults. Text, fill, line,
 effects, identity, and z-order remain. Text boxes and unsupported kinds are
-refused.
+refused. `ShapeMut::clear_style` removes `p:style` from a shape or connector
+and returns false when that element is already absent. A picture, graphic
+frame, group, or alternate content is refused without a package change.
 
 `ShapeRef::effects` reads and `ShapeMut::set_effects` replaces or removes the
 direct `a:effectLst` of shapes, pictures, connectors, and groups. Group
@@ -458,10 +466,14 @@ TextParagraphMut::add_run(&mut self, text: &str) -> TextRunMut<'_>;
 ```
 
 `TextFrame` also reads and replaces whole-frame text. Whole-frame text assigns
-one paragraph per line feed, and a vertical tab creates an `a:br`. This shared
-setter also serves shape, table cell, notes, comment, SmartArt, chart and
-imported text. The ODP importer maps `text:line-break` to a vertical tab so it
-remains a soft break. Paragraph handles replace
+one paragraph per line feed, and a vertical tab creates an `a:br`. Empty text
+leaves the paragraph properties and drops every run. `TextFrame.clear` uses
+that empty assignment, leaves one paragraph, and retires held runs of that
+frame. Runs on other shapes stay live. This shared
+setter also serves shape, table cell, comment, SmartArt, chart and
+imported text. A notes line that has text uses it too. An empty notes line
+keeps the notes body's first regular run, with empty text. The ODP importer
+maps `text:line-break` to a vertical tab so it remains a soft break. Paragraph handles replace
 text, paragraph properties, and bullets. Replaced text keeps the formatting of
 the paragraph's first regular run. A paragraph without one formats the new run
 with its `a:endParaRPr`, without hyperlinks, as PowerPoint formats text typed
@@ -1431,6 +1443,7 @@ pub enum ValidationIssue {
     CustomShowReference { slide_id: u32 },
     MissingLayoutRel { slide: usize },
     MissingThemeRel { master: usize },
+    InvalidXmlChild { part: String, path: String, message: String },
 }
 ```
 
@@ -1550,6 +1563,43 @@ mapping retains current slide links. Explicit mapping changes only the owning
 slide relationship target, preserving direct slide geometry, text and fields.
 
 ## Checked XML owner replacement
+
+Finite source admission covers CT_Shape, CT_Slide, CT_PresetGeometry2D and
+CT_TextParagraph direct children along supported owner routes. Shape requires
+nvSpPr then spPr, followed by optional style, txBody and extLst. Slide requires
+cSld, then optional clrMapOvr, transition, timing and extLst. Preset geometry
+admits one optional avLst. Text paragraphs admit optional pPr, any interleaving
+of r, br and fld, then optional endParaRPr. Qualified names, order and particle
+counts determine admission, independently of which content is rendered.
+
+Unknown or misplaced recognized-namespace children cannot gain admission from
+Ignorable. Foreign extension authority follows accumulated namespace URIs at
+their actual ancestor declarations. Blank local grants retain inherited ones,
+rebinding does not retarget them, and sibling scope is restored. Namespace URIs
+normalize once. Unchanged complex compatibility metadata retains raw value and
+resolved QName meaning, including unqualified Choice Requires. New unsupported
+complex metadata refuses explicitly. Namespace facts and ancestry routes use
+shared IDs and scope deltas rather than per-node copies of every ancestor.
+Compatibility traversal follows the existing provider: unsupported Choice
+branches retain opaque source, while the selected shape-tree Fallback receives
+its supported shape grammar checks, including nested AlternateContent reached
+through that Fallback. A root AlternateContent transition wrapper
+is delegated to the transition provider rather than counted as an ordinary
+slide child or flattened across mutually exclusive branches. Complex metadata
+still keeps its physical-owner, route and namespace custody. New, copied or
+reinterpreted compatibility metadata refuses. Unbound Requires prefixes remain
+invalid rather than acquiring guessed namespace authority.
+
+Ordinary imports retain malformed producer source. Validation reports finite
+frontier violations through InvalidXmlChild with part, path and message. The
+Python issue kind is invalid_xml_child. The additive public Rust enum variant
+requires downstream exhaustive matches to include the new arm. Validation does
+not become a complete recursive schema validator or reject all unsupported
+extension vocabularies. These new finite diagnostics are report-only at ordinary
+save and unrelated diagram-data edits. Existing validation categories retain
+their prior save policy. Only checked XML replacement applies the new raw and
+staged finite admission, including when the part already contains another
+preserved invalid island.
 
 Paragraph, regular run, table, cell, shape, text body, slide, layout and master
 XML use complete namespace-qualified expected roots. Captured shape kinds

@@ -4,23 +4,97 @@ description: The gate. Runs formatting, lints, tests, the hash harness and the p
 
 # /verify [--fast | --scoped F-XXX | --full]
 
-There are three deliberately different verification scopes:
+There are three verification scopes:
 
-- `--fast` is the inner loop. It runs formatting, changed-crate linting, and
-  changed-crate tests.
-- `--scoped F-XXX` is the feature-completion gate. It runs the fast checks,
-  the hash and repository-policy checks, and the exact risk riders declared by
-  that feature's approved design plan.
-- `--full` is the integrated sprint gate. It runs everything across the
-  workspace and is required by `/close-sprint`.
+- `--fast` runs formatting, changed-crate linting and the unique affected local
+  regression tests. It does not run whole-crate or complete installed suites.
+- `--scoped F-XXX` is the feature-completion gate for local evidence. It binds
+  the fast checks and the approved plan's named local RED/GREEN regressions to
+  the claimed Base and actual source. Independent `/microscope` remains required.
+- `--full` is the final integrated sprint gate. It runs the workspace suites
+  and the union of every approved plan's final oracle and risk checks once.
 
-Do not silently widen `--scoped` to `--full`. Feature completion proves the
-feature contract. Sprint closure proves that the integrated result works as a
-whole.
-Run only the focused external oracle cases named by the approved story plan
-under `--scoped`. Run the union of applicable oracle riders at the integrated
-`--full` gate. A dependency-prefix checkpoint confirms scoped evidence and focused integration
-checks. The full gate runs on the final integrated sprint result.
+Whole-crate suites, ordinary complete installed suites, external oracle
+comparisons, native Office controls, hash/pixel corpora, whole-package typing
+and stub checks, WASM, documentation, publication dry runs and supply-chain
+checks belong to the final union. A small affected typing or compile check can
+be a local regression when the change needs it. Do not promote it to another
+whole-suite run. Keep distinct configurations and artifact identities separate.
+
+The caller consumes an applicable successful observation instead of running
+it again. Record exact source, command/configuration, tools, inputs and results.
+A later failed attempt invalidates an older green result for the same check.
+After a source fix rerun affected checks, preserving earlier failures. Never
+call an unperformed final oracle a passed local gate.
+Record in-flight evidence and pending checks in the feature's existing
+`.claude/scratch/<F-ID>-progress.md` before handing over.
+
+## Acceptance applicability
+
+### Build, artifact and semantic outcome
+
+Dependent batches stop after a failed prerequisite. Use `set -e` in a shell
+build/test batch or check the actual child status before the next stage. A
+failed extension build must not fall through to tests or timings on an older
+installed module. Preserve the failed attempt and authenticate the replacement
+artifact after a successful build.
+
+Keep the wrapper/transport exit, checked child exit and semantic acceptance
+outcome separate. A wrapper that successfully records Cargo exit 101 has
+recorded a failed build. Exit zero with a reported target of false is successful
+measurement execution, not a satisfied target. Classify an approved trend as a
+trend and a required threshold miss as a failed criterion.
+
+Do not measure or test a leftover binary after a failed rebuild. Record the
+successful build command, actual child exit, source identity, profile/features,
+artifact path and content hash. Link the observation to that artifact and
+source, including the actual imported extension path for Python. A diagnostic
+such as enum size or body_content_bytes alone does not identify a binary.
+Retain failed attempts separately. A later successful build and run can
+supersede their applicable result, but must not relabel them as successful or
+claim to qualify newer source without an applicability check.
+
+For benchmarks, retain every required operation, small/large workload sizes,
+raw sample values and units, aggregation, ratios, threshold and pass/fail.
+Preserve relevant runtime/load observations. Near-threshold success remains
+success under the approved protocol. Do not retry to select a favorable result,
+change the denominator or relax the threshold after seeing it. Repeat only for
+an explicit invalidation or a predeclared sampling rule. Keep structural work
+bounds, timing, functional correctness and final native evidence distinct.
+Measure the acceptance consumer itself. Native timing does not qualify a
+Python API workload: retain the imported release extension path and hash, and
+include binding lookup, validation and publication in the timed call. Trace
+work counters through the actual loops they claim to bound. A constant marker
+beside an uncounted inventory scan is not a structural work-bound control.
+
+### Selecting applicable checks
+
+For scoped Python checks, select the A-ID tests and their affected controls
+before launching a broad file. Preflight only their required dependencies,
+oracle pins, installed extension identity and environment configuration. Avoid
+running a large known-unready suite to rediscover missing imports or settings.
+Final installed-product and oracle suites remain mandatory at their scheduled
+boundary. If a selected run fails for an environment reason, retain its failure
+and repair the environment or leave that check pending. Do not turn a required
+case into a skip. A broader failed command is still failed even when selected
+cases passed inside it. Cite those cases individually, and do not infer
+correctness from the absence of AssertionError or a particular error class.
+
+Before choosing commands, map each A-ID to the observation that proves it.
+Check selected test membership and discriminators, not just exit status. Cases
+that promise consumer agreement compare the same input across those paths.
+Keep internal agreement, round-trip correctness and native/oracle parity as
+separate claims. Preserve expected output, actual output and the failing
+assertion for semantic RED. A compile failure or self-catching reporter exit
+cannot replace that observation.
+
+After completion/status/capability edits, run only the metadata-dependent checks
+whose inputs changed, even when the earlier full product gate remains valid.
+At minimum run the existing live-capability-owner policy after status changes,
+plus classification checks when capability rows change. The metadata-adoption
+helper enforces the owner invariant but does not cover every possible delivery
+policy. Record exact post-edit applicability. Do not repeat unrelated product
+suites, native UI or corpora for metadata alone.
 
 ## Steps
 
@@ -29,22 +103,30 @@ checks. The full gate runs on the final integrated sprint result.
 2. **Lint.** For `--fast` and `--scoped`, run `cargo clippy -p <crate>
    --all-targets --all-features -- -D warnings` for each changed crate. For
    `--full`, run `cargo clippy --workspace --all-targets --all-features
-   --exclude rdocx-py --exclude rpptx-py -- -D warnings`.
+   -- -D warnings`. Include both PyO3 binding crates in this single workspace
+   lint. Only cargo test excludes their un-linkable extension test binaries.
 
-3. **Test the changed crates.** `cargo test -p <crate>` for each crate touched.
-   For `--scoped`, determine the set from `git diff --name-only` against the
-   feature's starting commit in `.claude/scratch/<F-ID>-progress.md`, or the
-   handoff `Base` for a worker. Do not use the sprint base because that reruns
-   every earlier story in the sprint. For `rdocx-py` and `rpptx-py`, run the
-   isolated Python suite declared by the design plan instead. Their
-   `pyo3/extension-module` configuration cannot link a Rust test binary.
+3. **Run the affected local tests.** Under `--fast` and `--scoped`, use the
+   approved plan's unique regression cases against the F-ID Base, not the sprint
+   base. Retain actual old-source RED and fixed-source GREEN evidence. Reuse
+   applicable observations already produced during implementation. Bindings
+   use focused fresh installed tests when needed, never a PyO3 Rust test binary.
+   Under `--full`, skip this category when the workspace or complete installed
+   suite already covers the same tests and configuration. Retain a distinct
+   focused configuration only when the broader suite does not cover it.
+
+   Batch related local cases sharing a test binary when practical, using exact
+   libtest filters or a bounded named group. Retain per-case outcomes and check
+   the selected membership. A successful batch does not cover filtered-out
+   cases. Reuse unaffected observations without another binary invocation.
 
 4. **Test the workspace.**
-   `cargo test --workspace --all-features --exclude rdocx-py --exclude rpptx-py`.
-   `--full` only.
+   `RUST_MIN_STACK=8388608 cargo test --workspace --all-features --exclude rdocx-py --exclude rpptx-py`.
+   Use the native test-thread budget documented in HLD15 and CI. It does not
+   change product runtime or input-depth limits. `--full` only.
 
-5. **The hash harness.** `python3 scripts/hash_harness.py --check`. Skipped by
-   `--fast` and required by `--scoped` and `--full`.
+5. **The hash harness.** `python3 scripts/hash_harness.py --check`. Run once under
+   `--full`, not under `--fast` or `--scoped`.
 
    **Mandatory for every story in M1 through M6.** An unexplained delta fails
    the gate. An expected delta must be declared in the design plan's
@@ -52,8 +134,14 @@ checks. The full gate runs on the final integrated sprint result.
    declared. A delta that is real but undeclared is a failure, not a prompt to
    update the baseline.
 
-6. **The repository-policy checks.** Skipped by `--fast` and required by
-   `--scoped` and `--full`.
+6. **The repository-policy checks.** Run once under `--full`. A workflow-only
+   change runs its unique affected policy tests locally, without product gates.
+   Newly written completion/review Markdown and commit messages receive their
+   cheap prose check after the full gate. Also rerun affected completion-policy
+   assertions against final metadata, including live capability ownership.
+   Metadata adoption enforces prose and owner consistency without repeating
+   product verification.
+   Do not run the entire policy suite after each product story.
 
    Run `python3 scripts/prose_check.py` over tracked Markdown and the commit
    message. No em-dash, no en-dash, no prose semicolon.
@@ -74,23 +162,22 @@ checks. The full gate runs on the final integrated sprint result.
    sprint is closed. S42 is the demonstration: F-X022 moved every version
    carrier under `crates/`, passed the entire local gate, and left the
    incubating preflight and the `ci.yml` WASM literal asserting the old
-   version. The whole module takes about four seconds.
+   version. The standalone README gate in step9 owns actual README compilation
+   and archive inventory checks. Policy tests retain their unique mutation and
+   contract assertions without replaying that full integration gate.
 
 7. **The no-default-features path.**
    `cargo test -p oxml-layout --no-default-features`. This is the only thing
    that exercises system font discovery being off while bundled fonts remain
-   available. Run it under `--full`, or under `--scoped` when the design
-   plan's risk routing requires it. Skip it under `--fast`.
+   available. Run once under `--full`. The plan records its
+   applicability there. Skip it under `--fast` and `--scoped`.
 
 8. **The wasm targets.**
    `cargo check --target wasm32-unknown-unknown -p rdocx-wasm -p rpptx-wasm`.
-   Run under `--full`, or under `--scoped` when the design plan's risk routing
-   requires it. Skip under `--fast`.
+   Run once under `--full`, not under `--fast` or `--scoped`.
 
 9. **Docs.** `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS=-D warnings`,
-   then `python3 scripts/readme_doctests.py`. Run under `--full`, or under
-   `--scoped` when the design plan's risk routing requires it. Skip under
-   `--fast`.
+   then `python3 scripts/readme_doctests.py`. Run once under `--full`, not under `--fast` or `--scoped`.
 
 10. **Packaging.** Run the workspace dry run with every publishable internal
     crate patched to its reviewed local source:
@@ -135,16 +222,13 @@ checks. The full gate runs on the final integrated sprint result.
     fi
     ```
 
-    Run under `--full`, or under `--scoped` when the design plan's risk routing
-    requires it. For an uncommitted `--scoped` feature, add `--allow-dirty` to
-    the command above so Cargo verifies the actual working source. Record that
-    flag in the feature evidence. The `--full` gate on the clean integrated
-    tree must use the command above without `--allow-dirty`. Skip packaging
-    under `--fast`. This is what `--no-verify` used to hide.
+    Run once under `--full` on the clean integrated tree without
+    `--allow-dirty`. Do not run publication dry runs under `--fast` or `--scoped`.
+    Its retained verified archives also supply the release preflight packaging
+    evidence at the same source. No second publication dry run in that preflight.
 
-11. **Supply chain.** `cargo deny check`. Run under `--full`, or under
-    `--scoped` when the design plan's risk routing requires it. Skip under
-    `--fast`.
+11. **Supply chain.** `cargo deny check`. Run once under `--full`, not under
+    `--fast` or `--scoped`.
 
 ## Reporting
 
@@ -159,7 +243,7 @@ skipped and why.
 
 - **`--fast` as the gate for `/complete-feature`.** Run `/verify --scoped
   F-XXX` instead.
-- **`--scoped` without the feature's declared risk riders.** The plan defines
-  the scope. Omitting a matched rider is a failed gate.
+- **Dropping a declared final rider or oracle.** Local scoped readiness does
+  not waive final acceptance. Preserve named pending checks in the handoff.
 - **Updating the hash baseline to make step 5 pass.** The baseline changes only
   through a declared, reviewed delta.

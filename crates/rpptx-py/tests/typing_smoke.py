@@ -30,6 +30,7 @@ from rpptx import (
     ValidationIssue,
 )
 from rpptx._rpptx import (
+    Chart,
     ThemeColors,
     MasterTextStyles,
     TextStyleList,
@@ -583,7 +584,7 @@ def colour_formats() -> None:
     font = slide.shapes.add_textbox(0, 0, 914400, 914400).text_frame.paragraphs[0].font
     assert_type(font.color, ColorFormat)
     assert_type(font.color.rgb, RGBColor | None)
-    assert_type(font.color.theme_color, str | None)
+    assert_type(font.color.theme_color, MSO_THEME_COLOR)
     assert_type(font.color.brightness, float | None)
     font.color = "#123456"
     font.color = (1, 2, 3)
@@ -676,8 +677,10 @@ def _fx205_typed_parity_surface(prs: Presentation) -> None:
     paragraph.auto_number_start = 3
     paragraph.bullet_color = RGBColor(0x33, 0x66, 0x99)
     paragraph.bullet_font = "Arial"
-    assert_type(paragraph.bullet_size, float | None)
+    assert_type(paragraph.bullet_size, float | Length | None)
     paragraph.bullet_size = 1.25
+    paragraph.bullet_size = Pt(17.85)
+    paragraph.bullet_size = None
     fill = slide.shapes[0].fill
     assert_type(fill.transparency, float | None)
     fill.gradient_path = "circle"
@@ -840,3 +843,26 @@ def fx240_owned_signature_reports(owner: Presentation, private_key: bytes, certi
     for checked in owner.verify_signatures():
         print(checked["signature_part"], checked["cryptographically_valid"])
     print(part, valid, complete, parts)
+
+
+def fx253_optional_chart_type(chart: "Chart") -> int:
+    assert_type(chart.chart_type, int | None)
+    value = chart.chart_type
+    if value is None:
+        return -1
+    assert_type(value, int)
+    return value
+
+
+def fx258_powerpoint_names(slide: Slide, font: Font) -> None:
+    from rpptx.enum.dml import MSO_COLOR_TYPE, MSO_THEME_COLOR
+    from rpptx.enum.lang import MSO_LANGUAGE_ID
+    assert_type(slide.slide_id, int)
+    assert_type(font.color.type, MSO_COLOR_TYPE | None)
+    assert_type(font.color.theme_color, MSO_THEME_COLOR)
+    assert_type(font.language_id, MSO_LANGUAGE_ID)
+    assert_type(MSO_LANGUAGE_ID(1033), MSO_LANGUAGE_ID)
+    font.language_id = MSO_LANGUAGE_ID.FRENCH
+    font.language_id = 1033
+    font.language_id = None
+    font.language = "en-US"

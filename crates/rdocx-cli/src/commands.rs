@@ -173,7 +173,7 @@ pub fn text(file: &Path, json_output: bool) -> Result<()> {
         for (body_index, content) in document.body.content.iter().enumerate() {
             match content {
                 BodyContent::Paragraph(paragraph) => {
-                    joining.push(paragraph);
+                    joining.push(paragraph.as_ref());
                     if !document.body.accepted_paragraph_joins_next(body_index) {
                         paragraphs.push(joined_paragraph_json(body_index, &joining));
                         joining.clear();
@@ -1528,7 +1528,7 @@ pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
             Ok(json!({
                 "id": comment.id(), "author": comment.author(), "initials": comment.initials(),
                 "date": comment.date(), "text": comment.text(), "parent_id": comment.parent_id(),
-                "resolved": comment.resolved(), "anchor_text": anchor_text, "anchor": anchor,
+                "resolved": comment.resolved() == Some(true), "anchor_text": anchor_text, "anchor": anchor,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1547,7 +1547,7 @@ pub fn comment_list(file: &Path, json_output: bool) -> Result<()> {
                 "{}\t{}\t{}\t{}",
                 comment.id(),
                 comment.author().unwrap_or(""),
-                if comment.resolved() {
+                if comment.resolved() == Some(true) {
                     "resolved"
                 } else {
                     "open"
@@ -3462,8 +3462,8 @@ fn read_font_file(path: &Path) -> Result<Vec<u8>> {
     }
 }
 pub fn font_embed(file: &Path, options: &FontEmbedOptions<'_>) -> Result<()> {
-    ensure_output_paths_allowed(&[options.output.to_path_buf()], file, false)?;
-    ensure_output_paths_allowed(&[options.output.to_path_buf()], options.font, false)?;
+    ensure_output_paths_allowed(&[options.output.to_path_buf()], file, true)?;
+    ensure_output_paths_allowed(&[options.output.to_path_buf()], options.font, true)?;
     ensure_output_paths_available(&[options.output.to_path_buf()])?;
     if !options.license_authorized || options.license_identity.trim().is_empty() {
         return Err(
@@ -3501,7 +3501,7 @@ pub fn font_remove(
     output: &Path,
     as_json: bool,
 ) -> Result<()> {
-    ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+    ensure_output_paths_allowed(&[output.to_path_buf()], file, true)?;
     ensure_output_paths_available(&[output.to_path_buf()])?;
     let mut document = Document::open(file)?;
     let removed = if let Some(kind) = kind {
@@ -3552,7 +3552,7 @@ pub fn font_settings(
         );
     }
     if let Some(output) = output {
-        ensure_output_paths_allowed(&[output.to_path_buf()], file, false)?;
+        ensure_output_paths_allowed(&[output.to_path_buf()], file, true)?;
         ensure_output_paths_available(&[output.to_path_buf()])?;
     }
     let mut document = Document::open(file)?;

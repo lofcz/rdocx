@@ -17,7 +17,10 @@ Keeping the three from diverging is the whole reason the design plan has an
 `/design` writes `## HLD impact` as a list of `docs/hld/` files. That list is
 consumed twice:
 
-1. `/complete-feature` step 3 updates **exactly those files**, no others.
+1. `/implement-feature` updates **exactly those files** before source freeze,
+   microscope and the final full gate. `/complete-feature` step3 confirms them.
+   HLD intent may describe the implemented mechanism while its native/oracle
+   qualification remains explicitly pending in the delivery record.
 2. `/microscope` and `/sprint-review` look for the inverse failure, a spec
    section the implementation contradicted that the plan never listed.
 
@@ -65,6 +68,22 @@ For each file the plan listed:
    state. A "what changed" heading is the first sign the set is rotting into a
    history.
 
+## Completion and capability consistency
+
+Before final freeze, reconcile each affected capability with implemented intent
+and its named evidence. Completed bounded capabilities have no active repair
+owner. An incomplete capability needs a pending/in-progress owner that actually
+owns its remaining acceptance, or an explicit permanent disposition the matrix
+allows. Never mark a capability complete merely to silence a policy test.
+After completion edits, rerun affected classification/owner/status assertions
+against the final records. A pre-completion green result does not prove the
+new status combination. Metadata adoption checks the final owner invariant,
+while other affected policy tests remain the caller's responsibility.
+
+Keep active plan prose consistent with its readiness state. Historical attempts,
+failed checks and native limitations remain attributed to their actual source.
+Do not rewrite completed historical plans merely to add a new template section.
+
 ## When the implementation contradicts an unlisted section
 
 Stop. This is a refused situation in `/complete-feature`, not a paperwork
@@ -89,6 +108,7 @@ as though it shipped.
 
 - `docs/hld/README.md`, the precedence rule and the set index.
 - `.claude/commands/design.md`, which writes the impact list.
-- `.claude/commands/complete-feature.md`, step 3, which executes it.
+- `.claude/commands/complete-feature.md`, step3, which confirms the reviewed
+  update without changing source intent after final verification.
 - `.claude/commands/realign-docs.md`, the bulk repair when drift has already
   accumulated.

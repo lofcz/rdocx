@@ -10,8 +10,10 @@ kind.
 
 Use it during `/design`, during `/run-sprint` wave planning, and when building
 the consolidated sprint gate. **Load only the rows the proposed diff triggers.**
-A matched row adds reading and adds checks. It never replaces the story's test
-plan or lowers the `/verify` floor.
+A matched row adds reading and final integrated checks. It never replaces the
+story's local regressions or drops a qualification obligation. Run the union
+once at final sprint acceptance. Do not rerun whole suites, external oracles,
+publication, documentation, WASM or font riders per story.
 
 ## The table
 
@@ -28,7 +30,17 @@ plan or lowers the `/verify` floor.
 | A new feature flag or a change to `default` | `CLAUDE.md` structural rules | A named consumer that exists today. `cargo test -p oxml-layout --no-default-features` is the only thing exercising bundled fonts being off |
 | A new trait, generic parameter, crate, module or file | `CLAUDE.md` structural rules | Name the second implementer or the second instantiation that exists **today**. A new crate, module or file needs an explicit ask first |
 | An external oracle comparison | `.claude/skills/differential-testing.md` | Pin the oracle version and record it. An unpinned oracle turns its upgrade into your regression |
+| Compatibility, numeric conversion or collection ordering | `.claude/commands/design.md`, Design validation before approval, and `.claude/skills/differential-testing.md`, Compatibility facts and oracle provenance | Pin the exact primary implementation, distinguish facts from choices, and specify field-specific ties, bounds and per-class ordering |
+| New getter or binding projection over an existing model | `.claude/commands/design.md`, Contract closure pass | Inventory accepted imported variants, absence and schema defaults. Specify read, preserve, assign and clear behavior, including exact unit scaling |
+| Cached read facts or projections | `.claude/commands/design.md`, Contract closure pass, and `.claude/skills/differential-testing.md`, Composition and discriminating fixtures | Trace all fact-changing publishers, including direct assignments with unchanged scopes or revision. Prove held, fresh, native and reopened values agree after an applicable edit |
+| XML creation or relocation in multiple parent contexts | `.claude/commands/design.md`, Design validation before approval, and the applicable schema | Record each qualified parent/content model, payload, order and cardinality. Verify every insertion path, including move/clone. Round-trip preservation does not authorize invalid placement |
+| Public API accepting raw XML bytes | `.claude/skills/differential-testing.md`, Composition and discriminating fixtures | Distinguish tokenization, legal names/values/entities and any approved namespace checks. Preserve explicitly valid opaque inputs. Malformed-input atomic refusal is a separate obligation |
+| Performance budget or bounded-edit optimization | `.claude/commands/design.md`, Contract closure pass, and `.claude/commands/verify.md`, Build, artifact and semantic outcome | Pin workload and sampling. Tie timing to a successful identified build. Preserve all required ratios and a deterministic work-bound control without dropping correctness |
 | Release scripting, version strings | `.claude/commands/release.md`, `docs/hld/15-build-and-toolchain.md` | Inspect every manifest, lockfile and README version diff. Require a clean full gate and a separate final approval before tagging |
+| Shared semantic behavior with multiple consumers | `.claude/skills/differential-testing.md`, Composition and discriminating fixtures | Consumer map and same-input comparison across relevant evaluation/update/serialize/render/reopen paths, including actual caller context |
+| Grammar, scope, compatibility mode or empty collection | `.claude/skills/differential-testing.md`, Composition and discriminating fixtures | Risk-based zero/one/many and implicit/explicit/legacy/versioned cases, with known invalid input and atomicity controls |
+| Completion status, capability ownership or evidence adoption | `.claude/WORKFLOW.md`, Acceptance contracts and composition checks | Rerun the policy checks whose metadata inputs changed after completion. Keep unaffected product evidence separate |
+| Contributed PR or new issue acceptance | `.claude/commands/design.md`, Acceptance criteria | Pin issue body and PR head, map every acceptance row, preserve omitted/unreduced criteria, choose public API compatibility before adoption |
 | A file move or rename with no behaviour change | `.claude/WORKFLOW.md`, the hash harness section | The harness must be byte-identical across the move. Never fold a behaviour change into a file move |
 
 ## Recording the result
@@ -47,8 +59,8 @@ whole sprint rather than once per worker.
 ## Why a router instead of running everything
 
 `/verify --scoped F-XXX` is the feature-completion floor, and `/verify --full`
-is the integrated sprint floor. The rows above add checks to the scoped gate
-when the feature earns them. They also join the consolidated sprint gate. The
+is the integrated sprint floor. The rows above add checks to the final integrated gate
+when the feature earns them. Scoped completion uses unique local regressions. The
 router exists so slow, manual, or environment-specific checks are chosen at
 design time rather than remembered at review time.
 

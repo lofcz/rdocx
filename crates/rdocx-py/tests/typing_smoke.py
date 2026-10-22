@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, assert_type
 
+from rdocx.enum.dml import MSO_COLOR_TYPE
+
 from rdocx import (
     Bookmark,
     BoundingBox,
@@ -11,6 +13,8 @@ from rdocx import (
     Comment,
     ComparisonDiagnostic,
     ContentFragment,
+    ContentLocation,
+    ContentControlTypePayload,
     CoreProperties,
     Document,
     HtmlDiagnostic,
@@ -19,6 +23,9 @@ from rdocx import (
     Hyperlink,
     Inches,
     Length,
+    Pt,
+    Emu,
+    Twips,
     LayoutFragment,
     FieldEvaluation,
     FieldsUpdateReport,
@@ -186,6 +193,15 @@ def exercise_rdocx_types(path: Path) -> None:
         different_first_page=True,
         break_type="continuous",
     )
+    document.update_section(0, margin_top=Twips(1440), margin_left=Emu(635), gutter=0)
+    document.section(0).margin_top = 1440
+    paragraph.paragraph_format.space_after = Pt(6)
+    paragraph.paragraph_format.space_after = 635
+    run.font.character_spacing = Emu(-635)
+    paragraph.paragraph_format.line_spacing = 2
+    paragraph.paragraph_format.line_spacing = 1.75
+    paragraph.paragraph_format.line_spacing = Pt(18)
+    assert_type(document.paragraphs[0].paragraph_format.line_spacing, Length | float | None)
     document.insert_section(1)
     document.remove_section(1)
     styles: tuple[Style, ...] = document.styles
@@ -438,6 +454,8 @@ def fx203_owned_document_operations(document: Document, paragraph: Paragraph, pa
         FragmentConflictPolicy, OdtExportResult, RtfExportResult, EpubExportResult,
         TextReport, ValidationReport, validate_bytes, validate_file,
     )
+    assert_type(document.render_template({"name": "Ada"}, grammar_version=1), int)
+    assert_type(document.render_template({"name": "Ada"}, grammar_version=None), int)
     assert_type(document.text_report(), TextReport)
     assert_type(document.validate(), ValidationReport)
     assert_type(validate_bytes(document.to_bytes()), ValidationReport)
@@ -453,6 +471,13 @@ def fx203_owned_document_operations(document: Document, paragraph: Paragraph, pa
     document.custom_properties.set("date", CustomFileTime("2026-10-12T12:00:00Z"))
     assert_type(document.custom_properties.get("date"), CustomProperty | None)
     assert_type(document.custom_properties.delete("absent"), bool)
+    document.custom_properties["Client"] = "Ada"
+    assert_type("Client" in document.custom_properties, bool)
+    del document.custom_properties["Client"]
+    assert_type(document.paragraphs[0].runs[0].font.color.type, MSO_COLOR_TYPE | None)
+    color_kind: MSO_COLOR_TYPE = MSO_COLOR_TYPE.RGB
+    assert_type(color_kind, MSO_COLOR_TYPE)
+
     policy = FragmentConflictPolicy.reuse_equivalent().with_style_reuse(False)
     story = document.stories[0]
     start = ContentLocation(story, "paragraph", [0])
@@ -614,3 +639,12 @@ if TYPE_CHECKING:
     _parity_document.save(io.BytesIO())
     _parity_document = Document.open(io.BytesIO())
     assert_type(_parity_document.styles, tuple[Style, ...])
+
+
+def s953_typed_authoring_contract(owner: Document, location: ContentLocation) -> None:
+    payload = ContentControlTypePayload.date("yyyy-MM-dd")
+    assert_type(payload, ContentControlTypePayload)
+    owner.set_content_control_type(location, payload)
+    assert_type(owner.add_custom_xml_store(b"<root/>"), str)
+    assert_type(owner.add_custom_xml_store(b"<root/>", ("urn:example",)), str)
+    assert_type(owner.remove_content_range(0, 0), int)

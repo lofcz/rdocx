@@ -18,7 +18,7 @@ The archive row is regenerated from the complete published package that carries 
 
 | Measurement | Value | Version | Platform | Build mode | Input | Command | Statistic | Measured on |
 |---|---|---|---|---|---|---|---|---|
-| Crates.io archive: oxml-layout | 5,170,683 compressed bytes, 10,312,186 member bytes, 62 members | 0.14.1 | Linux x86_64, Rust 1.97.1 | `cargo publish --workspace --dry-run --allow-dirty --locked` | Tracked `oxml-layout` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-10-16 |
+| Crates.io archive: oxml-layout | 5,170,669 compressed bytes, 10,312,220 member bytes, 62 members | 0.14.3 | Linux x86_64, Rust 1.97.1 | `cargo publish --workspace --dry-run --allow-dirty --locked` | Tracked `oxml-layout` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-10-22 |
 
 ## Use it when
 
@@ -45,4 +45,4 @@ let accent = Color::from_hex("3366CC");
 assert_eq!((accent.r, accent.g, accent.b), (0.2, 0.4, 0.8));
 ```
 
-Add `oxml-layout = { version = "0.14.1", default-features = false }` to your dependencies. Enable the default `system-fonts` feature only when host font discovery is intended.
+Add `oxml-layout = { version = "0.14.3", default-features = false }` to your dependencies. Enable the default `system-fonts` feature only when host font discovery is intended.
