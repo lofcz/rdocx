@@ -17,7 +17,7 @@ schema order, and retains unmodelled XML alongside typed edits.
 
 | Measurement | Value | Version | Platform | Build mode | Input | Command | Statistic | Measured on |
 |---|---|---|---|---|---|---|---|---|
-| Crates.io archive: rdocx-oxml | 541,303 compressed bytes, 3,334,078 member bytes, 32 members | 0.16.3 | Linux x86_64, Rust 1.97.1 | `cargo publish --workspace --dry-run --allow-dirty --locked` | Tracked `rdocx-oxml` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-10-22 |
+| Crates.io archive: rdocx-oxml | 566,876 compressed bytes, 3,495,153 member bytes, 32 members | 0.16.4 | Linux x86_64, Rust 1.97.1 | `cargo publish --workspace --dry-run --allow-dirty --locked` | Tracked `rdocx-oxml` package inventory | `python3 scripts/readme_doctests.py --record-measurements` | gzip archive bytes, tar member bytes, tar member count | 2026-10-30 |
 
 ## Use it when
 
@@ -44,5 +44,5 @@ assert_eq!(document.body.paragraphs().count(), 1);
 
 ```toml
 [dependencies]
-rdocx-oxml = "0.16.3"
+rdocx-oxml = "0.16.4"
 ```
