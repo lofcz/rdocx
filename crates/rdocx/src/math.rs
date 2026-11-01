@@ -1616,6 +1616,7 @@ fn normalize_argument(argument: &mut MathArgument) {
             && previous_is_fully_modelled
             && previous.properties == Default::default()
             && run.properties == Default::default()
+            && !separates_digits(&previous.text, &run.text)
         {
             previous.text.push_str(&run.text);
             continue;
@@ -1623,6 +1624,40 @@ fn normalize_argument(argument: &mut MathArgument) {
         normalized.push(expression);
     }
     argument.expressions = normalized;
+}
+
+/// `12,01` and `2{,}5` are decimal numbers: a comma written directly between
+/// digits joins the number before it. `1, 5` stays a list. Kept out of the
+/// recursive parser frame.
+#[inline(never)]
+fn join_decimal_comma(
+    source: &str,
+    atom: &MathArgument,
+    expressions: &mut [MathExpression],
+) -> bool {
+    if let [MathExpression::Run(comma)] = atom.expressions.as_slice()
+        && comma.text == ","
+        && comma.properties == Default::default()
+        && let Some(after) = source
+            .strip_prefix(',')
+            .or_else(|| source.strip_prefix("{,}"))
+        && after.starts_with(|ch: char| ch.is_ascii_digit())
+        && let Some(MathExpression::Run(previous)) = expressions.last_mut()
+        && previous.properties == Default::default()
+        && previous.text.ends_with(|ch: char| ch.is_ascii_digit())
+    {
+        previous.text.push(',');
+        return true;
+    }
+    false
+}
+
+/// A comma token between digits is list punctuation (`[-1, 1]`, MathML
+/// `<mn>1</mn><mo>,</mo><mn>1</mn>`). Merging it into the digits would make
+/// it a decimal mark (`<mn>2,5</mn>`, which arrives as one run).
+fn separates_digits(previous: &str, next: &str) -> bool {
+    (next == "," && previous.ends_with(|ch: char| ch.is_ascii_digit()))
+        || (previous == "," && next.starts_with(|ch: char| ch.is_ascii_digit()))
 }
 
 fn normalize_expression(expression: &mut MathExpression) {
@@ -2280,8 +2315,11 @@ impl<'a> LatexParser<'a> {
             {
                 break;
             }
+            let atom_start = self.offset;
             let atom = self.parse_complete_atom()?;
-            expressions.extend(atom.expressions);
+            if !join_decimal_comma(&self.input[atom_start..], &atom, &mut expressions) {
+                expressions.extend(atom.expressions);
+            }
         }
         if let Some(value) = terminator {
             if self.peek() != Some(value) {
@@ -4835,6 +4873,41 @@ mod tests {
     }
 
     #[test]
+    fn list_commas_between_digits_stay_separate_from_decimal_commas() {
+        fn runs(argument: &MathArgument) -> Vec<&str> {
+            argument
+                .expressions
+                .iter()
+                .map(|expression| match expression {
+                    MathExpression::Run(run) => run.text.as_str(),
+                    _ => panic!("expected runs only"),
+                })
+                .collect()
+        }
+        // KaTeX writes a list comma as its own `mo` and a decimal comma
+        // inside the `mn` (`2{,}5`).
+        let list = equation_from_mathml(&format!(
+            r#"<math xmlns="{MATHML_NS}"><mrow><mo stretchy="false">[</mo><mo>−</mo><mn>1</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">]</mo></mrow></math>"#,
+        ))
+        .unwrap();
+        assert_eq!(runs(&list.value), ["[−1", ",", "1]"]);
+        let decimal =
+            equation_from_mathml(&format!(r#"<math xmlns="{MATHML_NS}"><mn>2,5</mn></math>"#))
+                .unwrap();
+        assert_eq!(runs(&decimal.value), ["2,5"]);
+        // LaTeX: a comma written directly between digits is a decimal mark.
+        for (source, expected) in [
+            ("12,01", vec!["12,01"]),
+            ("2{,}5", vec!["2,5"]),
+            ("1, 5", vec!["1", ",", "5"]),
+            ("x,y", vec!["x,y"]),
+        ] {
+            let converted = equation_from_latex(source).unwrap();
+            assert_eq!(runs(&converted.value), expected, "{source}");
+        }
+    }
+
+    #[test]
     fn mathml_cases_preserve_their_one_sided_stretchy_fence() {
         let converted = equation_from_mathml(&format!(
             r#"<math xmlns="{MATHML_NS}"><mrow><mo fence="true">{{</mo><mtable><mtr><mtd><mi>x</mi></mtd></mtr><mtr><mtd><mi>y</mi></mtd></mtr></mtable></mrow></math>"#,
@@ -4945,7 +5018,16 @@ mod tests {
             panic!("underlined blank is a bottom bar")
         };
         assert_eq!(blank.position, BarPosition::Bottom);
-        assert_eq!(expressions.len(), 10, "{expressions:#?}");
+        // The list comma between digits stays its own run (not `4,6`).
+        let tail: Vec<&str> = expressions[9..]
+            .iter()
+            .map(|expression| match expression {
+                MathExpression::Run(run) => run.text.as_str(),
+                _ => panic!("bracketed list runs"),
+            })
+            .collect();
+        assert_eq!(tail, ["(4", ",", "6)"]);
+        assert_eq!(expressions.len(), 12, "{expressions:#?}");
 
         // KaTeX `\overset{a}{\longrightarrow}` wraps the construct in text-less `mo` tokens.
         let wrapped = equation_from_mathml(&format!(

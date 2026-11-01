@@ -717,6 +717,23 @@ fn apply_expression_limit_defaults(
     }
 }
 
+/// One atom (or class-transparent glue) of a formula list, before layout.
+struct ListItem<'a> {
+    /// Expression the item came from; runs contribute several items.
+    expression: usize,
+    body: ListBody<'a>,
+    /// Class seen by the previous and by the following atom. `None` is glue
+    /// (spaces), which neither takes nor changes inter-atom spacing.
+    classes: Option<(MathAtom, MathAtom)>,
+}
+
+enum ListBody<'a> {
+    /// Part of a run: one non-ordinary atom, a stretch of ordinary
+    /// characters, or explicit spacing.
+    Text(MathRun),
+    Structure(&'a MathExpression),
+}
+
 fn layout_expressions(
     expressions: &[MathExpression],
     fm: &mut FontManager,
@@ -733,22 +750,65 @@ fn layout_expressions(
     let has_math = ttf_parser::Face::parse(&data.data, data.face_index)
         .ok()
         .is_some_and(|face| face.tables().math.is_some());
-    let spacing = if has_math { 0.0 } else { spacing };
-    let mut measured = Vec::with_capacity(expressions.len());
+    // Faces without a MATH table get a small calibrated gap between adjacent
+    // top-level structures, matching Word's layout of the same equation.
+    let structure_gap = if has_math { 0.0 } else { spacing.max(0.0) };
+
+    let mut items = Vec::new();
     for (index, expression) in expressions.iter().enumerate() {
-        let path = format!("{source_path}/expression/{index}");
-        measured.push(match expression {
-            MathExpression::Run(run) if !has_math => layout_fallback_run(
-                run,
-                index > 0 && ends_with_operand(&expressions[index - 1]),
-                fm,
-                font_family,
-                context,
-                color,
-                &path,
-                diagnostics,
-            )?,
-            _ => layout_expression(
+        match expression {
+            MathExpression::Run(run) => {
+                for (text, class) in run_atoms(run) {
+                    let mut part = run.clone();
+                    part.text = text;
+                    items.push(ListItem {
+                        expression: index,
+                        body: ListBody::Text(part),
+                        classes: class.map(|class| (class, class)),
+                    });
+                }
+            }
+            _ => items.push(ListItem {
+                expression: index,
+                body: ListBody::Structure(expression),
+                classes: Some(structure_classes(expression)),
+            }),
+        }
+    }
+    resolve_binary_atoms(&mut items);
+
+    let script = context.script_level > 0;
+    let mut pieces = Vec::with_capacity(items.len() * 2);
+    let mut previous: Option<(usize, MathAtom, bool)> = None;
+    for item in &items {
+        let path = format!("{source_path}/expression/{}", item.expression);
+        let structure = matches!(item.body, ListBody::Structure(_));
+        if let Some((left, _)) = item.classes {
+            if let Some((expression, class, previous_structure)) = previous {
+                let atom_space =
+                    font_size * f64::from(inter_atom_space_mu(class, left, script)) / 18.0;
+                let gap = if expression == item.expression {
+                    atom_space
+                } else if structure && previous_structure && structure_gap > 0.0 {
+                    structure_gap
+                } else if structure || previous_structure {
+                    atom_space + structure_gap
+                } else {
+                    atom_space
+                };
+                if gap > 0.0 {
+                    pieces.push(MathAtom::spacer(gap));
+                }
+            }
+        }
+        pieces.push(match &item.body {
+            ListBody::Text(part) if has_math => {
+                layout_run(part, fm, font_family, context, color, &path, diagnostics)?
+            }
+            ListBody::Text(part) => {
+                layout_fallback_run(part, fm, font_family, context, color, &path, diagnostics)?
+            }
+            ListBody::Structure(expression) => layout_expression(
                 expression,
                 fm,
                 font_family,
@@ -758,39 +818,160 @@ fn layout_expressions(
                 diagnostics,
             )?,
         });
-        if has_math
-            && (matches!(
-                expression,
-                MathExpression::Nary(_)
-                    | MathExpression::LowerLimit(_)
-                    | MathExpression::UpperLimit(_)
-            ) || matches!(expression, MathExpression::Subscript(script)
-                    if matches!(script.base.expressions.as_slice(), [MathExpression::Run(run)]
-                        if run.properties.normal == Some(true) && run.text == "lim")))
-            && index + 1 < expressions.len()
-        {
-            let next_is_operator = matches!(&expressions[index + 1], MathExpression::Run(run)
-                if run.text.starts_with(['+', '−', '=']));
-            if !next_is_operator && let Some(last) = measured.last_mut() {
-                last.width += font_size * 3.0 / 18.0;
-            }
+        if let Some((_, right)) = item.classes {
+            previous = Some((item.expression, right, structure));
         }
     }
-    Ok(layout_spaced_sequence(measured, spacing))
+    if pieces.len() == 1 {
+        return Ok(pieces.pop().expect("one piece"));
+    }
+    Ok(layout_sequence(pieces))
 }
 
-/// Whether an operator right after `expression` has a left operand.
-fn ends_with_operand(expression: &MathExpression) -> bool {
-    match expression {
-        MathExpression::Run(run) => run
-            .text
-            .chars()
-            .rev()
-            .find(|ch| !ch.is_whitespace())
-            .is_some_and(|ch| {
-                MathAtom::classify(ch) == MathAtom::Ordinary && !matches!(ch, '(' | '[' | '{')
-            }),
-        _ => true,
+/// Split a run into TeX atoms. Ordinary characters stay together; every
+/// other atom is its own part. Spaces are glue (`None`).
+fn run_atoms(run: &MathRun) -> Vec<(String, Option<MathAtom>)> {
+    if run.text.chars().all(is_math_glue) {
+        return vec![(run.text.clone(), None)];
+    }
+    // `m:lit` and normal text (`\text{…}`) are single ordinary atoms; an
+    // upright normal-text name (`\sin`, `\operatorname{tr}`, `lim`) is an
+    // operator.
+    if run.properties.literal == Some(true) {
+        return vec![(run.text.clone(), Some(MathAtom::Ordinary))];
+    }
+    if run.properties.normal == Some(true) {
+        let function = run.properties.style.is_none()
+            && run.text.chars().count() > 1
+            && run.text.chars().all(char::is_alphabetic);
+        let class = if function {
+            MathAtom::Operator
+        } else {
+            MathAtom::Ordinary
+        };
+        return vec![(run.text.clone(), Some(class))];
+    }
+    let chars: Vec<char> = run.text.chars().collect();
+    let mut atoms: Vec<(String, Option<MathAtom>)> = Vec::new();
+    for (index, &ch) in chars.iter().enumerate() {
+        let class = if is_math_glue(ch) {
+            None
+        } else {
+            Some(MathAtom::classify_at(&chars, index))
+        };
+        match atoms.last_mut() {
+            Some((text, last))
+                if *last == class && matches!(class, None | Some(MathAtom::Ordinary)) =>
+            {
+                text.push(ch)
+            }
+            _ => atoms.push((ch.to_string(), class)),
+        }
+    }
+    atoms
+}
+
+/// Spaces in a formula: explicit glue, never an atom.
+fn is_math_glue(ch: char) -> bool {
+    ch.is_whitespace() || typographic_space_em(ch).is_some()
+}
+
+/// Classes a structure presents to its left and right neighbours.
+fn structure_classes(expression: &MathExpression) -> (MathAtom, MathAtom) {
+    // A scripted or limited single atom keeps its class (`\lim_{x}` and
+    // `\sum` are operators, `\overset{!}{=}` is a relation).
+    let base_class = |base: &MathArgument| match base.expressions.as_slice() {
+        [MathExpression::Run(run)] => match run_atoms(run).as_slice() {
+            [(_, Some(class))] => *class,
+            _ => MathAtom::Ordinary,
+        },
+        [MathExpression::Nary(_)] => MathAtom::Operator,
+        _ => MathAtom::Ordinary,
+    };
+    let class = match expression {
+        MathExpression::Nary(_) => MathAtom::Operator,
+        MathExpression::Subscript(value) | MathExpression::Superscript(value) => {
+            base_class(&value.base)
+        }
+        MathExpression::SubSuperscript(value) => base_class(&value.base),
+        MathExpression::LowerLimit(value) | MathExpression::UpperLimit(value) => {
+            base_class(&value.base)
+        }
+        // `m:d` is how Word stores plain brackets (`f(x)`, `2(x+1)`); it
+        // spaces like an opening and a closing delimiter around its content.
+        MathExpression::Delimiter(_) => return (MathAtom::Open, MathAtom::Close),
+        _ => MathAtom::Ordinary,
+    };
+    (class, class)
+}
+
+/// TeXbook Appendix G rules 5 and 6: a binary operator needs an operand on
+/// both sides. One that starts the list or follows Bin, Op, Rel, Open or
+/// Punct, or that precedes Rel, Close or Punct or ends the list, is ordinary
+/// (`-3`, `(-3`, `= -3`, `; -3`, `x^{-1}`).
+fn resolve_binary_atoms(items: &mut [ListItem<'_>]) {
+    fn ordinary(class: MathAtom) -> MathAtom {
+        if class == MathAtom::Binary {
+            MathAtom::Ordinary
+        } else {
+            class
+        }
+    }
+    let mut previous: Option<usize> = None;
+    for index in 0..items.len() {
+        let Some((left, right)) = items[index].classes else {
+            continue;
+        };
+        let before = previous
+            .and_then(|p| items[p].classes)
+            .map(|(_, right)| right);
+        if left == MathAtom::Binary
+            && before.is_none_or(|class| {
+                matches!(
+                    class,
+                    MathAtom::Binary
+                        | MathAtom::Operator
+                        | MathAtom::Relation
+                        | MathAtom::Open
+                        | MathAtom::Punctuation
+                )
+            })
+        {
+            items[index].classes = Some((MathAtom::Ordinary, ordinary(right)));
+        } else if matches!(
+            left,
+            MathAtom::Relation | MathAtom::Close | MathAtom::Punctuation
+        ) && before == Some(MathAtom::Binary)
+            && let Some(p) = previous
+            && let Some((previous_left, _)) = items[p].classes
+        {
+            items[p].classes = Some((ordinary(previous_left), MathAtom::Ordinary));
+        }
+        previous = Some(index);
+    }
+    if let Some(p) = previous
+        && let Some((left, MathAtom::Binary)) = items[p].classes
+    {
+        items[p].classes = Some((ordinary(left), MathAtom::Ordinary));
+    }
+}
+
+/// Inter-atom space in mu (1/18 em) between a `left` and a `right` atom
+/// (TeXbook chapter 18; `math_spacing` in tex.web). Rows and columns are
+/// Ord, Op, Bin, Rel, Open, Close, Punct; the Inner row and column are not
+/// needed because no OfficeMath structure is an inner atom. `1`, `3` and `4`
+/// are thin, medium and thick spaces that vanish in script styles; `2` is a
+/// thin space kept in every style; `*` cannot occur after rules 5 and 6.
+fn inter_atom_space_mu(left: MathAtom, right: MathAtom, script: bool) -> u8 {
+    const TABLE: [&[u8; 7]; 7] = [
+        b"0234000", b"22*4000", b"33**3**", b"44*0400", b"00*0000", b"0234000", b"11*1111",
+    ];
+    match TABLE[left as usize][right as usize] {
+        b'1' if !script => 3,
+        b'2' => 3,
+        b'3' if !script => 4,
+        b'4' if !script => 5,
+        _ => 0,
     }
 }
 
@@ -825,12 +1006,14 @@ fn layout_expression(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<MeasuredMath> {
     match expression {
-        MathExpression::Run(value) => layout_run(
-            value,
+        // A lone run is still a list of atoms (`-3`, `a+b`).
+        MathExpression::Run(_) => layout_expressions(
+            std::slice::from_ref(expression),
             fm,
             font_family,
             context,
             color,
+            0.0,
             source_path,
             diagnostics,
         ),
@@ -1095,7 +1278,6 @@ fn layout_run(
     {
         return layout_fallback_run(
             run,
-            false,
             fm,
             font_family,
             context,
@@ -1248,10 +1430,12 @@ fn layout_run(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One atom of a run in a face without a MATH table. Math italic applies to
+/// letters only: digits, operators and punctuation stay upright, so `2x`
+/// slants just `x`. Inter-atom spacing belongs to the list
+/// (`layout_expressions`), not to the run.
 fn layout_fallback_run(
     run: &MathRun,
-    left_operand: bool,
     fm: &mut FontManager,
     font_family: Option<&str>,
     context: MathLayoutStyle,
@@ -1259,7 +1443,6 @@ fn layout_fallback_run(
     source_path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<MeasuredMath> {
-    let font_size = context.font_size;
     let style = if run.properties.normal == Some(true) || run.properties.literal == Some(true) {
         MathStyle::Plain
     } else {
@@ -1267,53 +1450,19 @@ fn layout_fallback_run(
     };
     let bold = matches!(style, MathStyle::Bold | MathStyle::BoldItalic);
     let italic = matches!(style, MathStyle::Italic | MathStyle::BoldItalic);
-    // Word's math engine styles and spaces a run per character class: math
-    // italic applies to letters only (digits, operators and punctuation stay
-    // upright, so `2x+1` slants just `x`), binary operators and relations get
-    // TeX's medium / thick space on both sides, and a leading operator is
-    // unary (`-3`) and gets none.
-    let literal = run.properties.literal == Some(true);
-    let mut segments: Vec<(bool, MathAtom, String)> = Vec::new();
-    let chars: Vec<char> = run.text.chars().collect();
-    for (index, &ch) in chars.iter().enumerate() {
-        let atom = if literal {
-            MathAtom::Ordinary
-        } else {
-            MathAtom::classify_at(&chars, index)
-        };
+    let mut segments: Vec<(bool, String)> = Vec::new();
+    for ch in run.text.chars() {
         let slanted = italic && ch.is_alphabetic();
         match segments.last_mut() {
-            Some((last_slanted, last_atom, segment))
-                if *last_slanted == slanted && *last_atom == atom && atom == MathAtom::Ordinary =>
-            {
-                segment.push(ch)
-            }
-            _ => segments.push((slanted, atom, ch.to_string())),
+            Some((last, segment)) if *last == slanted => segment.push(ch),
+            _ => segments.push((slanted, ch.to_string())),
         }
     }
     if segments.is_empty() {
-        segments.push((italic, MathAtom::Ordinary, String::new()));
+        segments.push((italic, String::new()));
     }
-    let mut pieces = Vec::with_capacity(segments.len() * 3);
-    let mut previous = left_operand.then_some(MathAtom::Ordinary);
-    for (slanted, atom, segment) in &segments {
-        let (before, after) = match atom {
-            MathAtom::Ordinary => (0.0, 0.0),
-            // No operand before it: unary sign or a run that starts with the operator.
-            MathAtom::Binary if previous.is_none_or(|p| p != MathAtom::Ordinary) => (0.0, 0.0),
-            MathAtom::Binary => {
-                let gap = font_size * BINARY_OPERATOR_GAP_EM;
-                (gap, gap)
-            }
-            MathAtom::Relation => {
-                let gap = font_size * RELATION_GAP_EM;
-                (gap, gap)
-            }
-            MathAtom::Punctuation => (0.0, font_size * PUNCTUATION_GAP_EM),
-        };
-        if before > 0.0 {
-            pieces.push(MathAtom::spacer(before));
-        }
+    let mut pieces = Vec::with_capacity(segments.len());
+    for (slanted, segment) in &segments {
         pieces.push(layout_text(
             segment,
             fm,
@@ -1325,10 +1474,6 @@ fn layout_fallback_run(
             source_path,
             diagnostics,
         )?);
-        if after > 0.0 {
-            pieces.push(MathAtom::spacer(after));
-        }
-        previous = Some(*atom);
     }
     if pieces.len() == 1 {
         return Ok(pieces.pop().expect("one piece"));
@@ -1353,25 +1498,23 @@ fn typographic_space_em(ch: char) -> Option<f64> {
     })
 }
 
-/// TeX medium space (`\medmuskip`, 4/18 em) around binary operators.
-const BINARY_OPERATOR_GAP_EM: f64 = 4.0 / 18.0;
-/// TeX thick space (`\thickmuskip`, 5/18 em) around relations.
-const RELATION_GAP_EM: f64 = 5.0 / 18.0;
-/// TeX thin space (`\thinmuskip`, 3/18 em) after list punctuation.
-const PUNCTUATION_GAP_EM: f64 = 3.0 / 18.0;
-
-/// Spacing class of a formula character (a subset of TeX's atom types).
+/// TeX atom class of a formula character (TeXbook chapter 17). Inner
+/// atoms (`\left…\right`, `\frac` in plain TeX) have no OfficeMath
+/// counterpart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MathAtom {
     Ordinary,
+    Operator,
     Binary,
     Relation,
+    Open,
+    Close,
     Punctuation,
 }
 
 impl MathAtom {
-    /// Class of `chars[index]`; a comma between digits is a decimal mark
-    /// (`12,01`), not list punctuation.
+    /// Class of `chars[index]`; a comma between digits of one run is a
+    /// decimal mark (`12,01`), not list punctuation.
     fn classify_at(chars: &[char], index: usize) -> Self {
         let ch = chars[index];
         if ch == ',' {
@@ -1389,13 +1532,27 @@ impl MathAtom {
 
     fn classify(ch: char) -> Self {
         match ch {
-            ';' => Self::Punctuation,
-            ':' => Self::Relation,
-            '+' | '−' | '-' | '×' | '⋅' | '·' | '÷' | '±' | '∓' | '∗' | '∘' | '∖' | '∧' | '∨'
-            | '∩' | '∪' | '⊕' | '⊗' | '⊙' => Self::Binary,
-            '=' | '≠' | '<' | '>' | '≤' | '≥' | '≪' | '≫' | '≈' | '≐' | '≡' | '≢' | '∼' | '≃'
-            | '≅' | '∝' | '∈' | '∉' | '∋' | '⊂' | '⊃' | '⊆' | '⊇' | '∥' | '⊥' | '→' | '←' | '↔'
-            | '⇒' | '⇐' | '⇔' | '⟶' | '⟵' | '⟹' | '⟸' | '⟺' | '↦' | '⇌' | '≔' => {
+            ',' | ';' => Self::Punctuation,
+            '(' | '[' | '{' | '⟨' | '〈' | '⌊' | '⌈' | '⟦' | '⟮' | '⦃' | '⦅' => {
+                Self::Open
+            }
+            ')' | ']' | '}' | '⟩' | '〉' | '⌋' | '⌉' | '⟧' | '⟯' | '⦄' | '⦆' | '!' | '?' => {
+                Self::Close
+            }
+            '∑' | '∏' | '∐' | '∫' | '∬' | '∭' | '∮' | '∯' | '∰' | '⋀' | '⋁' | '⋂' | '⋃' | '⨀'
+            | '⨁' | '⨂' | '⨄' | '⨆' | '⨌' => Self::Operator,
+            '+' | '−' | '-' | '*' | '×' | '⋅' | '·' | '÷' | '±' | '∓' | '∗' | '∘' | '∙' | '∖'
+            | '∧' | '∨' | '∩' | '∪' | '⊎' | '⊓' | '⊔' | '⊕' | '⊖' | '⊗' | '⊘' | '⊙' | '⊞' | '⊟'
+            | '⊠' | '⊡' | '⋆' | '⋄' | '⋉' | '⋊' | '⊻' | '⊼' | '≀' | '†' | '‡' | '△' | '▽' | '◁'
+            | '▷' | '∔' => Self::Binary,
+            ':' | '=' | '≠' | '<' | '>' | '≤' | '≥' | '≦' | '≧' | '⩽' | '⩾' | '≮' | '≯' | '≰'
+            | '≱' | '≲' | '≳' | '≶' | '≷' | '≪' | '≫' | '≺' | '≻' | '⪯' | '⪰' | '≈' | '≉' | '≐'
+            | '≡' | '≢' | '∼' | '≃' | '≅' | '≇' | '≍' | '≔' | '≕' | '≜' | '≝' | '≟' | '∝' | '∶'
+            | '∷' | '∈' | '∉' | '∋' | '∌' | '⊂' | '⊃' | '⊆' | '⊇' | '⊄' | '⊅' | '⊈' | '⊉' | '⊊'
+            | '⊋' | '⊏' | '⊐' | '⊑' | '⊒' | '∣' | '∤' | '∥' | '∦' | '⊥' | '⊢' | '⊣' | '⊨' | '⋈'
+            | '⌢' | '⌣' => Self::Relation,
+            // Arrows, long arrows and supplemental arrows are relations.
+            '\u{2190}'..='\u{21FF}' | '\u{27F0}'..='\u{27FF}' | '\u{2900}'..='\u{297F}' => {
                 Self::Relation
             }
             _ => Self::Ordinary,
@@ -1529,29 +1686,6 @@ fn layout_text(
             }
         }
     }
-    let mut leading_space = 0.0;
-    if math_alphabet_covered && text.chars().count() == shaped.advances.len() {
-        // Math atom glue uses the conventional medium and thick mu spaces.
-        // It belongs to operator layout, not to the stored logical string.
-        for (index, character) in text.chars().enumerate() {
-            let gap = match character {
-                '+' | '−' | '×' | '⋅' | '÷' | '±' | '∓' | '∪' | '∩' => {
-                    font_size * 4.0 / 18.0
-                }
-                '=' | '≤' | '≥' | '≠' | '≈' | '≡' | '∼' | '∝' | '∈' | '⊂' | '⇒' | '←' => {
-                    font_size * 5.0 / 18.0
-                }
-                _ => 0.0,
-            };
-            if index == 0 {
-                leading_space += gap;
-            } else {
-                shaped.advances[index - 1] += gap;
-            }
-            shaped.advances[index] += gap;
-            shaped.width += 2.0 * gap;
-        }
-    }
     if shaped.glyph_ids.contains(&0) {
         diagnostics.push(Diagnostic {
             message: format!("OfficeMath text at {source_path} contains an unavailable glyph"),
@@ -1566,7 +1700,7 @@ fn layout_text(
             descent: metrics.descent.max(0.0),
             group: group(vec![PositionedElement::Text(GlyphRun {
                 origin: Point {
-                    x: leading_space,
+                    x: 0.0,
                     y: metrics.ascent.max(0.0),
                 },
                 font_id,
@@ -2831,6 +2965,9 @@ mod tests {
 
     type Geometry = (f64, f64, f64);
 
+    /// TeX medium space (`\medmuskip`, 4 mu) around a binary operator.
+    const BINARY_OPERATOR_GAP_EM: f64 = 4.0 / 18.0;
+
     fn text(value: &str) -> MathArgument {
         MathArgument::text(value)
     }
@@ -3735,6 +3872,238 @@ mod tests {
             "thin space: {} vs {expected}",
             thin.width
         );
+    }
+
+    /// A run with OfficeMath run properties (`m:sty`, `m:nor`).
+    fn styled_run(value: &str, style: Option<MathStyle>, normal: bool) -> MathExpression {
+        let mut run = MathRun::new(value);
+        run.properties.style = style;
+        run.properties.normal = normal.then_some(true);
+        run.into()
+    }
+
+    /// Inter-atom space of a laid-out list in mu: the list width minus the
+    /// widths of its atoms laid out on their own.
+    fn atom_space_mu(
+        expressions: &[MathExpression],
+        context: MathLayoutStyle,
+        spacing: f64,
+    ) -> f64 {
+        let mut fm = deterministic_font_manager();
+        let mut diagnostics = Vec::new();
+        let list = layout_expressions(
+            expressions,
+            &mut fm,
+            None,
+            context,
+            Color::BLACK,
+            spacing,
+            "test",
+            &mut diagnostics,
+        )
+        .expect("list layout");
+        let mut bare = 0.0;
+        for expression in expressions {
+            let parts: Vec<MathExpression> = match expression {
+                MathExpression::Run(run) => run_atoms(run)
+                    .into_iter()
+                    .map(|(text, _)| {
+                        let mut part = run.clone();
+                        part.text = text;
+                        part.into()
+                    })
+                    .collect(),
+                other => vec![other.clone()],
+            };
+            for part in parts {
+                // One atom alone has no neighbour to space against.
+                bare += layout_expression(
+                    &part,
+                    &mut fm,
+                    None,
+                    context,
+                    Color::BLACK,
+                    "test",
+                    &mut diagnostics,
+                )
+                .expect("atom layout")
+                .width;
+            }
+        }
+        (list.width - bare) * 18.0 / context.font_size
+    }
+
+    fn run_space_mu(value: &str) -> f64 {
+        atom_space_mu(
+            &[MathRun::new(value).into()],
+            MathLayoutStyle::new(11.0, false),
+            0.0,
+        )
+    }
+
+    #[test]
+    fn binary_operators_without_two_operands_are_ordinary_like_tex() {
+        // (formula, total inter-atom space in mu): thin 3, medium 4, thick 5.
+        for (formula, expected) in [
+            ("−3", 0.0),       // leading minus
+            ("(−3;2]", 3.0),   // after an opening bracket; thin after `;`
+            ("(−∞;−4⟩", 3.0),  // after `(` and after `;`
+            ("/:(−3)", 10.0),  // `:` is a relation; `(` then unary minus
+            ("−3<x", 10.0),    // thick around `<` only
+            ("a−b", 8.0),      // a real binary minus
+            ("5−3x≥17", 18.0), // medium around `−`, thick around `≥`
+            ("f(−x)", 0.0),    // unary inside brackets
+            ("x=−3", 10.0),    // after a relation
+            ("x,−3", 3.0),     // after a comma
+            ("x;−3", 3.0),     // after a semicolon
+            ("(x−)", 0.0),     // before a closing bracket
+            ("x−=y", 10.0),    // before a relation
+            ("x+−y", 8.0),     // after another binary operator
+            ("12,01", 0.0),    // a decimal comma in one number
+        ] {
+            let actual = run_space_mu(formula);
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "{formula}: {actual} mu, expected {expected} mu"
+            );
+        }
+    }
+
+    #[test]
+    fn atom_spacing_crosses_run_boundaries_without_extra_gaps() {
+        let size = 11.0;
+        let top = MathLayoutStyle::new(size, false);
+        // `\{x \in \mathbb{R}; -3 < x\}` as MathML import splits it.
+        let set = [
+            MathRun::new("{x").into(),
+            styled_run("∈", Some(MathStyle::Plain), false),
+            styled_run("ℝ", None, true),
+            MathRun::new(";−3<x}").into(),
+        ];
+        let actual = atom_space_mu(&set, top, size * EQUATION_SPACING_EM);
+        assert!((actual - 23.0).abs() < 0.01, "set builder: {actual} mu");
+
+        // `(-\infty; -4\rangle`: an upright `∞` run is an ordinary atom with
+        // no gap before `;`.
+        let interval = [
+            MathRun::new("(−").into(),
+            styled_run("∞", Some(MathStyle::Plain), false),
+            MathRun::new(";−4⟩").into(),
+        ];
+        let actual = atom_space_mu(&interval, top, size * EQUATION_SPACING_EM);
+        assert!((actual - 3.0).abs() < 0.01, "interval: {actual} mu");
+
+        // `[-1, 1]`: the list comma is its own run and keeps its thin space.
+        let list = [
+            MathRun::new("[−1").into(),
+            MathRun::new(",").into(),
+            MathRun::new("1]").into(),
+        ];
+        let actual = atom_space_mu(&list, top, size * EQUATION_SPACING_EM);
+        assert!((actual - 3.0).abs() < 0.01, "list: {actual} mu");
+
+        // `\sin x`: an upright function name is an operator (thin space).
+        let function = [styled_run("sin", None, true), MathRun::new("x").into()];
+        let actual = atom_space_mu(&function, top, 0.0);
+        assert!((actual - 3.0).abs() < 0.01, "function: {actual} mu");
+
+        // `\text{a-b}` is one ordinary atom.
+        let text_run = [styled_run("a-b", Some(MathStyle::Plain), true)];
+        assert!(atom_space_mu(&text_run, top, 0.0).abs() < 0.01);
+
+        // `f` followed by a bracket structure spaces like `f(`.
+        let call = [
+            MathRun::new("f").into(),
+            MathExpression::Delimiter(MathDelimiter::new("(", ")", vec![text("x")])),
+        ];
+        assert!(atom_space_mu(&call, top, 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn script_styles_drop_conditional_spaces() {
+        let script = MathLayoutStyle::new(11.0, false).script(SCRIPT_SCALE);
+        // `x^{-1}` and `x^{a+b}`: no medium or thick space in a script.
+        for formula in ["−1", "a+b", "n=1"] {
+            let actual = atom_space_mu(&[MathRun::new(formula).into()], script, 0.0);
+            assert!(actual.abs() < 0.01, "{formula} in a script: {actual} mu");
+        }
+        // The thin space after an operator survives every style.
+        let function = [styled_run("sin", None, true), MathRun::new("x").into()];
+        let actual = atom_space_mu(&function, script, 0.0);
+        assert!(
+            (actual - 3.0).abs() < 0.01,
+            "function in a script: {actual} mu"
+        );
+
+        // A whole superscript: the base and the unary exponent are untouched.
+        let mut fm = deterministic_font_manager();
+        let mut diagnostics = Vec::new();
+        let mut width = |exponent: &str| {
+            layout_expression(
+                &MathExpression::Superscript(MathScript::new(text("x"), text(exponent))),
+                &mut fm,
+                None,
+                MathLayoutStyle::new(11.0, false),
+                Color::BLACK,
+                "test",
+                &mut diagnostics,
+            )
+            .expect("script layout")
+            .width
+        };
+        let negative = width("−1");
+        let positive = width("1");
+        let minus = {
+            let mut fm = deterministic_font_manager();
+            layout_expression(
+                &MathRun::new("−").into(),
+                &mut fm,
+                None,
+                MathLayoutStyle::new(11.0, false).script(SCRIPT_SCALE),
+                Color::BLACK,
+                "test",
+                &mut Vec::new(),
+            )
+            .expect("minus")
+            .width
+        };
+        assert!(
+            (negative - positive - minus).abs() < 0.05,
+            "x^(-1) adds only the minus glyph: {negative} vs {positive} + {minus}"
+        );
+    }
+
+    #[test]
+    fn structures_keep_their_calibrated_gap_and_take_atom_classes() {
+        let size = 11.0;
+        let top = MathLayoutStyle::new(size, false);
+        let gap_mu = EQUATION_SPACING_EM * 18.0;
+        // `x^2+1`: medium space on both sides of `+`, plus the structure gap.
+        let sum = [
+            MathExpression::Superscript(MathScript::new(text("x"), text("2"))),
+            MathRun::new("+1").into(),
+        ];
+        let actual = atom_space_mu(&sum, top, size * EQUATION_SPACING_EM);
+        assert!((actual - (8.0 + gap_mu)).abs() < 0.01, "x²+1: {actual} mu");
+        // `-\frac{1}{2}`: unary minus before a fraction.
+        let negative = [
+            MathRun::new("−").into(),
+            MathExpression::Fraction(MathFraction::new(text("1"), text("2"))),
+        ];
+        let actual = atom_space_mu(&negative, top, size * EQUATION_SPACING_EM);
+        assert!((actual - gap_mu).abs() < 0.01, "−½: {actual} mu");
+        // `\lim_{x} = 1`: a scripted operator keeps its class (Op–Rel thick).
+        let mut lim = MathRun::new("lim");
+        lim.properties.normal = Some(true);
+        let limit = [
+            MathExpression::Subscript(MathScript::new(
+                MathArgument::new(vec![lim.into()]),
+                text("x"),
+            )),
+            MathRun::new("=1").into(),
+        ];
+        let actual = atom_space_mu(&limit, top, 0.0);
+        assert!((actual - 10.0).abs() < 0.01, "lim = 1: {actual} mu");
     }
 
     #[test]
